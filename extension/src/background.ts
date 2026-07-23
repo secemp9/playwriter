@@ -1669,19 +1669,23 @@ async function attachTab(
     // sendCommandWithTimeout exists for. Log the tab's lifecycle state so the relay log
     // shows WHY a setup command timed out, and pin the tab against Memory-Saver
     // auto-discard while it is under automation.
-    try {
-      const tab = await chrome.tabs.get(tabId)
-      logger.debug(
-        'attach: tab lifecycle', tabId,
-        'status:', tab.status,
-        'discarded:', tab.discarded,
-        'frozen:', (tab as { frozen?: boolean }).frozen,
-        'active:', tab.active,
-      )
-      if (tab.autoDiscardable) {
-        void chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {})
-      }
-    } catch {}
+    // Fire-and-forget: this is evidence and a nice-to-have pin, and tabs.get itself hangs
+    // when the worker's API pipeline wedges — it must never block the setup sequence.
+    void chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        logger.debug(
+          'attach: tab lifecycle', tabId,
+          'status:', tab.status,
+          'discarded:', tab.discarded,
+          'frozen:', (tab as { frozen?: boolean }).frozen,
+          'active:', tab.active,
+        )
+        if (tab.autoDiscardable) {
+          void chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {})
+        }
+      })
+      .catch(() => {})
 
     // Every setup command below should return near-instantly on a healthy renderer, so
     // all of them are bounded: a tab whose renderer never answers must fail ITS attach in
