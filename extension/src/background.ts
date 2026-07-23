@@ -102,6 +102,10 @@ type ExtensionIdentity = {
   email: string
   id: string
   installId: string
+  // 'storage' when installId is the persisted one; 'fallback' when storage did not answer
+  // in time and the worker-lifetime scope was used. Sent as `idSrc` on the relay URL so
+  // the relay log shows which path fired — observability for wedged chrome.* APIs.
+  idSource: 'storage' | 'fallback'
 }
 
 function sleep(ms: number): Promise<void> {
@@ -133,32 +137,20 @@ function browserNameFromBrands(brands: Array<{ brand: string; version: string }>
   return null
 }
 
-async function detectBrowserName(): Promise<string> {
+// Synchronous browser-name detection: property check plus UA sniff, no awaits. Used
+// directly on the connect path; the async high-entropy refinement below only improves
+// the label for later connects.
+function browserNameSync(): string {
   if ((chrome as unknown as { ghostPublicAPI?: unknown }).ghostPublicAPI) {
     return 'Ghost'
   }
-
-  const navigatorWithUaData = navigator as NavigatorWithUaData
-  const brands = navigatorWithUaData.userAgentData?.brands
-  const highEntropyValues = await navigatorWithUaData.userAgentData?.getHighEntropyValues?.([
-    'fullVersionList',
-  ]).catch(() => {
-    return null
-  })
-  const fullVersionList = highEntropyValues?.fullVersionList || []
-
-  const highEntropyName = browserNameFromBrands(fullVersionList)
-  if (highEntropyName) {
-    return highEntropyName
-  }
-
+  const brands = (navigator as NavigatorWithUaData).userAgentData?.brands
   if (brands && brands.length > 0) {
     const lowEntropyName = browserNameFromBrands(brands)
     if (lowEntropyName) {
       return lowEntropyName
     }
   }
-
   const ua = navigator.userAgent.toLowerCase()
   if (ua.includes('edg/')) return 'Edge'
   if (ua.includes('opr/')) return 'Opera'
@@ -168,7 +160,27 @@ async function detectBrowserName(): Promise<string> {
   return 'Chromium'
 }
 
-let installIdPromise: Promise<string> | null = null
+let cachedBrowserName: string | null = null
+let browserNameRefineStarted = false
+
+// Fire-and-forget refinement via the async high-entropy UA API (distinguishes e.g.
+// Chrome Canary). Never awaited on the connect path.
+function refineBrowserNameInBackground(): void {
+  if (cachedBrowserName || browserNameRefineStarted) return
+  browserNameRefineStarted = true
+  const navigatorWithUaData = navigator as NavigatorWithUaData
+  Promise.resolve(navigatorWithUaData.userAgentData?.getHighEntropyValues?.(['fullVersionList']))
+    .then((highEntropyValues) => {
+      const name = browserNameFromBrands(highEntropyValues?.fullVersionList || [])
+      if (name) {
+        cachedBrowserName = name
+      }
+    })
+    .catch(() => {
+      browserNameRefineStarted = false
+    })
+}
+
 const tabSessionScope = (() => {
   const values = new Uint32Array(2)
   crypto.getRandomValues(values)
@@ -179,27 +191,42 @@ const tabSessionScope = (() => {
     .join('')
 })()
 
-async function getInstallId(): Promise<string> {
-  if (installIdPromise) {
-    return installIdPromise
-  }
+let cachedInstallId: string | null = null
 
-  installIdPromise = (async () => {
-    const existing = await chrome.storage.local.get('playwriterInstallId')
+// Bounded installId lookup. chrome.storage.local has been observed to never settle in a
+// wedged worker (Default profile, Chrome 149), so the storage read is raced against a
+// short timeout. On timeout the worker-lifetime scope keeps us connectable (stable key
+// for this worker, retried against storage on the next attempt); only a RESOLVED storage
+// value is cached.
+const INSTALL_ID_STORAGE_TIMEOUT_MS = 1500
+
+async function getInstallId(): Promise<{ installId: string; idSource: 'storage' | 'fallback' }> {
+  if (cachedInstallId) {
+    return { installId: cachedInstallId, idSource: 'storage' }
+  }
+  try {
+    const existing = await Promise.race([
+      chrome.storage.local.get('playwriterInstallId'),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('storage.local.get timed out'))
+        }, INSTALL_ID_STORAGE_TIMEOUT_MS)
+      }),
+    ])
     const storedInstallId = typeof existing.playwriterInstallId === 'string' ? existing.playwriterInstallId : ''
     if (storedInstallId) {
-      return storedInstallId
+      cachedInstallId = storedInstallId
+      return { installId: storedInstallId, idSource: 'storage' }
     }
-
     const installId = createInstallId()
-    await chrome.storage.local.set({ playwriterInstallId: installId })
-    return installId
-  })().catch((error) => {
-    installIdPromise = null
-    throw error
-  })
-
-  return installIdPromise
+    cachedInstallId = installId
+    // Fire-and-forget persist: if this write hangs or fails, the id is still stable for
+    // this worker's lifetime and the next worker will mint a new one — churn, not outage.
+    void chrome.storage.local.set({ playwriterInstallId: installId }).catch(() => {})
+    return { installId, idSource: 'storage' }
+  } catch {
+    return { installId: tabSessionScope, idSource: 'fallback' }
+  }
 }
 
 // Profile info (email/id) is cosmetic metadata for the relay's browser list — it is NOT
@@ -226,19 +253,20 @@ function fetchProfileInBackground(): void {
     })
 }
 
+// The connect critical path may not perform any unbounded await on a chrome.* API: in
+// the failing profile getProfileUserInfo hung forever, and after moving that call off
+// the path, chrome.storage.local.get hung too. Everything here is synchronous, cached,
+// or explicitly bounded; background refiners improve later connects.
 async function getExtensionIdentity(): Promise<ExtensionIdentity> {
   fetchProfileInBackground()
-  const browser = await detectBrowserName()
-  const installId = await getInstallId().catch(() => {
-    // Storage can be unavailable briefly during startup. Fall back to the runtime scope so
-    // we still avoid the coarse browser-only key that causes cross-browser relay takeovers.
-    return tabSessionScope
-  })
+  refineBrowserNameInBackground()
+  const { installId, idSource } = await getInstallId()
   return {
-    browser,
+    browser: cachedBrowserName ?? browserNameSync(),
     email: cachedProfile?.email || '',
     id: cachedProfile?.id || '',
     installId,
+    idSource,
   }
 }
 
@@ -442,6 +470,7 @@ class ConnectionManager {
     if (identity.installId) {
       relayUrl.searchParams.set('installId', identity.installId)
     }
+    relayUrl.searchParams.set('idSrc', identity.idSource)
     if (typeof __PLAYWRITER_VERSION__ !== 'undefined') {
       relayUrl.searchParams.set('v', __PLAYWRITER_VERSION__)
     }
