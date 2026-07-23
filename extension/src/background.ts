@@ -1079,8 +1079,22 @@ async function getGroupOrUndefined(groupId: number): Promise<chrome.tabGroups.Ta
  *      ignores group-removal events for 'connecting' tabs. Together these stop a tab that is
  *      mid-attach from being ungrouped-then-disconnected.
  */
+// Tabs whose attachTab setup sequence is currently in flight. chrome.tabs.group() /
+// ungroup() targeting a tab mid-debugger-attach deterministically kills this service
+// worker (relay-log proof: the freestyle group op for an already-attached tab completes,
+// the cwd-bucket group call for the mid-attach auto-created tab is next in the same
+// Phase-3 pass, the worker dies with close 1001 — and 'Created workspace group: cwd:...'
+// has never once been logged). Group mutations are therefore deferred while any attach
+// is in flight; the state change that completes (or fails) an attach re-triggers
+// syncTabGroups via the store subscription, so a deferred pass is re-run, never dropped.
+const attachSetupInProgress = new Set<number>()
+
 async function syncTabGroups(): Promise<void> {
   try {
+    if (attachSetupInProgress.size > 0) {
+      logger.debug('syncTabGroups deferred: attach setup in flight for', Array.from(attachSetupInProgress))
+      return
+    }
     // Include 'connecting' tabs in a group only when the relay is alive, so that tabs the
     // user drags into a group stay visible while attaching. When the relay is dead all tabs
     // are 'connecting' (waiting for reconnect) and their groups should be cleaned up. The
@@ -1634,6 +1648,7 @@ async function attachTab(
 ): Promise<AttachTabResult> {
   const debuggee = { tabId }
   let debuggerAttached = false
+  attachSetupInProgress.add(tabId)
 
   try {
     logger.debug('Attaching debugger to tab:', tabId)
@@ -1826,6 +1841,8 @@ async function attachTab(
       chrome.debugger.detach(debuggee).catch(() => {})
     }
     throw error
+  } finally {
+    attachSetupInProgress.delete(tabId)
   }
 }
 
