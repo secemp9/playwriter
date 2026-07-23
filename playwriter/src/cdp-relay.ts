@@ -608,6 +608,41 @@ export async function startPlayWriterCDPRelayServer({
       return
     }
 
+    // Tab REUSE (user directive): before creating a blank tab, adopt an already-attached
+    // usable tab if one exists. This is what lets a session operate on the user's own
+    // already-open page (e.g. the molab tab, attached freestyle via a human icon-click)
+    // instead of spawning a redundant about:blank — whose attach has also proven fatal to
+    // the extension worker. Only freestyle tabs (workspaceKey === null) or tabs already
+    // ours are adoptable; a tab owned by a DIFFERENT real workspace is never stolen (that
+    // would break that session). "Usable" = a page target on a real (non-blank) URL. When
+    // several qualify, the first non-blank one is reused. Only when zero usable tabs exist
+    // do we fall through and create a fresh one.
+    const isBlankUrl = (url: string | undefined): boolean =>
+      !url || url === 'about:blank' || url === ':' || url === 'chrome://newtab/'
+    const adoptable = Array.from(conn.connectedTargets.values()).filter(
+      (t) =>
+        t.targetInfo.type === 'page' &&
+        !isBlankUrl(t.targetInfo.url) &&
+        (t.workspaceKey === null || t.workspaceKey === workspaceKey),
+    )
+    if (adoptable.length > 0) {
+      const reused = adoptable[0]
+      store.setState((s) =>
+        relayState.setTargetWorkspaceKey(s, {
+          extensionId: conn.id,
+          sessionId: reused.sessionId,
+          workspaceKey,
+        }),
+      )
+      logger?.log(
+        pc.green(
+          `Reusing existing tab for workspace ${workspaceKey} instead of creating a blank one ` +
+            `(sessionId: ${reused.sessionId}, url: ${reused.targetInfo.url})`,
+        ),
+      )
+      return
+    }
+
     try {
       logger?.log(pc.blue('Auto-creating initial tab for Playwright client'))
       const result = (await sendToExtension({

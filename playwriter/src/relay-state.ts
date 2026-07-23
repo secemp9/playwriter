@@ -391,6 +391,29 @@ export function addTarget(
   return { ...state, extensions: newExtensions }
 }
 
+/**
+ * Re-stamp an existing target's owning workspace (tab reuse / adoption). Used when a
+ * client connects to a workspace that owns no tab yet but a usable freestyle tab already
+ * exists: instead of creating a blank tab, that tab is adopted into the workspace so the
+ * client can see and drive it. No-op if the extension or target is absent. All other
+ * fields (targetId, targetInfo, frameIds) are preserved unchanged.
+ */
+export function setTargetWorkspaceKey(
+  state: RelayState,
+  { extensionId, sessionId, workspaceKey }: { extensionId: string; sessionId: string; workspaceKey: string | null },
+): RelayState {
+  const ext = state.extensions.get(extensionId)
+  const existingTarget = ext?.connectedTargets.get(sessionId)
+  if (!ext || !existingTarget) {
+    return state
+  }
+  const newTargets = new Map(ext.connectedTargets)
+  newTargets.set(sessionId, { ...existingTarget, workspaceKey })
+  const newExtensions = new Map(state.extensions)
+  newExtensions.set(extensionId, { ...ext, connectedTargets: newTargets })
+  return { ...state, extensions: newExtensions }
+}
+
 /** Remove a target by sessionId. No-op if extension or target doesn't exist. */
 export function removeTarget(
   state: RelayState,
