@@ -5,6 +5,12 @@ declare const __PLAYWRITER_VERSION__: string
 // Bundled automation builds should not burn a tab on the welcome page, especially
 // in headless/VPS flows where the extension is installed only to attach to the relay.
 declare const __PLAYWRITER_OPEN_WELCOME_PAGE__: boolean
+// Dev live-reload: true only in `npm run dev` builds (PLAYWRITER_DEV_RELOAD=1). When on,
+// the service worker polls the dev-reload server and calls chrome.runtime.reload() (which
+// re-reads the unpacked extension from disk) whenever dist/ changes. Never set in
+// production/store builds, so the poller and its localhost fetch never ship to users.
+declare const __PLAYWRITER_DEV_RELOAD__: boolean
+declare const __PLAYWRITER_DEV_RELOAD_PORT__: string
 
 import dedent from 'string-dedent'
 const js = dedent
@@ -478,7 +484,7 @@ class ConnectionManager {
     if (typeof __PLAYWRITER_VERSION__ !== 'undefined') {
       relayUrl.searchParams.set('v', __PLAYWRITER_VERSION__)
     }
-    logger.debug('Creating WebSocket connection to:', relayUrl)
+    logger.debug(`[worker ${workerInstanceId}] Creating WebSocket connection to:`, relayUrl)
     const socket = new WebSocket(relayUrl.toString())
 
     await new Promise<void>((resolve, reject) => {
@@ -703,7 +709,7 @@ class ConnectionManager {
     chrome.debugger.onEvent.addListener(onDebuggerEvent)
     chrome.debugger.onDetach.addListener(onDebuggerDetach)
 
-    logger.debug('Connection established')
+    logger.debug(`[worker ${workerInstanceId}] Connection established (up ${workerUptimeS()}s)`)
   }
 
   private handleClose(reason: string, code: number): void {
@@ -718,7 +724,7 @@ class ConnectionManager {
         )
       }
     } catch {}
-    logger.warn(`DISCONNECT: WS closed code=${code} reason=${reason || 'none'} stack=${getCallStack()}`)
+    logger.warn(`[worker ${workerInstanceId}] DISCONNECT: WS closed code=${code} reason=${reason || 'none'} up=${workerUptimeS()}s stack=${getCallStack()}`)
 
     chrome.debugger.onEvent.removeListener(onDebuggerEvent)
     chrome.debugger.onDetach.removeListener(onDebuggerDetach)
@@ -2314,9 +2320,40 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 // outage at ~30s: waking the worker re-runs module evaluation, which restarts
 // maintainLoop, which reconnects. The listener body is intentionally empty — being woken
 // IS the work.
+// A short random id unique to THIS service-worker instance. MV3 kills and respawns the
+// worker constantly and every log line lands in the same shared relay log, so without an
+// instance tag it is impossible to tell which lines belong to which worker life. Every
+// lifecycle/heartbeat/reload line below is prefixed with it, so the log reads as distinct
+// per-worker timelines instead of an undifferentiated stream.
+const workerInstanceId = Math.random().toString(36).slice(2, 8)
+const workerStartedAt = Date.now()
+const workerUptimeS = (): number => Math.round((Date.now() - workerStartedAt) / 1000)
+
+// Startup banner: the first line each worker emits. Records exactly which build and config
+// is live — the single most useful line when diagnosing "which version am I actually
+// running / why did behavior change", given how much build/key churn this extension sees.
+logger.log(
+  `[worker ${workerInstanceId}] START`,
+  `v=${typeof __PLAYWRITER_VERSION__ !== 'undefined' ? __PLAYWRITER_VERSION__ : '?'}`,
+  `relayPort=${RELAY_PORT}`,
+  `devReload=${typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__ ? `on:${__PLAYWRITER_DEV_RELOAD_PORT__}` : 'off'}`,
+  `ua=${navigator.userAgent.slice(0, 60)}`,
+)
+
+// Log WHY the worker (re)started: install / update / chrome start / periodic wake vs a
+// plain idle respawn. onInstalled also tells us when a live-reload actually took effect.
+chrome.runtime.onInstalled.addListener((details) => {
+  logger.log(`[worker ${workerInstanceId}] onInstalled reason=${details.reason}`, details.previousVersion ? `prev=${details.previousVersion}` : '')
+})
+chrome.runtime.onStartup.addListener(() => {
+  logger.log(`[worker ${workerInstanceId}] onStartup (browser launch)`)
+})
+
 const RECONNECT_ALARM = 'playwriter-reconnect'
 void chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
-chrome.alarms.onAlarm.addListener(() => {})
+chrome.alarms.onAlarm.addListener((alarm) => {
+  logger.debug(`[worker ${workerInstanceId}] alarm woke worker: ${alarm.name} (up ${workerUptimeS()}s)`)
+})
 
 // Worker heartbeat. The service worker's console is not observable from outside the
 // browser, and this worker has been repeatedly terminated mid-work; the heartbeat gives
@@ -2324,9 +2361,20 @@ chrome.alarms.onAlarm.addListener(() => {})
 // lives, and (b) whether the chrome.* API pipeline still answers (bounded probe — this
 // same pipeline has been observed to stop settling calls). The completed API call also
 // resets the idle timer, belt-and-suspenders alongside the relay's WS pings.
-const workerStartedAt = Date.now()
 setInterval(() => {
-  const uptimeS = Math.round((Date.now() - workerStartedAt) / 1000)
+  const uptimeS = workerUptimeS()
+  const ws = connectionManager.ws
+  const wsState =
+    ws === null
+      ? 'null'
+      : ws.readyState === WebSocket.OPEN
+        ? 'open'
+        : ws.readyState === WebSocket.CONNECTING
+          ? 'connecting'
+          : ws.readyState === WebSocket.CLOSING
+            ? 'closing'
+            : 'closed'
+  const { connectionState, tabs } = store.getState()
   void Promise.race([
     chrome.runtime.getPlatformInfo(),
     new Promise<never>((_, reject) => {
@@ -2336,13 +2384,62 @@ setInterval(() => {
     }),
   ]).then(
     () => {
-      logger.debug(`heartbeat: worker up ${uptimeS}s, chrome api ok`)
+      logger.debug(
+        `[worker ${workerInstanceId}] heartbeat up=${uptimeS}s api=ok ws=${wsState} conn=${connectionState} tabs=${tabs.size}`,
+      )
     },
     () => {
-      logger.warn(`heartbeat: worker up ${uptimeS}s, chrome.* API pipeline NOT answering`)
+      logger.warn(
+        `[worker ${workerInstanceId}] heartbeat up=${uptimeS}s api=NOT-ANSWERING ws=${wsState} conn=${connectionState} tabs=${tabs.size}`,
+      )
     },
   )
 }, 15000)
+
+// Dev live-reload. In `npm run dev` builds only: poll the dev-reload server for the
+// current build token (dist/background.js mtime). The FIRST successful poll sets the
+// baseline; any later change means a rebuild landed on disk, so reload the extension.
+// chrome.runtime.reload() re-reads the unpacked files from disk AND wipes
+// chrome.storage.session (clearing any stale tab-ownership state) — so a source edit
+// becomes a clean, automatic reload with zero manual clicks. Guarded so nothing here
+// exists in production builds.
+if (typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__) {
+  const devReloadUrl = `http://${RELAY_HOST}:${__PLAYWRITER_DEV_RELOAD_PORT__}/build-id`
+  let devReloadBaseline: string | null = null
+  // Track reachability so we log ONE line on each up<->down transition instead of spamming
+  // the log every second. 'unknown' until the first poll resolves either way.
+  let serverReachable: boolean | 'unknown' = 'unknown'
+  logger.log(`[worker ${workerInstanceId}] dev live-reload poller starting, url=${devReloadUrl}`)
+  const pollDevReload = async (): Promise<void> => {
+    try {
+      const res = await fetch(devReloadUrl, { signal: AbortSignal.timeout(2000) })
+      const token = (await res.text()).trim()
+      if (serverReachable !== true) {
+        logger.debug(`[worker ${workerInstanceId}] dev-reload server reachable, build=${token}`)
+        serverReachable = true
+      }
+      if (!token) return
+      if (devReloadBaseline === null) {
+        devReloadBaseline = token
+        logger.log(`[worker ${workerInstanceId}] dev live-reload armed, baseline build=${token}`)
+        return
+      }
+      if (token !== devReloadBaseline) {
+        logger.log(`[worker ${workerInstanceId}] dev live-reload: dist changed ${devReloadBaseline} -> ${token}, RELOADING`)
+        chrome.runtime.reload()
+      }
+    } catch (err) {
+      if (serverReachable !== false) {
+        logger.debug(
+          `[worker ${workerInstanceId}] dev-reload server unreachable (${(err as Error).name || 'error'}) — will keep polling`,
+        )
+        serverReachable = false
+      }
+    }
+  }
+  setInterval(pollDevReload, 1000)
+  void pollDevReload()
+}
 
 // Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
 // resolved by the time the first connect attempt reads it. Never awaited anywhere.

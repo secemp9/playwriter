@@ -16,6 +16,10 @@ const defineEnv: Record<string, string> = {
   'process.env.PLAYWRITER_PORT': JSON.stringify(process.env.PLAYWRITER_PORT || '19988'),
   __PLAYWRITER_VERSION__: JSON.stringify(playwriterPkg.version),
   __PLAYWRITER_OPEN_WELCOME_PAGE__: JSON.stringify(process.env.PLAYWRITER_OPEN_WELCOME_PAGE !== '0'),
+  // Dev live-reload: only `npm run dev` sets PLAYWRITER_DEV_RELOAD=1, so store/production
+  // builds compile the poller out entirely (the guard is a literal `false`).
+  __PLAYWRITER_DEV_RELOAD__: JSON.stringify(process.env.PLAYWRITER_DEV_RELOAD === '1'),
+  __PLAYWRITER_DEV_RELOAD_PORT__: JSON.stringify(process.env.PLAYWRITER_DEV_RELOAD_PORT || '19989'),
 }
 if (process.env.TESTING) {
   defineEnv['import.meta.env.TESTING'] = 'true'
