@@ -22,6 +22,12 @@ export type ConnectedTarget = {
   targetId: string
   targetInfo: Protocol.Target.TargetInfo
   frameIds: Set<string>
+  /**
+   * Workspace that owns this target (I2). Required and explicitly nullable:
+   * null POSITIVELY means freestyle (a human clicked the extension icon), which
+   * is visible to no workspace, ever — never "ownership unknown".
+   */
+  workspaceKey: string | null
 }
 
 export type ExtensionInfo = {
@@ -57,6 +63,23 @@ export type PlaywrightClient = {
   id: string
   extensionId: string | null
   ws: WSContext
+  /**
+   * Workspace that owns this client connection (I1). NON-NULLABLE: a client's
+   * workspaceKey is ALWAYS a non-empty string — never null, never absent, never
+   * defaulted. Guaranteed by the sole production caller, the /cdp handler (Todo 12),
+   * which reads the `workspace` query param and REJECTS any unkeyed client with
+   * ws.close(4005, 'Missing workspace') BEFORE the client is ever stored. This
+   * non-null type is what lets Todo 17's visibleToWorkspace(target,
+   * client.workspaceKey) typecheck against visibleToWorkspace's non-null param.
+   */
+  workspaceKey: string
+  /**
+   * Human-readable label for the owning workspace (basename of the workspace root,
+   * or the PLAYWRITER_WORKSPACE value). Rides with workspaceKey on the wire — the two
+   * are set together by getCdpUrl (Todo 5) and never arrive apart, and the /cdp
+   * handler (Todo 12) rejects any client missing either, so both are always present.
+   */
+  workspaceLabel: string
 }
 
 export type RelayState = {
@@ -192,10 +215,29 @@ export function removeExtension(state: RelayState, { extensionId }: { extensionI
 /** Add a playwright client (state + ws handle co-located). */
 export function addPlaywrightClient(
   state: RelayState,
-  { id, extensionId, ws }: { id: string; extensionId: string | null; ws: WSContext },
+  {
+    id,
+    extensionId,
+    ws,
+    workspaceKey,
+    workspaceLabel,
+  }: {
+    id: string
+    extensionId: string | null
+    ws: WSContext
+    /**
+     * Owning workspace of this client (I1). NON-NULLABLE — the sole production
+     * caller (the /cdp handler, Todo 12) reads these from the `workspace` /
+     * `workspaceLabel` query params and rejects any unkeyed client with
+     * ws.close(4005) BEFORE calling this, so a non-empty key/label always reaches
+     * here. Do NOT default it.
+     */
+    workspaceKey: string
+    workspaceLabel: string
+  },
 ): RelayState {
   const newClients = new Map(state.playwrightClients)
-  newClients.set(id, { id, extensionId, ws })
+  newClients.set(id, { id, extensionId, ws, workspaceKey, workspaceLabel })
   return { ...state, playwrightClients: newClients }
 }
 
@@ -311,12 +353,20 @@ export function addTarget(
     sessionId,
     targetId,
     targetInfo,
+    workspaceKey,
     existingFrameIds,
   }: {
     extensionId: string
     sessionId: string
     targetId: string
     targetInfo: Protocol.Target.TargetInfo
+    /**
+     * Workspace that owns this target (I2). Required and explicitly nullable so
+     * no call site can silently forget ownership. The caller always knows the
+     * owner — do NOT fall back to `existingTarget?.workspaceKey` on the update
+     * path; an implicit merge would be exactly the forbidden fallback.
+     */
+    workspaceKey: string | null
     /** Preserve existing frameIds if target already existed (update scenario). */
     existingFrameIds?: Set<string>
   },
@@ -333,6 +383,7 @@ export function addTarget(
     targetId,
     targetInfo,
     frameIds: existingFrameIds ?? existingTarget?.frameIds ?? new Set(),
+    workspaceKey,
   })
 
   const newExtensions = new Map(state.extensions)

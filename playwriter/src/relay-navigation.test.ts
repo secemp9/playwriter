@@ -10,6 +10,7 @@ import {
   type TestContext,
   withTimeout,
   createSimpleServer,
+  TEST_WORKSPACE,
 } from './test-utils.js'
 import './test-declarations.js'
 
@@ -66,7 +67,7 @@ describe('Relay Navigation Tests', () => {
 
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const context = browser.contexts()[0]
 
     const server = await createSimpleServer({
@@ -82,9 +83,12 @@ describe('Relay Navigation Tests', () => {
 
       const pagePromise = context.waitForEvent('page', { timeout: 5000 })
 
-      await serviceWorker.evaluate(async () => {
-        await globalThis.toggleExtensionForActiveTab()
-      })
+      await serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
 
       const targetPage = await pagePromise
       console.log('Page URL when event fired:', targetPage.url())
@@ -135,9 +139,12 @@ describe('Relay Navigation Tests', () => {
       await page.bringToFront()
 
       await withTimeout({
-        promise: serviceWorker.evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        }),
+        promise: serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        ),
         timeoutMs: 5000,
         errorMessage: 'Timed out toggling extension for iframe test',
       })
@@ -146,7 +153,7 @@ describe('Relay Navigation Tests', () => {
       })
 
       const browser = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 5000,
         errorMessage: 'Timed out connecting over CDP for iframe test',
       })
@@ -224,15 +231,18 @@ describe('Relay Navigation Tests', () => {
       await page.bringToFront()
 
       await withTimeout({
-        promise: serviceWorker.evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        }),
+        promise: serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        ),
         timeoutMs: 5000,
         errorMessage: 'Timed out toggling extension for empty-src iframe test',
       })
 
       const browser = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 5000,
         errorMessage: 'Timed out connecting over CDP for empty-src iframe test',
       })
@@ -302,11 +312,14 @@ describe('Relay Navigation Tests', () => {
     await page.goto('https://discord.com/login', { waitUntil: 'load' })
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const context = browser.contexts()[0]
 
     const pages = context.pages()
@@ -341,13 +354,16 @@ describe('Relay Navigation Tests', () => {
     await page.goto(initialUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
@@ -374,13 +390,16 @@ describe('Relay Navigation Tests', () => {
     await page.goto('about:blank')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
@@ -417,14 +436,17 @@ describe('Relay Navigation Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 100))
 
     for (let i = 0; i < 3; i++) {
-      const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
       const pages = browser.contexts()[0].pages()
       let iframePage
       for (const p of pages) {
@@ -456,11 +478,14 @@ describe('Relay Navigation Tests', () => {
 
     const targetUrl = 'https://example.com/'
 
-    const enableResult = await serviceWorker.evaluate(async (url) => {
-      const tab = await chrome.tabs.create({ url, active: true })
-      await new Promise((r) => setTimeout(r, 100))
-      return await globalThis.toggleExtensionForActiveTab()
-    }, targetUrl)
+    const enableResult = await serviceWorker.evaluate(
+      async ([url, k, l]) => {
+        const tab = await chrome.tabs.create({ url, active: true })
+        await new Promise((r) => setTimeout(r, 100))
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [targetUrl, TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string, string],
+    )
 
     console.log('Extension enabled:', enableResult)
     expect(enableResult.isConnected).toBe(true)
@@ -474,7 +499,7 @@ describe('Relay Navigation Tests', () => {
       verbose: 1,
       disablePino: true,
       localBrowserLaunchOptions: {
-        cdpUrl: getCdpUrl({ port: TEST_PORT }),
+        cdpUrl: getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }),
       },
     })
 
@@ -510,9 +535,12 @@ describe('Relay Navigation Tests', () => {
     await page.goto('https://example.com')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 200))
 
     // Test /json/version
@@ -570,9 +598,12 @@ describe('Relay Navigation Tests', () => {
     await recordingPage.goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' })
     await recordingPage.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 200))
 
     const outputPath = path.join(process.cwd(), 'tmp', 'test-recording.mp4')
@@ -654,9 +685,12 @@ describe('Relay Navigation Tests', () => {
       await page.bringToFront()
 
       await withTimeout({
-        promise: serviceWorker.evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        }),
+        promise: serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        ),
         timeoutMs: 5000,
         errorMessage: 'Timed out toggling extension for detach test',
       })
@@ -666,7 +700,15 @@ describe('Relay Navigation Tests', () => {
 
       // Connect a raw WebSocket to the relay — this lets us send CDP messages
       // exactly as they appear on the wire, without Playwright adding sessionId.
-      const ws = new WebSocket(`ws://localhost:${TEST_PORT}/cdp/test-detach-raw`)
+      // The relay requires the owning workspace on the connection URL (Todo 12's 4005
+      // guard), so stamp this raw client with the same workspace the tab was toggled into.
+      // URLSearchParams percent-encodes the `:` in the key to `%3A`; the relay reads it
+      // back with url.searchParams.get(), which decodes it to the original `wt:...` key.
+      const detachQuery = new URLSearchParams({
+        workspace: TEST_WORKSPACE.key,
+        workspaceLabel: TEST_WORKSPACE.label,
+      })
+      const ws = new WebSocket(`ws://localhost:${TEST_PORT}/cdp/test-detach-raw?${detachQuery.toString()}`)
       await new Promise<void>((resolve, reject) => {
         ws.on('open', () => {
           resolve()
@@ -817,9 +859,12 @@ describe('Relay Navigation Tests', () => {
 
       // Enable playwriter on this page — this must NOT crash the debugger
       await withTimeout({
-        promise: serviceWorker.evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        }),
+        promise: serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        ),
         timeoutMs: 5000,
         errorMessage: 'Timed out toggling extension on page with chrome-extension:// iframe',
       })
@@ -831,7 +876,7 @@ describe('Relay Navigation Tests', () => {
 
       // Verify the extension is still connected by connecting over CDP and interacting
       const browser = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 5000,
         errorMessage: 'Timed out connecting over CDP — extension likely crashed',
       })
@@ -854,9 +899,12 @@ describe('Relay Navigation Tests', () => {
       // Toggle off to clean up
       await page.bringToFront()
       await serviceWorker
-        .evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        })
+        .evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        )
         .catch(() => {})
       await page.close()
       await server.close()

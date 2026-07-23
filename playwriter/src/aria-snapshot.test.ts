@@ -7,7 +7,7 @@ import path from 'node:path'
 import { getAriaSnapshot } from './aria-snapshot.js'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
-import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, type TestContext } from './test-utils.js'
+import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, TEST_WORKSPACE, type TestContext } from './test-utils.js'
 
 const TEST_PORT = 19986
 const SNAPSHOTS_DIR = path.join(import.meta.dirname, 'aria-snapshots')
@@ -77,9 +77,12 @@ describe('aria-snapshot', () => {
     page = await ctx.browserContext.newPage()
     const serviceWorker = await getExtensionServiceWorker(ctx.browserContext)
     await page.goto('about:blank')
-    await serviceWorker.evaluate(async () => {
-      await (globalThis as any).toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await (globalThis as any).toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     if (!fs.existsSync(SNAPSHOTS_DIR)) {
       fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true })
     }

@@ -12,6 +12,7 @@ import {
   setupTestContext,
   cleanupTestContext,
   getExtensionServiceWorker,
+  TEST_WORKSPACE,
   type TestContext,
   safeCloseCDPBrowser,
 } from './test-utils.js'
@@ -45,12 +46,15 @@ describe('onMouseAction callback', () => {
     await page.goto('data:text/html,<html><body><button id="btn">Click me</button></body></html>')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await (globalThis as any).toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await (globalThis as any).toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => { setTimeout(r, 200) })
 
-    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const contexts = directBrowser.contexts()
     const pages = contexts[0].pages()
     const targetPage = pages.find((p) => p.url().startsWith('data:'))
@@ -87,7 +91,7 @@ describe('onMouseAction callback', () => {
   it('should fire onMouseAction for locator.click()', async () => {
     const browserContext = testCtx!.browserContext
 
-    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const contexts = directBrowser.contexts()
     const pages = contexts[0].pages()
     const targetPage = pages.find((p) => p.url().startsWith('data:'))
@@ -117,7 +121,7 @@ describe('onMouseAction callback', () => {
   it('should animate ghost cursor from onMouseAction callback', async () => {
     const browserContext = testCtx!.browserContext
 
-    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     let targetPage: Page | null = null
     try {
       const contexts = directBrowser.contexts()
@@ -173,7 +177,7 @@ describe('onMouseAction callback', () => {
   it('should not fire when onMouseAction is set to null', async () => {
     const browserContext = testCtx!.browserContext
 
-    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const contexts = directBrowser.contexts()
     const pages = contexts[0].pages()
     const targetPage = pages.find((p) => p.url().startsWith('data:'))
@@ -206,9 +210,12 @@ describe('onMouseAction callback', () => {
     await page.goto('data:text/html,<html><body><h1>always-on-cursor</h1></body></html>')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await (globalThis as any).toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await (globalThis as any).toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => {
       setTimeout(r, 300)
     })

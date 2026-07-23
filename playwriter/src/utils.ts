@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { Workspace } from './workspace-key.js'
 
 // Playwriter extension IDs - used for validation and Chrome flag commands
 export const EXTENSION_IDS = [
@@ -31,16 +32,27 @@ export function parseRelayHost(host: string, port: number = 19988): { httpBaseUr
   }
 }
 
+/**
+ * Build the relay CDP WebSocket URL for one client.
+ *
+ * `workspace` carries the client's isolation identity to the relay, which reads it back
+ * off the query string and decides which targets that client may ever see. This function
+ * stays a pure URL builder and deliberately does NOT call deriveWorkspace() itself: the
+ * key must be derived in the MCP/CLI client process, never in the shared relay daemon,
+ * which holds the cwd and env of whichever session happened to spawn it. Callers pass it.
+ */
 export function getCdpUrl({
   port = 19988,
   host = '127.0.0.1',
   token,
   extensionId,
+  workspace,
 }: {
   port?: number
   host?: string
   token?: string
   extensionId?: string | null
+  workspace?: Workspace
 } = {}) {
   const id = `${Math.random().toString(36).substring(2, 15)}_${Date.now()}`
   const params = new URLSearchParams()
@@ -50,14 +62,14 @@ export function getCdpUrl({
   if (extensionId) {
     params.set('extensionId', extensionId)
   }
+  if (workspace) {
+    params.set('workspace', workspace.key)
+    params.set('workspaceLabel', workspace.label)
+  }
   const queryString = params.toString()
   const suffix = queryString ? `?${queryString}` : ''
   const { wsBaseUrl } = parseRelayHost(host, port)
   return `${wsBaseUrl}/cdp/${id}${suffix}`
-}
-
-export function shouldAutoEnablePlaywriter(): boolean {
-  return process.env.PLAYWRITER_AUTO_ENABLE?.toLowerCase() !== 'false'
 }
 
 // Use ~/.playwriter for logs so each OS user gets their own dir (avoids permission errors on shared machines, see #44)

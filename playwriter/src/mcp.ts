@@ -17,6 +17,7 @@ import dedent from 'string-dedent'
 import { LOG_FILE_PATH, VERSION, parseRelayHost } from './utils.js'
 import { ensureRelayServer, RELAY_PORT } from './relay-client.js'
 import { PlaywrightExecutor, CodeExecutionTimeoutError } from './executor.js'
+import { deriveWorkspace } from './workspace-key.js'
 import { discoverChromeInstances, resolveDirectInput, appendSessionToWsUrl } from './chrome-discovery.js'
 import crypto from 'node:crypto'
 
@@ -26,6 +27,14 @@ const require = createRequire(import.meta.url)
 
 // Single executor instance for MCP (created lazily)
 let executor: PlaywrightExecutor | null = null
+
+// Workspace identity for this MCP session, derived ONCE per process here in the client —
+// never in the shared relay daemon (I4). process.cwd() is frozen at spawn, so this key
+// stays stable for the session's whole life even if the user cd's. This file is only ever
+// imported by the MCP entrypoint (cli.ts), so derivation cannot leak into the daemon.
+// Only the relay/extension path consumes it; direct-CDP and headless own their own browser
+// and never touch the relay (see the CdpConfig.workspace doc in executor.ts).
+const workspace = deriveWorkspace()
 
 interface RemoteConfig {
   host: string
@@ -150,8 +159,11 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
     await ensureRelayServerForMcp()
   }
 
-  // Pass config instead of pre-generated URL so executor can generate unique URLs for each connection
-  const cdpConfig = remote || { port: RELAY_PORT }
+  // Pass config instead of pre-generated URL so executor can generate unique URLs for each connection.
+  // The workspace rides on cdpConfig and reaches the relay via getCdpUrl (executor.ts). It is set
+  // ONLY here on the relay/remote path — the direct-CDP branch above deliberately omits it, since
+  // that path connects straight to Chrome and never calls getCdpUrl.
+  const cdpConfig = { ...(remote || { port: RELAY_PORT }), workspace }
   executor = new PlaywrightExecutor({
     cdpConfig,
     logger: mcpLogger,
@@ -362,6 +374,7 @@ export async function startMcp(options: { host?: string; token?: string } = {}) 
   if (process.env.PLAYWRITER_DIRECT) {
     mcpLog(`Using direct CDP connection: ${process.env.PLAYWRITER_DIRECT}`)
   } else {
+    mcpLog(`Workspace: ${workspace.label} (${workspace.key}, ${workspace.kind})`)
     const remote = getRemoteConfig()
     if (!remote) {
       await ensureRelayServerForMcp()

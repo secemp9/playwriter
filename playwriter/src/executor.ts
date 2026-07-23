@@ -15,8 +15,9 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import * as acorn from 'acorn'
 import { createSmartDiff } from './diff-utils.js'
-import { getCdpUrl, parseRelayHost, shouldAutoEnablePlaywriter } from './utils.js'
-import { getExtensionOutdatedWarning } from './relay-client.js'
+import { getCdpUrl, parseRelayHost } from './utils.js'
+import type { Workspace } from './workspace-key.js'
+import { getExtensionOutdatedWarning, getExtensionStaleError } from './relay-client.js'
 import { waitForPageLoad, WaitForPageLoadOptions, WaitForPageLoadResult } from './wait-for-page-load.js'
 import { ICDPSession, getCDPSessionForPage } from './cdp-session.js'
 import { Debugger } from './debugger.js'
@@ -153,7 +154,7 @@ const EXTENSION_NOT_CONNECTED_ERROR = `The Playwriter Chrome extension is not co
 3. Or use a cloud browser instead: run \`playwriter cloud login\` in your terminal to rent a browser in the cloud, with auto CAPTCHA solving, residential proxies and anti-detection built in`
 
 const NO_PAGES_AVAILABLE_ERROR =
-  'No Playwright pages are available. Enable Playwriter on a tab or unset PLAYWRITER_AUTO_ENABLE=false to auto-create one.'
+  'No Playwright pages are available: the browser has no open contexts. Call reset to reconnect.'
 
 const CLOUD_SESSION_EXPIRED_ERROR =
   'Cloud browser session expired or was destroyed. Create a new session with: playwriter session new --browser cloud'
@@ -264,6 +265,10 @@ export interface CdpConfig {
   port?: number
   token?: string
   extensionId?: string | null
+  /** Isolation identity for this client, carried to the relay on the CDP URL's query string.
+   *  Derived in the MCP/CLI client process and passed in — never derived here (I4).
+   *  Only meaningful for relay/extension mode: directCdpUrl and headless never call getCdpUrl. */
+  workspace?: Workspace
   /** Direct CDP WebSocket URL — bypasses relay + extension, connects straight to Chrome */
   directCdpUrl?: string
   /** Launch a headless Chrome via chromium.launch() instead of connecting to an existing one.
@@ -275,6 +280,11 @@ export interface SessionMetadata {
   extensionId: string | null
   browser: string | null
   profile: { email: string; id: string } | null
+  /** Isolation identity for the session. ExecutorManager merges this into the executor's
+   *  CdpConfig, which is how it reaches the relay via getCdpUrl. null means the session is
+   *  not workspace-keyed — correct for headless and direct-CDP sessions, which own their
+   *  browser outright and never touch the relay. */
+  workspace: Workspace | null
 }
 
 export interface SessionInfo {
@@ -377,7 +387,7 @@ export class PlaywrightExecutor {
   constructor(options: ExecutorOptions) {
     this.cdpConfig = options.cdpConfig
     this.logger = options.logger || { log: console.log, error: console.error }
-    this.sessionMetadata = options.sessionMetadata || { extensionId: null, browser: null, profile: null }
+    this.sessionMetadata = options.sessionMetadata || { extensionId: null, browser: null, profile: null, workspace: null }
     this.sessionCwd = options.cwd ? path.resolve(options.cwd) : null
     this.cloudSession = options.cloudSession || null
     // ScopedFS expects an array of allowed directories. If cwd is provided, use it; otherwise use defaults.
@@ -530,6 +540,21 @@ export class PlaywrightExecutor {
     this.warningEvents = this.warningEvents.filter((warning) => {
       return warning.id > pruneBeforeOrAt
     })
+  }
+
+  /**
+   * Hard-reject a STALE extension (older than this relay/CLI). Unlike
+   * warnIfExtensionOutdated (the NEWER-extension case, which warns and continues), a stale
+   * extension no longer echoes workspace ownership, so every page it opens is invisible to
+   * this session — "no pages anywhere". Throwing here surfaces an explicit, actionable error
+   * instead of that silent empty-page mystery. Deliberately NOT gated by
+   * hasWarnedExtensionOutdated: that boolean must never suppress this error path.
+   */
+  private throwIfExtensionStale(playwriterVersion: string | null) {
+    const staleError = getExtensionStaleError(playwriterVersion)
+    if (staleError) {
+      throw new Error(staleError)
+    }
   }
 
   private warnIfExtensionOutdated(playwriterVersion: string | null) {
@@ -835,6 +860,7 @@ export class PlaywrightExecutor {
     if (!extensionStatus.connected) {
       throw new Error(EXTENSION_NOT_CONNECTED_ERROR)
     }
+    this.throwIfExtensionStale(extensionStatus.playwriterVersion)
     this.warnIfExtensionOutdated(extensionStatus.playwriterVersion)
 
     const cdpUrl = getCdpUrl(this.cdpConfig)
@@ -1718,7 +1744,7 @@ export class PlaywrightExecutor {
     }
   }
 
-  // When extension is connected but has no pages, auto-create unless PLAYWRITER_AUTO_ENABLE=false disables it.
+  // When extension is connected but has no pages, auto-create one.
   // In direct CDP mode, always create a page (no extension check needed).
   private async ensurePageForContext(options: { context: BrowserContext; timeout: number }): Promise<Page> {
     const { context, timeout } = options
@@ -1738,19 +1764,6 @@ export class PlaywrightExecutor {
     const extensionStatus = await this.checkExtensionStatus()
     if (!extensionStatus.connected) {
       throw new Error(EXTENSION_NOT_CONNECTED_ERROR)
-    }
-
-    if (!shouldAutoEnablePlaywriter()) {
-      const waitTimeoutMs = Math.min(timeout, 1000)
-      const startTime = Date.now()
-      while (Date.now() - startTime < waitTimeoutMs) {
-        const availablePages = context.pages().filter((p) => !p.isClosed())
-        if (availablePages.length > 0) {
-          return availablePages[0]
-        }
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      }
-      throw new Error(NO_PAGES_AVAILABLE_ERROR)
     }
 
     const page = await context.newPage()
@@ -1821,15 +1834,22 @@ export class ExecutorManager {
     let executor = this.executors.get(sessionId)
     if (!executor) {
       const cdpConfig = (() => {
-        // Per-session override takes priority (used for direct CDP sessions)
+        // Per-session override takes priority (used for direct CDP and headless sessions).
+        // Those bypass the relay entirely, so no workspace is merged in: they never reach getCdpUrl.
         if (options.cdpConfig) {
           return options.cdpConfig
         }
         const baseConfig = typeof this.cdpConfig === 'function' ? this.cdpConfig(sessionId) : this.cdpConfig
+        // extensionId and workspace are independent: the extension route sets BOTH, so these
+        // must accumulate rather than early-return, or whichever is checked second is dropped.
+        let config = baseConfig
         if (sessionMetadata?.extensionId) {
-          return { ...baseConfig, extensionId: sessionMetadata.extensionId }
+          config = { ...config, extensionId: sessionMetadata.extensionId }
         }
-        return baseConfig
+        if (sessionMetadata?.workspace) {
+          config = { ...config, workspace: sessionMetadata.workspace }
+        }
+        return config
       })()
       executor = new PlaywrightExecutor({
         cdpConfig,

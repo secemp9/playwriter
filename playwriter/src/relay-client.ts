@@ -4,6 +4,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pc from 'picocolors'
@@ -213,6 +214,45 @@ export function getExtensionOutdatedWarning(extensionPlaywriterVersion: string |
   return null
 }
 
+/**
+ * Detect a STALE extension — the exact inverse of getExtensionOutdatedWarning.
+ *
+ * The extension bundles the playwriter version it was built with and sends it as `?v=`;
+ * the relay surfaces it as `playwriterVersion`. `VERSION` is the running relay/CLI's own
+ * playwriter version. When the extension's version is OLDER than the relay's, the loaded
+ * service worker predates the running server — the classic "rebuilt the server, forgot to
+ * reload the unpacked extension at chrome://extensions" mistake.
+ *
+ * Why this is FATAL, not a warning (unlike the newer-extension case above): workspace
+ * ownership is echoed by the extension's service worker on `Target.attachedToTarget`
+ * (it stamps `workspaceKey` on every tab it attaches). A stale service worker never echoes
+ * it, so EVERY extension-attached target lands `workspaceKey: null` (freestyle) and becomes
+ * invisible to every keyed client — the symptom is "no pages anywhere", near-undiagnosable.
+ * Continuing silently reproduces exactly that mystery, so callers must throw on this.
+ *
+ * This compares against the CLI's own `VERSION` (not a hard-coded floor) deliberately: a
+ * freshly-rebuilt extension always matches the CLI it shipped alongside, so this never
+ * false-fires on a correct lockstep build, and it starts catching stale extensions the
+ * moment a release bumps the version above them. It is dormant only when the two versions
+ * are equal, which is the correct reading of "not stale".
+ *
+ * Returns an actionable error message if the extension is stale, null otherwise.
+ */
+export function getExtensionStaleError(extensionPlaywriterVersion: string | null | undefined): string | null {
+  if (!extensionPlaywriterVersion) {
+    return null
+  }
+  if (compareVersions(extensionPlaywriterVersion, VERSION) < 0) {
+    return (
+      `Your Playwriter browser extension is stale: it was built with playwriter ${extensionPlaywriterVersion} ` +
+      `but the relay is running ${VERSION}. A stale extension no longer reports workspace ownership, so every ` +
+      `page it opens is invisible to this session (you would see "no pages anywhere"). ` +
+      `Reload the unpacked extension at chrome://extensions (or rebuild it with \`cd extension && pnpm build\`), then retry.`
+    )
+  }
+  return null
+}
+
 export interface EnsureRelayServerOptions {
   logger?: { log: (...args: any[]) => void }
   /** If true, will kill and restart server on version mismatch. Default: true */
@@ -302,10 +342,31 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
     ? path.resolve(__dirname, './start-relay-server.ts')
     : path.resolve(__dirname, './start-relay-server.js')
 
+  // The relay daemon is a detached singleton: whichever session spawns it first serves
+  // every other session for the daemon's entire life. It must therefore carry NO identity
+  // of its own that could leak into another session's workspace derivation (I4).
+  //   - cwd: os.homedir() — never a worktree. A detached daemon that inherited a worktree
+  //     cwd keeps it forever; deleting that worktree then pins a stale inode on Linux, and
+  //     any process.cwd()-relative work inside the daemon would resolve against the wrong
+  //     session's directory. Home is neutral and always exists.
+  //   - strip the ambient Claude-session identity vars from the inherited env so no
+  //     daemon-side code (present or future) can read one session's identity and brand
+  //     another. CLAUDE_PROJECT_DIR is the only one read today (workspace-key.ts's default
+  //     arg), but the CLI route always passes an explicit body.cwd so it is unused there;
+  //     the other two are stripped defensively. This enforces I4 structurally, not by
+  //     discipline. additionalEnv (explicit caller intent) is layered on top of the stripped
+  //     base so a caller could still set one deliberately.
+  const daemonEnv: NodeJS.ProcessEnv = { ...process.env }
+  delete daemonEnv.CLAUDE_PROJECT_DIR
+  delete daemonEnv.CLAUDE_CODE_SESSION_ID
+  delete daemonEnv.CLAUDECODE
+  Object.assign(daemonEnv, additionalEnv)
+
   const serverProcess = spawn(isRunningFromSource ? 'tsx' : process.execPath, [scriptPath], {
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, ...additionalEnv },
+    cwd: os.homedir(),
+    env: daemonEnv,
   })
 
   serverProcess.unref()

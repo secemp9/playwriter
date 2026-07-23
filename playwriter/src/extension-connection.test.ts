@@ -5,7 +5,7 @@ import { createMCPClient } from './mcp-client.js'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium } from '@xmorse/playwright-core'
 import { getCdpUrl } from './utils.js'
-import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, type TestContext, js } from './test-utils.js'
+import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, TEST_WORKSPACE, type TestContext, js } from './test-utils.js'
 import { getExtensionsStatus } from './relay-client.js'
 import './test-declarations.js'
 
@@ -47,13 +47,16 @@ describe('Extension Connection Tests', () => {
     await page.bringToFront()
 
     // 2. Enable extension on this new tab
-    const result = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const result = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(result.isConnected).toBe(true)
 
     // 3. Verify we can connect via direct CDP and see the page
-    let directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    let directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     let contexts = directBrowser.contexts()
     let pages = contexts[0].pages()
 
@@ -67,13 +70,16 @@ describe('Extension Connection Tests', () => {
     await directBrowser.close()
 
     // 4. Disable extension on this tab
-    const resultDisabled = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const resultDisabled = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(resultDisabled.isConnected).toBe(false)
 
     // 5. Connect again - page should NOT be visible
-    directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     contexts = directBrowser.contexts()
     pages = contexts[0].pages()
 
@@ -83,13 +89,16 @@ describe('Extension Connection Tests', () => {
     await directBrowser.close()
 
     // 6. Re-enable extension
-    const resultEnabled = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const resultEnabled = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(resultEnabled.isConnected).toBe(true)
 
     // 7. Verify page is back
-    directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     await new Promise((r) => setTimeout(r, 100))
 
     contexts = directBrowser.contexts()
@@ -113,7 +122,7 @@ describe('Extension Connection Tests', () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
-    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const directBrowser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     await new Promise((r) => setTimeout(r, 100))
 
     // 1. Create a new page
@@ -123,9 +132,12 @@ describe('Extension Connection Tests', () => {
     await page.bringToFront()
 
     // 2. Enable extension
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // 3. Verify page appears (polling)
     let foundPage
@@ -142,9 +154,12 @@ describe('Extension Connection Tests', () => {
     expect(sum1).toBe(30)
 
     // 4. Disable extension
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // 5. Verify page disappears (polling)
     for (let i = 0; i < 50; i++) {
@@ -156,9 +171,12 @@ describe('Extension Connection Tests', () => {
     expect(foundPage).toBeUndefined()
 
     // 6. Re-enable extension
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // 7. Verify page reappears (polling)
     for (let i = 0; i < 50; i++) {
@@ -188,12 +206,15 @@ describe('Extension Connection Tests', () => {
     await page.bringToFront()
 
     // 2. Enable extension
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // 3. Connect via CDP
-    const cdpUrl = getCdpUrl({ port: TEST_PORT })
+    const cdpUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const directBrowser = await chromium.connectOverCDP(cdpUrl)
     const connectedPage = directBrowser
       .contexts()[0]
@@ -234,18 +255,24 @@ describe('Extension Connection Tests', () => {
     await pageA.goto('https://example.com/tab-a')
     await pageA.bringToFront()
     await new Promise((resolve) => setTimeout(resolve, 100))
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // Tab B
     const pageB = await browserContext.newPage()
     await pageB.goto('https://example.com/tab-b')
     await pageB.bringToFront()
     await new Promise((resolve) => setTimeout(resolve, 100))
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     // Get target IDs for both
     const targetIds = await serviceWorker.evaluate(async () => {
@@ -275,7 +302,7 @@ describe('Extension Connection Tests', () => {
     expect(targetIds.idA).not.toBe(targetIds.idB)
 
     // Verify independent connections
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
 
     const pages = browser.contexts()[0].pages()
 
@@ -322,16 +349,22 @@ describe('Extension Connection Tests', () => {
     const pageA = await browserContext.newPage()
     await pageA.goto('https://example.com/close-warning-a')
     await pageA.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const pageB = await browserContext.newPage()
     await pageB.goto('https://example.com/close-warning-b')
     await pageB.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const closeResult = await client.callTool({
       name: 'execute',
@@ -380,16 +413,22 @@ describe('Extension Connection Tests', () => {
     const pageA = await browserContext.newPage()
     await pageA.goto('https://example.com/close-no-state-warning-a')
     await pageA.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const pageB = await browserContext.newPage()
     await pageB.goto('https://example.com/close-no-state-warning-b')
     await pageB.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const closeResult = await client.callTool({
       name: 'execute',
@@ -439,11 +478,14 @@ describe('Extension Connection Tests', () => {
 
     await page.waitForLoadState('domcontentloaded')
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     await new Promise((r) => setTimeout(r, 100))
 
     const cdpPage = browser
@@ -471,9 +513,12 @@ describe('Extension Connection Tests', () => {
     await page.bringToFront()
 
     // Enable extension on this page
-    const initialEnable = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const initialEnable = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     console.log('Initial enable result:', initialEnable)
     expect(initialEnable.isConnected).toBe(true)
 
@@ -525,12 +570,15 @@ describe('Extension Connection Tests', () => {
     // 4. Re-enable extension on the same page
     console.log('Re-enabling extension...')
     await page.bringToFront()
-    const reconnectResult = await serviceWorker.evaluate(async () => {
-      console.log('About to call toggleExtensionForActiveTab')
-      const result = await globalThis.toggleExtensionForActiveTab()
-      console.log('toggleExtensionForActiveTab result:', result)
-      return result
-    })
+    const reconnectResult = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        console.log('About to call toggleExtensionForActiveTab')
+        const result = await globalThis.toggleExtensionForActiveTab(k, l)
+        console.log('toggleExtensionForActiveTab result:', result)
+        return result
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     console.log('Reconnect result:', reconnectResult)
     expect(reconnectResult.isConnected).toBe(true)
@@ -593,9 +641,12 @@ describe('Extension Connection Tests', () => {
     await page.waitForLoadState('domcontentloaded')
     await page.bringToFront()
 
-    const initialEnable = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const initialEnable = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(initialEnable.isConnected).toBe(true)
     await new Promise((resolve) => setTimeout(resolve, 100))
 
@@ -629,9 +680,12 @@ describe('Extension Connection Tests', () => {
 
     // Re-enable extension
     await page.bringToFront()
-    const reconnectResult = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const reconnectResult = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(reconnectResult.isConnected).toBe(true)
     await new Promise((resolve) => setTimeout(resolve, 100))
 
@@ -678,9 +732,12 @@ describe('Extension Connection Tests', () => {
     await page.waitForLoadState('domcontentloaded')
     await page.bringToFront()
 
-    const enableResult = await serviceWorker.evaluate(async () => {
-      return await globalThis.toggleExtensionForActiveTab()
-    })
+    const enableResult = await serviceWorker.evaluate(
+      async ([k, l]) => {
+        return await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     expect(enableResult.isConnected).toBe(true)
 
     const secondUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-conn-second-'))
@@ -757,13 +814,16 @@ describe('Extension Connection Tests', () => {
     await page.goto(targetUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPages = browser.contexts()[0].pages()
     const testPage = cdpPages.find((p) => p.url().includes('sw-test'))
 
@@ -784,12 +844,15 @@ describe('Extension Connection Tests', () => {
     await page.goto(targetUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     for (let i = 0; i < 5; i++) {
-      const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+      const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
       const cdpPages = browser.contexts()[0].pages()
       const testPage = cdpPages.find((p) => p.url().includes('repeated-test'))
 
@@ -812,9 +875,12 @@ describe('Extension Connection Tests', () => {
     await page.goto(targetUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 400))
 
@@ -829,7 +895,7 @@ describe('Extension Connection Tests', () => {
             `,
         },
       }),
-      chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+      chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
     ])
 
     const mcpOutput = (mcpResult as any).content[0].text

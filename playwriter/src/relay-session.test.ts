@@ -15,6 +15,7 @@ import {
   type TestContext,
   withTimeout,
   js,
+  TEST_WORKSPACE,
 } from './test-utils.js'
 import './test-declarations.js'
 
@@ -54,12 +55,15 @@ describe('CDP Session Tests', () => {
     await page.goto(testUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -122,13 +126,16 @@ describe('CDP Session Tests', () => {
     await page.goto(testUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
     const executor = new PlaywrightExecutor({
-      cdpConfig: { port: TEST_PORT },
+      cdpConfig: { port: TEST_PORT, workspace: TEST_WORKSPACE },
       logger: {
         log: () => {},
         error: () => {},
@@ -166,19 +173,22 @@ describe('CDP Session Tests', () => {
     `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().startsWith('about:'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -209,12 +219,15 @@ describe('CDP Session Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -246,12 +259,15 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -316,12 +332,15 @@ describe('CDP Session Tests', () => {
     await page.goto(testUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page })
     await cdpSession.send('Profiler.enable')
     await cdpSession.send('Profiler.start')
@@ -370,19 +389,22 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     const initialTargets = await cdpSession.send('Target.getTargets')
@@ -420,27 +442,33 @@ describe('CDP Session Tests', () => {
     const page1 = await browserContext.newPage()
     await page1.goto('https://example.com/')
     await page1.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const page2 = await browserContext.newPage()
     await page2.goto('https://example.org/')
     await page2.bringToFront()
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     const { targetInfos } = await cdpSession.send('Target.getTargets')
@@ -480,22 +508,25 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
     await page.goto('https://example.org/', { waitUntil: 'domcontentloaded' })
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.org'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     const evalResult = await cdpSession.send('Runtime.evaluate', {
@@ -518,19 +549,22 @@ describe('CDP Session Tests', () => {
     await page.goto(initialUrl)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     const initialEvalResult = await cdpSession.send('Runtime.evaluate', {
@@ -573,19 +607,22 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -653,12 +690,15 @@ describe('CDP Session Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     let cdpPage
     for (const p of browser.contexts()[0].pages()) {
       const html = await p.content()
@@ -669,7 +709,7 @@ describe('CDP Session Tests', () => {
     }
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const dbg = new Debugger({ cdp: cdpSession })
 
@@ -722,12 +762,15 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
@@ -766,19 +809,22 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const editor = new Editor({ cdp: cdpSession })
 
@@ -836,19 +882,22 @@ describe('CDP Session Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const editor = new Editor({ cdp: cdpSession })
 
@@ -944,12 +993,15 @@ describe('CDP Session Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 500))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const pages = browser.contexts()[0].pages()
     const cdpPage = pages.find((p) => p.url().startsWith('about:'))
     expect(cdpPage).toBeDefined()
@@ -961,7 +1013,7 @@ describe('CDP Session Tests', () => {
     const hasBippyBefore = await cdpPage!.evaluate(() => !!globalThis.__bippy)
     expect(hasBippyBefore).toBe(false)
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     const { getReactSource, getReactComponentInfo } = await import('./react-source.js')
@@ -1040,12 +1092,15 @@ describe('Service Worker Target Tests', () => {
     await page.goto('https://web.dev/', { waitUntil: 'load' })
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 500))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const context = browser.contexts()[0]
 
     const pages = context.pages()
@@ -1075,19 +1130,22 @@ describe('Service Worker Target Tests', () => {
     await page.goto('https://example.com/')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT }))
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     const cdpPage = browser
       .contexts()[0]
       .pages()
       .find((p) => p.url().includes('example.com'))
     expect(cdpPage).toBeDefined()
 
-    const wsUrl = getCdpUrl({ port: TEST_PORT })
+    const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
     await cdpSession.send('Network.disable')
@@ -1141,9 +1199,12 @@ describe('Service Worker Target Tests', () => {
       await page.bringToFront()
 
       await withTimeout({
-        promise: serviceWorker.evaluate(async () => {
-          await globalThis.toggleExtensionForActiveTab()
-        }),
+        promise: serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        ),
         timeoutMs: 5000,
         errorMessage: 'toggleExtensionForActiveTab timed out',
       })
@@ -1152,7 +1213,7 @@ describe('Service Worker Target Tests', () => {
       })
 
       browser = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 5000,
         errorMessage: 'connectOverCDP timed out',
       })
@@ -1235,7 +1296,6 @@ describe('Auto-enable Tests', () => {
   let cleanup: (() => Promise<void>) | null = null
 
   beforeAll(async () => {
-    process.env.PLAYWRITER_AUTO_ENABLE = '1'
     testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-auto-test-' })
 
     const result = await createMCPClient({ port: TEST_PORT })
@@ -1251,7 +1311,6 @@ describe('Auto-enable Tests', () => {
   }, 600000)
 
   afterAll(async () => {
-    delete process.env.PLAYWRITER_AUTO_ENABLE
     await cleanupTestContext(testCtx, cleanup)
     cleanup = null
     testCtx = null
@@ -1277,15 +1336,7 @@ describe('Auto-enable Tests', () => {
     })
     expect(tabCountBefore).toBe(0)
 
-    const previousAutoEnable = process.env.PLAYWRITER_AUTO_ENABLE
-    delete process.env.PLAYWRITER_AUTO_ENABLE
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })).finally(() => {
-      if (previousAutoEnable === undefined) {
-        delete process.env.PLAYWRITER_AUTO_ENABLE
-        return
-      }
-      process.env.PLAYWRITER_AUTO_ENABLE = previousAutoEnable
-    })
+    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
 
     const pages = browser.contexts()[0].pages()
     expect(pages.length).toBeGreaterThan(0)

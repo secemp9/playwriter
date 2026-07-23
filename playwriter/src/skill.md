@@ -326,14 +326,14 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 ## context variables
 
 - `state` - object persisted between calls **within your session**. Each session has its own isolated state. Use to store pages, data, listeners (e.g., `state.page = await context.newPage()`)
-- `page` - a default page (may be shared with other agents). Prefer creating your own page and storing it in `state` (see "working with pages")
+- `page` - a default page (prefer `state.page`, which persists per session — see "working with pages")
 - `context` - browser context, access all pages via `context.pages()`
 - `require` - load Node.js modules (e.g., `const fs = require('node:fs')`). ESM `import` is not available in the sandbox
 - Node.js globals: `setTimeout`, `setInterval`, `fetch`, `URL`, `Buffer`, `crypto`, `process`, etc.
 
 **Not available in the sandbox:** `__dirname`, `__filename`, `import`.
 
-**Important:** `state` is **session-isolated** but pages are **shared** across all sessions. See "working with pages" for how to avoid interference.
+**Important:** `state` is **session-isolated**, and browser tabs are **isolated per git worktree** — `context.pages()` only ever returns your own worktree's tabs. Two sessions in the *same* worktree deliberately share tabs; sessions in different worktrees never see each other's tabs. See "working with pages".
 
 **Sandboxed `fs` write restrictions:** `require('node:fs')` is scoped. Writes (writeFileSync, mkdirSync, etc.) only succeed in:
 - The **directory where `playwriter` CLI was invoked** (the session's cwd)
@@ -646,16 +646,14 @@ await state.page.locator('li').nth(3).click() // 4th item (0-indexed)
 
 ## working with pages
 
-**Pages are shared, state is not.** `context.pages()` returns all browser tabs with playwriter enabled — shared across all sessions. Multiple agents see the same tabs. If another agent navigates or closes a page you're using, you'll be affected. To avoid interference, **get your own page**.
+**Tabs are isolated per git worktree.** `context.pages()` returns only the tabs that belong to **your workspace** — identified by your git worktree. Playwriter gives each worktree its own tabs in its own distinctly colored tab group and auto-creates that first tab for you, so there's no extension click to set up. A session can never see or drive tabs belonging to a different worktree. Two sessions in the *same* worktree deliberately share one tab group and see the same tabs; to avoid stepping on each other, **store your working page in `state.page` and reuse it**.
 
 **Get or create your page (first call):**
 
-On your very first execute call, reuse an existing empty tab or create a new one, and navigate it **in the same execute call**. Store it in `state` and use `state.page` for all subsequent operations instead of the default `page` variable:
+On your very first execute call, reuse the auto-created blank tab or open a new one. Store it in `state` and use `state.page` for all subsequent operations instead of the default `page` variable:
 
 ```js
-// Reuse an empty about:blank tab if available, otherwise create a new one.
-// IMPORTANT: always navigate immediately in the same call to avoid another
-// agent grabbing the same about:blank tab between execute calls.
+// Reuse the auto-created blank tab if available, otherwise create a new one.
 state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
 await state.page.goto('https://example.com')
 // Use state.page for ALL subsequent operations
@@ -674,11 +672,11 @@ await state.page.goto('https://example.com')
 
 **Use an existing page only when the user asks:**
 
-Only use a page from `context.pages()` if the user explicitly asks you to control a specific tab they already opened (e.g., they're logged into an app). Find it by URL pattern and store it in state:
+Only use a page from `context.pages()` if the user explicitly asks you to control a specific tab. `context.pages()` only lists tabs in **your** workspace — a tab the user put into the shared **freestyle** group by clicking the extension icon carries no worktree ownership, is never agent-targetable, and will not appear here. Find the tab by URL pattern and store it in state:
 
 ```js
 const pages = context.pages().filter((x) => x.url().includes('myapp.com'))
-if (pages.length === 0) throw new Error('No myapp.com page found. Ask user to enable playwriter on it.')
+if (pages.length === 0) throw new Error('No myapp.com page found in your workspace')
 if (pages.length > 1) throw new Error(`Found ${pages.length} matching pages, expected 1`)
 state.targetPage = pages[0]
 ```

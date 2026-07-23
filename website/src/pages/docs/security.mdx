@@ -1,7 +1,7 @@
 ---
 title: Security Model and Sandboxed Execution
 sidebarTitle: Security
-description: How Playwriter keeps your browser safe with localhost-only architecture, origin validation, explicit tab consent, and a sandboxed filesystem for code execution.
+description: How Playwriter keeps your browser safe with localhost-only architecture, origin validation, per-worktree tab isolation, and a sandboxed filesystem for code execution.
 icon: lucide:shield
 ---
 
@@ -28,7 +28,7 @@ Everything runs **on your machine**. The relay binds to `localhost:19988` and on
 
 **Origin validation.** The extension WebSocket endpoint only accepts the Playwriter extension origin. Browsers cannot spoof the `Origin` header, so malicious websites cannot connect and control your browser. CLI and MCP connect as local Node.js clients on localhost; for remote access, always use [token authentication](./remote-access.mdx).
 
-**Explicit consent.** Only tabs where you clicked the extension icon are controlled. No background access to other tabs. Chrome shows an automation banner on controlled tabs so you always know which tabs are being automated.
+**Scoped, isolated tabs.** Playwriter automates only tabs it created for you; it has no background access to your other tabs. Each Claude session, identified by its git worktree, gets its own tabs in its own distinctly colored tab group, and a session can never see or drive tabs belonging to a different worktree. Clicking the extension icon instead drops the current tab into a shared grey **freestyle** group that carries no workspace ownership; no agent can see or drive a freestyle tab.
 
 **Visible automation.** The Chrome debugger banner is always visible on controlled tabs. You can see everything the agent does in real time.
 

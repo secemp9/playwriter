@@ -199,7 +199,8 @@ with `snapshot()`, so you can switch between text and visual modes freely.
 
 Run **multiple agents at once** without them stepping on each other. Each session is an
 isolated sandbox with its own `state` object. Variables, pages, and listeners persist between
-calls. Browser tabs are shared, but state is not.
+calls. Your `state` is isolated per session, and browser tabs are isolated per git worktree, so
+agents in different worktrees never see each other's tabs.
 
 ```bash
 playwriter session new    # => 1

@@ -28,11 +28,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
-import { VERSION, EXTENSION_IDS, shouldAutoEnablePlaywriter } from './utils.js'
+import { VERSION, EXTENSION_IDS } from './utils.js'
 import { createCdpLogger, type CdpLogEntry, type CdpLogger } from './cdp-log.js'
 import { RecordingRelay } from './recording-relay.js'
 import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
+import { deriveWorkspace, type Workspace } from './workspace-key.js'
 
 /**
  * Checks if a target should be filtered out (not exposed to Playwright).
@@ -181,6 +182,27 @@ export async function startPlayWriterCDPRelayServer({
     }
 
     return null
+  }
+
+  /**
+   * Z6: a target is visible to a client only when their workspace keys are strictly equal.
+   * target.workspaceKey === null means FREESTYLE (a human clicked the extension icon).
+   * Freestyle targets are visible to NO workspace, ever. There is no claiming and no fallback.
+   */
+  function visibleToWorkspace(target: relayState.ConnectedTarget, clientWorkspaceKey: string): boolean {
+    return target.workspaceKey === clientWorkspaceKey
+  }
+  /**
+   * The requesting client's workspace key, or null when there is no such client
+   * (a disconnect race) — or, during migration, when the client was recorded with a
+   * null key (Todo 12 makes that impossible by rejecting unkeyed clients before they
+   * are stored). Callers MUST treat null as "send nothing", NEVER "send everything".
+   * This is enforced by type: visibleToWorkspace's clientWorkspaceKey param is a
+   * non-null string, so a null returned here cannot be handed to it — a keyless client
+   * can therefore match no target, which is precisely the intended behaviour.
+   */
+  function getClientWorkspaceKey(clientId: string): string | null {
+    return store.getState().playwrightClients.get(clientId)?.workspaceKey ?? null
   }
 
   const normalizeSessionId = (value: string | number | null | undefined): string | null => {
@@ -343,8 +365,41 @@ export async function startPlayWriterCDPRelayServer({
       }
     } else {
       const { playwrightClients } = store.getState()
+
+      // Todo 17: workspace-scope the LIVE broadcast (the push counterpart of the
+      // replay filtering in Todos 13/15/16). A message that belongs to a specific
+      // target — identified by its top-level CDP `sessionId`, the key under which
+      // connectedTargets is stored — must reach ONLY the client whose workspace owns
+      // that target. We resolve the owning target ONCE here, then compare per client
+      // with visibleToWorkspace (strict `target.workspaceKey === client.workspaceKey`,
+      // no prefix stripping, no claiming, no fallback).
+      //
+      // A message with NO resolvable target is BROWSER-LEVEL: it has no owning
+      // workspace and MUST still reach every client of the extension. The canonical
+      // case is Browser.downloadWillBegin / Browser.downloadProgress synthesized by
+      // maybeEmitBrowserDownloadCompatEvent — those carry no sessionId, so they
+      // resolve to no target and broadcast unchanged. Dropping them because they
+      // "match no workspace" would silently break downloads for EVERY client. This
+      // is the ONE place where the absence of a target legitimately means "not
+      // target-scoped, broadcast it" — it is NOT the forbidden "if we can't tell,
+      // show everything" fallback: any message that DOES resolve to a target is
+      // strictly filtered to that target's owner below.
+      const messageSessionId = typeof message.sessionId === 'string' ? message.sessionId : null
+      const owningExtensionId =
+        extensionId ?? (messageSessionId ? findExtensionIdByCdpSession(messageSessionId) : null)
+      const owningTarget =
+        messageSessionId && owningExtensionId
+          ? store.getState().extensions.get(owningExtensionId)?.connectedTargets.get(messageSessionId) ?? null
+          : null
+
       for (const client of playwrightClients.values()) {
         if (extensionId && client.extensionId !== extensionId) {
+          continue
+        }
+        // Target-scoped message → deliver only to the owning workspace's client(s).
+        // Browser-level message (owningTarget === null) → falls through to every
+        // client selected by the extensionId filter above, unfiltered.
+        if (owningTarget && !visibleToWorkspace(owningTarget, client.workspaceKey)) {
           continue
         }
         safeSend(client)
@@ -523,23 +578,46 @@ export async function startPlayWriterCDPRelayServer({
     return recordingRelays.get(connId) || null
   }
 
-  // Auto-create an initial blank tab when no targets exist. Set
-  // PLAYWRITER_AUTO_ENABLE=false to require manually enabled tabs instead.
-  async function maybeAutoCreateInitialTab(extensionId: string): Promise<void> {
-    if (!shouldAutoEnablePlaywriter()) {
-      return
-    }
+  // Auto-create an initial blank tab when the requesting client's workspace has no
+  // tab yet. workspaceKey/workspaceLabel are the CREATING client's own workspace (I1:
+  // a connected client always has a non-empty key — Todo 12's 4005 rejection), so the
+  // tab this creates belongs to that workspace.
+  async function maybeAutoCreateInitialTab({
+    extensionId,
+    workspaceKey,
+    workspaceLabel,
+  }: {
+    extensionId: string
+    workspaceKey: string
+    workspaceLabel: string
+  }): Promise<void> {
     const conn = getExtensionConnection(extensionId)
     if (!conn) {
       return
     }
-    if (conn.connectedTargets.size > 0) {
+    // Z6/per-workspace guard (THE zero-click fix): skip auto-create only when THIS
+    // client's own workspace already owns a tab. Count only targets whose workspaceKey
+    // === this client's key (visibleToWorkspace); tabs owned by OTHER workspaces, and
+    // freestyle tabs (workspaceKey === null), do NOT count. So a fresh workspace always
+    // gets its own tab even when the extension already holds other workspaces' tabs —
+    // no human click required. This replaces the old `connectedTargets.size > 0` guard,
+    // which suppressed creation whenever ANY tab existed and forced session B to silently
+    // drive session A's tab. No prefix stripping, no claiming, no fallback.
+    const mine = Array.from(conn.connectedTargets.values()).filter((t) => visibleToWorkspace(t, workspaceKey))
+    if (mine.length > 0) {
       return
     }
 
     try {
       logger?.log(pc.blue('Auto-creating initial tab for Playwright client'))
-      const result = (await sendToExtension({ extensionId, method: 'createInitialTab', timeout: 10000 })) as {
+      const result = (await sendToExtension({
+        extensionId,
+        method: 'createInitialTab',
+        // Carry the creating client's workspace so the extension (Todo 20) can stamp the
+        // new tab's ownership and place it in the right tab group.
+        params: { workspaceKey, workspaceLabel },
+        timeout: 10000,
+      })) as {
         success: boolean
         tabId: number
         sessionId: string
@@ -552,6 +630,10 @@ export async function startPlayWriterCDPRelayServer({
             sessionId: result.sessionId,
             targetId: result.targetInfo.targetId,
             targetInfo: result.targetInfo,
+            // Todo 14: stamp the auto-created target with the CREATING client's workspace
+            // key so it belongs to that workspace (first of Todo 9's two seams, now filled;
+            // the extension-echo seam remains Todo 20's).
+            workspaceKey,
           }),
         )
         const updatedTargets = store.getState().extensions.get(extensionId)?.connectedTargets.size || 0
@@ -656,12 +738,20 @@ export async function startPlayWriterCDPRelayServer({
     params,
     sessionId,
     source,
+    workspaceKey,
+    workspaceLabel,
   }: {
     extensionId: string | null
     method: CDPCommand['method'] | (string & {})
     params: CDPCommand['params']
     sessionId?: CDPCommand['sessionId']
     source?: CDPCommand['source']
+    // The requesting client's workspace (from getCdpUrl's ?workspace= param, read at the
+    // /cdp handler). null only in a disconnect race (I1). Used by the Target.setAutoAttach
+    // case to auto-create a tab for THIS workspace. Todo 16 consumes these further for
+    // its own per-workspace filtering of getTargets/attachToTarget/getTargetInfo.
+    workspaceKey: string | null
+    workspaceLabel: string | null
   }) {
     const conn = getExtensionConnection(extensionId)
     const connectedTargets = conn?.connectedTargets || new Map<string, relayState.ConnectedTarget>()
@@ -700,8 +790,12 @@ export async function startPlayWriterCDPRelayServer({
         if (sessionId) {
           break
         }
-        if (conn) {
-          await maybeAutoCreateInitialTab(conn.id)
+        // Auto-create a tab for the requesting client's workspace. workspaceKey/Label are
+        // null ONLY in a disconnect race (I1: a live connected client always has a
+        // non-null key via Todo 12's 4005 rejection). With no live client there is no
+        // recipient, so skipping auto-create is correct — this is NOT a fallback.
+        if (conn && workspaceKey && workspaceLabel) {
+          await maybeAutoCreateInitialTab({ extensionId: conn.id, workspaceKey, workspaceLabel })
         }
         // Forward auto-attach so Chrome emits iframe Target.attachedToTarget events.
         // Playwright relies on these (with parentFrameId) when reconnecting over CDP.
@@ -725,7 +819,15 @@ export async function startPlayWriterCDPRelayServer({
 
         for (const target of connectedTargets.values()) {
           if (target.targetId === attachParams.targetId) {
-            return { sessionId: target.sessionId } satisfies Protocol.Target.AttachToTargetResponse
+            // Todo 16: refuse to attach a client to a target its workspace doesn't own.
+            // workspaceKey is null only in a disconnect race (I1). A non-visible match is
+            // treated as absent — break out and fall through to the SAME "not found" error
+            // as a genuinely missing target, so a foreign target's existence is never leaked
+            // (Z6/I3). No prefix stripping, no claiming, no fallback.
+            if (workspaceKey !== null && visibleToWorkspace(target, workspaceKey)) {
+              return { sessionId: target.sessionId } satisfies Protocol.Target.AttachToTargetResponse
+            }
+            break
           }
         }
 
@@ -736,9 +838,12 @@ export async function startPlayWriterCDPRelayServer({
         const infoReqParams = params as Protocol.Target.GetTargetInfoRequest | undefined
         const targetId = infoReqParams?.targetId
 
+        // Todo 16: a client may only see targets its own workspace owns. workspaceKey is
+        // null only in a disconnect race (I1). EVERY lookup below is gated on visibility so a
+        // foreign target's info is never revealed (Z6/I3). No prefix stripping, no claiming.
         if (targetId) {
           for (const target of connectedTargets.values()) {
-            if (target.targetId === targetId) {
+            if (target.targetId === targetId && workspaceKey !== null && visibleToWorkspace(target, workspaceKey)) {
               return { targetInfo: target.targetInfo }
             }
           }
@@ -746,19 +851,32 @@ export async function startPlayWriterCDPRelayServer({
 
         if (sessionId) {
           const target = connectedTargets.get(sessionId)
-          if (target) {
+          if (target && workspaceKey !== null && visibleToWorkspace(target, workspaceKey)) {
             return { targetInfo: target.targetInfo }
           }
         }
 
-        const firstTarget = Array.from(connectedTargets.values())[0]
-        return { targetInfo: firstTarget?.targetInfo }
+        // The old fallback returned Array.from(connectedTargets.values())[0] — an ARBITRARY
+        // target that could belong to ANOTHER workspace, silently handing the client a
+        // foreign tab on a lookup miss (the sneakiest leak in the file). Scope the fallback
+        // to targets THIS workspace owns; if none is visible, return no targetInfo rather
+        // than a foreign one. This is NOT a fallback to a foreign target (Z6/I3).
+        const firstVisibleTarget = Array.from(connectedTargets.values()).find(
+          (t) => workspaceKey !== null && visibleToWorkspace(t, workspaceKey),
+        )
+        return { targetInfo: firstVisibleTarget?.targetInfo }
       }
 
       case 'Target.getTargets': {
+        // Todo 16: expose ONLY targets the requesting client's own workspace owns.
+        // workspaceKey is null only in a disconnect race (I1) — then nothing is visible.
+        // A freestyle target (workspaceKey === null) matches no keyed client. Strict
+        // equality, full string, no prefix stripping, no "unowned = visible to all"
+        // fallback (Z6/I3).
         return {
           targetInfos: Array.from(connectedTargets.values())
             .filter((t) => !isRestrictedTarget(t.targetInfo))
+            .filter((t) => workspaceKey !== null && visibleToWorkspace(t, workspaceKey))
             .map((t) => ({
               ...t.targetInfo,
               attached: true,
@@ -767,10 +885,18 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       case 'Target.createTarget': {
+        // Todo 20 (Job B): context.newPage() reaches the extension as Target.createTarget,
+        // but the extension cannot know which client asked for the page — only the relay
+        // does. Inject the requesting client's workspace so the extension stamps the new
+        // tab's ownership (I2) and its creator can see it. workspaceKey/Label are null only
+        // in a disconnect race (I1); the extension then treats the tab as freestyle. This
+        // mirrors how createInitialTab carries the workspace (Todo 14). NOT defaulting to
+        // null here is the whole point: a null-owned newPage() would be invisible to its
+        // own keyed creator.
         return await sendToExtension({
           extensionId: resolvedExtensionId,
           method: 'forwardCDPCommand',
-          params: { method, params, source },
+          params: { method, params, source, workspaceKey, workspaceLabel },
         })
       }
 
@@ -1147,9 +1273,38 @@ export async function startPlayWriterCDPRelayServer({
             return
           }
 
-          // Add client first so it can receive Target.attachedToTarget events
+          // Read the client's owning-workspace identity off the connection URL.
+          // getCdpUrl (Todo 5) sets `workspace` (= workspace.key) and `workspaceLabel`
+          // (= workspace.label) together. URLSearchParams percent-decodes the `:` in
+          // the key back from `%3A`, so `wt:`/`cwd:`/`x:` prefixes arrive intact — do
+          // NOT hand-parse the query string (that would keep the literal `%3A` and
+          // break every === comparison downstream).
+          const workspaceKey = url.searchParams.get('workspace')
+          const workspaceLabel = url.searchParams.get('workspaceLabel')
+          // I1: every real client (MCP Todo 7, CLI Todo 8, tests Todo 26) supplies a
+          // key. A missing/empty key is a bug, not a case to default — reject it loudly
+          // so it can never silently recreate the shared-tabs leak. Mirrors the
+          // 4003/4004 rejection style above and runs BEFORE addPlaywrightClient (no
+          // zombie client is registered). Requiring both non-empty also narrows them
+          // from `string | null` to `string` for the non-nullable field below (I1).
+          if (!workspaceKey || !workspaceLabel) {
+            const reason = 'Missing workspace'
+            logger?.log(pc.yellow(`Rejecting Playwright client ${clientId}: ${reason}`))
+            ws.close(4005, reason)
+            return
+          }
+
+          // Add client first so it can receive Target.attachedToTarget events.
+          // workspaceKey/workspaceLabel are the owning-workspace identity read above,
+          // guaranteed non-empty by the 4005 rejection.
           store.setState((s) => {
-            return relayState.addPlaywrightClient(s, { id: clientId, extensionId: clientExtensionId, ws })
+            return relayState.addPlaywrightClient(s, {
+              id: clientId,
+              extensionId: clientExtensionId,
+              ws,
+              workspaceKey,
+              workspaceLabel,
+            })
           })
           const extensionConnection = getExtensionConnection(clientExtensionId)
           const targetCount = extensionConnection?.connectedTargets.size || 0
@@ -1203,21 +1358,44 @@ export async function startPlayWriterCDPRelayServer({
           }
 
           try {
+            // Read the requesting client's own workspace (key + label) from one snapshot so
+            // routeCdpCommand's Target.setAutoAttach case can auto-create a tab for THIS
+            // workspace. Both are non-null for any live client (I1: Todo 12's 4005 rejection);
+            // undefined only if the client vanished mid-flight, in which case auto-create is
+            // correctly skipped downstream (no recipient) — never defaulted.
+            const requestingClient = store.getState().playwrightClients.get(clientId)
             const result = await routeCdpCommand({
               extensionId: extensionConn.id,
               method,
               params,
               sessionId,
               source,
+              workspaceKey: requestingClient?.workspaceKey ?? null,
+              workspaceLabel: requestingClient?.workspaceLabel ?? null,
             })
 
             if (method === 'Target.setAutoAttach' && !sessionId) {
+              // Z6/I3: this loop is how a client learns which pages exist on connect.
+              // Replay ONLY targets owned by the requesting client's own workspace.
+              // getClientWorkspaceKey returns null only when the client vanished
+              // mid-flight (disconnect race); a keyless client gets nothing (I1 means a
+              // connected client always has a non-null key — Todo 12's 4005 rejection).
+              const clientWorkspaceKey = getClientWorkspaceKey(clientId)
+              if (!clientWorkspaceKey) {
+                return
+              }
               // Re-read state after async routeCdpCommand — targets may have changed
               const freshExt = store.getState().extensions.get(extensionConn.id)
               const freshTargets = freshExt?.connectedTargets || new Map()
               for (const target of freshTargets.values()) {
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
                 if (isRestrictedTarget(target.targetInfo)) {
+                  continue
+                }
+                // Z6/I3: strict-equality workspace filter. A freestyle target
+                // (workspaceKey === null) matches no keyed client, so it is never
+                // replayed here. No claiming, no fallback, no prefix stripping.
+                if (!visibleToWorkspace(target, clientWorkspaceKey)) {
                   continue
                 }
                 const attachedPayload = {
@@ -1250,11 +1428,29 @@ export async function startPlayWriterCDPRelayServer({
             }
 
             if (method === 'Target.setDiscoverTargets' && (params as Protocol.Target.SetDiscoverTargetsRequest)?.discover) {
+              // Z6/I3: the discovery channel is a SECOND way a client learns which
+              // pages exist. Replay ONLY targets owned by the requesting client's own
+              // workspace, identically to the Target.setAutoAttach filter above —
+              // otherwise a client would learn of foreign targets here even though the
+              // attach channel is filtered (a partial leak showing up as ghost pages).
+              // getClientWorkspaceKey returns null only when the client vanished
+              // mid-flight (disconnect race); a keyless client gets nothing (I1 means a
+              // connected client always has a non-null key — Todo 12's 4005 rejection).
+              const clientWorkspaceKey = getClientWorkspaceKey(clientId)
+              if (!clientWorkspaceKey) {
+                return
+              }
               const freshExt2 = store.getState().extensions.get(extensionConn.id)
               const freshTargets2 = freshExt2?.connectedTargets || new Map()
               for (const target of freshTargets2.values()) {
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
                 if (isRestrictedTarget(target.targetInfo)) {
+                  continue
+                }
+                // Z6/I3: strict-equality workspace filter. A freestyle target
+                // (workspaceKey === null) matches no keyed client, so it is never
+                // replayed here. No claiming, no fallback, no prefix stripping.
+                if (!visibleToWorkspace(target, clientWorkspaceKey)) {
                   continue
                 }
                 const targetCreatedPayload = {
@@ -1288,12 +1484,26 @@ export async function startPlayWriterCDPRelayServer({
               const attachResponse = result as Protocol.Target.AttachToTargetResponse | undefined
               const attachRequestParams = params as Protocol.Target.AttachToTargetRequest | undefined
               if (attachResponse?.sessionId) {
+                // Z6/I3: replay the attach event ONLY for a target the requesting client's
+                // own workspace owns. routeCdpCommand's Target.attachToTarget case already
+                // refuses to return a sessionId for a foreign/absent target, so this applies
+                // the SAME predicate to the event push (defense-in-depth). getClientWorkspaceKey
+                // returns null only when the client vanished mid-flight (disconnect race); a
+                // keyless client gets nothing (I1: a connected client always has a non-null key
+                // via Todo 12's 4005 rejection).
+                const clientWorkspaceKey = getClientWorkspaceKey(clientId)
+                if (!clientWorkspaceKey) {
+                  return
+                }
                 const freshExt3 = store.getState().extensions.get(extensionConn.id)
                 const freshTargets3 = freshExt3?.connectedTargets || new Map()
                 const target = Array.from(freshTargets3.values()).find((t) => {
                   return t.targetId === attachRequestParams?.targetId
                 })
-                if (target) {
+                // Z6/I3: strict-equality workspace filter. A freestyle target
+                // (workspaceKey === null) matches no keyed client, so it is never replayed
+                // here. No claiming, no fallback, no prefix stripping.
+                if (target && visibleToWorkspace(target, clientWorkspaceKey)) {
                   const attachedPayload = {
                     method: 'Target.attachedToTarget',
                     params: {
@@ -1598,6 +1808,15 @@ export async function startPlayWriterCDPRelayServer({
                   sessionId: targetParams.sessionId,
                   targetId: targetParams.targetInfo.targetId,
                   targetInfo: targetParams.targetInfo,
+                  // Todo 20 (Job A): stamp the owning workspace from the key the extension
+                  // echoes on Target.attachedToTarget (the tab's own key for a page target,
+                  // the parent tab's key for a child/OOPIF target). null = freestyle (human
+                  // icon-click), visible to no workspace. `undefined` (an older extension
+                  // that does not echo) is treated as freestyle — its pre-Todo-20 behaviour;
+                  // Todo 33 owns the loud version-skew warning. This is what finally gives
+                  // extension-attached targets a real non-null owner so Todo 17's live
+                  // broadcast reaches the right client.
+                  workspaceKey: extensionEvent.params.workspaceKey ?? null,
                 }),
               )
 
@@ -2049,6 +2268,9 @@ export async function startPlayWriterCDPRelayServer({
           extensionId: null,
           browser: 'Chrome (Headless)',
           profile: null,
+          // Headless launches its own browser and gives this executor its own context.
+          // It is isolated by construction and never reaches the relay, so it is never keyed.
+          workspace: null,
         },
       })
       try {
@@ -2086,6 +2308,9 @@ export async function startPlayWriterCDPRelayServer({
           extensionId: null,
           browser: body.browser || null,
           profile: firstProfile ? { email: firstProfile.email, id: firstProfile.name } : null,
+          // Direct-CDP and cloud sessions connect straight to a browser they own outright,
+          // bypassing relay and extension. There is no client to key.
+          workspace: null,
         },
         cloudSession: body.cloud ? { timeoutAt: cloudTimeoutAt, blockProxyResources: body.cloud.blockProxyResources } : undefined,
       })
@@ -2123,6 +2348,23 @@ export async function startPlayWriterCDPRelayServer({
         : 'Multiple extensions connected. Specify extensionId.'
       return c.json({ error }, 404)
     }
+    // I4: the workspace key for a CLI session MUST be derived from the request body's own
+    // cwd, NEVER from the daemon's process.cwd()/env. The daemon is a singleton that keeps
+    // the cwd and env of whichever session first spawned it while serving all the others, so
+    // a daemon-side derivation would brand every session with that first session's identity —
+    // the exact bug this feature exists to kill. deriveWorkspace() called with no argument
+    // falls back to the daemon's own CLAUDE_PROJECT_DIR/process.cwd(), and an empty string
+    // resolves to process.cwd() as well, so a missing/empty cwd is a hard, loud error here
+    // rather than a silent daemon-side default.
+    if (!cwd) {
+      return c.json({ error: 'Missing cwd: a CLI extension session must send its working directory so the relay can derive the workspace key.' }, 400)
+    }
+    let workspace: Workspace
+    try {
+      workspace = deriveWorkspace(cwd)
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
+    }
     const manager = await getExecutorManager()
     const executor = manager.getExecutor({
       sessionId,
@@ -2131,6 +2373,9 @@ export async function startPlayWriterCDPRelayServer({
         extensionId: conn.stableKey,
         browser: conn.info.browser || null,
         profile: conn.info ? { email: conn.info.email || '', id: conn.info.id || '' } : null,
+        // Keyed from the CLI session's own cwd (body.cwd), derived above. This is the one
+        // relay/extension topology that needs keying; headless/direct/cloud stay null.
+        workspace,
       },
     })
     const metadata = executor.getSessionMetadata()

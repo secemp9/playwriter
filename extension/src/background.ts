@@ -10,6 +10,15 @@ import dedent from 'string-dedent'
 const js = dedent
 import { createStore } from 'zustand/vanilla'
 import type { ExtensionState, ConnectionState, TabState, TabInfo } from './types'
+import {
+  setTabOwner,
+  deleteTabOwner,
+  rehydrateTabOwners,
+  getGroupIds,
+  setGroupId,
+  deleteGroupId,
+  FREESTYLE_GROUP_KEY,
+} from './workspace-groups'
 import { initPlaywriterToolbar } from './toolbar/toolbar'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
@@ -227,8 +236,63 @@ async function getExtensionIdentity(): Promise<ExtensionIdentity> {
   return identityPromise
 }
 
-const TAB_GROUP_COLOR: chrome.tabGroups.ColorEnum = 'green'
-const TAB_GROUP_TITLE = 'playwriter'
+// The single SHARED freestyle group (D3): every human-clicked / freestyle tab
+// (workspaceKey === null) shares ONE grey group titled 'playwriter'. Grey is RESERVED
+// for freestyle and is never assigned to a worktree group (invariant I6).
+const FREESTYLE_GROUP_TITLE = 'playwriter'
+const FREESTYLE_GROUP_COLOR: chrome.tabGroups.ColorEnum = 'grey'
+// Chrome's eight non-grey tab-group colours. Each worktree group is given a deterministic,
+// distinct colour chosen from this list by pickColor(); grey is deliberately excluded so a
+// worktree can never look like a freestyle group (I6).
+const WORKTREE_COLORS: readonly chrome.tabGroups.ColorEnum[] = [
+  'blue',
+  'red',
+  'yellow',
+  'green',
+  'pink',
+  'purple',
+  'cyan',
+  'orange',
+]
+
+/**
+ * Deterministic FNV-1a 32-bit hash of the FULL workspace key (no prefix stripping — the
+ * bytes hashed are the same bytes used for identity, invariant D of Todo 22). Used only to
+ * SEED the colour probe order; identity comparisons never use this.
+ */
+function hashKey(key: string): number {
+  let h = 0x811c9dc5 // FNV offset basis
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) // FNV prime
+  }
+  return h >>> 0
+}
+
+/**
+ * Choose a tab-group colour for a worktree key. The key's hash seeds the START of a probe
+ * that walks WORKTREE_COLORS in a fixed rotated order, returning the first colour NOT already
+ * used by another live worktree group (`takenColors`). Properties this guarantees:
+ *   (a) determinism — for a given key and takenColors set the result is identical every call
+ *       (pure function, no randomness);
+ *   (b) grey is never returned — grey is not in WORKTREE_COLORS (I6);
+ *   (c) N distinct concurrent keys get N distinct colours while N ≤ 8, because each newly
+ *       assigned colour is added to takenColors before the next key is coloured;
+ *   (d) the full key is hashed (no prefix stripping).
+ * With more than 8 concurrent worktrees the eight-colour palette is exhausted and, by the
+ * pigeonhole principle, a repeat is unavoidable — the key's deterministic first choice is
+ * returned. That is palette exhaustion, not a fallback for a missing input.
+ */
+function pickColor(key: string, takenColors: Set<chrome.tabGroups.ColorEnum>): chrome.tabGroups.ColorEnum {
+  const start = hashKey(key) % WORKTREE_COLORS.length
+  for (let i = 0; i < WORKTREE_COLORS.length; i++) {
+    const color = WORKTREE_COLORS[(start + i) % WORKTREE_COLORS.length]
+    if (!takenColors.has(color)) {
+      return color
+    }
+  }
+  return WORKTREE_COLORS[start]
+}
 
 let childSessions: Map<string, { tabId: number; targetId?: string }> = new Map()
 let nextSessionId = 1
@@ -436,7 +500,15 @@ class ConnectionManager {
           logger.debug('Creating initial tab for Playwright client')
           const tab = await createTabInPreferredWindow({ url: 'about:blank', active: false })
           if (tab.id) {
-            setTabConnecting(tab.id)
+            // The auto-created tab belongs to the workspace of the client that triggered
+            // the create. The relay (Todo 14) sends that identity on the createInitialTab
+            // message params; stamp it here so the tab is owned by — and visible to — that
+            // workspace. (Todo 20 makes attachTab preserve this ownership onto the
+            // 'connected' TabInfo and echo it back to the relay.)
+            setTabConnecting(tab.id, {
+              workspaceKey: message.params.workspaceKey,
+              workspaceLabel: message.params.workspaceLabel,
+            })
             const { targetInfo, sessionId } = await attachTab(tab.id, { skipAttachedEvent: true })
             logger.debug('Initial tab created and connected:', tab.id, 'sessionId:', sessionId)
             sendMessage({
@@ -517,7 +589,14 @@ class ConnectionManager {
           const tabId = result.result as number
           if (tabId) {
             logger.debug('Auto-connecting Ghost Browser tab:', tabId)
-            setTabConnecting(tabId)
+            // FREESTYLE (null): a tab opened via chrome.ghostPublicAPI.openTab carries no
+            // agent-workspace identity — the Ghost Browser command does not thread a
+            // workspace key, so there is genuinely none to stamp. Per Z6 that makes it a
+            // freestyle tab (visible to no keyed workspace). This is a positive decision,
+            // not a placeholder. NOTE: no todo in the plan covers ghost-browser ownership;
+            // if such tabs must be visible to their requesting client, the workspace key
+            // has to be threaded from the relay onto the ghost-browser command first.
+            setTabConnecting(tabId, { workspaceKey: null, workspaceLabel: null })
             await sleep(100)
             await attachTab(tabId)
           }
@@ -739,7 +818,10 @@ globalThis.disconnectEverything = disconnectEverything
 globalThis.getExtensionState = () => store.getState()
 
 declare global {
-  var toggleExtensionForActiveTab: () => Promise<{ isConnected: boolean; state: ExtensionState }>
+  var toggleExtensionForActiveTab: (
+    workspaceKey: string | null,
+    workspaceLabel: string | null,
+  ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
 }
@@ -886,83 +968,174 @@ async function createTabInPreferredWindow(options: { url: string; active: boolea
   }
 }
 
-async function syncTabGroup(): Promise<void> {
+/**
+ * Resolve a persisted tab-group id to its live group, or undefined when the group no longer
+ * exists. chrome.tabGroups.get throws for an unknown id; a throw here means the group was
+ * closed (group ids are unique within a browser session and vanish when a group empties or
+ * the browser restarts). This is a documented Chrome state we handle by RECREATING the group,
+ * never by falling back to a shared/global group.
+ */
+async function getGroupOrUndefined(groupId: number): Promise<chrome.tabGroups.TabGroup | undefined> {
   try {
-    // Include 'connecting' tabs in the group only when the relay is alive, so that
-    // tabs the user drags into the group stay visible while attaching. When the relay
-    // is dead all tabs are 'connecting' (waiting for reconnect) and the group should
-    // be cleaned up. The onUpdated handler (line ~1601) already guards against the
-    // ungroup→disconnect loop for 'connecting' tabs, so excluding them here is safe.
+    return await chrome.tabGroups.get(groupId)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Reconcile Chrome tab groups with the current ownership in `store.tabs`. Each workspace key
+ * owns its own group (identity from workspace-groups.ts's persisted `groupIds` map, NEVER a
+ * title query — invariant I5); freestyle tabs (workspaceKey === null) all share the single
+ * grey FREESTYLE_GROUP_KEY group (D3). Two sessions in the same worktree share one group
+ * because they share one key.
+ *
+ * LOOP-GUARD NOTE (do not weaken): this function is the densest edge-case logic in the file.
+ * Its protection against the ungroup→disconnect / group-change→event→re-sync feedback loop
+ * rests on three facts, none of which this function may break:
+ *   1. It is only ever scheduled on the single serialized `tabGroupQueue` chain (see the
+ *      store.subscribe below and disconnectEverything), so it never runs concurrently with
+ *      the chrome.tabs.onUpdated group handler or with itself.
+ *   2. It NEVER calls store.setState — it only reads store.getState(). So the programmatic
+ *      grouping/ungrouping it performs cannot trigger the store.subscribe that (re)schedules
+ *      it. There is no path from this function back into itself except the queue.
+ *   3. 'connecting' tabs are grouped only while the relay is connected; the onUpdated handler
+ *      ignores group-removal events for 'connecting' tabs. Together these stop a tab that is
+ *      mid-attach from being ungrouped-then-disconnected.
+ */
+async function syncTabGroups(): Promise<void> {
+  try {
+    // Include 'connecting' tabs in a group only when the relay is alive, so that tabs the
+    // user drags into a group stay visible while attaching. When the relay is dead all tabs
+    // are 'connecting' (waiting for reconnect) and their groups should be cleaned up. The
+    // chrome.tabs.onUpdated handler (registered near the bottom of this file) already guards
+    // against the ungroup→disconnect loop for 'connecting' tabs, so excluding them here is
+    // safe.
     const { connectionState } = store.getState()
     const isRelayConnected = connectionState === 'connected'
-    const connectedTabIds = Array.from(store.getState().tabs.entries())
-      .filter(([_, info]) => info.state === 'connected' || (info.state === 'connecting' && isRelayConnected))
-      .map(([tabId]) => tabId)
 
-    // Always query by title - no cached ID that can go stale
-    const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
-
-    // If no connected tabs, clear any existing playwriter groups
-    if (connectedTabIds.length === 0) {
-      for (const group of existingGroups) {
-        const tabsInGroup = await chrome.tabs.query({ groupId: group.id })
-        const tabIdsToUngroup = tabsInGroup.map((t) => t.id).filter((id): id is number => id !== undefined)
-        if (tabIdsToUngroup.length > 0) {
-          await chrome.tabs.ungroup(tabIdsToUngroup)
-        }
-        logger.debug('Cleared playwriter group:', group.id)
-      }
-      return
-    }
-
-    // Consolidate duplicate groups into one
-    let groupId: number | undefined = existingGroups[0]?.id
-    if (existingGroups.length > 1) {
-      const [keep, ...duplicates] = existingGroups
-      groupId = keep.id
-      for (const group of duplicates) {
-        const tabsInDupe = await chrome.tabs.query({ groupId: group.id })
-        const tabIdsToUngroup = tabsInDupe.map((t) => t.id).filter((id): id is number => id !== undefined)
-        if (tabIdsToUngroup.length > 0) {
-          await chrome.tabs.ungroup(tabIdsToUngroup)
-        }
-        logger.debug('Removed duplicate playwriter group:', group.id)
-      }
-    }
-
-    const allTabs = await chrome.tabs.query({})
-    const tabsInGroup = allTabs.filter((t) => t.groupId === groupId && t.id !== undefined)
-    const tabIdsInGroup = new Set(tabsInGroup.map((t) => t.id!))
-
-    const tabsToAdd = connectedTabIds.filter((id) => !tabIdsInGroup.has(id))
-    const tabsToRemove = Array.from(tabIdsInGroup).filter((id) => !connectedTabIds.includes(id))
-
-    if (tabsToRemove.length > 0) {
-      try {
-        await chrome.tabs.ungroup(tabsToRemove)
-        logger.debug('Removed tabs from group:', tabsToRemove)
-      } catch (e: any) {
-        logger.debug('Failed to ungroup tabs:', tabsToRemove, e.message)
-      }
-    }
-
-    if (tabsToAdd.length > 0) {
-      if (groupId === undefined) {
-        const newGroupId = await chrome.tabs.group({ tabIds: tabsToAdd })
-        await chrome.tabGroups.update(newGroupId, { title: TAB_GROUP_TITLE, color: TAB_GROUP_COLOR })
-        logger.debug('Created tab group:', newGroupId, 'with tabs:', tabsToAdd)
+    // Partition connected tabs by their owning workspace key. Freestyle tabs
+    // (workspaceKey === null) all fall into the single shared FREESTYLE_GROUP_KEY bucket (D3);
+    // every worktree key gets its own bucket. Each bucket carries the label used to title its
+    // group — null for the freestyle bucket (which uses FREESTYLE_GROUP_TITLE), and, by the
+    // TabInfo invariant (workspaceLabel non-null iff workspaceKey non-null), non-null for
+    // every worktree bucket.
+    const buckets = new Map<string, { tabIds: number[]; label: string | null }>()
+    for (const [tabId, info] of store.getState().tabs.entries()) {
+      const isConnected =
+        info.state === 'connected' || (info.state === 'connecting' && isRelayConnected)
+      if (!isConnected) continue
+      const bucketKey = info.workspaceKey === null ? FREESTYLE_GROUP_KEY : info.workspaceKey
+      const existing = buckets.get(bucketKey)
+      if (existing) {
+        existing.tabIds.push(tabId)
       } else {
-        await chrome.tabs.group({ tabIds: tabsToAdd, groupId })
-        await chrome.tabGroups.update(groupId, { title: TAB_GROUP_TITLE, color: TAB_GROUP_COLOR })
-        logger.debug('Added tabs to existing group:', tabsToAdd)
+        buckets.set(bucketKey, { tabIds: [tabId], label: info.workspaceLabel })
       }
-    } else if (groupId !== undefined) {
-      // No tabs to add, but ensure the existing group keeps the right color/title.
-      // Chrome can reset these on group collapse/expand or tab moves.
-      await chrome.tabGroups.update(groupId, { title: TAB_GROUP_TITLE, color: TAB_GROUP_COLOR })
+    }
+
+    const groupIds = await getGroupIds()
+
+    // --- Phase 1: clean up groups whose bucket went empty. For every persisted key that has
+    // no connected tabs now, ungroup ONLY that key's own group and forget its map entry.
+    // Never touch another key's group (per-key isolation).
+    for (const [key, groupId] of Object.entries(groupIds)) {
+      if (buckets.has(key)) continue
+      const group = await getGroupOrUndefined(groupId)
+      if (group !== undefined) {
+        const tabsInGroup = await chrome.tabs.query({ groupId })
+        const idsToUngroup = tabsInGroup.map((t) => t.id).filter((id): id is number => id !== undefined)
+        if (idsToUngroup.length > 0) {
+          await chrome.tabs.ungroup(idsToUngroup)
+        }
+      }
+      await deleteGroupId(key)
+      logger.debug('Cleared empty workspace group:', key, groupId)
+    }
+
+    // --- Phase 2: resolve each live bucket's group id against the persisted map, validating
+    // the mapped id with chrome.tabGroups.get. A stale/absent id resolves to null → a fresh
+    // group is created in Phase 3. A live worktree group's current colour is recorded so a
+    // newly created worktree group can avoid it (distinct concurrent worktrees look distinct).
+    const resolved = new Map<string, { groupId: number; color: chrome.tabGroups.ColorEnum } | null>()
+    const takenColors = new Set<chrome.tabGroups.ColorEnum>()
+    for (const key of buckets.keys()) {
+      const mappedId = groupIds[key]
+      if (mappedId === undefined) {
+        resolved.set(key, null)
+        continue
+      }
+      const group = await getGroupOrUndefined(mappedId)
+      if (group === undefined) {
+        resolved.set(key, null)
+        continue
+      }
+      resolved.set(key, { groupId: mappedId, color: group.color })
+      if (key !== FREESTYLE_GROUP_KEY) {
+        takenColors.add(group.color)
+      }
+    }
+
+    // --- Phase 3: reconcile each live bucket against its own group, creating one if needed.
+    for (const [key, bucket] of buckets.entries()) {
+      const isFreestyle = key === FREESTYLE_GROUP_KEY
+      let title: string
+      if (isFreestyle) {
+        title = FREESTYLE_GROUP_TITLE
+      } else {
+        if (bucket.label === null) {
+          // The TabInfo invariant guarantees a non-null label for a keyed tab; a null here is
+          // a real upstream bug, not a state to paper over with a default (no fallback).
+          throw new Error(
+            `Worktree group '${key}' has a null workspaceLabel — the ownership invariant ` +
+              `(workspaceLabel non-null whenever workspaceKey is non-null) is violated`,
+          )
+        }
+        title = bucket.label.slice(0, 20)
+      }
+
+      const existing = resolved.get(key) ?? null
+
+      if (existing === null) {
+        // No live group for this key — create one and record its id in the identity map.
+        const color = isFreestyle ? FREESTYLE_GROUP_COLOR : pickColor(key, takenColors)
+        if (!isFreestyle) {
+          takenColors.add(color)
+        }
+        const newGroupId = await chrome.tabs.group({ tabIds: bucket.tabIds })
+        await setGroupId(key, newGroupId)
+        await chrome.tabGroups.update(newGroupId, { title, color })
+        logger.debug('Created workspace group:', key, newGroupId, color, 'tabs:', bucket.tabIds)
+      } else {
+        // A live group already exists for this key. Keep its colour STABLE (Chrome can reset
+        // title/colour on collapse/expand or tab moves, so we re-apply the exact colour we
+        // read back — never re-pick, which would make an existing group flip colours).
+        const groupId = existing.groupId
+        const color = isFreestyle ? FREESTYLE_GROUP_COLOR : existing.color
+        const tabsInGroup = await chrome.tabs.query({ groupId })
+        const idsInGroup = new Set(
+          tabsInGroup.map((t) => t.id).filter((id): id is number => id !== undefined),
+        )
+        const toAdd = bucket.tabIds.filter((id) => !idsInGroup.has(id))
+        const toRemove = Array.from(idsInGroup).filter((id) => !bucket.tabIds.includes(id))
+
+        if (toRemove.length > 0) {
+          try {
+            await chrome.tabs.ungroup(toRemove)
+            logger.debug('Removed tabs from group:', key, toRemove)
+          } catch (e: any) {
+            logger.debug('Failed to ungroup tabs:', toRemove, e.message)
+          }
+        }
+        if (toAdd.length > 0) {
+          await chrome.tabs.group({ tabIds: toAdd, groupId })
+          logger.debug('Added tabs to group:', key, toAdd)
+        }
+        await chrome.tabGroups.update(groupId, { title, color })
+      }
     }
   } catch (error: any) {
-    logger.debug('Failed to sync tab group:', error.message)
+    logger.debug('Failed to sync tab groups:', error.message)
   }
 }
 
@@ -1125,7 +1298,20 @@ async function handleCommand(msg: ExtensionCommandMessage): Promise<any> {
       logger.debug('Creating new tab with URL:', url)
       const tab = await createTabInPreferredWindow({ url, active: false })
       if (!tab.id) throw new Error('Failed to create tab')
-      setTabConnecting(tab.id)
+      // Target.createTarget is context.newPage(): the new tab belongs to the workspace of
+      // the client that requested it, so that client — and only it — can see the page.
+      // The relay injects that identity onto the forwarded command (Todo 20, Job B). A
+      // missing (undefined) key means the relay never injected it (older/misconfigured
+      // relay): fail loudly rather than silently mis-own the tab. null is a real value
+      // (the requester is freestyle/keyless in a disconnect race) — never default to it.
+      const { workspaceKey, workspaceLabel } = msg.params
+      if (workspaceKey === undefined || workspaceLabel === undefined) {
+        throw new Error(
+          'Target.createTarget received no workspace ownership from the relay; the relay must ' +
+            'inject workspaceKey/workspaceLabel (Todo 20). Refusing to create an unowned tab.',
+        )
+      }
+      setTabConnecting(tab.id, { workspaceKey, workspaceLabel })
       logger.debug('Created tab:', tab.id, 'waiting for it to load...')
       await sleep(100)
       const { targetInfo } = await attachTab(tab.id)
@@ -1244,6 +1430,13 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
       sessionId: source.sessionId || tab.sessionId,
       method,
       params,
+      // Echo the owning workspace key for every event this tab forwards (Todo 20, Job A).
+      // The relay only consumes it on Target.attachedToTarget, where it stamps the target's
+      // ownership — including child/OOPIF targets, which belong to their parent tab's
+      // workspace (`tab` here is the parent, resolved from source.tabId). Without this, an
+      // owned tab's cross-origin iframe target would be stamped freestyle and its live
+      // events would reach nobody. null = freestyle.
+      workspaceKey: tab.workspaceKey,
     },
   })
 }
@@ -1444,6 +1637,22 @@ async function attachTab(
     const attachOrder = nextSessionId
     const sessionId = `pw-tab-${tabSessionScope}-${nextSessionId++}`
 
+    // Ownership (I2) was stamped by setTabConnecting BEFORE attachTab ran — every caller
+    // sets the tab to 'connecting' with its owner first: createInitialTab and
+    // Target.createTarget (real key from the relay), connectTab (its own params), and the
+    // maintainLoop re-attach (which preserves ownership via `{ ...tab, state:'connecting' }`).
+    // Preserve that owner onto the 'connected' TabInfo — never re-derive or default it. If
+    // there is no prior TabInfo, the tab was never marked connecting: that is a bug, so fail
+    // loudly (a defaulted owner would silently mis-own the tab).
+    const owner = store.getState().tabs.get(tabId)
+    if (!owner) {
+      throw new Error(
+        `attachTab: tab ${tabId} has no TabInfo to inherit ownership from; ` +
+          `setTabConnecting must run before attachTab`,
+      )
+    }
+    const { workspaceKey, workspaceLabel } = owner
+
     store.setState((state) => {
       const newTabs = new Map(state.tabs)
       newTabs.set(tabId, {
@@ -1451,6 +1660,8 @@ async function attachTab(
         targetId: targetInfo.targetId,
         state: 'connected',
         attachOrder,
+        workspaceKey,
+        workspaceLabel,
       })
       return { tabs: newTabs, connectionState: 'connected', errorText: undefined }
     })
@@ -1460,6 +1671,12 @@ async function attachTab(
         method: 'forwardCDPEvent',
         params: {
           method: 'Target.attachedToTarget',
+          // Echo the owning workspace key so the relay stamps ConnectedTarget.workspaceKey
+          // (Todo 20, Job A) instead of null. Without this, live target-scoped events
+          // (Todo 17) reach nobody for this extension-attached tab. Field name is
+          // `workspaceKey` on both ends — a `workspace` mismatch fails silently. null =
+          // freestyle (human icon-click), visible to no workspace.
+          workspaceKey,
           params: {
             sessionId,
             targetInfo: { ...targetInfo, attached: true },
@@ -1565,11 +1782,14 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   }
 }
 
-async function connectTab(tabId: number): Promise<void> {
+async function connectTab(
+  tabId: number,
+  { workspaceKey, workspaceLabel }: { workspaceKey: string | null; workspaceLabel: string | null },
+): Promise<void> {
   try {
     logger.debug(`Starting connection to tab ${tabId}`)
 
-    setTabConnecting(tabId)
+    setTabConnecting(tabId, { workspaceKey, workspaceLabel })
 
     await connectionManager.ensureConnection()
     await attachTab(tabId)
@@ -1629,19 +1849,38 @@ async function connectTab(tabId: number): Promise<void> {
       }
       store.setState((state) => {
         const newTabs = new Map(state.tabs)
-        newTabs.set(tabId, { state: 'error', errorText: `Error: ${error.message}` })
+        // Stamp the ownership this connect was invoked with (I2): an errored tab still
+        // belongs to whatever workspace asked for it (null = freestyle human click).
+        newTabs.set(tabId, { state: 'error', errorText: `Error: ${error.message}`, workspaceKey, workspaceLabel })
         return { tabs: newTabs }
       })
     }
   }
 }
 
-function setTabConnecting(tabId: number): void {
+function setTabConnecting(
+  tabId: number,
+  { workspaceKey, workspaceLabel }: { workspaceKey: string | null; workspaceLabel: string | null },
+): void {
   store.setState((state) => {
     const newTabs = new Map(state.tabs)
     const existing = newTabs.get(tabId)
-    newTabs.set(tabId, { ...existing, state: 'connecting' })
+    // The caller always knows the owning workspace (I2): a real key for a
+    // programmatic/agent tab, or null for a freestyle (human icon-click) tab. Stamp it
+    // explicitly — this also completes the TabInfo for a brand-new tab, where `existing`
+    // is undefined and the spread alone would leave workspaceKey/workspaceLabel missing.
+    // Never inherit `existing?.workspaceKey`: the caller is the authority (Todo 9's
+    // "no merge" rule), and a re-click must be able to re-stamp the owner.
+    newTabs.set(tabId, { ...existing, state: 'connecting', workspaceKey, workspaceLabel })
     return { tabs: newTabs }
+  })
+  // Persist ownership so it survives a service-worker restart (Todo 21). This is the single
+  // chokepoint every attach path funnels through (createInitialTab, Target.createTarget,
+  // connectTab, ghost-browser), so persisting here captures every owned/freestyle tab.
+  // Fire-and-forget: the store update above is the source of truth for the live SW; the
+  // storage write only needs to win before the SW dies, and it is serialized internally.
+  void setTabOwner(tabId, { workspaceKey, workspaceLabel }).catch((error) => {
+    logger.debug('Failed to persist tab owner:', tabId, error)
   })
 }
 
@@ -1655,15 +1894,32 @@ async function disconnectTab(tabId: number): Promise<void> {
   }
 
   detachTab(tabId, true)
+  // Drop the persisted ownership (Todo 21) so a DELIBERATELY disconnected tab does not
+  // rehydrate and silently re-attach on the next SW restart. disconnectTab is the single
+  // chokepoint for every intentional disconnect — onTabRemoved (the plan's named sync
+  // point), a manual drag out of the group, disconnectEverything, and the icon-click
+  // toggle all route through here. A transient WS loss does NOT: handleClose keeps tabs in
+  // 'connecting' and never calls disconnectTab, so their owners correctly stay persisted.
+  void deleteTabOwner(tabId).catch((error) => {
+    logger.debug('Failed to delete persisted tab owner:', tabId, error)
+  })
   // WS connection is maintained even with no tabs - maintainConnection handles it
 }
 
-async function toggleExtensionForActiveTab(): Promise<{ isConnected: boolean; state: ExtensionState }> {
+async function toggleExtensionForActiveTab(
+  workspaceKey: string | null,
+  workspaceLabel: string | null,
+): Promise<{ isConnected: boolean; state: ExtensionState }> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
   const tab = tabs[0]
   if (!tab?.id) throw new Error('No active tab found')
 
-  await onActionClicked(tab)
+  // Programmatic (agent/test) toggle — the twin of the human icon click, but keyed: the
+  // caller passes its OWN workspace so the tab is owned by and visible to that workspace.
+  // A caller that genuinely wants a freestyle tab passes (null, null) explicitly. This is
+  // why toggleExtensionForActiveTab does NOT route through onActionClicked, which is
+  // permanently freestyle (Z6).
+  await applyActionForTab(tab, workspaceKey, workspaceLabel)
 
   await new Promise<void>((resolve) => {
     const check = () => {
@@ -1855,7 +2111,17 @@ async function onTabActivated(activeInfo: chrome.tabs.TabActiveInfo): Promise<vo
   store.setState({ currentTabId: activeInfo.tabId, preferredWindowId: activeInfo.windowId })
 }
 
-async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
+// Shared connect/disconnect toggle for a tab. workspaceKey/workspaceLabel are the
+// ownership to stamp when the tab (re)connects (I2): a real key = programmatic/agent tab
+// (owned by, and visible to, that workspace); null = freestyle (visible to no workspace,
+// ever — Z6). The two entry points differ ONLY in what they pass here: onActionClicked
+// (human icon click) hardcodes (null, null); toggleExtensionForActiveTab (agent/test)
+// passes its caller's real key.
+async function applyActionForTab(
+  tab: chrome.tabs.Tab,
+  workspaceKey: string | null,
+  workspaceLabel: string | null,
+): Promise<void> {
   if (!tab.id) {
     logger.debug('No tab ID available')
     return
@@ -1877,7 +2143,7 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
   if (connectionState === 'extension-replaced') {
     logger.debug('Clearing extension-replaced state, attempting to reconnect')
     store.setState({ connectionState: 'idle', errorText: undefined })
-    await connectTab(tab.id)
+    await connectTab(tab.id, { workspaceKey, workspaceLabel })
     return
   }
 
@@ -1895,12 +2161,53 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
   if (tabInfo?.state === 'connected') {
     await disconnectTab(tab.id)
   } else {
-    await connectTab(tab.id)
+    await connectTab(tab.id, { workspaceKey, workspaceLabel })
   }
 }
 
-resetDebugger()
-connectionManager.maintainLoop()
+// The human clicking the extension icon. ALWAYS freestyle, permanently (Z6): a clicked
+// tab carries no workspace key (null, null), so it is visible to no agent workspace,
+// ever. This is the ONE place null is the intended, correct value — never a placeholder,
+// never a shortcut. If this ever passed a real key, clicked tabs would become claimable
+// and Z6 would be violated at its most visible point.
+async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
+  await applyActionForTab(tab, null, null)
+}
+
+// Startup sequence (Todo 21): resetDebugger force-detaches stale debugger targets, THEN we
+// rehydrate persisted tab ownership from chrome.storage.session, THEN the reconnect loop
+// starts. Order is load-bearing: rehydration must run AFTER resetDebugger (which just tore
+// down any leftover debugger attachments) and BEFORE maintainLoop, so maintainLoop's
+// existing re-attach path (which reads each tab's owner off its 'connecting' TabInfo)
+// restores rehydrated tabs with ownership intact. Rehydrated tabs are marked 'connecting',
+// never 'connected': their debugger is detached, so 'connected' would be a lying state
+// machine. maintainLoop always starts (finally), even if rehydration hiccups.
+void (async () => {
+  try {
+    await resetDebugger()
+    const survivors = await rehydrateTabOwners()
+    if (survivors.size > 0) {
+      store.setState((state) => {
+        const newTabs = new Map(state.tabs)
+        for (const [tabId, owner] of survivors) {
+          // Never clobber a tab a live path already re-added in the meantime.
+          if (newTabs.has(tabId)) continue
+          newTabs.set(tabId, {
+            state: 'connecting',
+            workspaceKey: owner.workspaceKey,
+            workspaceLabel: owner.workspaceLabel,
+          })
+        }
+        return { tabs: newTabs }
+      })
+      logger.log(`Rehydrated ${survivors.size} tab(s) from chrome.storage.session`)
+    }
+  } catch (error) {
+    logger.warn('Startup tab-ownership rehydration failed:', error)
+  } finally {
+    connectionManager.maintainLoop()
+  }
+})()
 
 chrome.contextMenus
   .remove('playwriter-pin-element')
@@ -1956,8 +2263,8 @@ store.subscribe((state, prevState) => {
   updateContextMenuVisibility()
   const tabsChanged = serializeTabs(state.tabs) !== serializeTabs(prevState.tabs)
   if (tabsChanged) {
-    tabGroupQueue = tabGroupQueue.then(syncTabGroup).catch((e) => {
-      logger.debug('syncTabGroup error:', e)
+    tabGroupQueue = tabGroupQueue.then(syncTabGroups).catch((e) => {
+      logger.debug('syncTabGroups error:', e)
     })
   }
 })
@@ -2023,20 +2330,37 @@ chrome.action.onClicked.addListener(onActionClicked)
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void updateIcons()
   if (changeInfo.groupId !== undefined) {
-    // Queue tab group operations to serialize with syncTabGroup and disconnectEverything
+    // Narrowed to `number` here; captured so the (deferred) async callback below keeps the
+    // narrowing — TypeScript drops the outer narrowing across the closure boundary.
+    const changedGroupId = changeInfo.groupId
+    // Queue tab group operations to serialize with syncTabGroups and disconnectEverything
     tabGroupQueue = tabGroupQueue
       .then(async () => {
-        // Query for playwriter group by title - no stale cached ID
-        const existingGroups = await chrome.tabGroups.query({ title: TAB_GROUP_TITLE })
-        const groupId = existingGroups[0]?.id
-        if (groupId === undefined) {
-          return
-        }
+        // Recognise playwriter groups by IDENTITY, never by title (invariant I5): reverse-look
+        // up the changed group id in workspace-groups.ts's persisted `groupIds` map. A HIT means
+        // the tab landed in one of OUR groups (any worktree group OR the single shared freestyle
+        // group); a MISS means it left them — ungrouped (id -1), or moved to a group that is not
+        // ours. This supersedes the old chrome.tabGroups.query({title}) lookup, which only ever
+        // recognised the freestyle group and so misclassified worktree-group events.
+        //
+        // This reverse lookup is what closes the residual worktree-thrash edge Todo 22
+        // documented: when syncTabGroups first groups an already-'connected' worktree tab, it
+        // awaits setGroupId(key, newGroupId) BEFORE returning, and this handler is chained AFTER
+        // syncTabGroups on the single serialized tabGroupQueue, so the map already contains that
+        // group id by the time this runs. The event therefore lands in the benign added-branch
+        // (tab already tracked → no-op) instead of falling through to disconnectTab.
+        const groupIds = await getGroupIds()
+        const isPlaywriterGroup = Object.values(groupIds).includes(changedGroupId)
         const { tabs } = store.getState()
-        if (changeInfo.groupId === groupId) {
+        if (isPlaywriterGroup) {
           if (!tabs.has(tabId) && !isRestrictedUrl(tab.url)) {
             logger.debug('Tab manually added to playwriter group:', tabId)
-            await connectTab(tabId)
+            // A human dragged this UNTRACKED tab into a playwriter group by hand — same
+            // semantics as clicking the extension icon: freestyle (null), owned by no agent
+            // workspace. There is NO claiming, even when the tab is dropped into a WORKTREE
+            // group (Z6). A tab that syncTabGroups grouped is already tracked, so this branch
+            // no-ops for it — only genuine human drags of new tabs reach connectTab here.
+            await connectTab(tabId, { workspaceKey: null, workspaceLabel: null })
           }
         } else if (tabs.has(tabId)) {
           const tabInfo = tabs.get(tabId)
@@ -2100,10 +2424,20 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
 
     const { tabs: connectedTabs } = store.getState()
     let sourceTabId: number | undefined
+    // A relocated popup inherits the workspace of the tab that opened it: the opener is a
+    // Playwriter-connected tab, so its TabInfo carries the real owning workspace, and the
+    // popup belongs to that same workspace (window.open from a keyed page must stay
+    // visible to that page's agent). Captured here alongside sourceTabId; the null-init is
+    // never used as-is because we return early when sourceTabId stays undefined.
+    let sourceWorkspaceKey: string | null = null
+    let sourceWorkspaceLabel: string | null = null
     for (const tabId of tabIds) {
       const candidate = popupSourceTabMap.get(tabId)
-      if (candidate !== undefined && connectedTabs.has(candidate)) {
+      const candidateOwner = candidate !== undefined ? connectedTabs.get(candidate) : undefined
+      if (candidateOwner !== undefined) {
         sourceTabId = candidate
+        sourceWorkspaceKey = candidateOwner.workspaceKey
+        sourceWorkspaceLabel = candidateOwner.workspaceLabel
         break
       }
     }
@@ -2146,7 +2480,7 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     for (const tabId of tabIds) {
       if (connectedTabs.has(tabId)) continue
       try {
-        await connectTab(tabId)
+        await connectTab(tabId, { workspaceKey: sourceWorkspaceKey, workspaceLabel: sourceWorkspaceLabel })
       } catch (e) {
         logger.warn(`Failed to auto-connect relocated popup tab ${tabId}:`, e)
       }

@@ -9,8 +9,19 @@ import os from 'node:os'
 import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
 import { killPortProcess } from './kill-port.js'
+import { deriveWorkspace } from './workspace-key.js'
 
 const execAsync = promisify(exec)
+
+/**
+ * The single workspace every test in this suite acts as. All tests run from one cwd,
+ * so they derive one key — which is why keying them changes nothing about the suite's
+ * semantics except that their relay clients are no longer 4005-rejected as unkeyed.
+ * Todos 26-31 pass `TEST_WORKSPACE.key`/`.label` at every toggle + getCdpUrl site where
+ * the test's own client must see its tab; `null, null` only on the deliberate freestyle
+ * (human-icon-click) path, whose tab must then be invisible to every keyed client.
+ */
+export const TEST_WORKSPACE = deriveWorkspace()
 const extensionBuildQueues: Map<string, Promise<void>> = new Map()
 
 async function buildExtension({ port, distDir }: { port: number; distDir: string }): Promise<void> {
@@ -114,9 +125,12 @@ export async function setupTestContext({
   if (toggleExtension) {
     const page = await browserContext.newPage()
     await page.goto('about:blank')
-    await serviceWorker.evaluate(async () => {
-      await (globalThis as any).toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
   }
 
   return { browserContext, userDataDir, relayServer }

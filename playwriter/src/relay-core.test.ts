@@ -14,6 +14,7 @@ import {
   tryJsonParse,
   createSimpleServer,
   safeCloseCDPBrowser,
+  TEST_WORKSPACE,
 } from './test-utils.js'
 import './test-declarations.js'
 
@@ -58,9 +59,12 @@ describe('Relay Core Tests', () => {
     await page.goto('about:blank')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     await new Promise((r) => {
       setTimeout(r, 100)
@@ -82,9 +86,12 @@ describe('Relay Core Tests', () => {
     await page.bringToFront()
 
     await withTimeout({
-      promise: serviceWorker.evaluate(async () => {
-        await globalThis.toggleExtensionForActiveTab()
-      }),
+      promise: serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      ),
       timeoutMs: 10000,
       errorMessage: 'Timed out toggling extension for active tab',
     })
@@ -168,12 +175,15 @@ describe('Relay Core Tests', () => {
     await page.goto(server.baseUrl, { waitUntil: 'domcontentloaded' })
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
 
     const directBrowser = await withTimeout({
-      promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+      promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
       timeoutMs: 10000,
       errorMessage: 'Timed out connecting over CDP for download reproduction test',
     })
@@ -312,21 +322,24 @@ describe('Relay Core Tests', () => {
       await page.goto(server.baseUrl, { waitUntil: 'domcontentloaded' })
       await page.bringToFront()
 
-      await serviceWorker.evaluate(async () => {
-        await globalThis.toggleExtensionForActiveTab()
-      })
+      await serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
 
       await new Promise((r) => {
         setTimeout(r, 100)
       })
 
       browserA = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 10000,
         errorMessage: 'Timed out connecting first CDP client for dialog test',
       })
       browserB = await withTimeout({
-        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT })),
+        promise: chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })),
         timeoutMs: 10000,
         errorMessage: 'Timed out connecting second CDP client for dialog test',
       })
@@ -515,9 +528,12 @@ describe('Relay Core Tests', () => {
       await page.goto(server.baseUrl, { waitUntil: 'domcontentloaded' })
       await page.bringToFront()
 
-      await serviceWorker.evaluate(async () => {
-        await globalThis.toggleExtensionForActiveTab()
-      })
+      await serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
 
       await new Promise((r) => {
         setTimeout(r, 200)
@@ -1126,9 +1142,12 @@ describe('Relay Core Tests', () => {
       })
       expect(colorSchemeBefore).toBe('dark')
 
-      await serviceWorker.evaluate(async () => {
-        await globalThis.toggleExtensionForActiveTab()
-      })
+      await serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
       await new Promise((r) => setTimeout(r, 500))
 
       const result = await client.callTool({
@@ -1190,9 +1209,12 @@ describe('Relay Core Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 400))
 
     // Test basic getCleanHTML
@@ -1291,9 +1313,12 @@ describe('Relay Core Tests', () => {
         `)
     await page.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 400))
 
     // Test basic getPageMarkdown
@@ -1373,9 +1398,12 @@ describe('Relay Core Tests', () => {
     await page1.goto('https://example.com/first-page')
     await page1.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
     // 3. Reset MCP to ensure page1 becomes the default page (only page available)
@@ -1403,9 +1431,12 @@ describe('Relay Core Tests', () => {
     await page2.goto('https://example.com/second-page')
     await page2.bringToFront()
 
-    await serviceWorker.evaluate(async () => {
-      await globalThis.toggleExtensionForActiveTab()
-    })
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
     await new Promise((r) => setTimeout(r, 100))
 
     // 6. Close the first page (which is the default `page` in MCP scope)

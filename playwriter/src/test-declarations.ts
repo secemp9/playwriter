@@ -1,7 +1,10 @@
 import type { ExtensionState } from 'mcp-extension/src/types.js'
 
 declare global {
-  var toggleExtensionForActiveTab: () => Promise<{ isConnected: boolean; state: ExtensionState }>
+  var toggleExtensionForActiveTab: (
+    workspaceKey: string | null,
+    workspaceLabel: string | null,
+  ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
 

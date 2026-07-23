@@ -165,9 +165,9 @@ describe('removeExtension', () => {
 
   test('also removes playwright clients bound to the extension', () => {
     let state = stateWithExtension('ext-1')
-    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: 'ext-1', ws: fakeWs() })
-    state = relayState.addPlaywrightClient(state, { id: 'c2', extensionId: 'ext-1', ws: fakeWs() })
-    state = relayState.addPlaywrightClient(state, { id: 'c3', extensionId: 'ext-2', ws: fakeWs() })
+    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: 'ext-1', ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
+    state = relayState.addPlaywrightClient(state, { id: 'c2', extensionId: 'ext-1', ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
+    state = relayState.addPlaywrightClient(state, { id: 'c3', extensionId: 'ext-2', ws: fakeWs(), workspaceKey: 'wt:bbb', workspaceLabel: 'wsB' })
 
     const after = relayState.removeExtension(state, { extensionId: 'ext-1' })
 
@@ -185,19 +185,28 @@ describe('addPlaywrightClient', () => {
   test('adds client with ws handle', () => {
     const before = emptyState()
     const ws = fakeWs()
-    const after = relayState.addPlaywrightClient(before, { id: 'client-1', extensionId: 'ext-1', ws })
+    const after = relayState.addPlaywrightClient(before, {
+      id: 'client-1',
+      extensionId: 'ext-1',
+      ws,
+      workspaceKey: 'wt:f3998c9758d0',
+      workspaceLabel: 'playwriter',
+    })
 
     expect(after.playwrightClients.size).toBe(1)
     const client = after.playwrightClients.get('client-1')!
     expect(client.extensionId).toBe('ext-1')
     expect(client.ws).toBe(ws)
+    // The owning workspace round-trips through addPlaywrightClient exactly (I1).
+    expect(client.workspaceKey).toBe('wt:f3998c9758d0')
+    expect(client.workspaceLabel).toBe('playwriter')
     expect(before.playwrightClients.size).toBe(0)
   })
 })
 
 describe('removePlaywrightClient', () => {
   test('removes client', () => {
-    const before = relayState.addPlaywrightClient(emptyState(), { id: 'c1', extensionId: null, ws: fakeWs() })
+    const before = relayState.addPlaywrightClient(emptyState(), { id: 'c1', extensionId: null, ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
     const after = relayState.removePlaywrightClient(before, { clientId: 'c1' })
 
     expect(after.playwrightClients.size).toBe(0)
@@ -255,7 +264,7 @@ describe('extension I/O fields', () => {
   test('playwright client ws handle is co-located with state', () => {
     let state = emptyState()
     const ws = fakeWs()
-    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: null, ws })
+    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: null, ws, workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
     expect(state.playwrightClients.get('c1')?.ws).toBe(ws)
 
     state = relayState.removePlaywrightClient(state, { clientId: 'c1' })
@@ -272,9 +281,9 @@ describe('rebindClientsToExtension', () => {
       stableKey: 'profile:chrome-1',
       ws: fakeWs(),
     })
-    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: 'ext-old', ws: fakeWs() })
-    state = relayState.addPlaywrightClient(state, { id: 'c2', extensionId: 'ext-old', ws: fakeWs() })
-    state = relayState.addPlaywrightClient(state, { id: 'c3', extensionId: 'ext-new', ws: fakeWs() })
+    state = relayState.addPlaywrightClient(state, { id: 'c1', extensionId: 'ext-old', ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
+    state = relayState.addPlaywrightClient(state, { id: 'c2', extensionId: 'ext-old', ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
+    state = relayState.addPlaywrightClient(state, { id: 'c3', extensionId: 'ext-new', ws: fakeWs(), workspaceKey: 'wt:bbb', workspaceLabel: 'wsB' })
 
     const after = relayState.rebindClientsToExtension(state, {
       fromExtensionId: 'ext-old',
@@ -300,11 +309,14 @@ describe('addTarget', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo,
+      workspaceKey: 'wt:abcdef123456',
     })
 
     const ext = after.extensions.get('ext-1')!
     expect(ext.connectedTargets.size).toBe(1)
     expect(ext.connectedTargets.get('pw-tab-1')?.targetId).toBe('target-1')
+    // Ownership is stored verbatim (I2).
+    expect(ext.connectedTargets.get('pw-tab-1')?.workspaceKey).toBe('wt:abcdef123456')
     // Original unchanged
     expect(before.extensions.get('ext-1')!.connectedTargets.size).toBe(0)
   })
@@ -316,6 +328,7 @@ describe('addTarget', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
 
     expect(after).toBe(before)
@@ -328,6 +341,7 @@ describe('addTarget', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: 'wt:original',
       existingFrameIds: new Set(['frame-A']),
     })
 
@@ -337,11 +351,14 @@ describe('addTarget', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo({ url: 'https://updated.com' }),
+      workspaceKey: 'wt:updated',
     })
 
     const target = state.extensions.get('ext-1')!.connectedTargets.get('pw-tab-1')!
     expect(target.targetInfo.url).toBe('https://updated.com')
     expect(target.frameIds.has('frame-A')).toBe(true)
+    // workspaceKey takes the new caller-supplied value on update — no implicit merge.
+    expect(target.workspaceKey).toBe('wt:updated')
   })
 })
 
@@ -353,6 +370,7 @@ describe('removeTarget', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
     const after = relayState.removeTarget(state, { extensionId: 'ext-1', sessionId: 'pw-tab-1' })
 
@@ -375,6 +393,7 @@ describe('removeTargetByCrash', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
     const after = relayState.removeTargetByCrash(state, { extensionId: 'ext-1', targetId: 'target-1' })
 
@@ -401,6 +420,7 @@ describe('updateTargetInfo', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo({ title: 'Old Title' }),
+      workspaceKey: null,
     })
 
     const newInfo = makeTargetInfo({ title: 'New Title' })
@@ -424,6 +444,7 @@ describe('addFrameId', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
     const after = relayState.addFrameId(state, { extensionId: 'ext-1', sessionId: 'pw-tab-1', frameId: 'frame-1' })
 
@@ -437,6 +458,7 @@ describe('addFrameId', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
     state = relayState.addFrameId(state, { extensionId: 'ext-1', sessionId: 'pw-tab-1', frameId: 'frame-1' })
     const after = relayState.addFrameId(state, { extensionId: 'ext-1', sessionId: 'pw-tab-1', frameId: 'frame-1' })
@@ -453,6 +475,7 @@ describe('removeFrameId', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
     state = relayState.addFrameId(state, { extensionId: 'ext-1', sessionId: 'pw-tab-1', frameId: 'frame-1' })
     const after = relayState.removeFrameId(state, { extensionId: 'ext-1', frameId: 'frame-1' })
@@ -480,6 +503,7 @@ describe('updateTargetUrl', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo({ url: 'https://old.com', title: 'Old' }),
+      workspaceKey: null,
     })
 
     const after = relayState.updateTargetUrl(state, {
@@ -501,6 +525,7 @@ describe('updateTargetUrl', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo({ url: 'https://example.com', title: 'Keep This' }),
+      workspaceKey: null,
     })
 
     const after = relayState.updateTargetUrl(state, {
@@ -554,6 +579,7 @@ describe('findExtensionIdByCdpSession', () => {
       sessionId: 'pw-tab-1',
       targetId: 'target-1',
       targetInfo: makeTargetInfo(),
+      workspaceKey: null,
     })
 
     expect(relayState.findExtensionIdByCdpSession(state, 'pw-tab-1')).toBe('ext-1')
@@ -590,8 +616,9 @@ describe('store.setState with transitions', () => {
         sessionId: 'pw-tab-1',
         targetId: 'target-1',
         targetInfo: makeTargetInfo(),
+        workspaceKey: null,
       })
-      next = relayState.addPlaywrightClient(next, { id: 'c1', extensionId: 'ext-1', ws: fakeWs() })
+      next = relayState.addPlaywrightClient(next, { id: 'c1', extensionId: 'ext-1', ws: fakeWs(), workspaceKey: 'wt:aaa', workspaceLabel: 'wsA' })
       return next
     })
 

@@ -11,6 +11,17 @@ type ForwardCDPCommand = {
       sessionId?: string
       params?: ProtocolMapping.Commands[K]['paramsType'][0]
       source?: 'playwriter'
+      /**
+       * Todo 20: the requesting client's workspace, injected by the relay onto the
+       * forwarded `Target.createTarget` (context.newPage()) so the extension can stamp
+       * the new tab's ownership (I2) — otherwise the extension has no way to know which
+       * client asked for the page. Present only on `Target.createTarget`; a value of null
+       * means the requesting client is genuinely freestyle/keyless (disconnect race, I1).
+       * `undefined` means no workspace was injected (e.g. an older relay) — the extension
+       * must fail loudly rather than mis-own the tab (Todo 33 owns version-skew warnings).
+       */
+      workspaceKey?: string | null
+      workspaceLabel?: string | null
     }
   }
 }[keyof ProtocolMapping.Commands]
@@ -36,6 +47,17 @@ export type ExtensionEventMessage = {
       method: CDPEventFor<K>['method']
       sessionId?: string
       params?: CDPEventFor<K>['params']
+      /**
+       * Todo 20: the extension echoes the owning workspace key on every
+       * `Target.attachedToTarget` it reports (the tab's own key for a page target, the
+       * parent tab's key for a child/OOPIF target) so the relay can stamp
+       * ConnectedTarget.workspaceKey instead of null. This is what makes live
+       * target-scoped events (Todo 17) reach the owning client for extension-attached
+       * tabs. null = freestyle (human icon-click), which is visible to no workspace.
+       * `undefined` = an older extension that does not echo — the relay treats it as
+       * freestyle (its pre-Todo-20 behaviour); Todo 33 owns the loud version-skew warning.
+       */
+      workspaceKey?: string | null
     }
   }
 }[keyof ProtocolMapping.Events]

@@ -8,6 +8,19 @@ export interface TabInfo {
   errorText?: string
   attachOrder?: number
   isRecording?: boolean
+  /**
+   * Workspace that owns this tab (I2). Required and explicitly nullable:
+   * null POSITIVELY means freestyle (a human clicked the extension icon), which
+   * is visible to no workspace, ever — never "ownership unknown" and never a
+   * migration placeholder to be defaulted away. A programmatic (auto-created)
+   * tab always carries a real key here.
+   */
+  workspaceKey: string | null
+  /**
+   * Human-readable label for the owning workspace, carried so the extension can
+   * title this tab's group (Todo 22). null iff workspaceKey is null (freestyle).
+   */
+  workspaceLabel: string | null
 }
 
 export interface ExtensionState {

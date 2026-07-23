@@ -43,6 +43,7 @@ describe('ExecutorManager.listSessions', () => {
       extensionId: 'profile:test',
       browser: 'Chrome',
       profile: { email: 'test@example.com', id: 'profile-1' },
+      workspace: null,
     }
 
     try {

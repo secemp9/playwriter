@@ -5,7 +5,7 @@ description: Run multiple AI agents on the same browser without interference. Ea
 icon: lucide:layers
 ---
 
-Sessions let you run **multiple agents at once** without interference. Each session is an isolated sandbox with its own `state` object. Variables, pages, and listeners persist between calls. Browser tabs are shared, but state is not.
+Sessions let you run **multiple agents at once** without interference. Each session is an isolated sandbox with its own `state` object. Variables, pages, and listeners persist between calls. Your `state` is isolated per session, and browser tabs are isolated per git worktree, so agents working in different worktrees never see each other's tabs.
 
 ## Creating sessions
 
@@ -43,18 +43,26 @@ console.log(state.results.length) // 0
 state.results.push(await state.page.title())
 ```
 
-## Pages are shared, state is not
+## Tabs are isolated per worktree
 
-`context.pages()` returns all browser tabs with Playwriter enabled, **shared across all sessions**. Multiple agents see the same tabs. To avoid interference, always **get your own page**:
+`context.pages()` returns only the tabs that belong to **your workspace** — identified by your git worktree. Playwriter gives each worktree its own tabs in its own distinctly colored tab group, and auto-creates that first tab for you, so there's no extension click to set up. A session can never see or drive tabs belonging to a different worktree.
+
+Two Claude sessions running in the **same** worktree deliberately share one tab group and see the same tabs; sessions in different worktrees are fully isolated from each other.
+
+Because tabs are scoped to your worktree, store your working page in `state.page` and reuse it. This keeps the page handle alive across calls and avoids stepping on a tab that another session in the same worktree is driving:
 
 ```js
-// First call: grab an empty tab or create one, navigate immediately
+// First call: reuse the auto-created blank tab or open a new one
 state.page = context.pages().find(p => p.url() === 'about:blank') ?? await context.newPage()
 await state.page.goto('https://example.com')
 // Store in state.page and use it for ALL subsequent operations
 ```
 
-Navigate **in the same call** as creating the page. This prevents another agent from grabbing the same `about:blank` tab between execute calls.
+## Freestyle tabs and workspace overrides
+
+Clicking the extension icon puts the current tab into a shared grey **freestyle** group that carries no worktree ownership. No agent can see or drive a freestyle tab — agents only ever work with the tabs Playwriter created for their worktree.
+
+Your workspace is your git worktree by default (or the current directory when you're outside a git repo). Set `PLAYWRITER_WORKSPACE` to an explicit name to override this: sessions that share the same `PLAYWRITER_WORKSPACE` value share tabs regardless of their directory, and sessions with different values stay isolated.
 
 ## Handle page closures
 
@@ -97,7 +105,7 @@ Every session has access to these globals:
 | Variable | Description |
 |---|---|
 | `state` | Persisted object, isolated per session |
-| `page` | Default page (shared, prefer `state.page`) |
+| `page` | Default page (prefer `state.page`, which persists per session) |
 | `context` | Browser context, access all pages via `context.pages()` |
 | `require` | Load Node.js modules (`path`, `fs`, `crypto`, etc.) |
 | `fetch` | Standard fetch API |

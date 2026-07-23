@@ -73,7 +73,7 @@ The file runs in the same sandbox as `-e` with all context variables available.
 
 ## Session management
 
-Each session is an **isolated sandbox** with its own `state` object. Browser tabs are shared across sessions, but state is not.
+Each session is an **isolated sandbox** with its own `state` object. State is isolated per session, and browser tabs are isolated per git worktree, so sessions in different worktrees never see each other's tabs.
 
 ```bash
 playwriter session new              # create sandbox, outputs id (e.g. 1)
@@ -161,7 +161,7 @@ Code executed with `-e` or `-f` has access to:
 
 | Variable | Description |
 |---|---|
-| `page` | Default page (may be shared with other agents) |
+| `page` | Default page (prefer `state.page`, which persists per session) |
 | `context` | Browser context, access all pages via `context.pages()` |
 | `state` | Object persisted between calls within your session |
 | `require` | Load Node.js modules (e.g. `require('node:fs')`) |

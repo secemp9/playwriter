@@ -32,28 +32,6 @@ The MCP exposes:
 - `execute` tool - run Playwright code snippets
 - `reset` tool - reconnect if connection issues occur
 
-## Environment Variables
-
-### `PLAYWRITER_AUTO_ENABLE`
-
-Auto-creates a tab when Playwright connects (no manual extension click needed). **Enabled by default** in both CLI and MCP. The auto-created tab starts at `about:blank`; navigate it to any URL.
-
-Set `PLAYWRITER_AUTO_ENABLE=false` to disable and require manually enabling the extension on a tab before connecting:
-
-```json
-{
-  "mcpServers": {
-    "playwriter": {
-      "command": "npx",
-      "args": ["-y", "playwriter@latest"],
-      "env": {
-        "PLAYWRITER_AUTO_ENABLE": "false"
-      }
-    }
-  }
-}
-```
-
 ## Direct CDP (no extension needed)
 
 Connect directly to Chrome's DevTools Protocol without the extension. Set `PLAYWRITER_DIRECT` in your MCP config:
