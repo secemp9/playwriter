@@ -168,7 +168,6 @@ async function detectBrowserName(): Promise<string> {
   return 'Chromium'
 }
 
-let identityPromise: Promise<ExtensionIdentity> | null = null
 let installIdPromise: Promise<string> | null = null
 const tabSessionScope = (() => {
   const values = new Uint32Array(2)
@@ -203,37 +202,44 @@ async function getInstallId(): Promise<string> {
   return installIdPromise
 }
 
-async function getExtensionIdentity(): Promise<ExtensionIdentity> {
-  if (identityPromise) {
-    return identityPromise
-  }
+// Profile info (email/id) is cosmetic metadata for the relay's browser list — it is NOT
+// part of the stable connection key (that is installId). chrome.identity.getProfileUserInfo
+// can hang indefinitely in some profiles, so it must never sit on the connect critical
+// path: it is fetched in the background, only a RESOLVED value is cached, and each connect
+// attempt uses whatever has resolved so far. A hung or failed fetch costs an empty profile
+// label in `playwriter browser list`, never the connection itself.
+let cachedProfile: { email: string; id: string } | null = null
+let profileFetchInFlight = false
 
-  identityPromise = (async () => {
-    const browser = await detectBrowserName()
-    const installId = await getInstallId().catch(() => {
-      // Storage can be unavailable briefly during startup. Fall back to the runtime scope so
-      // we still avoid the coarse browser-only key that causes cross-browser relay takeovers.
-      return tabSessionScope
+function fetchProfileInBackground(): void {
+  if (cachedProfile || profileFetchInFlight) return
+  profileFetchInFlight = true
+  chrome.identity
+    .getProfileUserInfo({ accountStatus: 'ANY' })
+    .then((info) => {
+      cachedProfile = { email: info.email || '', id: info.id || '' }
     })
-    try {
-      const info = await chrome.identity.getProfileUserInfo({ accountStatus: 'ANY' })
-      return {
-        browser,
-        email: info.email || '',
-        id: info.id || '',
-        installId,
-      }
-    } catch {
-      return {
-        browser,
-        email: '',
-        id: '',
-        installId,
-      }
-    }
-  })()
+    .catch(() => {
+      // Allow a later connect attempt to retry. A HANG (never settles) intentionally does
+      // not retry within this worker: one stuck call per worker lifetime, blocking nothing.
+      profileFetchInFlight = false
+    })
+}
 
-  return identityPromise
+async function getExtensionIdentity(): Promise<ExtensionIdentity> {
+  fetchProfileInBackground()
+  const browser = await detectBrowserName()
+  const installId = await getInstallId().catch(() => {
+    // Storage can be unavailable briefly during startup. Fall back to the runtime scope so
+    // we still avoid the coarse browser-only key that causes cross-browser relay takeovers.
+    return tabSessionScope
+  })
+  return {
+    browser,
+    email: cachedProfile?.email || '',
+    id: cachedProfile?.id || '',
+    installId,
+  }
 }
 
 // The single SHARED freestyle group (D3): every human-clicked / freestyle tab
@@ -344,6 +350,13 @@ function flushRecordingChunkBuffer(ws: WebSocket): void {
 class ConnectionManager {
   ws: WebSocket | null = null
   private connectionPromise: Promise<void> | null = null
+  // Monotonic id for connect attempts. Every await inside connect() is a suspension point
+  // where the attempt may have been superseded (the global timeout fired and the maintain
+  // loop started a fresh attempt while the old one was stuck). Post-await checkpoints
+  // abort any attempt whose generation is no longer current, which makes "two live
+  // sockets from one worker" unrepresentable — the race that made the relay replace our
+  // own connection (close 4001) and strand the worker in 'extension-replaced'.
+  private generation = 0
   preserveTabsOnDetach = false
 
   async ensureConnection(): Promise<void> {
@@ -364,10 +377,19 @@ class ConnectionManager {
     // This protects against edge cases where individual timeouts don't fire
     // (e.g., DNS resolution hangs, AbortSignal doesn't work, etc.)
     const GLOBAL_TIMEOUT_MS = 15000
+    const attempt = this.connect()
+    // The race below may settle via the timeout while `attempt` is still pending; give the
+    // abandoned promise a handler so its eventual rejection is not an unhandled rejection.
+    attempt.catch(() => {})
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
     this.connectionPromise = Promise.race([
-      this.connect(),
+      attempt,
       new Promise<never>((_, reject) => {
-        setTimeout(() => {
+        timeoutId = setTimeout(() => {
+          // Invalidate the timed-out attempt: if its continuation ever resumes, the
+          // generation checkpoints in connect() abort it before it can open a socket
+          // that would replace whatever a newer attempt establishes.
+          this.generation++
           reject(new Error('Connection timeout (global)'))
         }, GLOBAL_TIMEOUT_MS)
       }),
@@ -376,11 +398,14 @@ class ConnectionManager {
     try {
       await this.connectionPromise
     } finally {
+      clearTimeout(timeoutId)
       this.connectionPromise = null
     }
   }
 
   private async connect(): Promise<void> {
+    const gen = ++this.generation
+    const isCurrent = () => gen === this.generation
     logger.debug(`Waiting for server at http://${RELAY_HOST}:${RELAY_PORT}...`)
 
     // Retry for up to 5 seconds with 1s intervals, then give up (maintain loop will retry later)
@@ -401,6 +426,9 @@ class ConnectionManager {
     }
 
     const identity = await getExtensionIdentity()
+    if (!isCurrent()) {
+      throw new Error('Connection attempt superseded')
+    }
     const relayUrl = new URL(`ws://${RELAY_HOST}:${RELAY_PORT}/extension`)
     if (identity.browser) {
       relayUrl.searchParams.set('browser', identity.browser)
@@ -465,6 +493,15 @@ class ConnectionManager {
         }
       }
     })
+
+    if (!isCurrent()) {
+      // A newer attempt won while we were waiting for the socket to open. Close this
+      // socket before the relay treats it as a replacement for the winner's connection.
+      try {
+        socket.close()
+      } catch {}
+      throw new Error('Connection attempt superseded')
+    }
 
     this.ws = socket
 
@@ -617,6 +654,12 @@ class ConnectionManager {
     }
 
     this.ws.onclose = (event: CloseEvent) => {
+      // Stale-socket guard: only the socket the manager currently owns may drive state
+      // transitions. A superseded socket closing late (e.g. the relay's 4001 after a
+      // same-key replacement) must not tear down or poison the live connection's state.
+      if (this.ws !== socket) {
+        return
+      }
       this.handleClose(event.reason, event.code)
     }
 
@@ -2182,6 +2225,9 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 // restores rehydrated tabs with ownership intact. Rehydrated tabs are marked 'connecting',
 // never 'connected': their debugger is detached, so 'connected' would be a lying state
 // machine. maintainLoop always starts (finally), even if rehydration hiccups.
+// Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
+// resolved by the time the first connect attempt reads it. Never awaited anywhere.
+fetchProfileInBackground()
 void (async () => {
   try {
     await resetDebugger()
