@@ -50,6 +50,10 @@ const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
 // blocking the entire Playwright connection setup for 30s per command.
 // Note: Page.addScriptToEvaluateOnNewDocument is NOT included because user-provided
 // scripts with runImmediately:true can legitimately take longer than 10s.
+// Timeout for attachTab's own post-attach setup commands (Page.enable, our injected
+// scripts, Target.getTargetInfo). All should be near-instant on a healthy renderer.
+const ATTACH_SETUP_TIMEOUT_MS = 10000
+
 const FAST_CDP_COMMAND_TIMEOUT_MS = new Map<string, number>([
   ['Browser.getWindowForTarget', 10000],
   ['Page.enable', 10000],
@@ -1660,12 +1664,42 @@ async function attachTab(
     debuggerAttached = true
     logger.debug('Debugger attached successfully to tab:', tabId)
 
-    await chrome.debugger.sendCommand(debuggee, 'Page.enable')
+    // Evidence + anti-freeze: a discarded/frozen renderer accepts the debugger attach but
+    // never answers renderer-side DevTools commands — the documented hang that
+    // sendCommandWithTimeout exists for. Log the tab's lifecycle state so the relay log
+    // shows WHY a setup command timed out, and pin the tab against Memory-Saver
+    // auto-discard while it is under automation.
+    try {
+      const tab = await chrome.tabs.get(tabId)
+      logger.debug(
+        'attach: tab lifecycle', tabId,
+        'status:', tab.status,
+        'discarded:', tab.discarded,
+        'frozen:', (tab as { frozen?: boolean }).frozen,
+        'active:', tab.active,
+      )
+      if (tab.autoDiscardable) {
+        void chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {})
+      }
+    } catch {}
+
+    // Every setup command below should return near-instantly on a healthy renderer, so
+    // all of them are bounded: a tab whose renderer never answers must fail ITS attach in
+    // seconds — not hang attachTab forever, strand the relay's awaiting createInitialTab,
+    // and take the whole connection down with it. (The addScriptToEvaluateOnNewDocument
+    // exemption in FAST_CDP_COMMAND_TIMEOUT_MS is about USER-provided scripts routed
+    // through handleCommand; these are our own tiny bundles.)
+    const setupCommand = (method: string, params?: object): Promise<unknown> => {
+      logger.debug(`attach step: ${method} tab:`, tabId)
+      return sendCommandWithTimeout(debuggee, method, params, ATTACH_SETUP_TIMEOUT_MS)
+    }
+
+    await setupCommand('Page.enable')
 
     // Reapply cached auto-attach for new tabs so OOPIF targets are reported immediately.
     if (autoAttachParams) {
       try {
-        await chrome.debugger.sendCommand(debuggee, 'Target.setAutoAttach', autoAttachParams)
+        await setupCommand('Target.setAutoAttach', autoAttachParams)
       } catch (error) {
         logger.debug('Failed to apply auto-attach for tab:', tabId, error)
       }
@@ -1676,23 +1710,20 @@ async function attachTab(
         window.__playwriter_lastRightClicked = e.target;
       }, true);
     `
-    await chrome.debugger.sendCommand(debuggee, 'Page.addScriptToEvaluateOnNewDocument', { source: contextMenuScript })
-    await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', { expression: contextMenuScript })
+    await setupCommand('Page.addScriptToEvaluateOnNewDocument', { source: contextMenuScript })
+    await setupCommand('Runtime.evaluate', { expression: contextMenuScript })
 
     // Ghost cursor — survives navigations via addScriptToEvaluateOnNewDocument.
     try {
-      await chrome.debugger.sendCommand(debuggee, 'Page.addScriptToEvaluateOnNewDocument', {
+      await setupCommand('Page.addScriptToEvaluateOnNewDocument', {
         source: ghostCursorBundleCode,
       })
-      await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', { expression: ghostCursorBundleCode })
+      await setupCommand('Runtime.evaluate', { expression: ghostCursorBundleCode })
     } catch (err) {
       logger.debug('Could not inject ghost cursor (restricted page):', (err as Error).message)
     }
 
-    const result = (await chrome.debugger.sendCommand(
-      debuggee,
-      'Target.getTargetInfo',
-    )) as Protocol.Target.GetTargetInfoResponse
+    const result = (await setupCommand('Target.getTargetInfo')) as Protocol.Target.GetTargetInfoResponse
 
     const targetInfo = result.targetInfo
 
@@ -2265,6 +2296,32 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 const RECONNECT_ALARM = 'playwriter-reconnect'
 void chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener(() => {})
+
+// Worker heartbeat. The service worker's console is not observable from outside the
+// browser, and this worker has been repeatedly terminated mid-work; the heartbeat gives
+// the relay log (a) a timestamped record of how long each worker instance actually
+// lives, and (b) whether the chrome.* API pipeline still answers (bounded probe — this
+// same pipeline has been observed to stop settling calls). The completed API call also
+// resets the idle timer, belt-and-suspenders alongside the relay's WS pings.
+const workerStartedAt = Date.now()
+setInterval(() => {
+  const uptimeS = Math.round((Date.now() - workerStartedAt) / 1000)
+  void Promise.race([
+    chrome.runtime.getPlatformInfo(),
+    new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('probe timeout'))
+      }, 2000)
+    }),
+  ]).then(
+    () => {
+      logger.debug(`heartbeat: worker up ${uptimeS}s, chrome api ok`)
+    },
+    () => {
+      logger.warn(`heartbeat: worker up ${uptimeS}s, chrome.* API pipeline NOT answering`)
+    },
+  )
+}, 15000)
 
 // Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
 // resolved by the time the first connect attempt reads it. Never awaited anywhere.
