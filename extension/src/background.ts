@@ -2225,6 +2225,18 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 // restores rehydrated tabs with ownership intact. Rehydrated tabs are marked 'connecting',
 // never 'connected': their debugger is detached, so 'connected' would be a lying state
 // machine. maintainLoop always starts (finally), even if rehydration hiccups.
+// Wake source of last resort. MV3 kills the service worker whenever Chrome deems it
+// idle; the relay's WebSocket pings extend its life only best-effort (observed on
+// Chrome 149: workers terminated ~2.5min after connect despite 5s pings). A dead worker
+// has no maintainLoop, so without an external wake the extension silently vanishes from
+// the relay until some user event in this profile fires. The periodic alarm bounds that
+// outage at ~30s: waking the worker re-runs module evaluation, which restarts
+// maintainLoop, which reconnects. The listener body is intentionally empty — being woken
+// IS the work.
+const RECONNECT_ALARM = 'playwriter-reconnect'
+void chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
+chrome.alarms.onAlarm.addListener(() => {})
+
 // Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
 // resolved by the time the first connect attempt reads it. Never awaited anywhere.
 fetchProfileInBackground()

@@ -4,6 +4,7 @@
   "version": "0.0.98",
   "description": "Automate your Browser using Cursor, Claude, VS Code. More capable and context efficient than Playwright MCP.",
   "permissions": [
+    "alarms",
     "debugger",
     "scripting",
     "tabGroups",
