@@ -1,5 +1,6 @@
 import type { ICDPSession } from './cdp-session.js'
 import type { Locator } from '@xmorse/playwright-core'
+import { computeSpecificity, compareSpecificity, type NormalizedRule, type Specificity } from './css-cascade.js'
 
 export interface StyleSource {
   url: string
@@ -232,6 +233,171 @@ export async function getStylesForLocator({
     inlineStyle,
     rules: filteredRules,
   }
+}
+
+/**
+ * Convert a raw CDP `CSS.getMatchedStylesForNode` response into the
+ * `NormalizedRule[]` shape `resolveCascade` (css-cascade.ts) expects. Pure and
+ * synchronous: directly-matched rules first (in CDP application order), then the
+ * inline style (ranked last). Inherited rules are intentionally excluded — under
+ * the real cascade, inheritance only applies when nothing directly declares the
+ * property, so mixing inherited declarations into the same specificity sort would
+ * be incorrect. Preserves `source {url,line,column}`, `origin`, and `!important`
+ * flags. `order` is the CDP order (later = wins the source-order tiebreak).
+ */
+export function normalizeMatchedStyles(matchedStyles: any): NormalizedRule[] {
+  const rules: NormalizedRule[] = []
+  const headers: CSSStyleSheetHeader[] = matchedStyles?.cssStyleSheetHeaders ?? []
+
+  const urlFor = (styleSheetId: string | undefined, origin: string): string => {
+    if (origin === 'user-agent') return 'user-agent'
+    if (!styleSheetId) return ''
+    const header = headers.find((h) => h.styleSheetId === styleSheetId)
+    return header?.sourceURL || `stylesheet:${styleSheetId}`
+  }
+
+  let order = 0
+
+  if (matchedStyles?.matchedCSSRules) {
+    for (const ruleMatch of matchedStyles.matchedCSSRules as RuleMatch[]) {
+      const rule = ruleMatch.rule
+      const { declarations, important } = splitDeclarations(rule.style)
+      if (Object.keys(declarations).length === 0) {
+        continue
+      }
+
+      const sourceRange = (rule as any).selectorList?.range as SourceRange | undefined
+      let source: StyleSource | null = null
+      if (sourceRange) {
+        source = {
+          url: urlFor(rule.styleSheetId, rule.origin),
+          line: sourceRange.startLine + 1,
+          column: sourceRange.startColumn,
+        }
+      }
+
+      rules.push({
+        selector: rule.selectorList.text,
+        specificity: specificityForRule(rule, ruleMatch.matchingSelectors),
+        declarations,
+        important,
+        origin: rule.origin,
+        source,
+        order: order++,
+        styleSheetId: rule.styleSheetId,
+      })
+    }
+  }
+
+  if (matchedStyles?.inlineStyle) {
+    const { declarations, important } = splitDeclarations(matchedStyles.inlineStyle as CSSStyle)
+    if (Object.keys(declarations).length > 0) {
+      rules.push({
+        selector: 'element.style',
+        specificity: [0, 0, 0],
+        declarations,
+        important,
+        origin: 'regular',
+        source: null,
+        inline: true,
+        order: order++,
+      })
+    }
+  }
+
+  return rules
+}
+
+/**
+ * Fetch and normalize the matched styles for a locator's element, returning the
+ * `NormalizedRule[]` ready for `resolveCascade` plus the element's backendNodeId
+ * and the raw CDP response (for callers that want stylesheet text / code-frames).
+ * Additive helper — does not affect `getStylesForLocator`.
+ */
+export async function fetchNormalizedStyles({
+  locator,
+  cdp,
+}: {
+  locator: Locator
+  cdp: ICDPSession
+}): Promise<{ backendNodeId: number; nodeId: number; rules: NormalizedRule[]; matchedStyles: any }> {
+  await cdp.send('DOM.enable')
+  await cdp.send('CSS.enable')
+  // CDP rejects `DOM.pushNodesByBackendIdsToFrontend` with "Document needs to be
+  // requested first" unless the document has been fetched on THIS session. On a
+  // fresh session nothing else has done it yet, so do it here.
+  await cdp.send('DOM.getDocument', { depth: 0 })
+
+  const elementHandle = await locator.elementHandle()
+  if (!elementHandle) {
+    throw new Error('Could not get element handle from locator')
+  }
+
+  const objectId = (elementHandle as any)._channel?.objectId as string | undefined
+  let backendNodeId: number
+  if (objectId) {
+    const nodeInfo = await cdp.send('DOM.describeNode', { objectId })
+    backendNodeId = nodeInfo.node.backendNodeId
+  } else {
+    const box = await elementHandle.boundingBox()
+    if (!box) {
+      throw new Error('Element has no bounding box')
+    }
+    const nodeAtPoint = await cdp.send('DOM.getNodeForLocation', {
+      x: Math.round(box.x + box.width / 2),
+      y: Math.round(box.y + box.height / 2),
+    })
+    backendNodeId = nodeAtPoint.backendNodeId
+  }
+
+  const pushResult = await cdp.send('DOM.pushNodesByBackendIdsToFrontend', {
+    backendNodeIds: [backendNodeId],
+  })
+  const nodeId = pushResult.nodeIds[0]
+  if (!nodeId) {
+    throw new Error('Could not get nodeId for element')
+  }
+
+  const matchedStyles = await cdp.send('CSS.getMatchedStylesForNode', { nodeId })
+  return { backendNodeId, nodeId, rules: normalizeMatchedStyles(matchedStyles), matchedStyles }
+}
+
+/** Like `extractDeclarations` but keeps clean values + a separate `!important` set. */
+function splitDeclarations(style: CSSStyle): { declarations: StyleDeclarations; important: Set<string> } {
+  const declarations: StyleDeclarations = {}
+  const important = new Set<string>()
+  if (!style?.cssProperties) {
+    return { declarations, important }
+  }
+  for (const prop of style.cssProperties) {
+    if (!prop.value || prop.value === 'initial' || prop.name.startsWith('-webkit-')) {
+      continue
+    }
+    declarations[prop.name] = prop.value
+    if (prop.important) {
+      important.add(prop.name)
+    }
+  }
+  return { declarations, important }
+}
+
+/** Specificity of a matched rule, taking the MAX over just its matched selectors. */
+function specificityForRule(rule: CSSRule, matchingSelectors?: number[]): Specificity {
+  const selectors = (rule as any).selectorList?.selectors as Array<{ text: string }> | undefined
+  if (Array.isArray(selectors) && Array.isArray(matchingSelectors) && matchingSelectors.length > 0) {
+    let best: Specificity = [0, 0, 0]
+    for (const idx of matchingSelectors) {
+      const text = selectors[idx]?.text
+      if (typeof text === 'string') {
+        const spec = computeSpecificity(text)
+        if (compareSpecificity(spec, best) > 0) {
+          best = spec
+        }
+      }
+    }
+    return best
+  }
+  return computeSpecificity(rule.selectorList?.text ?? '')
 }
 
 function extractDeclarations(style: CSSStyle): StyleDeclarations {

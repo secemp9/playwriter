@@ -22,8 +22,23 @@ import { waitForPageLoad, WaitForPageLoadOptions, WaitForPageLoadResult } from '
 import { ICDPSession, getCDPSessionForPage } from './cdp-session.js'
 import { Debugger } from './debugger.js'
 import { Editor } from './editor.js'
-import { getStylesForLocator, formatStylesAsText, type StylesResult } from './styles.js'
+import { getStylesForLocator, formatStylesAsText, fetchNormalizedStyles, type StylesResult } from './styles.js'
+import { resolveCascade, formatCascadeReport, type DeclRef, type NormalizedRule } from './css-cascade.js'
+import { codeFrameColumns } from '@babel/code-frame'
 import { getReactSource, getReactComponentInfo, type ReactSourceLocation } from './react-source.js'
+import { buildPageModel, type PageModel } from './page-model.js'
+import { buildModuleGraph, type ModuleGraph } from './module-graph.js'
+import {
+  traceValue,
+  readLogpoints,
+  storeIdentity,
+  netTimeline,
+  netDelay,
+  fiberSnapshot,
+  fiberDiff,
+  replayPure,
+  type TraceDeps,
+} from './trace.js'
 import { ScopedFS } from './scoped-fs.js'
 import {
   screenshotWithAccessibilityLabels,
@@ -37,6 +52,7 @@ export type { SnapshotFormat }
 import { getCleanHTML, type GetCleanHTMLOptions } from './clean-html.js'
 import { getPageMarkdown, type GetPageMarkdownOptions } from './page-markdown.js'
 import { createRecordingApi } from './screen-recording.js'
+import { startCdpScreencast, type CdpScreencastHandle } from './cdp-screencast.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
@@ -356,6 +372,17 @@ export class PlaywrightExecutor {
   private pageLogCursor: Map<Page, number> = new Map()
   private lastSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
   private lastRefToLocator: WeakMap<Page, Map<string, string>> = new WeakMap()
+  // Per-page PageModel cache (same lifecycle as lastSnapshots). Used as the diff
+  // baseline for `changedSince` markers on the next buildPageModel for the page.
+  private lastPageModel: WeakMap<Page, PageModel> = new WeakMap()
+  /** In-flight CDP screencast, if any. Survives across execute() calls. */
+  cdpScreencast: CdpScreencastHandle | null = null
+  // Per-cwd module-graph cache (M4): traceValue/backwardSlice reuse the parsed
+  // graph across turns instead of re-walking the source tree each call.
+  private moduleGraphCache: Map<string, ModuleGraph> = new Map()
+  // Per-page Debugger cache (M4): logpoint/script-source/trace closures reuse a
+  // single Debugger per page instead of re-enabling on every call.
+  private debuggerCache: WeakMap<Page, Debugger> = new WeakMap()
   private warningEvents: WarningEvent[] = []
   private nextWarningEventId = 0
   private lastDeliveredWarningEventId = 0
@@ -1447,6 +1474,202 @@ export class PlaywrightExecutor {
         return getReactComponentInfo({ locator: options.locator, cdp })
       }
 
+      // Resolve a { locator } | { node } arg to a Playwright Locator. `node` may be
+      // a PageModel handle (carries a `.locator` selector string) or a raw locator.
+      const resolveStyleTargetLocator = (options: { locator?: any; node?: any }): Locator => {
+        if (options.locator && typeof options.locator.page === 'function') {
+          return options.locator
+        }
+        const node = options.node
+        if (node) {
+          if (typeof node.page === 'function') return node as Locator
+          if (typeof node.locator === 'string') return page.locator(node.locator)
+        }
+        throw new Error('debugStyle/whyOccluded require a { locator } or a { node } with a locator')
+      }
+
+      // Best-effort code-frame for a winning declaration. Fetches the stylesheet
+      // text by styleSheetId and renders the source region. Returns null if the
+      // text is unavailable — code-frame is a nice-to-have, never required.
+      const renderDeclCodeFrame = async (
+        cdp: ICDPSession,
+        rule: NormalizedRule | undefined,
+        message: string,
+      ): Promise<string | null> => {
+        if (!rule || !rule.styleSheetId || !rule.source) return null
+        try {
+          const { text } = await cdp.send('CSS.getStyleSheetText', { styleSheetId: rule.styleSheetId })
+          if (typeof text !== 'string' || text.length === 0) return null
+          return codeFrameColumns(
+            text,
+            { start: { line: rule.source.line, column: rule.source.column + 1 } },
+            { highlightCode: false, message },
+          )
+        } catch {
+          return null
+        }
+      }
+
+      // Find the NormalizedRule that produced a winning DeclRef (to recover its
+      // styleSheetId for code-frames). Matches on selector + source location.
+      const findRuleForRef = (rules: NormalizedRule[], ref: DeclRef): NormalizedRule | undefined => {
+        return rules.find(
+          (r) =>
+            r.selector === ref.selector &&
+            r.source?.url === ref.source?.url &&
+            r.source?.line === ref.source?.line &&
+            r.source?.column === ref.source?.column,
+        )
+      }
+
+      // debugStyle: explain WHY a property has the value it does — the winning
+      // declaration plus the ordered losers, with source locations (and, when
+      // cheaply available, a code-frame of the winning rule).
+      const debugStyle = async (options: { locator?: any; node?: any; property?: string }) => {
+        const locator = resolveStyleTargetLocator(options)
+        const cdp = await getCDPSession({ page: locator.page() })
+        const { rules } = await fetchNormalizedStyles({ locator, cdp })
+        const cascade = resolveCascade(rules)
+
+        // Which props to report: the requested one, else contested props (a real
+        // conflict), else all winners.
+        const allProps = Object.keys(cascade.winnerFor)
+        let properties: string[]
+        if (options.property) {
+          properties = allProps.includes(options.property) ? [options.property] : []
+        } else {
+          const contested = allProps.filter((p) => (cascade.losersFor[p]?.length ?? 0) > 0)
+          properties = contested.length > 0 ? contested : allProps
+        }
+
+        const propertiesReport: Record<
+          string,
+          { winner: DeclRef; losers: DeclRef[] }
+        > = {}
+        for (const prop of properties) {
+          propertiesReport[prop] = {
+            winner: cascade.winnerFor[prop],
+            losers: cascade.losersFor[prop] ?? [],
+          }
+        }
+
+        let text = formatCascadeReport({
+          winnerFor: cascade.winnerFor,
+          losersFor: cascade.losersFor,
+          properties,
+        })
+
+        // Code-frame the single requested winner when one property is targeted.
+        if (options.property && properties.length === 1) {
+          const winner = cascade.winnerFor[options.property]
+          const winRule = findRuleForRef(rules, winner)
+          const frame = await renderDeclCodeFrame(cdp, winRule, `${options.property}: ${winner.value} (winner)`)
+          if (frame) {
+            text = `${text}\n\n${frame}`
+          }
+        }
+
+        return { properties: propertiesReport, text }
+      }
+
+      // whyOccluded: best-effort stacking-context report for an element. M2 emits
+      // the element's own stacking-relevant declarations + source locations.
+      // TODO(M3): full paint-order hit-testing to name the actual occluding element.
+      const STACKING_PROPS = [
+        'z-index',
+        'position',
+        'opacity',
+        'transform',
+        'filter',
+        'mix-blend-mode',
+        'isolation',
+        'will-change',
+        'pointer-events',
+        'clip-path',
+      ]
+      const whyOccluded = async (options: { locator?: any; node?: any }) => {
+        const locator = resolveStyleTargetLocator(options)
+        const cdp = await getCDPSession({ page: locator.page() })
+        const { rules } = await fetchNormalizedStyles({ locator, cdp })
+        const cascade = resolveCascade(rules)
+
+        const stacking: Record<string, { value: string; selector: string; important: boolean; source: DeclRef['source'] }> =
+          {}
+        for (const prop of STACKING_PROPS) {
+          const ref = cascade.winnerFor[prop]
+          if (ref) {
+            stacking[prop] = { value: ref.value, selector: ref.selector, important: ref.important, source: ref.source }
+          }
+        }
+
+        const position = cascade.winnerFor['position']?.value
+        const zIndex = cascade.winnerFor['z-index']?.value
+        // Heuristic: does this element establish its own stacking context?
+        const createsStackingContext =
+          (zIndex != null && zIndex !== 'auto' && position != null && position !== 'static') ||
+          (cascade.winnerFor['opacity'] != null && cascade.winnerFor['opacity'].value !== '1') ||
+          cascade.winnerFor['transform'] != null ||
+          cascade.winnerFor['filter'] != null ||
+          cascade.winnerFor['mix-blend-mode'] != null ||
+          (cascade.winnerFor['isolation']?.value === 'isolate') ||
+          cascade.winnerFor['will-change'] != null
+
+        const text = formatCascadeReport({
+          element: 'stacking-relevant declarations',
+          winnerFor: cascade.winnerFor,
+          losersFor: cascade.losersFor,
+          properties: Object.keys(stacking),
+        })
+
+        return {
+          stacking,
+          createsStackingContext,
+          position: position ?? null,
+          zIndex: zIndex ?? null,
+          // Full paint-order hit-testing (naming the actual element on top) is a
+          // later milestone; this reports the element's own stacking inputs only.
+          occludedBy: null as null,
+          note: 'M2: element stacking inputs only. Paint-order hit-testing is a later milestone.',
+          text,
+        }
+      }
+
+      // Build (or rebuild) the PageModel for a page, diffing against the previous
+      // per-page model so `changedSince` markers are populated. Caches on lastPageModel.
+      const buildPageModelFn = async (options?: { page?: Page; scope?: string }): Promise<PageModel> => {
+        const p = options?.page || page
+        const cdp = await getCDPSession({ page: p })
+        const model = await buildPageModel({ page: p, cdp, scope: options?.scope })
+        const prev = self.lastPageModel.get(p)
+        if (prev) model.diffAgainst(prev)
+        self.lastPageModel.set(p, model)
+        return model
+      }
+
+      // `pm`: lazy per-execute accessor. Builds the page model once (per page) and
+      // reuses it across anchor/query/renderText/debugMode calls in the same turn.
+      // Returns only cycle-free projections (handles/rows/strings), never the live model.
+      const pmModels = new Map<Page, PageModel>()
+      const getPmModel = async (targetPage?: Page): Promise<PageModel> => {
+        const p = targetPage || page
+        if (!p) {
+          throw new Error('pm requires a page')
+        }
+        const existing = pmModels.get(p)
+        if (existing) return existing
+        const model = await buildPageModelFn({ page: p })
+        pmModels.set(p, model)
+        return model
+      }
+      const pm = {
+        anchor: async (selector: any, options?: { page?: Page }) =>
+          (await getPmModel(options?.page)).anchor(selector),
+        query: async (opts?: any) => (await getPmModel(opts?.page)).query(opts),
+        renderText: async (opts?: any) => (await getPmModel(opts?.page)).renderText(opts),
+        debugMode: async (options?: { page?: Page }) => (await getPmModel(options?.page)).debugMode(),
+      }
+      const queryPage = async (opts?: any) => (await getPmModel(opts?.page)).query(opts)
+
       const inspectPinnedElement = async (pageUrl: string, elementExpression: string) => {
         const targetPage = context.pages().find((candidate) => candidate.url() === pageUrl) || context.pages()[0]
         if (!targetPage) {
@@ -1556,6 +1779,151 @@ export class PlaywrightExecutor {
       })
 
 
+      // ---- M4: runtime-debug / trace lane wiring ---------------------------
+      // Reuse one Debugger per page (logpoints, script-source, captureArgs).
+      const getDebuggerForPage = async (targetPage?: Page): Promise<Debugger> => {
+        const p = targetPage || page
+        const existing = self.debuggerCache.get(p)
+        if (existing) return existing
+        const cdp = await getCDPSession({ page: p })
+        const dbg = new Debugger({ cdp })
+        self.debuggerCache.set(p, dbg)
+        return dbg
+      }
+
+      // Lazily build + cache the module graph for a root (defaults to session cwd).
+      const getModuleGraph = (root?: string): ModuleGraph => {
+        const key = root ?? self.sessionCwd ?? process.cwd()
+        const cached = self.moduleGraphCache.get(key)
+        if (cached) return cached
+        const graph = buildModuleGraph({ root: key })
+        self.moduleGraphCache.set(key, graph)
+        return graph
+      }
+
+      const setLogpointFn = async (options: { page?: Page; file: string; line: number; expr: string; tag?: string }) => {
+        const dbg = await getDebuggerForPage(options.page)
+        return dbg.setLogpoint({ file: options.file, line: options.line, expr: options.expr, tag: options.tag })
+      }
+
+      const getScriptSourceByUrlFn = async (options: { page?: Page; url: string }) => {
+        const dbg = await getDebuggerForPage(options.page)
+        return dbg.getScriptSourceByUrl({ url: options.url })
+      }
+
+      const readLogpointsFn = async (options?: { page?: Page; tag?: string; sinceCursor?: number }) => {
+        return readLogpoints({
+          getLogs: async () => getLatestLogs({ page: options?.page }),
+          tag: options?.tag,
+          sinceCursor: options?.sinceCursor,
+        })
+      }
+
+      const storeIdentityFn = async (options: { page?: Page; action: () => Promise<void> | void; storeExpr?: string }) => {
+        const p = options.page || page
+        return storeIdentity({ page: p, action: options.action, storeExpr: options.storeExpr })
+      }
+
+      const netFns = {
+        timeline: (options?: { page?: Page; urlPattern?: string | RegExp }) => {
+          const p = options?.page || page
+          return netTimeline({ page: p, urlPattern: options?.urlPattern })
+        },
+        delay: async (options: { page?: Page; urlPattern: string; ms: number }) => {
+          const p = options.page || page
+          const cdp = await getCDPSession({ page: p })
+          return netDelay({ cdp, urlPattern: options.urlPattern, ms: options.ms })
+        },
+      }
+
+      const fiberSnapshotFn = async (options: { locator: Locator | ElementHandle }) => {
+        const targetPage = await (async (): Promise<Page | null> => {
+          if ('page' in options.locator) return options.locator.page()
+          return (await options.locator.ownerFrame())?.page() ?? null
+        })()
+        if (!targetPage) throw new Error('Could not get page from locator')
+        const cdp = await getCDPSession({ page: targetPage })
+        return fiberSnapshot({ locator: options.locator, cdp })
+      }
+
+      // traceValue: orchestrates anchor + static slice + probe arming, returning
+      // a cycle-free, token-bounded summary (the render() string + compact blocked
+      // leaves), NEVER the live TraceHop tree. The lossless result is retained in
+      // the closure so `expand(hopId)` / `runProbe(hopId)` drill without re-tracing.
+      const traceValueFn = async (options: any = {}) => {
+        const targetPage = options.page || page
+        const cdp = targetPage ? await getCDPSession({ page: targetPage }) : undefined
+        const dbg = targetPage ? await getDebuggerForPage(targetPage) : undefined
+        const deps: TraceDeps = {
+          page: targetPage ?? undefined,
+          cdp,
+          dbg,
+          getLogs: async () => getLatestLogs({ page: targetPage }),
+          buildGraph: ({ root }) => getModuleGraph(root),
+          action: options.action,
+          storeExpr: options.storeExpr,
+          urlPattern: options.urlPattern,
+        }
+        const result = await traceValue({ ...options, deps })
+        const compactHop = (hop: any) =>
+          hop && {
+            kind: hop.kind,
+            site: hop.site,
+            blockedBy: hop.blockedBy,
+            hazards: hop.hazards,
+            note: hop.note,
+            evaluated: hop.evaluated,
+            codeFrame: hop.codeFrame,
+            childCount: hop.children ? hop.children.length : 0,
+          }
+        return {
+          render: result.render(),
+          anchor: result.anchor,
+          blocked: result.blocked.map((b) => ({
+            id: b.id,
+            blockedBy: b.blockedBy,
+            site: b.site,
+            note: b.note,
+            probe: b.probe ? { type: b.probe.type, passive: b.probe.passive, spec: b.probe.spec } : null,
+          })),
+          expand: (hopId: string) => compactHop(result.expand(hopId)),
+          runProbe: async (hopId: string) => {
+            const leaf = result.blocked.find((b) => b.id === hopId)
+            if (!leaf?.probe) throw new Error(`no probe armed at hop ${hopId}`)
+            return leaf.probe.run()
+          },
+        }
+      }
+
+      // --- gesture-free CDP screencast (direct-CDP mode only) ---
+      // NOTE: the handle lives on the executor instance, NOT in this closure —
+      // `execute()` runs fresh per call, so a closure variable would be reset
+      // between `startCdp` and `stopCdp`.
+
+      const startCdpRecording = async (options: { page?: Page; outputPath: string; quality?: number; fps?: number; maxWidth?: number; maxHeight?: number; maxDurationMs?: number }) => {
+        if (self.cdpScreencast) throw new Error('A CDP screencast is already running; stop it first.')
+        const p = options.page || page
+        if (!p) throw new Error('No page available to record')
+        const cdp = await getCDPSession({ page: p })
+        self.cdpScreencast = await startCdpScreencast({ cdp, ...options })
+        return { started: true, outputPath: options.outputPath }
+      }
+
+      const stopCdpRecording = async () => {
+        if (!self.cdpScreencast) throw new Error('No CDP screencast is running')
+        const handle = self.cdpScreencast
+        self.cdpScreencast = null
+        return handle.stop()
+      }
+
+      const cancelCdpRecording = async () => {
+        if (!self.cdpScreencast) return { cancelled: false }
+        const handle = self.cdpScreencast
+        self.cdpScreencast = null
+        await handle.cancel()
+        return { cancelled: true }
+      }
+
       let vmContextObj: any = {
         page,
         context,
@@ -1576,8 +1944,22 @@ export class PlaywrightExecutor {
         createEditor,
         getStylesForLocator: getStylesForLocatorFn,
         formatStylesAsText,
+        debugStyle,
+        whyOccluded,
         getReactSource: getReactSourceFn,
         getReactComponentInfo: getReactComponentInfoFn,
+        // M4 runtime-debug / trace lane
+        traceValue: traceValueFn,
+        setLogpoint: setLogpointFn,
+        getScriptSourceByUrl: getScriptSourceByUrlFn,
+        readLogpoints: readLogpointsFn,
+        storeIdentity: storeIdentityFn,
+        net: netFns,
+        fiberSnapshot: fiberSnapshotFn,
+        fiberDiff,
+        replayPure,
+        pm,
+        queryPage,
         inspectPinnedElement,
         screenshotWithAccessibilityLabels: screenshotWithAccessibilityLabelsFn,
         resizeImageForAgent: resizeImageForAgentFn,
@@ -1592,6 +1974,12 @@ export class PlaywrightExecutor {
           stop: recordingApi.stop,
           isRecording: recordingApi.isRecording,
           cancel: recordingApi.cancel,
+          // Gesture-free CDP screencast recorder. Works only over a DIRECT CDP
+          // connection (Chrome started with --remote-debugging-port); Chrome
+          // withholds screencast frames from the extension's debugger API.
+          startCdp: startCdpRecording,
+          stopCdp: stopCdpRecording,
+          cancelCdp: cancelCdpRecording,
         },
         // Backward-compatible aliases
         startRecording: recordingApi.start,

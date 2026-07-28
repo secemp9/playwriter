@@ -127,6 +127,79 @@ function buildStylesApi() {
   writeToDestinations('styles-api.md', content)
 }
 
+function buildPageModelApi() {
+  const pageModelTypes = cleanTypes(readFile('dist/page-model.d.ts'))
+  const cascadeTypes = cleanTypes(readFile('dist/css-cascade.d.ts'))
+  const pageModelExamples = readFile('src/page-model-examples.ts')
+
+  const content = dedent`
+    # PageModel API Reference
+
+    The PageModel fuses the ARIA snapshot, the flattened DOM, and lazy React/CSS
+    edges into one queryable tree. In the sandbox it is reached through the \`pm\`
+    helper (\`pm.query\` / \`pm.anchor\` / \`pm.renderText\` / \`pm.debugMode\`) and the
+    CSS-provenance helpers \`debugStyle\` / \`whyOccluded\`. Queries return plain,
+    cycle-free projection rows — never the live model.
+
+    ## Types
+
+    \`\`\`ts
+    ${pageModelTypes}
+    \`\`\`
+
+    ## CSS cascade types
+
+    \`\`\`ts
+    ${cascadeTypes}
+    \`\`\`
+
+    ## Examples
+
+    \`\`\`ts
+    ${pageModelExamples}
+    \`\`\`
+  `
+
+  writeToDestinations('page-model-api.md', content)
+}
+
+function buildTraceApi() {
+  const traceTypes = cleanTypes(readFile('dist/trace.d.ts'))
+  const staticAnalysisTypes = cleanTypes(readFile('dist/static-analysis.d.ts'))
+  const traceExamples = readFile('src/trace-examples.ts')
+
+  const content = dedent`
+    # Trace API Reference
+
+    The trace lane turns a symptom into a cause. \`traceValue\` anchors a wrong
+    on-screen value to its React source, runs the static backward slice, and arms
+    (never auto-runs) a runtime probe at each blind spot. The probe toolkit
+    (\`storeIdentity\`, \`setLogpoint\` / \`readLogpoints\`, \`net.timeline\` / \`net.delay\`,
+    \`fiberSnapshot\` / \`fiberDiff\`, \`replayPure\`) resolves those blind spots. Never
+    fabricate a value past a \`blockedBy\` — run the armed probe instead.
+
+    ## Types
+
+    \`\`\`ts
+    ${traceTypes}
+    \`\`\`
+
+    ## Static-analysis types
+
+    \`\`\`ts
+    ${staticAnalysisTypes}
+    \`\`\`
+
+    ## Examples
+
+    \`\`\`ts
+    ${traceExamples}
+    \`\`\`
+  `
+
+  writeToDestinations('trace-api.md', content)
+}
+
 function buildPerformanceProfiling() {
   const performanceExamples = readFile('src/performance-examples.ts')
 
@@ -503,6 +576,8 @@ function buildWellKnownSkills() {
 buildDebuggerApi()
 buildEditorApi()
 buildStylesApi()
+buildPageModelApi()
+buildTraceApi()
 buildPerformanceProfiling()
 buildPromptFromSkill()
 buildWellKnownSkills()

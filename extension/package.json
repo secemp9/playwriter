@@ -19,7 +19,7 @@
     "build": "tsc --project . && vite build --config vite.config.mts && tsx scripts/download-prism.ts",
     "reload": "bun run build && open -a 'Google Chrome' 'chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid'",
     "watch": "vite build --watch --config vite.config.mts",
-    "dev": "concurrently -k -n vite,reload \"PLAYWRITER_DEV_RELOAD=1 vite build --watch --config vite.config.mts\" \"node scripts/dev-reload-server.mjs\"",
+    "dev": "concurrently -k -n tsc,vite \"tsc --project . --noEmit --watch --preserveWatchOutput\" \"PLAYWRITER_DEV_RELOAD=1 vite build --watch --config vite.config.mts\"",
     "clean": "rm -rf dist"
   },
   "devDependencies": {

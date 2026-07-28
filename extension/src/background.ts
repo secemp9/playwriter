@@ -2336,7 +2336,7 @@ logger.log(
   `[worker ${workerInstanceId}] START`,
   `v=${typeof __PLAYWRITER_VERSION__ !== 'undefined' ? __PLAYWRITER_VERSION__ : '?'}`,
   `relayPort=${RELAY_PORT}`,
-  `devReload=${typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__ ? `on:${__PLAYWRITER_DEV_RELOAD_PORT__}` : 'off'}`,
+  `devReload=${typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__ ? 'on:self-hash' : 'off'}`,
   `ua=${navigator.userAgent.slice(0, 60)}`,
 )
 
@@ -2396,50 +2396,10 @@ setInterval(() => {
   )
 }, 15000)
 
-// Dev live-reload. In `npm run dev` builds only: poll the dev-reload server for the
-// current build token (dist/background.js mtime). The FIRST successful poll sets the
-// baseline; any later change means a rebuild landed on disk, so reload the extension.
-// chrome.runtime.reload() re-reads the unpacked files from disk AND wipes
-// chrome.storage.session (clearing any stale tab-ownership state) — so a source edit
-// becomes a clean, automatic reload with zero manual clicks. Guarded so nothing here
-// exists in production builds.
-if (typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__) {
-  const devReloadUrl = `http://${RELAY_HOST}:${__PLAYWRITER_DEV_RELOAD_PORT__}/build-id`
-  let devReloadBaseline: string | null = null
-  // Track reachability so we log ONE line on each up<->down transition instead of spamming
-  // the log every second. 'unknown' until the first poll resolves either way.
-  let serverReachable: boolean | 'unknown' = 'unknown'
-  logger.log(`[worker ${workerInstanceId}] dev live-reload poller starting, url=${devReloadUrl}`)
-  const pollDevReload = async (): Promise<void> => {
-    try {
-      const res = await fetch(devReloadUrl, { signal: AbortSignal.timeout(2000) })
-      const token = (await res.text()).trim()
-      if (serverReachable !== true) {
-        logger.debug(`[worker ${workerInstanceId}] dev-reload server reachable, build=${token}`)
-        serverReachable = true
-      }
-      if (!token) return
-      if (devReloadBaseline === null) {
-        devReloadBaseline = token
-        logger.log(`[worker ${workerInstanceId}] dev live-reload armed, baseline build=${token}`)
-        return
-      }
-      if (token !== devReloadBaseline) {
-        logger.log(`[worker ${workerInstanceId}] dev live-reload: dist changed ${devReloadBaseline} -> ${token}, RELOADING`)
-        chrome.runtime.reload()
-      }
-    } catch (err) {
-      if (serverReachable !== false) {
-        logger.debug(
-          `[worker ${workerInstanceId}] dev-reload server unreachable (${(err as Error).name || 'error'}) — will keep polling`,
-        )
-        serverReachable = false
-      }
-    }
-  }
-  setInterval(pollDevReload, 1000)
-  void pollDevReload()
-}
+// Dev live-reload lives in `dev-reload.ts` and is armed by the `background-dev.ts`
+// entry point (dev builds only), BEFORE this module runs. It must be registered
+// outside this file: Chrome stops delivering events to a service worker that threw
+// during evaluation, so a poller living here would die with any broken edit.
 
 // Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
 // resolved by the time the first connect attempt reads it. Never awaited anywhere.

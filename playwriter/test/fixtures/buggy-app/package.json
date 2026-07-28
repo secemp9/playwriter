@@ -1,0 +1,24 @@
+{
+  "name": "buggy-app-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Standalone Vite+React+TS fixture with four canonical bugs for trace/debug e2e tests. NOT part of the pnpm workspace; install with plain `npm install`.",
+  "scripts": {
+    "dev": "vite --port 4317",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4318 --strictPort",
+    "serve": "vite preview --port 4318 --strictPort"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

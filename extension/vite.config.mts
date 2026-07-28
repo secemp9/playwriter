@@ -28,8 +28,36 @@ if (process.env.TESTING) {
 // Allow tests to build per-port extension outputs to avoid parallel run conflicts.
 const outDir = process.env.PLAYWRITER_EXTENSION_DIST || 'dist'
 
+
+// Dev-only: prepend the live-reload prelude and wrap the app body in try/catch.
+// Done at emit time rather than in source because ES `import` is hoisted (the body
+// would evaluate before any guard) and dynamic `import()` is disallowed in a
+// ServiceWorkerGlobalScope — so concatenation is the only ordering that works.
+function devResilientReload() {
+  return {
+    name: 'dev-resilient-reload',
+    apply: 'build' as const,
+    enforce: 'post' as const,
+    renderChunk(code: string, chunk: any) {
+      if (process.env.PLAYWRITER_DEV_RELOAD !== '1') return null
+      if (chunk.fileName !== 'background.js') return null
+      const prelude = readFileSync(resolve(__dirname, 'scripts/dev-reload-prelude.js'), 'utf-8')
+      // Safe to wrap: the emitted SW bundle has no top-level static imports.
+      return {
+        code:
+          prelude +
+          '\ntry {\n' +
+          code +
+          '\n globalThis.__playwriterDevClear && globalThis.__playwriterDevClear()\n' +
+          '} catch (e) { globalThis.__playwriterDevReport && globalThis.__playwriterDevReport(e) }\n',
+        map: null,
+      }
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [
+  plugins: [devResilientReload(), 
     viteStaticCopy({
       targets: [
         {

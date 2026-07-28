@@ -245,6 +245,34 @@ server.resource(
   },
 )
 
+server.resource(
+  'page-model-api',
+  'https://playwriter.dev/resources/page-model-api.md',
+  { mimeType: 'text/plain' },
+  async () => {
+    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageDir = path.dirname(packageJsonPath)
+    const content = fs.readFileSync(path.join(packageDir, 'dist', 'page-model-api.md'), 'utf-8')
+    return {
+      contents: [{ uri: 'https://playwriter.dev/resources/page-model-api.md', text: content, mimeType: 'text/plain' }],
+    }
+  },
+)
+
+server.resource(
+  'trace-api',
+  'https://playwriter.dev/resources/trace-api.md',
+  { mimeType: 'text/plain' },
+  async () => {
+    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageDir = path.dirname(packageJsonPath)
+    const content = fs.readFileSync(path.join(packageDir, 'dist', 'trace-api.md'), 'utf-8')
+    return {
+      contents: [{ uri: 'https://playwriter.dev/resources/trace-api.md', text: content, mimeType: 'text/plain' }],
+    }
+  },
+)
+
 server.tool(
   'execute',
   promptContent,

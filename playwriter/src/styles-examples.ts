@@ -1,4 +1,4 @@
-import { page, getStylesForLocator, formatStylesAsText, console } from './debugger-examples-types.js'
+import { page, getStylesForLocator, formatStylesAsText, debugStyle, whyOccluded, console } from './debugger-examples-types.js'
 
 // Example: Get styles for an element and display them
 async function getElementStyles() {
@@ -74,6 +74,48 @@ async function compareStyles() {
   console.log(formatStylesAsText(secondary))
 }
 
+// Example: Debug WHY a property has the value it does (cascade winner + losers)
+async function debugWinningColor() {
+  const loc = page.locator('.btn-primary')
+  // Pass a specific property to see the winner and every overridden declaration.
+  const report = await debugStyle({ locator: loc, property: 'color' })
+
+  // `report.text` is a ready-to-read cascade explanation:
+  //   color:
+  //     > .btn-primary.active { color: white } /* app.css:42:2 */
+  //     x .btn-primary        { color: blue }  /* app.css:30:2 */
+  console.log(report.text)
+
+  // `report.properties` is the structured form (winner + ordered losers per prop).
+  const { winner, losers } = report.properties.color
+  console.log('winner:', winner.selector, '=>', winner.value)
+  console.log('overridden:', losers.map((l) => `${l.selector} (${l.value})`))
+}
+
+// Example: See every contested property at once (no property filter)
+async function debugAllContestedProps() {
+  const loc = page.locator('.card')
+  const report = await debugStyle({ locator: loc })
+  console.log(report.text)
+}
+
+// Example: Debug a node handle from the PageModel instead of a raw locator
+async function debugFromNode(node: unknown) {
+  const report = await debugStyle({ node, property: 'display' })
+  console.log(report.text)
+}
+
+// Example: Inspect stacking-context inputs when an element appears occluded
+async function inspectStacking() {
+  const loc = page.locator('.modal')
+  const info = await whyOccluded({ locator: loc })
+
+  console.log('position:', info.position, 'z-index:', info.zIndex)
+  console.log('creates its own stacking context:', info.createsStackingContext)
+  console.log(info.text)
+  // info.occludedBy is null for now — paint-order hit-testing lands in a later milestone.
+}
+
 export {
   getElementStyles,
   inspectButtonStyles,
@@ -81,4 +123,8 @@ export {
   findPropertySource,
   checkInheritedStyles,
   compareStyles,
+  debugWinningColor,
+  debugAllContestedProps,
+  debugFromNode,
+  inspectStacking,
 }

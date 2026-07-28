@@ -28,6 +28,35 @@ export interface ScriptInfo {
     scriptId: string;
     url: string;
 }
+/** One resolved scope in a paused call frame, with its variables read eagerly. */
+export interface ScopeVars {
+    type: string;
+    variables: Record<string, unknown>;
+}
+/**
+ * A single paused call frame. Unlike `inspectLocalVariables` (top frame only,
+ * heavily truncated) this reads EVERY frame's local/closure scopes and keeps the
+ * values (large ones capped, not dropped). Only valid while paused.
+ */
+export interface CallFrameInfo {
+    functionName: string;
+    url: string;
+    location: {
+        line: number;
+        column: number;
+    };
+    this?: unknown;
+    scopeChain: ScopeVars[];
+}
+/** Handle returned by `captureArgsAt` — the caller drains hits from the log stream. */
+export interface CaptureArgsHandle {
+    breakpointId: string | null;
+    tag: string;
+    file: string;
+    fn: string;
+    line: number | null;
+    note: string;
+}
 /**
  * A class for debugging JavaScript code via Chrome DevTools Protocol.
  * Works with both Node.js (--inspect) and browser debugging.
@@ -379,6 +408,66 @@ export declare class Debugger {
      * Returns the current list of blackbox patterns.
      */
     listBlackboxPatterns(): string[];
+    /**
+     * Set a non-pausing logpoint: a conditional breakpoint whose condition logs a
+     * tagged, JSON-serialised expression and then evaluates to `false`, so it never
+     * pauses execution. Drain the emitted `[[logpoint:TAG]] <json>` lines from the
+     * page console stream (see `readLogpoints`).
+     *
+     * @returns The breakpoint id (remove with `deleteBreakpoint`).
+     *
+     * @example
+     * ```ts
+     * await dbg.setLogpoint({ file: 'app.js', line: 42, expr: 'state.total', tag: 'total' })
+     * ```
+     */
+    setLogpoint({ file, line, expr, tag }: {
+        file: string;
+        line: number;
+        expr: string;
+        tag?: string;
+    }): Promise<string>;
+    /**
+     * Resolve a script URL to its source. Maps url -> scriptId via the parsed-script
+     * index (exact match first, then a substring match), then fetches the source.
+     * Returns null when no script matches or the source is unavailable.
+     *
+     * @example
+     * ```ts
+     * const src = await dbg.getScriptSourceByUrl({ url: 'app.js' })
+     * // { url, scriptId, source }
+     * ```
+     */
+    getScriptSourceByUrl({ url }: {
+        url: string;
+    }): Promise<{
+        url: string;
+        scriptId: string;
+        source: string;
+    } | null>;
+    /**
+     * Read EVERY paused call frame (not just the top one) with its local/closure
+     * scopes resolved to plain values. Unlike `inspectLocalVariables` this walks the
+     * whole stack and keeps values (large strings/objects are capped, never dropped).
+     * `this` is surfaced separately per frame. Only valid while paused.
+     *
+     * @throws Error if the debugger is not paused.
+     */
+    getCallFrames(): Promise<CallFrameInfo[]>;
+    /**
+     * Convenience: arm an entry logpoint that logs a function's `arguments` every
+     * time it is called, tagged so the caller can drain hits from the console log
+     * stream (`readLogpoints`). Best-effort: locates the function body in the script
+     * source by name. `maxHits` is advisory (the reader caps output).
+     */
+    captureArgsAt({ file, fn, maxHits }: {
+        file: string;
+        fn: string;
+        maxHits?: number;
+    }): Promise<CaptureArgsHandle>;
+    private findFunctionEntryLine;
+    private capRemoteValue;
+    private capString;
     private truncateValue;
     private formatPropertyValue;
     private processRemoteObject;

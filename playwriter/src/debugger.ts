@@ -29,6 +29,38 @@ export interface ScriptInfo {
   url: string
 }
 
+/** One resolved scope in a paused call frame, with its variables read eagerly. */
+export interface ScopeVars {
+  type: string
+  variables: Record<string, unknown>
+}
+
+/**
+ * A single paused call frame. Unlike `inspectLocalVariables` (top frame only,
+ * heavily truncated) this reads EVERY frame's local/closure scopes and keeps the
+ * values (large ones capped, not dropped). Only valid while paused.
+ */
+export interface CallFrameInfo {
+  functionName: string
+  url: string
+  location: { line: number; column: number }
+  this?: unknown
+  scopeChain: ScopeVars[]
+}
+
+/** Handle returned by `captureArgsAt` — the caller drains hits from the log stream. */
+export interface CaptureArgsHandle {
+  breakpointId: string | null
+  tag: string
+  file: string
+  fn: string
+  line: number | null
+  note: string
+}
+
+// Cap for large scope/logpoint values: keep the value, don't drop it.
+const MAX_CAP_LENGTH = 10000
+
 /**
  * A class for debugging JavaScript code via Chrome DevTools Protocol.
  * Works with both Node.js (--inspect) and browser debugging.
@@ -624,6 +656,201 @@ export class Debugger {
    */
   listBlackboxPatterns(): string[] {
     return [...this.blackboxPatterns]
+  }
+
+  // -------------------------------------------------------------------------
+  // M4 additions (runtime-debug / trace lane). All additive — none of the
+  // existing methods change behaviour.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Set a non-pausing logpoint: a conditional breakpoint whose condition logs a
+   * tagged, JSON-serialised expression and then evaluates to `false`, so it never
+   * pauses execution. Drain the emitted `[[logpoint:TAG]] <json>` lines from the
+   * page console stream (see `readLogpoints`).
+   *
+   * @returns The breakpoint id (remove with `deleteBreakpoint`).
+   *
+   * @example
+   * ```ts
+   * await dbg.setLogpoint({ file: 'app.js', line: 42, expr: 'state.total', tag: 'total' })
+   * ```
+   */
+  async setLogpoint({ file, line, expr, tag }: { file: string; line: number; expr: string; tag?: string }): Promise<string> {
+    const t = tag ?? 'lp'
+    const condition = '(console.log("[[logpoint:' + t + ']] "+JSON.stringify((' + expr + '))),false)'
+    return this.setBreakpoint({ file, line, condition })
+  }
+
+  /**
+   * Resolve a script URL to its source. Maps url -> scriptId via the parsed-script
+   * index (exact match first, then a substring match), then fetches the source.
+   * Returns null when no script matches or the source is unavailable.
+   *
+   * @example
+   * ```ts
+   * const src = await dbg.getScriptSourceByUrl({ url: 'app.js' })
+   * // { url, scriptId, source }
+   * ```
+   */
+  async getScriptSourceByUrl({ url }: { url: string }): Promise<{ url: string; scriptId: string; source: string } | null> {
+    await this.enable()
+    let match: ScriptInfo | undefined
+    for (const s of this.scripts.values()) {
+      if (s.url === url) {
+        match = s
+        break
+      }
+    }
+    if (!match) {
+      for (const s of this.scripts.values()) {
+        if (s.url.includes(url) || url.includes(s.url)) {
+          match = s
+          break
+        }
+      }
+    }
+    if (!match) return null
+    try {
+      const { scriptSource } = await this.cdp.send('Debugger.getScriptSource', { scriptId: match.scriptId })
+      return { url: match.url, scriptId: match.scriptId, source: scriptSource }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Read EVERY paused call frame (not just the top one) with its local/closure
+   * scopes resolved to plain values. Unlike `inspectLocalVariables` this walks the
+   * whole stack and keeps values (large strings/objects are capped, never dropped).
+   * `this` is surfaced separately per frame. Only valid while paused.
+   *
+   * @throws Error if the debugger is not paused.
+   */
+  async getCallFrames(): Promise<CallFrameInfo[]> {
+    await this.enable()
+    if (!this.paused || this.currentCallFrames.length === 0) {
+      throw new Error('Debugger is not paused at a breakpoint')
+    }
+
+    const frames: CallFrameInfo[] = []
+    for (const frame of this.currentCallFrames) {
+      const scopeChain: ScopeVars[] = []
+      for (const scope of frame.scopeChain) {
+        // Skip the global scope (huge, low signal); keep local/closure/block/catch.
+        if (scope.type === 'global') continue
+        if (!scope.object.objectId) continue
+        const variables: Record<string, unknown> = {}
+        try {
+          const props = await this.cdp.send('Runtime.getProperties', {
+            objectId: scope.object.objectId,
+            ownProperties: true,
+            accessorPropertiesOnly: false,
+            generatePreview: true,
+          })
+          for (const prop of props.result) {
+            if (prop.value) variables[prop.name] = this.capRemoteValue(prop.value)
+          }
+        } catch {
+          // A scope we cannot read is skipped rather than failing the whole frame.
+        }
+        scopeChain.push({ type: scope.type, variables })
+      }
+      frames.push({
+        functionName: frame.functionName || '(anonymous)',
+        url: frame.url,
+        location: { line: frame.location.lineNumber + 1, column: frame.location.columnNumber ?? 0 },
+        this: frame.this ? this.capRemoteValue(frame.this) : undefined,
+        scopeChain,
+      })
+    }
+    return frames
+  }
+
+  /**
+   * Convenience: arm an entry logpoint that logs a function's `arguments` every
+   * time it is called, tagged so the caller can drain hits from the console log
+   * stream (`readLogpoints`). Best-effort: locates the function body in the script
+   * source by name. `maxHits` is advisory (the reader caps output).
+   */
+  async captureArgsAt({ file, fn, maxHits }: { file: string; fn: string; maxHits?: number }): Promise<CaptureArgsHandle> {
+    await this.enable()
+    const tag = `args:${fn}`
+    const src = await this.getScriptSourceByUrl({ url: file })
+    if (!src) {
+      return { breakpointId: null, tag, file, fn, line: null, note: `no script found for url "${file}"` }
+    }
+    const line = this.findFunctionEntryLine(src.source, fn)
+    if (line == null) {
+      return { breakpointId: null, tag, file: src.url, fn, line: null, note: `function "${fn}" not found in ${src.url}` }
+    }
+    const breakpointId = await this.setLogpoint({
+      file: src.url,
+      line,
+      expr: 'Array.prototype.slice.call(arguments)',
+      tag,
+    })
+    return {
+      breakpointId,
+      tag,
+      file: src.url,
+      fn,
+      line,
+      note: `entry logpoint armed at ${src.url}:${line}; drain hits from the console log stream (tag "${tag}", maxHits=${maxHits ?? 'unbounded'})`,
+    }
+  }
+
+  private findFunctionEntryLine(source: string, fn: string): number | null {
+    const esc = fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const lines = source.split('\n')
+    const patterns = [
+      new RegExp(`function\\s*\\*?\\s+${esc}\\b`),
+      new RegExp(`\\b${esc}\\s*=\\s*(async\\s+)?function\\b`),
+      new RegExp(`\\b${esc}\\s*=\\s*(async\\s*)?\\([^)]*\\)\\s*=>`),
+      new RegExp(`\\b${esc}\\s*=\\s*(async\\s*)?[A-Za-z_$][\\w$]*\\s*=>`),
+      new RegExp(`\\b${esc}\\s*\\([^)]*\\)\\s*{`),
+    ]
+    for (let i = 0; i < lines.length; i++) {
+      if (patterns.some((p) => p.test(lines[i]))) {
+        // Set the logpoint on the first body line so `arguments` is in scope.
+        for (let j = i; j < Math.min(lines.length, i + 6); j++) {
+          if (lines[j].includes('{')) {
+            return Math.min(lines.length, j + 2)
+          }
+        }
+        return i + 1
+      }
+    }
+    return null
+  }
+
+  // Read a RemoteObject into a plain, cycle-free value keeping content (one
+  // preview level for objects/arrays) and capping only very large strings.
+  private capRemoteValue(value: Protocol.Runtime.RemoteObject): unknown {
+    if (value.type === 'function') return '[function]'
+    if (value.subtype === 'null') return null
+    if (value.type === 'undefined') return undefined
+    if (value.value !== undefined) return this.capString(value.value)
+    if (value.type === 'object') {
+      const preview = value.preview
+      if (preview) {
+        const obj: Record<string, unknown> = {}
+        for (const p of preview.properties ?? []) {
+          obj[p.name] = p.value !== undefined ? this.capString(p.value) : `[${p.type}]`
+        }
+        if (preview.overflow) obj['…'] = '[more]'
+        return value.subtype === 'array' ? Object.values(obj) : obj
+      }
+      return value.description ?? `[${value.subtype || value.type}]`
+    }
+    return value.description ?? `[${value.type}]`
+  }
+
+  private capString(value: unknown): unknown {
+    if (typeof value === 'string' && value.length > MAX_CAP_LENGTH) {
+      return value.slice(0, MAX_CAP_LENGTH) + `... (${value.length} chars)`
+    }
+    return value
   }
 
   private truncateValue(value: unknown): unknown {
