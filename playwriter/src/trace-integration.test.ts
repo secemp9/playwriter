@@ -289,7 +289,7 @@ describe('PageModel & traceValue integration (MCP execute pipeline)', () => {
       async ([k, l]: [string, string]) => {
         await (globalThis as any).toggleExtensionForActiveTab(k, l)
       },
-      [TEST_WORKSPACE.key, TEST_WORKSPACE.label],
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
     // Wait for React to render in the persistent browser page
     await page.waitForSelector('[data-testid="tab-cart"]', { timeout: 15000 })
@@ -361,7 +361,7 @@ describe('PageModel & traceValue integration (MCP execute pipeline)', () => {
       async ([k, l]: [string, string]) => {
         await (globalThis as any).toggleExtensionForActiveTab(k, l)
       },
-      [TEST_WORKSPACE.key, TEST_WORKSPACE.label],
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
     await page.waitForSelector('[data-testid="tab-cart"]', { timeout: 15000 })
 
