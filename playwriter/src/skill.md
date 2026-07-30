@@ -908,7 +908,9 @@ const pageLogs = await getLatestLogs({ page: state.page, count: 100 })
 const hydrationErrors = await getLatestLogs({ page: state.page, search: /hydration|pageerror|React/i })
 ```
 
-**getCleanHTML** - get cleaned HTML from a locator or page, with search and diffing:
+Three readers below (`getCleanHTML`, `getPageMarkdown`, and `snapshot`) share the same two options: `search` (string/regex — returns the first 10 matching lines with 5 lines of context) and `showDiffSinceLastCall` (default `true`, forced `false` when `search` is given; pass `false` for the full text).
+
+**getCleanHTML** - get cleaned HTML from a locator or page:
 
 ```js
 await getCleanHTML({ locator, search?, showDiffSinceLastCall?, includeStyles? })
@@ -918,14 +920,7 @@ const html = await getCleanHTML({ locator: state.page, search: /button/i })
 const fullHtml = await getCleanHTML({ locator: state.page, showDiffSinceLastCall: false })  // disable diff
 ```
 
-**Parameters:**
-
-- `locator` - Playwright Locator or Page to get HTML from
-- `search` - string/regex to filter results (returns first 10 matching lines with 5 lines context)
-- `showDiffSinceLastCall` - returns diff since last call (default: `true`, but `false` when `search` is provided). Pass `false` to get full HTML.
-- `includeStyles` - keep style and class attributes (default: false)
-
-Cleans HTML automatically: removes script/style/svg/head tags, unwraps empty wrappers, removes empty elements, truncates long values. Keeps semantic attributes (`href`, `name`, `type`, `aria-*`, `data-*`).
+`includeStyles` keeps style and class attributes (default false). Cleans HTML automatically: removes script/style/svg/head tags, unwraps empty wrappers, removes empty elements, truncates long values. Keeps semantic attributes (`href`, `name`, `type`, `aria-*`, `data-*`).
 
 **getPageMarkdown** - extract main page content as plain text using Mozilla Readability (same algorithm as Firefox Reader View). Strips navigation, ads, sidebars, and other clutter. Returns formatted text with title, author, and content:
 
@@ -936,23 +931,7 @@ const content = await getPageMarkdown({ page: state.page, showDiffSinceLastCall:
 const matches = await getPageMarkdown({ page: state.page, search: /API/i })  // search within content
 ```
 
-**Output format:**
-
-```
-# Article Title
-
-Author: John Doe | Site: example.com | Published: 2024-01-15
-
-> Article excerpt or description
-
-The main article content as plain text, with paragraphs preserved...
-```
-
-**Parameters:**
-
-- `page` - Playwright Page to extract content from
-- `search` - string/regex to filter content (returns first 10 matching lines with 5 lines context)
-- `showDiffSinceLastCall` - returns diff since last call (default: `true`, but `false` when `search` is provided). Pass `false` to get full content.
+Output is a title line, an `Author | Site | Published` line, the excerpt as a blockquote, then the article text.
 
 **waitForPageLoad** - smart load detection that ignores analytics/ads:
 
@@ -995,7 +974,7 @@ const info = await getReactComponentInfo({ locator: state.page.locator('[data-te
 await inspectPinnedElement('https://example.com', 'globalThis.playwriterPinnedElem1')
 ```
 
-**getStylesForLocator** - inspect CSS styles applied to an element, like browser DevTools "Styles" panel. Useful for debugging styling issues, finding where a CSS property is defined (file:line), and checking inherited styles. Returns selector, source location, and declarations for each matching rule. ALWAYS fetch `https://playwriter.dev/resources/styles-api.md` first with curl or webfetch tool.
+**getStylesForLocator** - raw DevTools-style listing of every matching rule (selector, source `file:line`, declarations, inherited styles). For "why is this property THIS value", prefer `debugStyle` — it resolves the cascade and names the winner plus every overridden loser. Reach for this when you want the unresolved rule list. Full reference: `https://playwriter.dev/resources/styles-api.md`.
 
 ```js
 const styles = await getStylesForLocator({
@@ -1045,7 +1024,7 @@ await screenshotWithAccessibilityLabels({ page: state.page })
 // Both images are included in the response
 ```
 
-Labels are color-coded: yellow=links, orange=buttons, coral=inputs, pink=checkboxes, peach=sliders, salmon=menus, amber=tabs.
+Labels are colour-coded by role (links, buttons, inputs, checkboxes, sliders, menus, tabs).
 
 **resizeImageForAgent** - shrink an image so it consumes fewer tokens when read back into context. The resized image is automatically included in the response (visible to the LLM). `await resizeImageForAgent({ input: '/absolute/path/to/screenshot.png' })`. Also accepts `width`, `height`, `maxDimension`, `quality`, `format` (default: `'png'`), `output`. Alias: `resizeImage`.
 
@@ -1106,11 +1085,10 @@ await ghostCursor.hide({ page: state.page }) // hide until next show() or hard n
 
 **createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, always pass `--timeout 120000` or higher.
 
-```js
-// After recording.stop(), save full result to state (executionTimestamps powers idle detection)
-state.recordingResult = await recording.stop({ page: state.page })
+Save the whole `recording.stop()` result to `state` (shown above) — its `executionTimestamps` are what drive idle detection.
 
-// In a SEPARATE execute call with --timeout 120000:
+```js
+// SEPARATE execute call, with --timeout 120000:
 const demoPath = await createDemoVideo({
   recordingPath: state.recordingResult.path,
   durationMs: state.recordingResult.duration,
