@@ -1905,7 +1905,9 @@ export class PlaywrightExecutor {
         const p = options.page || page
         if (!p) throw new Error('No page available to record')
         const cdp = await getCDPSession({ page: p })
-        self.cdpScreencast = await startCdpScreencast({ cdp, ...options })
+        // Pass the page so screenshot mode can foreground the tab (a backgrounded
+        // tab has no compositor surface and captureScreenshot hangs).
+        self.cdpScreencast = await startCdpScreencast({ cdp, page: p, ...options })
         return { started: true, outputPath: options.outputPath }
       }
 

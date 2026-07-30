@@ -1,5 +1,5 @@
 /**
- * cdp-screencast.ts — gesture-free tab recording via CDP `Page.startScreencast`.
+ * cdp-screencast.ts — gesture-free tab recording.
  *
  * Why this exists alongside `screen-recording.ts`:
  *
@@ -7,21 +7,28 @@
  * compositor output at a fixed frame rate — but `chrome.tabCapture.getMediaStreamId`
  * is gated behind an **activeTab grant that only a genuine user gesture produces**.
  * Neither Playwriter's unconditional tab auto-creation nor the programmatic
- * `toggleExtensionForActiveTab` satisfies Chrome; the human must click the
- * extension icon on that tab. That is fine interactively and useless unattended.
+ * `toggleExtensionForActiveTab` satisfies Chrome; a human must click the extension
+ * icon on that tab. Fine interactively, useless unattended.
  *
- * `Page.startScreencast` needs no such grant — but Chrome deliberately withholds
- * `Page.screencastFrame` events from the `chrome.debugger` extension API (verified:
- * the command succeeds and `Page.screencastVisibilityChanged` fires, but zero frames
- * ever arrive). So this recorder only works over a **direct CDP connection** to a
- * Chrome started with `--remote-debugging-port`, where no extension sits in the path.
+ * This recorder needs no gesture and works on an ordinary extension-connected
+ * session as well as over direct CDP.
  *
- * Screencast is change-driven: Chrome emits a frame when the page repaints, not on a
- * clock. A still page produces no frames at all. We therefore keep each frame's real
- * arrival time and let ffmpeg rebuild constant-rate video from those timestamps, so a
- * two-second pause stays two seconds long in the output instead of collapsing.
+ * THE ACTUAL CONSTRAINT IS TAB VISIBILITY, NOT CONNECTION TYPE. A backgrounded tab
+ * has no compositor surface, so `Page.startScreencast` delivers zero frames and
+ * `Page.captureScreenshot` hangs until timeout — neither returns an error, which
+ * makes it very easy to misread as an API restriction. Foreground the tab first;
+ * `'screenshot'`/`'auto'` mode does that for you when handed a `page`.
+ *
+ * Two capture paths, because screencast can legitimately produce nothing:
+ *   - screencast  — change-driven, cheap, preferred.
+ *   - screenshot  — polls `Page.captureScreenshot` (~8.5fps measured through the
+ *                   extension). Always produces frames on a foregrounded tab, even
+ *                   for a page that never repaints.
+ *
+ * Screencast emits a frame when the page repaints, not on a clock, so we keep each
+ * frame's real arrival time and let ffmpeg rebuild constant-rate video from those
+ * timestamps — a two-second pause stays two seconds instead of collapsing.
  */
-
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -38,6 +45,25 @@ export interface CdpScreencastOptions {
   cdp: ICDPSession
   /** Where to write the .mp4 */
   outputPath: string
+  /**
+   * How frames are obtained.
+   *
+   * - `'screencast'` — `Page.startScreencast`. Cheap and change-driven; works through
+   *   the extension too. Yields nothing if the tab is backgrounded or never repaints.
+   * - `'screenshot'` — poll `Page.captureScreenshot` (~8.5fps / 118ms per frame
+   *   measured through the extension). Produces frames even on a static page.
+   * - `'auto'` (default) — try screencast, and if no frame arrives within `probeMs`,
+   *   switch to screenshot polling. Covers the static-page case and any environment
+   *   where screencast frames do not arrive.
+   *
+   * All modes require a FOREGROUND tab; `'screenshot'`/`'auto'` call `bringToFront()`
+   * when given a `page`.
+   */
+  mode?: 'auto' | 'screencast' | 'screenshot'
+  /** How long `'auto'` waits for a screencast frame before falling back (default 1500ms). */
+  probeMs?: number
+  /** Page handle — required for `'screenshot'`/`'auto'` so the tab can be foregrounded. */
+  page?: { bringToFront(): Promise<void> }
   /** JPEG quality 0-100 (default 70). Lower = smaller files, faster frames. */
   quality?: number
   /** Cap the captured frame width/height; Chrome scales to fit. */
@@ -64,6 +90,8 @@ export interface CdpScreencastResult {
   outputPath: string
   frames: number
   durationMs: number
+  /** Which capture path actually produced the frames. */
+  mode?: 'screencast' | 'screenshot'
   /** False when nothing repainted, so no video was produced. */
   wrote: boolean
   note?: string
@@ -85,6 +113,9 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     fps = 10,
     maxDurationMs = 10 * 60 * 1000,
     maxFrames = 5000,
+    mode = 'auto',
+    probeMs = 1500,
+    page,
   } = options
 
   const frames: CapturedFrame[] = []
@@ -108,13 +139,65 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
   cdp.on('Page.screencastFrame' as never, onFrame as never)
 
   await cdp.send('Page.enable')
-  await cdp.send('Page.startScreencast', {
-    format: 'jpeg',
-    quality,
-    ...(maxWidth ? { maxWidth } : {}),
-    ...(maxHeight ? { maxHeight } : {}),
-    everyNthFrame: 1,
-  })
+
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+  let usedMode: 'screencast' | 'screenshot' = 'screencast'
+
+  /**
+   * Poll `Page.captureScreenshot`. Unlike screencast this is a plain request/response
+   * command, so the extension debugger API forwards it normally — which is what makes
+   * gesture-free recording possible on an ordinary extension-connected session.
+   * Serialised (no overlapping calls) because a backlog only adds latency.
+   */
+  async function startScreenshotPolling(): Promise<void> {
+    usedMode = 'screenshot'
+    // A backgrounded tab has no compositor surface: captureScreenshot then hangs
+    // until the CDP timeout rather than returning an error.
+    try {
+      await page?.bringToFront()
+    } catch {
+      // Best-effort; if we cannot foreground it the first capture will surface the problem.
+    }
+    let inFlight = false
+    pollTimer = setInterval(() => {
+      if (stopped || inFlight || frames.length >= maxFrames) return
+      inFlight = true
+      void cdp
+        .send('Page.captureScreenshot', { format: 'jpeg', quality })
+        .then((r: any) => {
+          if (!stopped && r?.data) {
+            frames.push({ data: Buffer.from(r.data, 'base64'), offsetMs: Date.now() - startedAt })
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false
+        })
+    }, Math.max(1000 / fps, 60))
+    if (typeof pollTimer.unref === 'function') pollTimer.unref()
+  }
+
+  if (mode === 'screenshot') {
+    await startScreenshotPolling()
+  } else {
+    await cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality,
+      ...(maxWidth ? { maxWidth } : {}),
+      ...(maxHeight ? { maxHeight } : {}),
+      everyNthFrame: 1,
+    })
+    if (mode === 'auto') {
+      // Nothing in the CDP session says whether an extension is in the path, so detect
+      // by observation: no frame within probeMs means screencast will never deliver.
+      setTimeout(() => {
+        if (!stopped && frames.length === 0) {
+          void cdp.send('Page.stopScreencast').catch(() => {})
+          void startScreenshotPolling()
+        }
+      }, probeMs).unref?.()
+    }
+  }
 
   const guard = setTimeout(() => {
     if (!stopped) void teardown().catch(() => {})
@@ -126,6 +209,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     if (stopped) return
     stopped = true
     clearTimeout(guard)
+    if (pollTimer) clearInterval(pollTimer)
     cdp.off?.('Page.screencastFrame' as never, onFrame as never)
     try {
       await cdp.send('Page.stopScreencast')
@@ -151,6 +235,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
           outputPath,
           frames: 0,
           durationMs,
+          mode: usedMode,
           wrote: false,
           // Two very different causes produce zero frames, and guessing the wrong one
           // sends you looking in the wrong place — so name both. The connection-mode
@@ -158,13 +243,11 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
           // success and `screencastVisibilityChanged` fires even when frames will
           // never be delivered, so there is nothing to detect at start() time.
           note:
-            'No frames captured. Either (a) this session is connected THROUGH THE ' +
-            'PLAYWRITER EXTENSION — Chrome withholds Page.screencastFrame from the ' +
-            'extension debugger API, so startCdp only works over a direct CDP ' +
-            'connection (`playwriter session new --direct <ws-url>`); use ' +
-            'recording.start() plus one extension-icon click instead — or (b) the page ' +
-            'genuinely never repainted, since screencast is change-driven and a static ' +
-            'page yields nothing.',
+            'No frames captured. The usual cause is a BACKGROUNDED TAB — it has no ' +
+            'compositor surface, so neither screencast nor screenshot can capture it, ' +
+            'and Chrome reports no error. Call page.bringToFront() (or pass `page` so ' +
+            'this recorder can) and retry. Otherwise the recording window may simply ' +
+            'have been too short to contain any repaint.',
         }
       }
 
@@ -174,6 +257,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         outputPath,
         frames: frames.length,
         durationMs,
+        mode: usedMode,
         wrote: true,
         note: droppedForCap > 0 ? `Hit the ${maxFrames}-frame cap; dropped ${droppedForCap} later frames.` : undefined,
       }

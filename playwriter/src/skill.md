@@ -115,7 +115,7 @@ playwriter -s 1 -e "await page.goto('https://example.com')"
 - `ws://` or `wss://` URL — explicit WebSocket endpoint (local or cloud browser provider)
 - `host:port` — resolves via HTTP probe to a ws:// URL
 
-**Limitations:** `recording.start`/`recording.stop` are unavailable in direct CDP mode (they rely on the extension's `chrome.tabCapture`). Direct CDP sessions use `recording.startCdp`/`stopCdp` instead, which needs no extension-icon click but does not work on extension-connected sessions. See the recording section for the full comparison.
+**Limitations:** `recording.start`/`recording.stop` are unavailable in direct CDP mode (they rely on the extension's `chrome.tabCapture`). Use `recording.startCdp`/`stopCdp` instead — it works in both direct CDP and extension sessions and needs no icon click. See the recording section.
 
 ### Headless browser (no extension, no user browser)
 
@@ -1062,28 +1062,28 @@ state.recordingResult = await recording.stop({ page: state.page })
 // Other: recording.isRecording({ page }), recording.cancel({ page })
 ```
 
-**recording.startCdp / recording.stopCdp / recording.cancelCdp** — gesture-free recorder for **direct CDP sessions only**. Use this when nobody is around to click the extension icon.
-
-The two recorders solve different problems and are not interchangeable:
-
-| | `recording.start` | `recording.startCdp` |
-|---|---|---|
-| Mechanism | `chrome.tabCapture` | `Page.startScreencast` |
-| Needs an icon click | **yes** — one per tab per session | no |
-| Extension-connected session | ✅ works | ❌ silently yields 0 frames |
-| Direct CDP (`--direct`) | ❌ unavailable | ✅ works |
-| Headless | ❌ unavailable | ❌ unavailable |
-| Picture | compositor output, fixed frame rate | change-driven frames, re-timed by ffmpeg |
+**recording.startCdp / recording.stopCdp / recording.cancelCdp** — gesture-free recorder. **No extension-icon click, no CLI flag, no separate Chrome.** Works on a normal extension-connected session and over direct CDP.
 
 ```js
-await recording.startCdp({ outputPath: '/abs/path/bug.mp4', fps: 10, quality: 70 })
+await page.bringToFront()                     // required — see below
+await recording.startCdp({ outputPath: '/abs/path/bug.mp4', fps: 8, quality: 55 })
 // ...reproduce the bug, one action per call...
-const r = await recording.stopCdp()   // { outputPath, frames, durationMs, wrote }
+const r = await recording.stopCdp()   // { outputPath, frames, durationMs, mode, wrote }
 ```
 
-**Why `startCdp` cannot replace the icon click on a normal session:** Chrome withholds `Page.screencastFrame` from the extension debugger API. `startScreencast` still returns success and `screencastVisibilityChanged` still fires, so there is nothing to detect up front — you simply get `wrote: false` and zero frames at the end. Both routes to page pixels are consent-gated; that is Chrome's position, not a gap in Playwriter. On an extension-connected tab, ask for the one click and use `recording.start`.
+**The tab must be FOREGROUND.** This is the one real constraint, and it is easy to misdiagnose. A backgrounded tab has no compositor surface, so `Page.startScreencast` delivers zero frames and `Page.captureScreenshot` hangs until timeout — *neither returns an error*. If recording produces nothing, or screenshots start timing out, the tab is almost certainly in the background. `startCdp` calls `bringToFront()` for you; bare CDP calls do not.
 
-`stopCdp` returns `wrote: false` with a `note` naming both possible causes (wrong connection mode, or a page that genuinely never repainted) rather than guessing.
+Two capture paths, selected automatically (`mode: 'auto'` by default, reported back on the result):
+
+| | `screencast` | `screenshot` |
+|---|---|---|
+| Source | `Page.startScreencast` | polls `Page.captureScreenshot` |
+| Rate | change-driven (frame per repaint) | ~8.5fps measured through the extension |
+| Static page | yields nothing | still captures |
+
+`'auto'` starts with screencast and falls back to screenshot polling if no frame arrives within `probeMs` (1500ms), which covers a page that simply never repaints. Force one with `mode: 'screencast' | 'screenshot'`.
+
+**When to use the other recorder instead:** `recording.start` (tabCapture) gives true compositor output at a higher, fixed frame rate and survives navigation. It needs one extension-icon click per tab, so prefer it when a human is present and picture quality matters; prefer `startCdp` when nothing can click.
 
 **ghostCursor.show / ghostCursor.hide** - the ghost cursor overlay is always on: the extension injects it on every Playwriter-attached tab and it stays visible at the last spot Playwright clicked or moved. These methods only matter if you want to change the cursor style or temporarily hide it:
 
