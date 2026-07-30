@@ -418,7 +418,7 @@ cli
         }
         const result = (await response.json()) as { id: string }
         console.log(`Session ${result.id} created (headless). Use with: playwriter -s ${result.id} -e "..."`)
-        console.log(pc.dim('NOTE: Recording unavailable in headless mode.'))
+        console.log(pc.dim('NOTE: Recording unavailable in headless mode (no compositor surface).'))
       } catch (error: any) {
         if (error.message?.includes('Could not find a supported browser binary')) {
           console.error('No Chrome browser found. Install one first:')
@@ -452,7 +452,7 @@ cli
       const serverUrl = await getServerUrl(options.host)
       const result = await createDirectSession({ serverUrl, cdpEndpoint, token: options.token })
       console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-      console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+      console.log(pc.dim('NOTE: recording.start (tabCapture) is unavailable in direct CDP mode — use recording.startCdp.'))
       return
     }
 
@@ -485,7 +485,7 @@ cli
         console.log(
           `Session ${result.id} created (direct CDP, ${instance.browser}${profileLabel}). Use with: playwriter -s ${result.id} -e "..."`,
         )
-        console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+        console.log(pc.dim('NOTE: recording.start (tabCapture) is unavailable in direct CDP mode — use recording.startCdp.'))
         return
       }
 
@@ -507,7 +507,7 @@ cli
         const serverUrl = await getServerUrl(options.host)
         const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
         console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-        console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+        console.log(pc.dim('NOTE: recording.start (tabCapture) is unavailable in direct CDP mode — use recording.startCdp.'))
         return
       }
 
@@ -696,7 +696,7 @@ cli
         } else if (selected.type === 'direct') {
           const result = await createDirectSession({ serverUrl, cdpEndpoint: selected.wsUrl!, browser: selected.browser, profiles: selected.profiles, token: options.token })
           console.log(`Session ${result.id} created (direct CDP). Use with: playwriter -s ${result.id} -e "..."`)
-          console.log(pc.dim('NOTE: Recording unavailable in direct CDP mode.'))
+          console.log(pc.dim('NOTE: recording.start (tabCapture) is unavailable in direct CDP mode — use recording.startCdp.'))
         } else {
           const cwd = process.cwd()
           const response = await fetch(`${serverUrl}/cli/session/new`, {

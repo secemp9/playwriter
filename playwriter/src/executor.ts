@@ -1976,9 +1976,10 @@ export class PlaywrightExecutor {
           stop: recordingApi.stop,
           isRecording: recordingApi.isRecording,
           cancel: recordingApi.cancel,
-          // Gesture-free CDP screencast recorder. Works only over a DIRECT CDP
-          // connection (Chrome started with --remote-debugging-port); Chrome
-          // withholds screencast frames from the extension's debugger API.
+          // Gesture-free recorder — no extension-icon click required. Works on
+          // extension-connected sessions as well as direct CDP. The real
+          // constraint is that the tab must be FOREGROUND (a backgrounded tab has
+          // no compositor surface); startCdp calls bringToFront() itself.
           startCdp: startCdpRecording,
           stopCdp: stopCdpRecording,
           cancelCdp: cancelCdpRecording,

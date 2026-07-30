@@ -408,51 +408,63 @@ Use `getLatestLogs({ sinceLastCall: true })` after every action, `getLatestLogs(
 
 ## debugging: symptom → cause
 
-**ALL debug helpers are GLOBAL VARIABLES in the sandbox.** Call them directly — no `import`, no `require`. They are available the same way `page`, `snapshot`, and `getStylesForLocator` are.
+When the symptom is deeper than "the page didn't respond" — a wrong value on screen, an element that renders but is unclickable, a handler that never fires — stop poking the DOM and reason from evidence.
 
-When the symptom is deeper than "the page didn't respond" — a wrong value on screen, an element that renders but is unclickable, a control whose handler never fires — stop poking the DOM and reason from evidence. The same **observe → act → observe** discipline applies, but the observation tools change. Full type/example references live in the `page-model-api` and `trace-api` MCP resources.
+**All of these are sandbox globals.** No `import`, no `require` (the sandbox `require` is locked to Node built-ins). Nearly all are async — `await` them. Use `return` to see output; `console.log` goes to the browser console, not your terminal. Full types and examples live in the `page-model-api` and `trace-api` MCP resources.
 
-**The PageModel (`pm`)** is a queryable tree that fuses the ARIA snapshot, the flattened DOM, and lazy React/CSS edges. Prefer it over raw DOM scraping when you need structure:
+**Pick the tool by symptom:**
 
-- `const rows = await pm.query({ roles: ['button'] })` — token-lean projection rows (role/name/tag/locator/visible). Add `select: 'Interactive'` / `'VisibleElement'` for page-path virtual types, `fields` to pick columns.
-- `const h = await pm.anchor('[data-testid="x"]')` — resolve a selector/backendNodeId/point to a lightweight handle; then follow lazy edges with `await h.reactFiber()` and `await h.styles()`. Returns `null` if not found.
-- `return await pm.renderText({ visibleOnly: true })` — an indented, aria-snapshot-like view of the fused tree.
-- `return pm.debugMode()` — flips the lossy projection levers (dedup, whitelist, visibleOnly) off for a full-fidelity pass.
+| Symptom | Reach for |
+|---|---|
+| Need the page's structure, not a guessed selector | `pm.query` / `pm.renderText` |
+| Wrong colour / spacing / invisible | `debugStyle` — winner **and** losers, with sources |
+| Visible but won't accept a click | `whyOccluded` |
+| A rendered value is wrong | `traceValue` |
+| Clicked, DOM looks right, nothing persisted | `storeIdentity` — `sameReference: true` ⇒ in-place mutation |
+| Effect fired with stale values | two `fiberSnapshot`s + `fiberDiff` |
+| Intermittent / order-dependent | `net.timeline`, then `net.delay` to force it |
+| Only makes sense as motion | `recording.startCdp` (see recording section) |
 
-**CSS provenance** answers "why does it look like this":
+**PageModel & CSS provenance** — a queryable tree fusing the ARIA snapshot, flattened DOM, and lazy React/CSS edges. Prefer it over raw DOM scraping. All take an optional `{ page }`, default to `state.page`, and return cycle-free projections.
 
-- `return debugStyle({ locator: page.locator('[data-testid="x"]'), property: 'color' })` — the cascade winner **and** every overridden loser, with source URLs. Also accepts `{ node: handle }` from `pm.anchor`.
-- `return whyOccluded({ locator: page.locator('[data-testid="x"]') })` — stacking-context inputs (position, z-index, whether it creates its own context) when something renders but can't be seen or clicked.
+```js
+await pm.query({ roles: ['button'], visibleOnly: true }) // projection rows; add select:'Interactive'/'VisibleElement', fields:[...]
+await queryPage({ select: 'Interactive' })                // same projection, top-level
+const h = await pm.anchor('button:has-text("Submit")')    // selector | { backendNodeId } | { x, y } → handle | null
+await h.reactFiber()                                       // lazy edge: { componentName, source, props }
+await h.styles()                                           // lazy edge: cascade winner per property
+await pm.renderText({ visibleOnly: true })                // indented aria-like view of the fused tree
+await pm.debugMode()                                       // projection config with lossy levers off
+await debugStyle({ locator, property: 'color' })          // cascade winner + overridden losers ({ node } also works)
+await whyOccluded({ locator })                            // stacking inputs (position, z-index, own context?)
+```
 
-**Runtime probes** prove or refute a hypothesis:
+**Trace lane & probe toolkit** — turns a wrong on-screen value into a cause.
 
-- `return storeIdentity({ action: async () => { await page.click('[data-testid="x"]') }, storeExpr: 'window.__STORE__?.getState()' })` → `{ sameReference, captured }`. `sameReference: true` proves an in-place mutation.
-- `return fiberSnapshot({ locator: page.locator('[data-testid="x"]') })` — capture React component props/hierarchy BEFORE a state change; then `fiberDiff(before, after)` to see what changed.
-- `net.timeline({ urlPattern: '/api/' })` — passive request/response order capture (non-perturbing, safe to auto-run).
-- `net.delay({ urlPattern: '/api/', ms: 800 })` — PERTURBING: force an async race to reproduce deterministically by holding matching requests.
+```js
+const t = await traceValue({ selector: '[data-testid="total"]' }) // anchor → static slice → armed probes
+t.render                                                    // token-bounded summary — read this FIRST
+t.blocked                                                   // blocked leaves: { id, blockedBy, site, probe }
+t.expand(hopId)                                             // lossless drill-down into one hop
+await t.runProbe(hopId)                                     // fire the armed probe for a blocked leaf
+await storeIdentity({ action })                            // { sameReference } true ⇒ mutating reducer
+await setLogpoint({ file, line, expr, tag })              // arm a logpoint; drain with readLogpoints
+await readLogpoints({ tag })                               // captured hits (token-capped)
+await getScriptSourceByUrl({ url })                       // bundled source when no author source exists
+net.timeline({ urlPattern })                              // PASSIVE request/response order; .entries()/.stop()
+await net.delay({ urlPattern, ms })                       // PERTURBING: hold requests to force a race; .stop()
+await fiberSnapshot({ locator })                          // capture a component's props/hierarchy
+fiberDiff(before, after)                                  // which props changed across a render
+replayPure({ fn, args })                                  // re-run a pure sliced fn (refuses impure fns)
+```
 
-**`traceValue` — the observe → act → observe loop for values.** It turns a wrong on-screen value into a cause. `traceValue` RETURNS A PROMISE — always `await` it or use `return`:
+**How to drive `traceValue`:** anchor with `{ selector }`, a `pm.anchor` handle via `{ node }`, or explicit `{ startFile, startExpr }`. Read `t.render` first, then `t.blocked`. Each blocked leaf names its blind spot (`mutation`, `interprocedural`, `async`, `unresolved-module`) and carries an armed-but-un-run probe. **Never fabricate a value past a `blockedBy`** — the static pass stopped there because it cannot see runtime state. Run the probe instead.
 
-1. **Anchor** the symptom with `{ selector: '[data-testid="total"]' }` (uses bippy to find React component), a `pm.anchor` handle via `{ node: handle }`, or an explicit `{ startFile: '/abs/path/to/file.tsx', startExpr: 'count' }`. **`startExpr` MUST be a variable/binding name** (like `'state'`, `'count'`, `'total'`) NOT a file path.
-2. **Read** `result.render` — the token-bounded summary with code frames at blocked leaves.
-3. **Each blocked leaf** carries a `blockedBy` reason and an *armed but un-run* runtime probe. Read `result.blocked` for the probe list. NEVER fabricate a value past a `blockedBy`.
-4. **Run the armed probe** (`result.runProbe(hopId)`) to resolve the blind spot, then **conclude**.
-
-**Four bug archetypes** and the probe that proves each:
-
-- **Mutating reducer** (state changes but React doesn't re-render) → `storeIdentity` — `sameReference: true` after the action is the fingerprint of an in-place mutation.
-- **Cross-module util returns the wrong thing** → `captureArgs` (an entry logpoint via `setLogpoint` + `readLogpoints`) to see the real arguments at the boundary.
-- **Async race** (value depends on which request lands first) → `net.timeline` to record request/response order passively, then `net.delay` to force the race deterministically.
-- **Stale effect deps** (effect fires with old values) → `fiberDiff` two `fiberSnapshot`s across the render to see which props actually changed.
-
-**⚠️ DEBUG TOOL PITFALLS:**
-- **These are globals, no imports needed.** `traceValue({...})`, not `const {traceValue} = require(...)`. The sandbox `require` is locked to Node built-ins.
-- **`traceValue` returns a Promise.** Always `await` it: `const r = await traceValue({...}); return r.render;`
-- **`startExpr` is a variable name** like `'count'` or `'state'`, NEVER a file path or expression like `'state.items.push(...)'`. Use `startFile` for the file path.
-- **`fiberSnapshot` takes `{locator: page.locator('...')}`**, not a raw selector string. Same for `debugStyle` and `whyOccluded`.
-- **`pm.anchor` and `pm.query` also return Promises** — always `await` them.
-- **Don't create new sessions** — the existing session already works. Just keep using the same `-s` number.
-- **Use `return` to see output.** `console.log` in the sandbox goes to browser console, not your CLI output. Use `return someValue;` or auto-return (last expression in the snippet).
+**⚠️ Pitfalls that actually bite:**
+- `startExpr` is a **variable name** (`'count'`, `'state'`) — never a file path or an expression like `'state.items.push(x)'`. Paths go in `startFile` (absolute).
+- `debugStyle` / `whyOccluded` / `fiberSnapshot` take `{ locator: page.locator('...') }`, not a raw selector string.
+- `pm.anchor` returns `null` for elements with no accessible role (a bare `<span>`). Anchor the nearest interactive ancestor.
+- Don't create new sessions to "fix" a problem — reuse the same `-s` number.
 
 ## common mistakes to avoid
 
@@ -1153,43 +1165,6 @@ Fill inputs with file content:
 const fs = require('node:fs')
 const content = fs.readFileSync('./data.txt', 'utf-8')
 await state.page.locator('textarea').fill(content)
-```
-
-## page model & trace helpers
-
-Deep-debugging helpers available in the sandbox (see the `page-model-api` and `trace-api` MCP resources for full types + examples, and the `## debugging: symptom → cause` doctrine above for when to reach for them). All accept an optional `{ page }`; they default to `state.page` and return only cycle-free projections.
-
-**PageModel & CSS provenance**
-
-```js
-await pm.query({ roles: ['button'], visibleOnly: true }) // token-lean projection rows; add select:'Interactive'/'VisibleElement', fields:[...]
-await queryPage({ select: 'Interactive' })                // same projection, exposed top-level
-const h = await pm.anchor('button:has-text("Submit")')    // selector | { backendNodeId } | { x, y } → handle | null
-await h.reactFiber()                                       // lazy edge: { componentName, source, props }
-await h.styles()                                           // lazy edge: cascade winner per property
-await pm.renderText({ visibleOnly: true })                // indented aria-like view of the fused tree
-await pm.debugMode()                                       // projection config with lossy levers off
-await debugStyle({ locator, property: 'color' })          // cascade winner + overridden losers, with sources ({ node } also works)
-await whyOccluded({ locator })                            // stacking-context inputs (position, z-index, own context?)
-```
-
-**Trace lane & probe toolkit**
-
-```js
-const t = await traceValue({ selector: '[data-testid="total"]' }) // anchor → static slice → armed probes
-t.render                                                    // token-bounded summary string — read first
-t.blocked                                                   // blocked leaves: { id, blockedBy, site, probe }
-t.expand(hopId)                                             // lossless drill-down into one hop
-await t.runProbe(hopId)                                     // fire the armed probe for a blocked leaf
-await storeIdentity({ action })                            // { sameReference } true ⇒ mutating reducer
-await setLogpoint({ file, line, expr, tag })              // arm a logpoint; drain with readLogpoints
-await readLogpoints({ tag })                               // captured logpoint hits (token-capped)
-await getScriptSourceByUrl({ url })                       // fetch bundled source when no author source exists
-net.timeline({ urlPattern })                              // PASSIVE request/response order; .entries()/.stop()
-await net.delay({ urlPattern, ms })                       // PERTURBING: hold requests to force a race; .stop()
-await fiberSnapshot({ locator })                          // capture a component's props/hierarchy
-fiberDiff(before, after)                                  // which props changed/added/removed across a render
-replayPure({ fn, args })                                  // re-run a pure sliced fn in-process (refuses impure fns)
 ```
 
 ## network interception
