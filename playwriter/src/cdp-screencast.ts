@@ -152,9 +152,19 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
           frames: 0,
           durationMs,
           wrote: false,
+          // Two very different causes produce zero frames, and guessing the wrong one
+          // sends you looking in the wrong place — so name both. The connection-mode
+          // case is by far the more common surprise: `Page.startScreencast` returns
+          // success and `screencastVisibilityChanged` fires even when frames will
+          // never be delivered, so there is nothing to detect at start() time.
           note:
-            'No frames captured — the page never repainted during the recording window. ' +
-            'Screencast is change-driven, so a completely static page yields nothing.',
+            'No frames captured. Either (a) this session is connected THROUGH THE ' +
+            'PLAYWRITER EXTENSION — Chrome withholds Page.screencastFrame from the ' +
+            'extension debugger API, so startCdp only works over a direct CDP ' +
+            'connection (`playwriter session new --direct <ws-url>`); use ' +
+            'recording.start() plus one extension-icon click instead — or (b) the page ' +
+            'genuinely never repainted, since screencast is change-driven and a static ' +
+            'page yields nothing.',
         }
       }
 
