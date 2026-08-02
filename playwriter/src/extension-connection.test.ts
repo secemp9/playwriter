@@ -5,11 +5,19 @@ import { createMCPClient } from './mcp-client.js'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium } from '@xmorse/playwright-core'
 import { getCdpUrl } from './utils.js'
-import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, TEST_WORKSPACE, type TestContext, js } from './test-utils.js'
+import {
+  setupTestContext,
+  cleanupTestContext,
+  getExtensionServiceWorker,
+  TEST_WORKSPACE,
+  testRelayPort,
+  type TestContext,
+  js,
+} from './test-utils.js'
 import { getExtensionsStatus } from './relay-client.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19990
+const TEST_PORT = testRelayPort(import.meta.url)
 
 describe('Extension Connection Tests', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
@@ -17,7 +25,7 @@ describe('Extension Connection Tests', () => {
   let testCtx: TestContext | null = null
 
   beforeAll(async () => {
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-conn-test-', toggleExtension: true })
+    testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-conn-test-', toggleExtension: true })
 
     const result = await createMCPClient({ port: TEST_PORT })
     client = result.client
@@ -550,22 +558,35 @@ describe('Extension Connection Tests', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 100))
 
-    // 3. Verify MCP cannot execute code anymore (no pages available)
+    // 3. The disconnected tab is gone from the MCP's view. This used to assert that execute
+    //    now FAILS with 'No Playwright pages are available', which stopped being true when the
+    //    relay gained zero-click auto-create: disconnectEverything() detaches every tab, the
+    //    executor reconnects, its Target.setAutoAttach reaches maybeAutoCreateInitialTab
+    //    (cdp-relay.ts:600), and the workspace — which now owns nothing — is handed a fresh
+    //    about:blank tab before the replay runs. Verified in the relay log:
+    //      Playwright client connected: ... (0 pages)
+    //      Auto-creating initial tab for Playwright client
+    //      Auto-created tab, now have 1 targets, url: about:blank
+    //    So the outcome to pin is not an error, it is that the OLD page is gone and exactly one
+    //    new blank tab took its place — which is a stronger statement than "it threw", since a
+    //    stale connection still serving the closed tab would have satisfied neither.
     const afterDisconnect = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
-          const pages = context.pages();
-          console.log('Pages after disconnect:', pages.length);
-          return { pagesCount: pages.length };
+          const urls = context.pages().map((p) => p.url());
+          console.log('Pages after disconnect:', urls.length);
+          return { pagesCount: urls.length, foundTestPage: urls.some((u) => u.includes('disconnect-test')), urls };
         `,
       },
     })
 
     const afterDisconnectOutput = (afterDisconnect as any).content[0].text
     console.log('After disconnect:', afterDisconnectOutput)
-    expect((afterDisconnect as any).isError).toBe(true)
-    expect(afterDisconnectOutput).toContain('No Playwright pages are available')
+    expect((afterDisconnect as any).isError).not.toBe(true)
+    expect(afterDisconnectOutput).toContain('foundTestPage: false')
+    expect(afterDisconnectOutput).toContain('pagesCount: 1')
+    expect(afterDisconnectOutput).toContain('about:blank')
 
     // 4. Re-enable extension on the same page
     console.log('Re-enabling extension...')
@@ -628,10 +649,48 @@ describe('Extension Connection Tests', () => {
     expect(afterReconnectOutput).toContain('foundTestPage')
     expect(afterReconnectOutput).toContain('disconnect-test')
 
-    // Clean up
+    // Clean up. Every other test in this file closes the pages it enabled, which disconnects
+    // them, so the implicit contract between tests here is "leave nothing connected". This one
+    // works on browserContext.pages()[0] and must not close it, so it has to hand the tabs back
+    // explicitly. It used to only navigate to about:blank — which was harmless while the test
+    // aborted at step 3 and never enabled anything, and became load-bearing the moment it ran
+    // to the end. See the note in the next test for what the leftover tab does to it.
+    await serviceWorker.evaluate(async () => {
+      await globalThis.disconnectEverything()
+    })
     await page.goto('about:blank')
   })
 
+  // KNOWN, UNFIXED, AND REACHABLE BY USERS — read this before "simplifying" the cleanup at the
+  // end of the previous test.
+  //
+  // This test disconnects everything and immediately re-enables the extension on its tab. When
+  // more than one tab is connected at the moment disconnectEverything() runs, the re-enabled tab
+  // can be torn straight back down. Relay log of the failure, in order:
+  //
+  //   Disconnecting tab <blank> / <disconnect-test> / <auto-reconnect>   (disconnectEverything)
+  //   Cleared empty workspace group: wt:… <groupId>
+  //   syncTabGroups deferred: attach setup in flight for [<auto-reconnect>]   (x3)
+  //   Tab attached successfully: <auto-reconnect> … state connected
+  //   Tab manually removed from playwriter group: <auto-reconnect>
+  //   Disconnecting tab <auto-reconnect>
+  //   Auto-creating initial tab for Playwright client → about:blank
+  //
+  // The groupId event queued by deleting the empty workspace group is processed after the tab
+  // has finished re-attaching. background.ts:2587-2594 only skips the disconnect while the tab
+  // is still 'connecting'; by then it is 'connected', and syncTabGroups — which would have put
+  // it back in a group — deferred itself because the attach was in flight. So the handler sees
+  // a genuinely ungrouped, genuinely connected tab and reads it as a human drag-out. The client
+  // loses its tab and is handed an auto-created about:blank instead.
+  //
+  // Not fixed here: the honest fix is in the extension's tab-group queue (the group-removal
+  // branch needs to ignore events generated before the tab's current attach, which the
+  // 'connecting' check only approximates), and that is a different change from the six this
+  // file's task covered. Acting on the tab's live groupId instead of the event's snapshot was
+  // tried and does NOT fix it — at that instant the tab really is ungrouped.
+  //
+  // What keeps this test green is that its predecessor now hands over with nothing connected,
+  // so only one tab is in flight here. Restore that cleanup if you see this test fail.
   it('should auto-reconnect MCP after extension WebSocket reconnects', async () => {
     const serviceWorker = await getExtensionServiceWorker(testCtx!.browserContext)
 

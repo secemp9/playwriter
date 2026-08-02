@@ -19,10 +19,20 @@ export interface GhostCursorClientOptions {
   speedPxPerMs?: number
 }
 
+/** One knot of a sampled trajectory. `tMs` is an offset from the start of playback. */
+export interface GhostCursorPathSample {
+  tMs: number
+  x: number
+  y: number
+}
+
 interface GhostCursorBrowserApi {
   enable: (options?: GhostCursorClientOptions) => void
   disable: () => void
   applyMouseAction: (event: MouseActionEvent) => void
+  playPath: (options: { samples: GhostCursorPathSample[] }) => { playing: boolean; durationMs: number }
+  cancelPath: () => void
+  isPlayingPath: () => boolean
 }
 
 let ghostCursorCode: string | null = null
@@ -38,13 +48,25 @@ function getGhostCursorCode(): string {
   return ghostCursorCode
 }
 
-async function ensureGhostCursorInjected(options: { page: Page }): Promise<void> {
-  const { page } = options
-  const hasGhostCursor = await page.evaluate(() => {
-    return Boolean((globalThis as { __playwriterGhostCursor?: unknown }).__playwriterGhostCursor)
-  })
+/**
+ * `requiredMethod` guards against VERSION SKEW, which is not hypothetical: the Chrome
+ * extension bundles its own copy of this overlay and injects it into every attached tab.
+ * A tab can therefore already hold an older `__playwriterGhostCursor` that predates a
+ * method this process wants to call. Testing only for the object's existence would skip
+ * re-injection and then silently fail on the missing method, so the capability itself is
+ * what gets probed.
+ */
+async function ensureGhostCursorInjected(options: { page: Page; requiredMethod?: string }): Promise<void> {
+  const { page, requiredMethod } = options
+  const isUsable = await page.evaluate((method) => {
+    const api = (globalThis as { __playwriterGhostCursor?: Record<string, unknown> }).__playwriterGhostCursor
+    if (!api) {
+      return false
+    }
+    return method ? typeof api[method] === 'function' : true
+  }, requiredMethod)
 
-  if (hasGhostCursor) {
+  if (isUsable) {
     return
   }
 
@@ -78,6 +100,59 @@ export async function disableGhostCursor(options: { page: Page }): Promise<void>
     await page.evaluate(() => {
       const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
       api?.disable()
+    })
+  } catch {
+    // Non-fatal — page may be closed or navigating.
+  }
+}
+
+/**
+ * Hand a whole sampled trajectory to the overlay in ONE round trip and let it play the
+ * path back against the page's rAF clock.
+ *
+ * The alternative — one `applyMouseAction` per sample — costs a full page.evaluate round
+ * trip each (measured at ~4-5ms through the extension) AND restarts a CSS transition
+ * every sample, so the overlay both lags and smooths away the trajectory's shape. This is
+ * the coordination fix that lets the drawn cursor and the real CDP pointer trace the same
+ * curve.
+ *
+ * Returns whether the overlay actually started playing, so the caller can report it
+ * rather than assume it.
+ */
+export async function playGhostCursorPath(options: {
+  page: Page
+  samples: GhostCursorPathSample[]
+}): Promise<{ playing: boolean; durationMs: number }> {
+  try {
+    const { page, samples } = options
+    if (samples.length < 2) {
+      return { playing: false, durationMs: 0 }
+    }
+
+    await ensureGhostCursorInjected({ page, requiredMethod: 'playPath' })
+
+    return await page.evaluate(
+      ({ pathSamples }) => {
+        const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
+        if (!api?.playPath) {
+          return { playing: false, durationMs: 0 }
+        }
+        return api.playPath({ samples: pathSamples })
+      },
+      { pathSamples: samples },
+    )
+  } catch {
+    // The overlay is cosmetic — a closed or navigating page must not fail the move.
+    return { playing: false, durationMs: 0 }
+  }
+}
+
+/** Stop any in-flight path playback and hand the cursor back to `applyMouseAction`. */
+export async function cancelGhostCursorPath(options: { page: Page }): Promise<void> {
+  try {
+    await options.page.evaluate(() => {
+      const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
+      api?.cancelPath?.()
     })
   } catch {
     // Non-fatal — page may be closed or navigating.

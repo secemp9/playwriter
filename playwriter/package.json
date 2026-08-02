@@ -7,7 +7,8 @@
   "types": "dist/index.d.ts",
   "repository": "https://github.com/remorses/playwriter",
   "scripts": {
-    "build": "rm -rf dist *.tsbuildinfo && mkdir dist && bun scripts/build-client-bundles.ts && tsc && bun scripts/build-extension-bundle.ts && bun scripts/build-resources.ts",
+    "build": "bun scripts/check-source-bytes.ts && rm -rf dist *.tsbuildinfo && mkdir dist && bun scripts/build-client-bundles.ts && tsc && bun scripts/build-extension-bundle.ts && bun scripts/build-resources.ts",
+    "check:source-bytes": "bun scripts/check-source-bytes.ts",
     "prepublishOnly": "pnpm build",
     "watch": "tsc -w",
     "cli": "vite-node src/cli.ts",
@@ -46,7 +47,6 @@
   "dependencies": {
     "@babel/code-frame": "^7.27.1",
     "@babel/parser": "^8.0.4",
-    "@babel/template": "^8.0.0",
     "@babel/traverse": "^8.0.4",
     "@hono/node-server": "^1.19.6",
     "@hono/node-ws": "^1.2.0",

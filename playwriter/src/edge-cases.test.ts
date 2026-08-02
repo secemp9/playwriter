@@ -40,9 +40,11 @@ import {
 import {
   buildPageModelFromRaw,
   PageModel,
+  type FrameGeometry,
   type PageModelNode,
   type NodeKey,
   type ModelDomInfo,
+  type SnapshotNodeGeometry,
 } from './page-model.js'
 
 // css-cascade
@@ -79,7 +81,7 @@ import type { TraceDeps, TraceResult } from './trace.js'
 import { makeSourceMapResolver, renderCodeFrame } from './source-provenance.js'
 
 // debugger
-import { Debugger, type CallFrameInfo } from './debugger.js'
+import { Debugger, verifyNonPausingCondition, type CallFrameInfo } from './debugger.js'
 
 // ===========================================================================
 // Helper: Mock ICDPSession (from debugger.test.ts conventions)
@@ -446,6 +448,49 @@ function rawAria(opts: Partial<RawAriaNode> & { role?: string }): RawAriaNode {
   } as RawAriaNode
 }
 
+/**
+ * `buildPageModelFromRaw` requires a layout snapshot: visibility is a measured fact, so
+ * an unmeasured model has nothing honest to report and is not constructible. These edge
+ * cases are about fusing/traversal rather than layout, so this factory supplies a plain
+ * measured record per node — laid out, opaque, on screen, non-overlapping boxes placed
+ * away from the origin (so point hit-tests at 0,0 still find nothing) and all siblings.
+ * Real captureSnapshot decoding is covered in `page-model-geometry.test.ts`.
+ */
+function testGeometry(frameId: string, backendNodeIds: number[] = []): Map<string, FrameGeometry> {
+  const byBackendId = new Map<number, SnapshotNodeGeometry>()
+  const byNodeIndex = new Map<number, SnapshotNodeGeometry>()
+  backendNodeIds.forEach((backendNodeId, index) => {
+    const record: SnapshotNodeGeometry = {
+      backendNodeId,
+      nodeIndex: index,
+      nodeType: 1,
+      nodeName: 'DIV',
+      label: 'div',
+      box: { x: 100, y: 100 + index * 30, width: 80, height: 20 },
+      paintOrder: index,
+      styles: { display: 'block', visibility: 'visible', opacity: '1', 'pointer-events': 'auto' },
+      stackingContext: false,
+    }
+    byBackendId.set(backendNodeId, record)
+    byNodeIndex.set(index, record)
+  })
+  return new Map<string, FrameGeometry>([
+    [
+      frameId,
+      {
+        frameId,
+        byBackendId,
+        byNodeIndex,
+        documentBackendIds: new Set(backendNodeIds),
+        parentIndex: backendNodeIds.map(() => -1),
+        scrollOffsetX: 0,
+        scrollOffsetY: 0,
+        viewport: { x: 0, y: 0, width: 800, height: 600 },
+      },
+    ],
+  ])
+}
+
 describe('PageModel edge cases', () => {
   // ---------- 2.1 Empty aria tree ----------
   it('buildPageModelFromRaw with empty aria tree does not crash', () => {
@@ -453,6 +498,7 @@ describe('PageModel edge cases', () => {
       ariaTree: [],
       domByBackendId: new Map(),
       frameId: 'frame1',
+      geometry: testGeometry('frame1'),
     })
     expect(model).toBeInstanceOf(PageModel)
     expect(model.root.children).toEqual([])
@@ -468,6 +514,7 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree as any,
       domByBackendId: new Map(),
       frameId: 'frame1',
+      geometry: testGeometry('frame1'),
     })
     // Synthetic nodes get negative backendNodeIds and are NOT added to byKey
     expect(model.byKey.size).toBe(0)
@@ -504,11 +551,13 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree1 as any,
       domByBackendId: new Map(),
       frameId: 'f',
+      geometry: testGeometry('f'),
     })
     const model2 = buildPageModelFromRaw({
       ariaTree: ariaTree2 as any,
       domByBackendId: new Map(),
       frameId: 'f',
+      geometry: testGeometry('f'),
     })
 
     model2.diffAgainst(model1)
@@ -524,6 +573,7 @@ describe('PageModel edge cases', () => {
       ariaTree: [],
       domByBackendId: new Map(),
       frameId: 'f',
+      geometry: testGeometry('f'),
     })
     const cfg = model.debugMode()
     expect(cfg.visibleOnly).toBe(false)
@@ -539,6 +589,7 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree as any,
       domByBackendId: new Map(),
       frameId: 'f',
+      geometry: testGeometry('f'),
     })
     const text = model.renderText()
     expect(text).toContain('button')
@@ -557,11 +608,13 @@ describe('PageModel edge cases', () => {
       ariaTree: [node1] as any,
       domByBackendId,
       frameId: 'frameA',
+      geometry: testGeometry('frameA', [42]),
     })
     const model2 = buildPageModelFromRaw({
       ariaTree: [node2] as any,
       domByBackendId,
       frameId: 'frameB',
+      geometry: testGeometry('frameB', [42]),
     })
 
     const key1 = `frameA:42`
@@ -583,6 +636,7 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree as any,
       domByBackendId,
       frameId: 'f',
+      geometry: testGeometry('f', [10]),
     })
 
     // By selector string (locator)
@@ -615,6 +669,7 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree as any,
       domByBackendId,
       frameId: 'f',
+      geometry: testGeometry('f', [10]),
     })
     // Use the locator string (exact match) — not a type selector
     const handle = model.anchor('button:has-text("Go")')
@@ -635,6 +690,7 @@ describe('PageModel edge cases', () => {
       ariaTree: ariaTree as any,
       domByBackendId,
       frameId: 'f',
+      geometry: testGeometry('f', [10]),
     })
     const handle = model.anchor('button:has-text("Go")')
     expect(handle).not.toBeNull()
@@ -703,11 +759,13 @@ describe('PageModel edge cases', () => {
       ariaTree: [rawAria({ role: 'button', backendNodeId: 1 })] as any,
       domByBackendId: domMap,
       frameId: 'f',
+      geometry: testGeometry('f', [1, 2]),
     })
     const modelB = buildPageModelFromRaw({
       ariaTree: [rawAria({ role: 'link', backendNodeId: 2 })] as any,
       domByBackendId: domMap,
       frameId: 'f',
+      geometry: testGeometry('f', [1, 2]),
     })
     // A is completely different from B
     modelB.diffAgainst(modelA)
@@ -1256,11 +1314,28 @@ describe('Trace orchestration edge cases', () => {
   })
 
   // Helper: build a slice from inline code (mirrors trace.test.ts pattern)
-  function sliceOf(filename: string, code: string, startExpr: string) {
+  // `opts` must go to backwardSlice, not to traceValue: traceValue given a pre-built
+  // `slice` does not re-slice, so maxHops/maxBreadth passed there are silently ignored.
+  function sliceOf(
+    filename: string,
+    code: string,
+    startExpr: string,
+    opts: { maxHops?: number; maxBreadth?: number } = {},
+  ) {
     const file = path.join(dir, filename)
     fs.writeFileSync(file, code)
     const graph = buildModuleGraph({ root: dir, files: [file] })
-    return backwardSlice({ graph, startFile: file, startExpr })
+    return backwardSlice({ graph, startFile: file, startExpr, ...opts })
+  }
+
+  /** Depth-first search over a hop tree; the interesting hop is rarely the root. */
+  function findHop(hop: any, pred: (h: any) => boolean): any | null {
+    if (pred(hop)) return hop
+    for (const child of hop.children ?? []) {
+      const found = findHop(child, pred)
+      if (found) return found
+    }
+    return null
   }
 
   // ---------- 6.1 No anchor/startFile/startExpr ----------
@@ -1272,31 +1347,50 @@ describe('Trace orchestration edge cases', () => {
   })
 
   // ---------- 6.2 maxHops=1 respects hop limit ----------
-  it('traceValue with maxHops=1 respects hop limit', async () => {
-    // Chain: x -> a -> b -> 5 (4 hops total, but limited to 1)
+  it('traceValue with maxHops=1 stops with a resumable budget block, not a runtime blind spot', async () => {
+    // Chain: x -> a -> b -> 5. One hop of budget cannot reach the literal.
     const slice = sliceOf('chain.ts',
       `export const x = a\nexport const a = b\nexport const b = 5\n`,
       'x',
+      { maxHops: 1 },
     )
-    const result = await traceValue({ slice, maxHops: 1 })
-    // The rendered output should mention max hop depth at the first expansion
-    const rendered = result.render()
-    // The root hop itself is not blocked by maxHops since depth=0
-    // But the first child should be blocked
-    expect(rendered).toBeTruthy()
+    const result = await traceValue({ slice })
+    const stopped = findHop(result.tree, (h) => h.blockedBy === 'budget-hops')
+    expect(stopped, 'exhausting maxHops must be reported as budget-hops').toBeTruthy()
+    // The distinction that matters: 'dynamic' sends an agent hunting for runtime
+    // evidence, which is the wrong move when the fix is simply a bigger budget.
+    expect(stopped.blockedBy).not.toBe('dynamic')
+    expect(stopped.resumable?.option).toBe('maxHops')
+    expect(stopped.resumable?.suggested).toBeGreaterThan(1)
+
+    // ...and the suggested budget actually finishes the walk.
+    const retried = await traceValue({
+      slice: sliceOf('chain2.ts',
+        `export const x = a\nexport const a = b\nexport const b = 5\n`,
+        'x',
+        { maxHops: stopped.resumable.suggested },
+      ),
+    })
+    expect(findHop(retried.tree, (h) => h.blockedBy === 'budget-hops')).toBeNull()
   })
 
-  // ---------- 6.3 maxBreadth=0 returns zero children ----------
-  it('traceValue with maxBreadth=0 returns zero children for param hops', async () => {
-    // Create a single-caller param: expand from 'x' in inner(x) -> arg
+  // ---------- 6.3 maxBreadth=0 truncates caller branches, and says so ----------
+  it('traceValue with maxBreadth=0 drops caller branches and reports the truncation', async () => {
+    // Single-caller param: `x` in inner(x) has exactly one caller, outer().
     const slice = sliceOf('single.ts',
       `function inner(x) { return x }\n` +
       `export function outer() { return inner(5) }\n`,
       'x',
+      { maxBreadth: 0 },
     )
-    const result = await traceValue({ slice, maxBreadth: 0 })
-    // With maxBreadth=0, no children are added to the param-caller hop
-    expect(result.tree.children ?? []).toHaveLength(0)
+    const result = await traceValue({ slice })
+    const param = findHop(result.tree, (h) => h.truncated != null)
+    // A hop that threw away its only caller must not be indistinguishable from
+    // one that never had a caller to begin with.
+    expect(param, 'the truncated param hop must be findable').toBeTruthy()
+    expect(param.children ?? []).toHaveLength(0)
+    expect(param.truncated).toMatchObject({ shown: 0, total: 1 })
+    expect(param.blockedBy).toBe('interprocedural')
   })
 
   // ---------- 6.4 Invalid startFile ----------
@@ -1451,7 +1545,7 @@ describe('Debugger edge cases', () => {
   // ---------- 7.2 setLogpoint with special characters in expr ----------
   it('setLogpoint with special characters in expr does not crash and produces valid condition', async () => {
     const mock = new MockCdp((method) => {
-      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-1', locations: [] }
+      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-1', locations: [{ scriptId: '1', lineNumber: 0, columnNumber: 0 }] }
       return {}
     })
     const dbg = new Debugger({ cdp: asCdp(mock) })
@@ -1460,9 +1554,11 @@ describe('Debugger edge cases', () => {
     const call = mock.find('Debugger.setBreakpointByUrl')
     const condition: string = call!.params.condition
     expect(condition).toContain('[[logpoint:test]]')
-    expect(condition).toContain('JSON.stringify((x.y')
-    expect(condition).toContain("'z'")
-    expect(condition.endsWith(',false)')).toBe(true)
+    // The expression is interpolated once, into a single parenthesized position.
+    expect(condition).toContain("var __pwV=(x.y['z'])")
+    // Non-pausing is now PROVEN over the assembled condition, not shape-matched.
+    expect(verifyNonPausingCondition(condition)).toEqual({ nonPausing: true, problems: [] })
+    expect(condition.trim().endsWith('return false})()')).toBe(true)
   })
 
   // ---------- 7.3 getScriptSourceByUrl with URL not in scripts map ----------
@@ -1477,7 +1573,7 @@ describe('Debugger edge cases', () => {
   // ---------- 7.4 Concurrent setLogpoint calls on different files ----------
   it('concurrent setLogpoint calls on different files both succeed', async () => {
     const mock = new MockCdp((method) => {
-      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-concurrent', locations: [] }
+      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-concurrent', locations: [{ scriptId: '1', lineNumber: 0, columnNumber: 0 }] }
       return {}
     })
     const dbg = new Debugger({ cdp: asCdp(mock) })
@@ -1492,7 +1588,7 @@ describe('Debugger edge cases', () => {
   // ---------- 7.5 setLogpoint with VERY long expr ----------
   it('setLogpoint with very long expression does not crash', async () => {
     const mock = new MockCdp((method) => {
-      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-long', locations: [] }
+      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-long', locations: [{ scriptId: '1', lineNumber: 0, columnNumber: 0 }] }
       return {}
     })
     const dbg = new Debugger({ cdp: asCdp(mock) })
@@ -1509,7 +1605,7 @@ describe('Debugger edge cases', () => {
   // ---------- 7.6 setBreakpoint with truthy but non-boolean condition ----------
   it('setBreakpoint with truthy non-boolean condition does not crash', async () => {
     const mock = new MockCdp((method) => {
-      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-truthy', locations: [] }
+      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-truthy', locations: [{ scriptId: '1', lineNumber: 0, columnNumber: 0 }] }
       return {}
     })
     const dbg = new Debugger({ cdp: asCdp(mock) })
@@ -1532,7 +1628,7 @@ describe('Debugger edge cases', () => {
         })
       }
       if (method === 'Debugger.getScriptSource') return { scriptSource: source }
-      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-arrow', locations: [] }
+      if (method === 'Debugger.setBreakpointByUrl') return { breakpointId: 'bp-arrow', locations: [{ scriptId: '1', lineNumber: 0, columnNumber: 0 }] }
       return {}
     })
     const dbg = new Debugger({ cdp: asCdp(mock) })

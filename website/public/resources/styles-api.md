@@ -7,6 +7,7 @@ The getStylesForLocator function inspects CSS styles applied to an element, simi
 ```ts
 import type { ICDPSession } from './cdp-session.js';
 import type { Locator } from '@xmorse/playwright-core';
+import type { Protocol } from 'devtools-protocol';
 import { type NormalizedRule } from './css-cascade.js';
 export interface StyleSource {
     url: string;
@@ -20,12 +21,83 @@ export interface StyleRule {
     origin: 'regular' | 'user-agent' | 'injected' | 'inspector';
     declarations: StyleDeclarations;
     inheritedFrom: string | null;
+    /**
+     * Declarations the rule DOES contain that `declarations` does not, as
+     * `"name: value — reason"`. Present only when something was dropped.
+     *
+     * `initial` values and `-webkit-` prefixed properties are filtered out on purpose, but
+     * silently: `declarations` looked like the rule's whole content, so a real
+     * `-webkit-line-clamp: 2` that Chrome does report simply had no representation
+     * anywhere in the result.
+     */
+    droppedDeclarations?: string[];
 }
 export interface StylesResult {
     element: string;
     inlineStyle: StyleDeclarations | null;
     rules: StyleRule[];
 }
+/**
+ * One tree the element path passes through. `enter` says how the tree is entered from
+ * the previous hop: `document` = the top-level document, `frame` = the content document
+ * of the iframe element the previous hop resolved, `shadow` = the shadow root of the
+ * host element the previous hop resolved. `path` is the chain of 0-based *element*
+ * child indexes to follow inside that tree.
+ */
+export interface ElementPathHop {
+    enter: 'document' | 'shadow' | 'frame';
+    path: number[];
+}
+export interface ElementPathResult {
+    hops: ElementPathHop[];
+    /** Lowercased tag name of the target, used to verify the walk landed on it. */
+    tagName: string;
+    /** Set when the path cannot be expressed, e.g. a detached or cross-origin element. */
+    error?: string;
+}
+/**
+ * Compute an element's exact position in its tree, as index paths split at shadow-root
+ * and iframe boundaries.
+ *
+ * This runs IN THE PAGE (it is stringified by `evaluate`), so it must stay entirely
+ * self-contained: no imports, no closure over module scope, no TypeScript-only syntax
+ * that would not survive `String(fn)`.
+ *
+ * This is identity, not geometry: the walk starts at the element itself, so nothing that
+ * happens to be painted on top of it can change the answer.
+ */
+export declare function computeElementPath(element: any): ElementPathResult;
+/**
+ * Resolve a locator to the CDP node it actually points at.
+ *
+ * Why not `DOM.getNodeForLocation`: that returns the TOPMOST node at a screen point, so
+ * anything covering the element — a modal, a sticky header, or just a child span holding
+ * the label — silently resolves to a *different* node, and every rule, cascade winner
+ * and source location reported afterwards then belongs to the wrong element. MEASURED
+ * against Chromium 145: over two absolutely-positioned 200x200 divs stacked at the same
+ * origin, `getNodeForLocation({x:50,y:50})` returns the LATER-painted one (`#over`), never
+ * the one underneath. That is the exact failure `debugStyle` exists to diagnose, so
+ * identity is resolved through the element's own node instead: the page reports the
+ * element's index path, and the path is walked over one pierced `DOM.getDocument` tree.
+ * The final node's tag name is verified against the page's, so a DOM mutation racing the
+ * walk fails loudly instead of answering about a neighbour.
+ *
+ * `DOM.getDocument` doubles as the priming call CDP requires before FRONTEND node ids can
+ * be handed out on a fresh session — measured: `DOM.pushNodesByBackendIdsToFrontend` on a
+ * session with `DOM.enable` but no `DOM.getDocument` is rejected with "Document needs to
+ * be requested first" — which is why both style entry points share this helper rather than
+ * each remembering to prime. (`DOM.getNodeForLocation` is NOT subject to that rule: the
+ * same measurement had it answer with no `DOM.getDocument` and indeed with no `DOM.enable`
+ * at all. It returns a backendNodeId, not a frontend one.)
+ */
+export declare function resolveElementNode({ locator, cdp, }: {
+    locator: Locator;
+    cdp: ICDPSession;
+}): Promise<{
+    nodeId: number;
+    backendNodeId: number;
+    node: Protocol.DOM.Node;
+}>;
 export declare function getStylesForLocator({ locator, cdp: cdpSession, includeUserAgentStyles, }: {
     locator: Locator;
     cdp: ICDPSession;
@@ -63,18 +135,20 @@ export declare function formatStylesAsText(styles: StylesResult): string;
 ## Examples
 
 ```ts
-import { page, getStylesForLocator, formatStylesAsText, debugStyle, whyOccluded, console } from './debugger-examples-types.js'
+// `state.page` is the tab this session owns. The bare `page` global is the DEFAULT tab,
+// which is very often not the one you navigated — see "working with pages" in skill.md.
+import { state, getStylesForLocator, formatStylesAsText, debugStyle, whyOccluded, console } from './debugger-examples-types.js'
 
 // Example: Get styles for an element and display them
 async function getElementStyles() {
-  const loc = page.locator('.my-button')
+  const loc = state.page.locator('.my-button')
   const styles = await getStylesForLocator({ locator: loc })
   console.log(formatStylesAsText(styles))
 }
 
 // Example: Inspect computed styles for a specific element
 async function inspectButtonStyles() {
-  const button = page.getByRole('button', { name: 'Submit' })
+  const button = state.page.getByRole('button', { name: 'Submit' })
   const styles = await getStylesForLocator({ locator: button })
 
   console.log('Element:', styles.element)
@@ -93,7 +167,7 @@ async function inspectButtonStyles() {
 
 // Example: Include browser default (user-agent) styles
 async function getStylesWithUserAgent() {
-  const loc = page.locator('input[type="text"]')
+  const loc = state.page.locator('input[type="text"]')
   const styles = await getStylesForLocator({
     locator: loc,
     includeUserAgentStyles: true,
@@ -103,7 +177,7 @@ async function getStylesWithUserAgent() {
 
 // Example: Find where a CSS property is defined
 async function findPropertySource() {
-  const loc = page.locator('.card')
+  const loc = state.page.locator('.card')
   const styles = await getStylesForLocator({ locator: loc })
 
   const backgroundRule = styles.rules.find((r) => 'background-color' in r.declarations)
@@ -117,7 +191,7 @@ async function findPropertySource() {
 
 // Example: Check inherited styles
 async function checkInheritedStyles() {
-  const loc = page.locator('.nested-text')
+  const loc = state.page.locator('.nested-text')
   const styles = await getStylesForLocator({ locator: loc })
 
   const inheritedRules = styles.rules.filter((r) => r.inheritedFrom)
@@ -129,8 +203,8 @@ async function checkInheritedStyles() {
 
 // Example: Compare styles between two elements
 async function compareStyles() {
-  const primary = await getStylesForLocator({ locator: page.locator('.btn-primary') })
-  const secondary = await getStylesForLocator({ locator: page.locator('.btn-secondary') })
+  const primary = await getStylesForLocator({ locator: state.page.locator('.btn-primary') })
+  const secondary = await getStylesForLocator({ locator: state.page.locator('.btn-secondary') })
 
   console.log('Primary button:')
   console.log(formatStylesAsText(primary))
@@ -141,7 +215,7 @@ async function compareStyles() {
 
 // Example: Debug WHY a property has the value it does (cascade winner + losers)
 async function debugWinningColor() {
-  const loc = page.locator('.btn-primary')
+  const loc = state.page.locator('.btn-primary')
   // Pass a specific property to see the winner and every overridden declaration.
   const report = await debugStyle({ locator: loc, property: 'color' })
 
@@ -159,7 +233,7 @@ async function debugWinningColor() {
 
 // Example: See every contested property at once (no property filter)
 async function debugAllContestedProps() {
-  const loc = page.locator('.card')
+  const loc = state.page.locator('.card')
   const report = await debugStyle({ locator: loc })
   console.log(report.text)
 }
@@ -170,15 +244,22 @@ async function debugFromNode(node: unknown) {
   console.log(report.text)
 }
 
-// Example: Inspect stacking-context inputs when an element appears occluded
+// Example: Inspect stacking context and find what is actually covering an element
 async function inspectStacking() {
-  const loc = page.locator('.modal')
+  const loc = state.page.locator('.modal')
   const info = await whyOccluded({ locator: loc })
 
   console.log('position:', info.position, 'z-index:', info.zIndex)
-  console.log('creates its own stacking context:', info.createsStackingContext)
+  // GROUND TRUTH from the layout tree (null when the node was not measured), plus the
+  // declarations that explain it. The declarations never decide the flag.
+  console.log('establishes a stacking context:', info.stackingContext, info.stackingReasons)
+
+  // INFERENCE from paint order + bounds: who is painting over this, and how much.
+  console.log('occluded:', info.occluded, 'by:', info.occludedByLabels, 'fraction:', info.occludedFraction)
+  // GROUND TRUTH tiebreak at the box centre. When the two disagree, this one wins.
+  if (info.hitTest && !info.hitTest.isTarget) console.log('a click actually hits:', info.hitTest.label)
+
   console.log(info.text)
-  // info.occludedBy is null for now — paint-order hit-testing lands in a later milestone.
 }
 
 export {

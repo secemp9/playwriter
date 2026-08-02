@@ -11,10 +11,11 @@ import {
   withTimeout,
   createSimpleServer,
   TEST_WORKSPACE,
+  testRelayPort,
 } from './test-utils.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19992
+const TEST_PORT = testRelayPort(import.meta.url)
 const FIXTURE_EXTENSION_PATH = path.resolve('../extension/test-fixtures/fixture-extension')
 
 describe('Relay Navigation Tests', () => {
@@ -22,7 +23,7 @@ describe('Relay Navigation Tests', () => {
 
   beforeAll(async () => {
     testCtx = await setupTestContext({
-      port: TEST_PORT,
+      suiteUrl: import.meta.url,
       tempDirPrefix: 'pw-nav-test-',
       toggleExtension: true,
       additionalExtensions: [FIXTURE_EXTENSION_PATH],

@@ -1,15 +1,17 @@
-import { page, getStylesForLocator, formatStylesAsText, debugStyle, whyOccluded, console } from './debugger-examples-types.js'
+// `state.page` is the tab this session owns. The bare `page` global is the DEFAULT tab,
+// which is very often not the one you navigated — see "working with pages" in skill.md.
+import { state, getStylesForLocator, formatStylesAsText, debugStyle, whyOccluded, console } from './debugger-examples-types.js'
 
 // Example: Get styles for an element and display them
 async function getElementStyles() {
-  const loc = page.locator('.my-button')
+  const loc = state.page.locator('.my-button')
   const styles = await getStylesForLocator({ locator: loc })
   console.log(formatStylesAsText(styles))
 }
 
 // Example: Inspect computed styles for a specific element
 async function inspectButtonStyles() {
-  const button = page.getByRole('button', { name: 'Submit' })
+  const button = state.page.getByRole('button', { name: 'Submit' })
   const styles = await getStylesForLocator({ locator: button })
 
   console.log('Element:', styles.element)
@@ -28,7 +30,7 @@ async function inspectButtonStyles() {
 
 // Example: Include browser default (user-agent) styles
 async function getStylesWithUserAgent() {
-  const loc = page.locator('input[type="text"]')
+  const loc = state.page.locator('input[type="text"]')
   const styles = await getStylesForLocator({
     locator: loc,
     includeUserAgentStyles: true,
@@ -38,7 +40,7 @@ async function getStylesWithUserAgent() {
 
 // Example: Find where a CSS property is defined
 async function findPropertySource() {
-  const loc = page.locator('.card')
+  const loc = state.page.locator('.card')
   const styles = await getStylesForLocator({ locator: loc })
 
   const backgroundRule = styles.rules.find((r) => 'background-color' in r.declarations)
@@ -52,7 +54,7 @@ async function findPropertySource() {
 
 // Example: Check inherited styles
 async function checkInheritedStyles() {
-  const loc = page.locator('.nested-text')
+  const loc = state.page.locator('.nested-text')
   const styles = await getStylesForLocator({ locator: loc })
 
   const inheritedRules = styles.rules.filter((r) => r.inheritedFrom)
@@ -64,8 +66,8 @@ async function checkInheritedStyles() {
 
 // Example: Compare styles between two elements
 async function compareStyles() {
-  const primary = await getStylesForLocator({ locator: page.locator('.btn-primary') })
-  const secondary = await getStylesForLocator({ locator: page.locator('.btn-secondary') })
+  const primary = await getStylesForLocator({ locator: state.page.locator('.btn-primary') })
+  const secondary = await getStylesForLocator({ locator: state.page.locator('.btn-secondary') })
 
   console.log('Primary button:')
   console.log(formatStylesAsText(primary))
@@ -76,7 +78,7 @@ async function compareStyles() {
 
 // Example: Debug WHY a property has the value it does (cascade winner + losers)
 async function debugWinningColor() {
-  const loc = page.locator('.btn-primary')
+  const loc = state.page.locator('.btn-primary')
   // Pass a specific property to see the winner and every overridden declaration.
   const report = await debugStyle({ locator: loc, property: 'color' })
 
@@ -94,7 +96,7 @@ async function debugWinningColor() {
 
 // Example: See every contested property at once (no property filter)
 async function debugAllContestedProps() {
-  const loc = page.locator('.card')
+  const loc = state.page.locator('.card')
   const report = await debugStyle({ locator: loc })
   console.log(report.text)
 }
@@ -105,15 +107,22 @@ async function debugFromNode(node: unknown) {
   console.log(report.text)
 }
 
-// Example: Inspect stacking-context inputs when an element appears occluded
+// Example: Inspect stacking context and find what is actually covering an element
 async function inspectStacking() {
-  const loc = page.locator('.modal')
+  const loc = state.page.locator('.modal')
   const info = await whyOccluded({ locator: loc })
 
   console.log('position:', info.position, 'z-index:', info.zIndex)
-  console.log('creates its own stacking context:', info.createsStackingContext)
+  // GROUND TRUTH from the layout tree (null when the node was not measured), plus the
+  // declarations that explain it. The declarations never decide the flag.
+  console.log('establishes a stacking context:', info.stackingContext, info.stackingReasons)
+
+  // INFERENCE from paint order + bounds: who is painting over this, and how much.
+  console.log('occluded:', info.occluded, 'by:', info.occludedByLabels, 'fraction:', info.occludedFraction)
+  // GROUND TRUTH tiebreak at the box centre. When the two disagree, this one wins.
+  if (info.hitTest && !info.hitTest.isTarget) console.log('a click actually hits:', info.hitTest.label)
+
   console.log(info.text)
-  // info.occludedBy is null for now — paint-order hit-testing lands in a later milestone.
 }
 
 export {

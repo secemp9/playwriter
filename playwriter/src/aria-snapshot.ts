@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import type { Protocol } from 'devtools-protocol'
 import { Sema } from 'async-sema'
 import type { ICDPSession } from './cdp-session.js'
-import { getCDPSessionForPage } from './cdp-session.js'
+import { getCDPSessionForPage, getCDPSessionForFrame } from './cdp-session.js'
 
 // Import sharp at module level - resolves to null if not available
 const sharpPromise = import('sharp')
@@ -44,11 +44,80 @@ function getA11yClientCode(): string {
   return a11yClientCode
 }
 
+/**
+ * Ceiling on a `page.evaluate` in this module.
+ *
+ * `page.evaluate` has NO deadline of its own, and that is not an oversight to work around
+ * but a fact to defend against. Playwright's frame dispatcher runs the call under
+ * `ProgressController.run(task, params?.timeout)` (dispatcher.ts:107) and the client sends
+ * no `timeout` for `evaluateExpression` (client/frame.ts:205), so the controller's deadline
+ * is `timeout ?? 0` — none. The very first thing `evaluateExpression` does is
+ * `await this._context('main')` (frames.ts:1445), which resolves only when a
+ * `Runtime.executionContextCreated` with `auxData.isDefault` has been seen for that frame.
+ * If that one event was ever missed, the promise is simply never settled: no error, no
+ * timeout, no log — the tool stops responding and has nothing to report. That is the exact
+ * failure this module hit against a second connected target (fixed in cdp-relay.ts's
+ * Runtime.enable ordering fence), and the reason a deadline belongs here regardless: the
+ * cause was upstream and the next one may be too.
+ *
+ * 20s, not a tight bound: a genuine evaluate on a heavy page plus a relay round trip is
+ * tens of milliseconds, so anything approaching this is a wedge, not slowness.
+ */
+const PAGE_EVALUATE_TIMEOUT_MS = 20000
+
+/**
+ * Run a `page.evaluate` with a deadline whose message names what was being waited for and
+ * on which target, so a stall reads as a legible error instead of a freeze.
+ */
+async function evaluateWithDeadline<T>({
+  page,
+  what,
+  run,
+  timeoutMs = PAGE_EVALUATE_TIMEOUT_MS,
+}: {
+  page: Page
+  what: string
+  run: () => Promise<T>
+  timeoutMs?: number
+}): Promise<T> {
+  const url = page.url()
+  let timeoutId: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(
+            new Error(
+              `page.evaluate did not return within ${timeoutMs}ms while ${what} on ${url || '<unknown url>'}. ` +
+                `page.evaluate has no deadline of its own, and it blocks on the target's main-world execution ` +
+                `context, so the usual cause is that Playwright never received this target's ` +
+                `Runtime.executionContextCreated (auxData.isDefault) — check the relay log for that session.`,
+            ),
+          )
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
 async function ensureA11yClient(page: Page): Promise<void> {
-  const hasA11y = await page.evaluate(() => !!(globalThis as any).__a11y)
+  const hasA11y = await evaluateWithDeadline({
+    page,
+    what: 'probing for the injected a11y client (globalThis.__a11y)',
+    run: () => page.evaluate(() => !!(globalThis as any).__a11y),
+  })
   if (!hasA11y) {
     const code = getA11yClientCode()
-    await page.evaluate(code)
+    await evaluateWithDeadline({
+      page,
+      what: 'injecting the a11y client bundle',
+      run: () => page.evaluate(code),
+    })
   }
 }
 
@@ -355,6 +424,23 @@ function buildBaseLocator({
   // won't match these because Chrome doesn't assign an implicit textbox role to
   // contenteditable divs. Elements that already had role="textbox" use the normal
   // role-based locator since Playwright matches those correctly.
+  //
+  // MEASURED against Chromium 145.0.7632.18 on a page holding
+  // `<div contenteditable=true>`, `<div contenteditable=true role=textbox>` and
+  // `<textarea>`. Chrome's own AX roles:
+  //
+  //     bare contenteditable div          role "generic"   (ignored: false)
+  //     contenteditable div + role=textbox role "textbox"
+  //     textarea                           role "textbox"
+  //
+  // and Playwright's `role=textbox` selector matches 2 of the 3 — the roled div and the
+  // textarea — and 0 for the bare one. So both halves of the paragraph above hold: Chrome
+  // really does report "generic", and Playwright really does not match it.
+  //
+  // KNOWN WEAKNESS of the replacement, not fixed here: `[contenteditable="true"]` is not
+  // unique. The same measurement had it match 2 elements on that page. `finalizeSnapshotOutput`
+  // disambiguates repeated base locators with `>> nth=`, but `getSelectorForRef` returns
+  // this string unqualified, so a ref for the second editor on a page resolves to the first.
   if (isPromotedContentEditable) {
     return `[contenteditable="true"]`
   }
@@ -967,36 +1053,26 @@ export async function getAriaSnapshot({
   interactiveOnly?: boolean
   cdp?: ICDPSession
 }): Promise<AriaSnapshotResult> {
-  const session = cdp || (await getCDPSessionForPage({ page }))
-
   // Resolve FrameLocator to an actual Frame. FrameLocator (from locator.contentFrame())
   // is a scoping helper without CDP access. We need the real Frame from page.frames()
-  // which has frameId() for OOPIF session attachment.
+  // which has frameId().
   const resolvedFrame = await resolveFrame({ frame, page })
-
-  // For cross-origin iframes (OOPIFs), we need to attach to the iframe's target
-  // to get a separate CDP session. Same-origin iframes can use frameId directly.
-  let oopifSessionId: string | null = null
   const frameId = resolvedFrame?.frameId() ?? null
 
-  if (frameId) {
-    const { targetInfos } = (await session.send('Target.getTargets')) as Protocol.Target.GetTargetsResponse
-    const frameUrl = resolvedFrame!.url()
-    const iframeTarget = targetInfos.find((t) => {
-      return t.type === 'iframe' && t.url === frameUrl
-    })
-    if (iframeTarget) {
-      const { sessionId } = (await session.send('Target.attachToTarget', {
-        targetId: iframeTarget.targetId,
-        flatten: true,
-      })) as Protocol.Target.AttachToTargetResponse
-      oopifSessionId = sessionId
-      await session.send('Runtime.runIfWaitingForDebugger', undefined, oopifSessionId)
-    }
-  }
+  // A cross-process iframe (OOPIF) has its OWN CDP session and must be asked directly;
+  // a same-process iframe has none and is asked through the page session with a
+  // `frameId` parameter. `getCDPSessionForFrame` is what tells the two apart, and the
+  // distinction is not cosmetic — see its doc comment for the measured behaviour of
+  // each. Getting it wrong returns the PARENT document's tree under the child's name.
+  const frameSession = resolvedFrame ? await getCDPSessionForFrame({ frame: resolvedFrame }) : null
+  const isOopif = frameSession !== null
+  // Only sessions this call created are detached in `finally`; a caller-supplied `cdp`
+  // outlives us.
+  const pageSession = cdp || (await getCDPSessionForPage({ page }))
+  const session: ICDPSession = frameSession ?? pageSession
 
-  await session.send('DOM.enable', undefined, oopifSessionId)
-  await session.send('Accessibility.enable', undefined, oopifSessionId)
+  await session.send('DOM.enable')
+  await session.send('Accessibility.enable')
   const scopeAttr = 'data-pw-scope'
   const scopeValue = crypto.randomUUID()
   let scopeApplied = false
@@ -1013,11 +1089,10 @@ export async function getAriaSnapshot({
       scopeApplied = true
     }
 
-    const { nodes: domNodes } = (await session.send(
-      'DOM.getFlattenedDocument',
-      { depth: -1, pierce: true },
-      oopifSessionId,
-    )) as Protocol.DOM.GetFlattenedDocumentResponse
+    const { nodes: domNodes } = (await session.send('DOM.getFlattenedDocument', {
+      depth: -1,
+      pierce: true,
+    })) as Protocol.DOM.GetFlattenedDocumentResponse
     const { domById, domByBackendId, childrenByParent } = buildDomIndex(domNodes)
 
     let scopeRootNodeId: Protocol.DOM.NodeId | null = null
@@ -1034,12 +1109,29 @@ export async function getAriaSnapshot({
 
     const allowedBackendIds = scopeRootNodeId ? buildBackendIdSet(scopeRootNodeId, childrenByParent, domById) : null
 
-    const axParams = !oopifSessionId && frameId ? { frameId } : undefined
-    const { nodes: axNodes } = (await session.send(
-      'Accessibility.getFullAXTree',
-      axParams,
-      oopifSessionId,
-    )) as Protocol.Accessibility.GetFullAXTreeResponse
+    // On the OOPIF's own session the document IS the frame, so scoping by frameId is
+    // both unnecessary and wrong (the parent's frame id is unknown there). On the page
+    // session an unscoped call would return the TOP document, so `frameId` is required
+    // whenever a frame was asked for.
+    const axParams = isOopif ? undefined : frameId ? { frameId } : undefined
+    const { nodes: axNodes } = (await session
+      .send('Accessibility.getFullAXTree', axParams)
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        // The one failure that used to be invisible: a cross-origin frame that Playwright
+        // holds no session for (so `getCDPSessionForFrame` returned null) is unreachable
+        // from the page session. Say so instead of falling back to the parent's tree.
+        if (frameId && /Frame with the given frameId is not found/i.test(message)) {
+          throw new Error(
+            `getAriaSnapshot: frame ${frameId} (${resolvedFrame?.url() ?? 'unknown url'}) is not reachable from the ` +
+              `page's CDP session, and Playwright holds no separate session for it either. It is a cross-process ` +
+              `iframe whose target was never attached — through the relay, iframe targets are not in ` +
+              `connectedTargets, so no session exists to ask. Refusing to return the parent document's tree in its ` +
+              `place. Original protocol error: ${message}`,
+          )
+        }
+        throw error
+      })) as Protocol.Accessibility.GetFullAXTreeResponse
 
     const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
     for (const node of axNodes) {
@@ -1061,6 +1153,13 @@ export async function getAriaSnapshot({
     // them as "generic" and they become invisible in the snapshot. We detect these
     // via the DOM tree and override the AX role to "textbox" so they appear as
     // interactive elements the AI can target.
+    //
+    // The "generic" is MEASURED, not inferred from the frameworks' behaviour: on
+    // Chromium 145 `Accessibility.getFullAXTree` reports a bare
+    // `<div contenteditable="true">` with `role.value === 'generic'` and
+    // `ignored: false`, while the same div with an explicit `role="textbox"` reports
+    // `'textbox'`. `generic` is in SKIP_WRAPPER_ROLES, so without this promotion the node
+    // is dropped as a wrapper and the editor is simply absent from the snapshot.
     const promotedContentEditableIds = new Set<Protocol.DOM.BackendNodeId>()
     for (const [, domInfo] of domByBackendId) {
       if (!isContentEditable(domInfo.attributes.get('contenteditable'))) {
@@ -1326,13 +1425,11 @@ export async function getAriaSnapshot({
         element.removeAttribute(attr)
       }, scopeAttr)
     }
-    if (oopifSessionId) {
-      await session.send('Target.detachFromTarget', { sessionId: oopifSessionId }).catch((e) => {
-        console.error('[aria-snapshot] Failed to detach OOPIF session:', oopifSessionId, e)
-      })
-    }
+    // The frame session is BORROWED from Playwright (`CDPSession.fromExistingSession`),
+    // so there is nothing to detach and nothing to tear down — Playwright's page
+    // lifecycle owns it. Detaching it here would be detaching Playwright's own session.
     if (!cdp) {
-      await session.detach()
+      await pageSession.detach()
     }
   }
 }
@@ -1509,30 +1606,39 @@ export async function showAriaRefLabels({
     log(`[showAriaRefLabels] getLabelBoxesForRefs: ${Date.now() - labelsStart}ms (${labels.length} boxes)`)
 
     const renderStart = Date.now()
-    const labelCount = await page.evaluate(
-      ({ entries, root, interactiveOnly: intOnly }) => {
-        const a11y = (
-          globalThis as {
-            __a11y?: {
-              renderA11yLabels?: (labels: typeof entries) => number
-              computeA11ySnapshot?: (options: { root: unknown; interactiveOnly: boolean; renderLabels: boolean }) => {
-                labelCount: number
+    const labelCount = await evaluateWithDeadline({
+      page,
+      what: 'rendering the ref-label overlay',
+      run: () =>
+        page.evaluate(
+          ({ entries, root, interactiveOnly: intOnly }) => {
+            const a11y = (
+              globalThis as {
+                __a11y?: {
+                  renderA11yLabels?: (labels: typeof entries) => number
+                  computeA11ySnapshot?: (options: {
+                    root: unknown
+                    interactiveOnly: boolean
+                    renderLabels: boolean
+                  }) => {
+                    labelCount: number
+                  }
+                }
               }
+            ).__a11y
+            if (a11y?.renderA11yLabels) {
+              return a11y.renderA11yLabels(entries)
             }
-          }
-        ).__a11y
-        if (a11y?.renderA11yLabels) {
-          return a11y.renderA11yLabels(entries)
-        }
-        if (a11y?.computeA11ySnapshot) {
-          const rootElement = root || document.body
-          return a11y.computeA11ySnapshot({ root: rootElement, interactiveOnly: intOnly, renderLabels: true })
-            .labelCount
-        }
-        throw new Error('a11y client not loaded')
-      },
-      { entries: shortLabels, root: rootHandle, interactiveOnly },
-    )
+            if (a11y?.computeA11ySnapshot) {
+              const rootElement = root || document.body
+              return a11y.computeA11ySnapshot({ root: rootElement, interactiveOnly: intOnly, renderLabels: true })
+                .labelCount
+            }
+            throw new Error('a11y client not loaded')
+          },
+          { entries: shortLabels, root: rootHandle, interactiveOnly },
+        ),
+    })
 
     log(`[showAriaRefLabels] renderA11yLabels: ${Date.now() - renderStart}ms (${labelCount} labels)`)
     log(`[showAriaRefLabels] total: ${Date.now() - startTime}ms`)
@@ -1547,21 +1653,26 @@ export async function showAriaRefLabels({
  * Remove all aria ref labels from the page.
  */
 export async function hideAriaRefLabels({ page }: { page: Page }): Promise<void> {
-  await page.evaluate(() => {
-    const a11y = (globalThis as any).__a11y
-    if (a11y) {
-      a11y.hideA11yLabels()
-    } else {
-      // Fallback if client not loaded
-      const doc = document
-      const win = window as any
-      const timerKey = '__playwriter_labels_timer__'
-      if (win[timerKey]) {
-        win.clearTimeout(win[timerKey])
-        win[timerKey] = null
-      }
-      doc.getElementById('__playwriter_labels__')?.remove()
-    }
+  await evaluateWithDeadline({
+    page,
+    what: 'removing the ref-label overlay',
+    run: () =>
+      page.evaluate(() => {
+        const a11y = (globalThis as any).__a11y
+        if (a11y) {
+          a11y.hideA11yLabels()
+        } else {
+          // Fallback if client not loaded
+          const doc = document
+          const win = window as any
+          const timerKey = '__playwriter_labels_timer__'
+          if (win[timerKey]) {
+            win.clearTimeout(win[timerKey])
+            win[timerKey] = null
+          }
+          doc.getElementById('__playwriter_labels__')?.remove()
+        }
+      }),
   })
 }
 

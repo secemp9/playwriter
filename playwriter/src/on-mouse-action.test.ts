@@ -15,10 +15,11 @@ import {
   TEST_WORKSPACE,
   type TestContext,
   safeCloseCDPBrowser,
+  testRelayPort,
 } from './test-utils.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19994
+const TEST_PORT = testRelayPort(import.meta.url)
 
 describe('onMouseAction callback', () => {
   let cleanup: (() => Promise<void>) | null = null
@@ -26,7 +27,7 @@ describe('onMouseAction callback', () => {
 
   beforeAll(async () => {
     testCtx = await setupTestContext({
-      port: TEST_PORT,
+      suiteUrl: import.meta.url,
       tempDirPrefix: 'pw-mouse-action-test-',
       toggleExtension: true,
     })

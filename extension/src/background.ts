@@ -5,12 +5,11 @@ declare const __PLAYWRITER_VERSION__: string
 // Bundled automation builds should not burn a tab on the welcome page, especially
 // in headless/VPS flows where the extension is installed only to attach to the relay.
 declare const __PLAYWRITER_OPEN_WELCOME_PAGE__: boolean
-// Dev live-reload: true only in `npm run dev` builds (PLAYWRITER_DEV_RELOAD=1). When on,
-// the service worker polls the dev-reload server and calls chrome.runtime.reload() (which
-// re-reads the unpacked extension from disk) whenever dist/ changes. Never set in
-// production/store builds, so the poller and its localhost fetch never ship to users.
+// Dev live-reload: true only in `npm run dev` builds (PLAYWRITER_DEV_RELOAD=1). Read here
+// solely to report the mode in diagnostics — the reloader itself is the prelude described
+// at the bottom of this file, and needs no cooperation from this module. Never set in
+// production/store builds, so none of it ships to users.
 declare const __PLAYWRITER_DEV_RELOAD__: boolean
-declare const __PLAYWRITER_DEV_RELOAD_PORT__: string
 
 import dedent from 'string-dedent'
 const js = dedent
@@ -2396,10 +2395,11 @@ setInterval(() => {
   )
 }, 15000)
 
-// Dev live-reload lives in `dev-reload.ts` and is armed by the `background-dev.ts`
-// entry point (dev builds only), BEFORE this module runs. It must be registered
-// outside this file: Chrome stops delivering events to a service worker that threw
-// during evaluation, so a poller living here would die with any broken edit.
+// Dev live-reload lives in `scripts/dev-reload-prelude.js`, which the `dev-resilient-reload`
+// vite plugin concatenates AHEAD of this bundle in dev builds only. It must sit outside this
+// module: Chrome stops delivering events — alarms included — to a service worker that threw
+// during evaluation, so a poller living here would die with any broken edit and the extension
+// would stay broken until a human clicked reload.
 
 // Warm the profile cache now (fire-and-forget) so a healthy profile's email has usually
 // resolved by the time the first connect attempt reads it. Never awaited anywhere.

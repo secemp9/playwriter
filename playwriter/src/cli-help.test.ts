@@ -39,14 +39,35 @@ describe('playwriter cli help', () => {
     expect(stderr).toBe('')
   }, 30000)
 
+  // An unknown TOP-LEVEL command is split across both streams by goke (goke.ts:2062 —
+  // `this.console.error('Unknown command: ...')` then `this.outputHelp()`, then exit 1):
+  // the rejection goes to stderr, the usage hint — the whole root help — goes to stdout.
+  //
+  // This test used to also assert stderr contained the literal 'playwriter --help'. That
+  // string is printed by nothing: not by cli.ts, which has no unknown-command handling of
+  // its own, and not by goke on any path (its nearest text is `Run "playwriter <command>
+  // --help" ...`, on stdout, and only for the prefix path). It was introduced in d02fa5d
+  // together with the goke bump that added these messages, so it has never passed. The
+  // sibling test below reads `error.stdout` for the prefix path, which is the same
+  // help-goes-to-stdout contract checked correctly — so the expectation, not the CLI, was
+  // the thing out of step. Both streams are now pinned, so a future goke bump that drops
+  // either half fails here instead of silently degrading the error.
   test('unknown command exits with code 1', async () => {
     try {
       await runCli(['run'])
       expect.unreachable('should have thrown')
     } catch (error: any) {
       expect(error.code).toBe(1)
+      // stderr carries the rejection and only the rejection, so a caller who discards
+      // stdout still learns the command was refused.
       expect(error.stderr).toContain('Unknown command: run')
-      expect(error.stderr).toContain('playwriter --help')
+      expect(error.stderr).not.toContain('Usage:')
+      // stdout carries the remedy: the usage line and the flag that reprints it...
+      expect(error.stdout).toContain('$ playwriter <command> [options]')
+      expect(error.stdout).toContain('-h, --help')
+      // ...followed by the real command list, so the hint is not an empty banner.
+      expect(error.stdout).toContain('session new')
+      expect(error.stdout).toContain('serve')
     }
   }, 30000)
 

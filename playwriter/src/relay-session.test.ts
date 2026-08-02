@@ -16,10 +16,11 @@ import {
   withTimeout,
   js,
   TEST_WORKSPACE,
+  testRelayPort,
 } from './test-utils.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19993
+const TEST_PORT = testRelayPort(import.meta.url)
 
 // --- CDP Session Tests ---
 
@@ -27,7 +28,7 @@ describe('CDP Session Tests', () => {
   let testCtx: TestContext | null = null
 
   beforeAll(async () => {
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-cdp-test-', toggleExtension: true })
+    testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-cdp-test-', toggleExtension: true })
 
     const serviceWorker = await getExtensionServiceWorker(testCtx.browserContext)
     await serviceWorker.evaluate(async () => {
@@ -98,12 +99,17 @@ describe('CDP Session Tests', () => {
     expect(location.sourceContext).toContain('debugger')
 
     const vars = await dbg.inspectLocalVariables()
-    expect(vars).toMatchInlineSnapshot(`
-          {
-            "localVar": "hello",
-            "numberVar": 42,
-          }
-        `)
+    // Asserted explicitly rather than snapshotted: the `limits.note` is prose that
+    // will keep growing, and a snapshot of it turns documentation edits into test
+    // failures. The VALUES are what must not drift.
+    expect(vars.variables).toEqual({ localVar: 'hello', numberVar: 42 })
+    expect(typeof vars.variables.numberVar).toBe('number')
+    expect(vars.frame).toMatchObject({ functionName: 'testFunction', line: 4, column: 16, index: 0, totalFrames: 2 })
+    expect(vars.scopes).toEqual([{ type: 'local', variableCount: 2, shadowed: [], unreadable: false }])
+    expect(vars.cappedValues).toEqual([])
+    expect(vars.overflowedContainers).toEqual([])
+    expect(vars.limits.topFrameOnly).toBe(true)
+    expect(vars.limits.globalScopeSkipped).toBe(true)
 
     const evalResult = await dbg.evaluate({ expression: 'localVar + " world"' })
     expect(evalResult.value).toBe('hello world')
@@ -735,15 +741,21 @@ describe('CDP Session Tests', () => {
     expect(dbg.isPaused()).toBe(true)
 
     const localVars = await dbg.inspectLocalVariables()
-    expect(localVars).toMatchInlineSnapshot(`
-          {
-            "GLOBAL_CONFIG": "production",
-            "scores": "[array]",
-            "settings": "[object]",
-            "userAge": 25,
-            "userName": "Alice",
-          }
-        `)
+    // `scores` is [10, 20, 30] — NUMBERS. CDP hands nested preview values back as
+    // strings for every type, so this used to read ["10","20","30"] and would have
+    // confirmed a type bug that does not exist.
+    expect(localVars.variables).toEqual({
+      GLOBAL_CONFIG: 'production',
+      scores: [10, 20, 30],
+      settings: { lang: 'en', theme: 'dark' },
+      userAge: 25,
+      userName: 'Alice',
+    })
+    for (const n of localVars.variables.scores as unknown[]) expect(typeof n).toBe('number')
+    expect(localVars.frame).toMatchObject({ functionName: 'runTest', index: 0 })
+    expect(localVars.scopes.map((sc) => sc.type)).toEqual(['local', 'script'])
+    expect(localVars.cappedValues).toEqual([])
+    expect(localVars.overflowedContainers).toEqual([])
 
     await dbg.resume()
     // Wait for evaluate to complete after resume
@@ -1071,7 +1083,7 @@ describe('Service Worker Target Tests', () => {
   let testCtx: TestContext | null = null
 
   beforeAll(async () => {
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-sw-test-', toggleExtension: true })
+    testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-sw-test-', toggleExtension: true })
   }, 600000)
 
   afterAll(async () => {
@@ -1296,7 +1308,7 @@ describe('Auto-enable Tests', () => {
   let cleanup: (() => Promise<void>) | null = null
 
   beforeAll(async () => {
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-auto-test-' })
+    testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-auto-test-' })
 
     const result = await createMCPClient({ port: TEST_PORT })
     client = result.client

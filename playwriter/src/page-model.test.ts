@@ -3,8 +3,10 @@ import type { AriaSnapshotNode } from './aria-snapshot.js'
 import {
   buildPageModelFromRaw,
   DEFAULT_FIELDS,
+  type FrameGeometry,
   type ModelDomInfo,
   type PageModelNode,
+  type SnapshotNodeGeometry,
 } from './page-model.js'
 
 // --- fixtures ---------------------------------------------------------------
@@ -59,8 +61,59 @@ function makeDomIndex(): Map<number, ModelDomInfo> {
   ])
 }
 
+/**
+ * Geometry is a required input — a model nobody measured cannot answer "is this
+ * visible?", so `buildPageModelFromRaw` refuses to build one. These tests are about
+ * fusing and projection rather than layout, so this factory hands every node a plain
+ * measured record: laid out, opaque, on screen, and stacked so that no box overlaps
+ * another (hence no occlusion). Geometry-specific behaviour is covered in
+ * `page-model-geometry.test.ts`, which decodes real captureSnapshot payloads.
+ */
+function measuredGeometry(backendNodeIds: number[]): Map<string, FrameGeometry> {
+  const byBackendId = new Map<number, SnapshotNodeGeometry>()
+  const byNodeIndex = new Map<number, SnapshotNodeGeometry>()
+  backendNodeIds.forEach((backendNodeId, index) => {
+    const record: SnapshotNodeGeometry = {
+      backendNodeId,
+      nodeIndex: index,
+      nodeType: 1,
+      nodeName: 'DIV',
+      label: 'div',
+      box: { x: 0, y: index * 30, width: 100, height: 20 },
+      paintOrder: index,
+      styles: { display: 'block', visibility: 'visible', opacity: '1', 'pointer-events': 'auto' },
+      stackingContext: false,
+    }
+    byBackendId.set(backendNodeId, record)
+    byNodeIndex.set(index, record)
+  })
+  return new Map<string, FrameGeometry>([
+    [
+      FRAME,
+      {
+        frameId: FRAME,
+        byBackendId,
+        byNodeIndex,
+        documentBackendIds: new Set(backendNodeIds),
+        // All siblings: no node is an ancestor of another.
+        parentIndex: backendNodeIds.map(() => -1),
+        scrollOffsetX: 0,
+        scrollOffsetY: 0,
+        viewport: { x: 0, y: 0, width: 800, height: 600 },
+      },
+    ],
+  ])
+}
+
+const GEOMETRY = measuredGeometry([10, 11, 12, 13, 14])
+
 function build() {
-  return buildPageModelFromRaw({ ariaTree: makeAriaTree(), domByBackendId: makeDomIndex(), frameId: FRAME })
+  return buildPageModelFromRaw({
+    ariaTree: makeAriaTree(),
+    domByBackendId: makeDomIndex(),
+    frameId: FRAME,
+    geometry: GEOMETRY,
+  })
 }
 
 // --- tests ------------------------------------------------------------------
@@ -202,7 +255,7 @@ describe('diffAgainst', () => {
     })
     const dom = makeDomIndex()
     dom.set(14, { nodeName: 'BUTTON', attributes: { id: 'delete' } })
-    const next = buildPageModelFromRaw({ ariaTree: tree, domByBackendId: dom, frameId: FRAME })
+    const next = buildPageModelFromRaw({ ariaTree: tree, domByBackendId: dom, frameId: FRAME, geometry: GEOMETRY })
 
     next.diffAgainst(prev)
 
@@ -223,7 +276,7 @@ describe('diffAgainst', () => {
     })
     const dom = makeDomIndex()
     dom.set(14, { nodeName: 'BUTTON', attributes: {} })
-    const next = buildPageModelFromRaw({ ariaTree: tree, domByBackendId: dom, frameId: FRAME })
+    const next = buildPageModelFromRaw({ ariaTree: tree, domByBackendId: dom, frameId: FRAME, geometry: GEOMETRY })
     next.diffAgainst(prev)
 
     const rows = next.query({ roles: ['button'], changedSince: true })

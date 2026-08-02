@@ -2,12 +2,17 @@ import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
 import http from 'node:http'
 import net from 'node:net'
-import { chromium, BrowserContext } from '@xmorse/playwright-core'
+// Type-only: importing the value would make every module that touches this file (including
+// the browser-free suites that only want testRelayPort) load playwright-core. setupTestContext
+// imports chromium dynamically instead, at the one place that actually launches a browser.
+import type { BrowserContext } from '@xmorse/playwright-core'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
-import { createFileLogger } from './create-logger.js'
+import { createCdpLogger, type CdpLogger } from './cdp-log.js'
+import { createFileLogger, type Logger } from './create-logger.js'
 import { killPortProcess } from './kill-port.js'
 import { deriveWorkspace } from './workspace-key.js'
 
@@ -22,6 +27,95 @@ const execAsync = promisify(exec)
  * (human-icon-click) path, whose tab must then be invisible to every keyed client.
  */
 export const TEST_WORKSPACE = deriveWorkspace()
+
+/**
+ * The port a real relay daemon listens on (relay-client.ts's RELAY_PORT default). No test
+ * suite may take it: a suite that did would fight the developer's own running daemon.
+ */
+const PRODUCTION_RELAY_PORT = 19988
+
+/**
+ * The single place a test suite's relay port is decided.
+ *
+ * Two suites sharing a port is not a nuisance, it is a whole-file outage: the second relay
+ * to bind throws EADDRINUSE inside beforeAll, so every test in that file fails to collect
+ * while both files still pass in isolation. That is exactly what happened when
+ * popup-relocation.test.ts and trace-integration.test.ts both hardcoded 19995 — it cost all
+ * 7 trace-integration tests, silently, only in a full run.
+ *
+ * Renumbering one of them would have moved the tripwire, not removed it. So every port lives
+ * here, keyed by the test file that owns it, and three invariants are checked at import time
+ * by the block below — meaning any suite that imports this module fails loudly and
+ * immediately, before a single browser is launched:
+ *
+ *   1. no two suites may share a port,
+ *   2. no suite may take PRODUCTION_RELAY_PORT,
+ *   3. an unregistered suite gets an exception from testRelayPort(), never a number it made up.
+ *
+ * The remaining way to collide would be to hardcode a number instead of calling
+ * testRelayPort(). setupTestContext() closes that off by construction: it takes `suiteUrl`
+ * (pass `import.meta.url`) and resolves the port itself, so there is no port parameter for a
+ * literal to be passed to.
+ *
+ * Ports are deliberately stable per suite rather than ephemeral: buildExtension() bakes the
+ * port into the extension bundle (PLAYWRITER_PORT) and caches the result in
+ * ../extension/dist-<port>, so a random port every run would rebuild the extension every run
+ * and leave an unbounded pile of dist directories behind.
+ */
+const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
+  'relay-workspace.test.ts': 19771,
+  'relay-two-targets.test.ts': 19772,
+  'trace-integration.test.ts': 19985,
+  'aria-snapshot.test.ts': 19986,
+  'relay-core.test.ts': 19987,
+  'extension-connection.test.ts': 19990,
+  'snapshot-tools.test.ts': 19991,
+  'relay-navigation.test.ts': 19992,
+  'relay-session.test.ts': 19993,
+  'on-mouse-action.test.ts': 19994,
+  'popup-relocation.test.ts': 19995,
+  'relay-state.test.ts': 19996,
+})
+
+// Invariants (1) and (2), enforced at module load so a bad edit cannot reach a test run.
+{
+  const ownerByPort = new Map<number, string>()
+  for (const [suite, port] of Object.entries(TEST_RELAY_PORTS)) {
+    if (port === PRODUCTION_RELAY_PORT) {
+      throw new Error(
+        `TEST_RELAY_PORTS: ${suite} is assigned ${port}, the port a real relay daemon uses. Pick another.`,
+      )
+    }
+    const previousOwner = ownerByPort.get(port)
+    if (previousOwner) {
+      throw new Error(
+        `TEST_RELAY_PORTS: ${previousOwner} and ${suite} are both assigned port ${port}. ` +
+          `Two suites on one port make the second relay die with EADDRINUSE and take its whole file ` +
+          `with it. Give one of them an unused port.`,
+      )
+    }
+    ownerByPort.set(port, suite)
+  }
+}
+
+/**
+ * The relay port owned by the calling test file. Pass `import.meta.url`.
+ *
+ * Throws for an unregistered suite (invariant 3) rather than inventing a port, so a new test
+ * file cannot quietly reuse another's.
+ */
+export function testRelayPort(suiteUrl: string): number {
+  const suite = path.basename(suiteUrl.startsWith('file:') ? fileURLToPath(suiteUrl) : suiteUrl)
+  const port = TEST_RELAY_PORTS[suite]
+  if (port === undefined) {
+    throw new Error(
+      `No relay port is registered for ${suite}. Add it to TEST_RELAY_PORTS in src/test-utils.ts ` +
+        `with a port no other suite uses — do not hardcode one in the test file.`,
+    )
+  }
+  return port
+}
+
 const extensionBuildQueues: Map<string, Promise<void>> = new Map()
 
 async function buildExtension({ port, distDir }: { port: number; distDir: string }): Promise<void> {
@@ -81,21 +175,32 @@ export interface TestContext {
   browserContext: BrowserContext
   userDataDir: string
   relayServer: RelayServer
+  /** The suite's relay port, resolved from TEST_RELAY_PORTS. */
+  port: number
+  /** This suite's own relay log. Never the shared one — see setupTestContext. */
+  logger: Logger
+  /** This suite's own CDP wire log. Never the shared one — see setupTestContext. */
+  cdpLogger: CdpLogger
 }
 
 export async function setupTestContext({
-  port,
+  suiteUrl,
   tempDirPrefix,
   toggleExtension = false,
   additionalExtensions = [],
 }: {
-  port: number
+  /**
+   * Pass `import.meta.url`. The relay port is looked up from TEST_RELAY_PORTS, never supplied
+   * by the caller — that is what makes a hardcoded, collidable port impossible on this path.
+   */
+  suiteUrl: string
   tempDirPrefix: string
   /** Create initial page and toggle extension on it */
   toggleExtension?: boolean
   /** Additional extension paths to load alongside the main playwriter extension */
   additionalExtensions?: string[]
 }): Promise<TestContext> {
+  const port = testRelayPort(suiteUrl)
   await killPortProcess({ port }).catch(() => {})
 
   // Use a port-scoped dist folder so parallel tests don't replace each other's extension builds.
@@ -105,14 +210,22 @@ export async function setupTestContext({
   await buildExtension({ port, distDir })
   console.log('Extension built')
 
-  const localLogPath = path.join(process.cwd(), 'relay-server.log')
-  const logger = createFileLogger({ logFilePath: localLogPath })
-  const relayServer = await startPlayWriterCDPRelayServer({ port, logger })
+  // Both loggers truncate their file on construction and buffer writes for 500ms. Pointing
+  // every suite at one shared file therefore does two things to any test that reads the log
+  // back: a suite starting its relay wipes the file another suite is midway through
+  // measuring, and line-count slicing across that wipe silently yields nothing. That is what
+  // made the download-events assertion in relay-core flip to all-false in a full run while
+  // passing alone. Per-port files remove the sharing; TestContext hands the test the exact
+  // logger so it can flush() before reading, which removes the 500ms buffer race too.
+  const logger = createFileLogger({ logFilePath: path.join(process.cwd(), 'tmp', `relay-server-${port}.log`) })
+  const cdpLogger = createCdpLogger({ logFilePath: path.join(process.cwd(), 'tmp', `cdp-${port}.jsonl`) })
+  const relayServer = await startPlayWriterCDPRelayServer({ port, logger, cdpLogger })
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix))
   const extensionPath = path.resolve('../extension', distDir)
   const allExtensionPaths = [extensionPath, ...additionalExtensions].join(',')
 
+  const { chromium } = await import('@xmorse/playwright-core')
   const browserContext = await chromium.launchPersistentContext(userDataDir, {
     channel: 'chromium',
     headless: !process.env.HEADFUL,
@@ -133,7 +246,7 @@ export async function setupTestContext({
     )
   }
 
-  return { browserContext, userDataDir, relayServer }
+  return { browserContext, userDataDir, relayServer, port, logger, cdpLogger }
 }
 
 export async function cleanupTestContext(
@@ -367,6 +480,46 @@ export async function safeCloseCDPBrowser(
   await browser.close()
 }
 
+/**
+ * Read a committed page fixture, `src/assets/fixture-<name>.html`.
+ *
+ * These are real, complicated websites captured once and neutralised so they load nothing at all
+ * from the network — see scripts/capture-page-fixture.ts, which is both how they were made and
+ * how they are regenerated. Serve one through createSimpleServer() and a suite gets the same
+ * deep, dense, real-world DOM the live site used to provide, minus the live site: the aria
+ * snapshot and ref-label tests need a tree that hand-written HTML does not produce, and pointing
+ * a browser at news.ycombinator.com to get one made those tests fail on network luck.
+ */
+export function readPageFixture(name: string): string {
+  const fixtureFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'assets', `fixture-${name}.html`)
+  if (!fs.existsSync(fixtureFile)) {
+    throw new Error(
+      `Missing page fixture ${fixtureFile}. Regenerate it with: bun scripts/capture-page-fixture.ts ${name}`,
+    )
+  }
+  return fs.readFileSync(fixtureFile, 'utf-8')
+}
+
+/**
+ * URL prefixes that fetch nothing over the network, on top of the fixture server's own origin.
+ * `chrome-extension:` is here because the playwriter extension injects its toolbar into every
+ * connected tab.
+ *
+ * Exported as data, not just baked into the predicate below, because one of the two call sites
+ * runs inside the MCP sandbox as a code string and has to inline the list — one definition
+ * rather than two that can drift.
+ */
+export const INERT_REQUEST_URL_PREFIXES: readonly string[] = ['data:', 'about:', 'blob:', 'chrome-extension://']
+
+/**
+ * Whether a request a fixture-served page made stayed local. Anything else means the fixture
+ * still reaches the internet, which is the exact failure the fixtures exist to remove — so the
+ * tests assert on this every run rather than trusting the capture script's one-time check.
+ */
+export function isLocalOrInertRequestUrl({ url, baseUrl }: { url: string; baseUrl: string }): boolean {
+  return url.startsWith(baseUrl) || INERT_REQUEST_URL_PREFIXES.some((prefix) => url.startsWith(prefix))
+}
+
 export type SimpleServer = {
   baseUrl: string
   close: () => Promise<void>
@@ -379,11 +532,15 @@ export async function createSimpleServer({ routes }: { routes: Record<string, st
     const url = req.url || '/'
     const body = routes[url]
     if (!body) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
       res.end('not found')
       return
     }
-    res.writeHead(200, { 'Content-Type': 'text/html' })
+    // charset=utf-8 explicitly, matching every other local test server in this package. Without
+    // it Chrome falls back to encoding sniffing, and the committed page fixtures served through
+    // here (src/assets/fixture-*.html) are full of non-ASCII — Hacker News's "[–]" collapse
+    // links alone would come back mojibake and change the accessible names under test.
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(body)
   })
 

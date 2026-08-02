@@ -71,6 +71,21 @@ function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
 // Only events that no Playwright API depends on. See: https://github.com/remorses/playwriter/issues/96
 // NOTE: *ExtraInfo events feed Playwright's ResponseExtraInfoTracker for request/response.allHeaders().
 // webSocketFrame* events feed page.on('websocket') frame events. Both must be forwarded.
+//
+// VERIFIED against the pinned playwright-core 1.59.10 source rather than assumed, because dropping an
+// event a Playwright API depends on produces a silently incomplete result, not an error:
+//   - Network.requestWillBeSentExtraInfo / responseReceivedExtraInfo — subscribed at
+//     crNetworkManager.ts:68 and :71, both feeding `ResponseExtraInfoTracker` (declared :737), which is
+//     what patches the real headers onto a response before `requestfinished`. Dropping them would make
+//     allHeaders() return the pre-flight header set with nothing to say headers were missing.
+//   - Network.webSocketFrameSent / webSocketFrameReceived / webSocketFrameError — subscribed at
+//     crNetworkManager.ts:80, :81 and :83, feeding frameManager.onWebSocketFrameSent /
+//     webSocketFrameReceived / webSocketError. Dropping them makes page.on('websocket') report a socket
+//     that never carries a frame.
+//   - Network.dataReceived and Network.resourceChangedPriority — searched the whole of
+//     playwright-core/src: the ONLY occurrences are type declarations in the generated protocol.d.ts.
+//     No listener anywhere, so nothing observable is lost by dropping them. That is why these two, and
+//     only these two, are in the set below.
 const DROPPED_CDP_EVENTS = new Set([
   'Network.dataReceived',
   'Network.resourceChangedPriority',
@@ -213,6 +228,283 @@ export async function startPlayWriterCDPRelayServer({
     return normalized ? normalized : null
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // CDP per-session ordering: the Runtime.enable fence
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  //
+  // Real CDP puts everything for one session on ONE ordered pipe, so a command's response
+  // always reaches the client before any event the NEXT command produces. This bridge
+  // cannot inherit that guarantee. A command travels
+  //   Playwright -> relay -> extension WS -> chrome.debugger.sendCommand -> Chrome
+  // and comes back as a promise resolution, while an event travels
+  //   Chrome -> chrome.debugger.onEvent -> extension WS -> relay -> Playwright
+  // as an independent push. Chrome gives an extension service worker no ordering
+  // guarantee between those two dispatch paths, and the relay hands every Playwright
+  // command to its own async task, so responses and events race.
+  //
+  // MEASURED, not assumed. In the run this was found in (tmp/cdp-19991.jsonl, a suite with
+  // three connected page targets), for the third session the relay delivered the three
+  // Runtime.executionContextCreated events — including the isDefault:true main world —
+  // and only AFTER them the Page.getFrameTree response for the same session:
+  //
+  //   1945 to-playwright Runtime.executionContextCreated pw-tab-…-11 id=5 isDefault=false
+  //   1947 to-playwright Runtime.executionContextCreated pw-tab-…-11 id=4 isDefault=false
+  //   1949 to-playwright Runtime.executionContextCreated pw-tab-…-11 id=3 isDefault=TRUE
+  //   1957 to-playwright RESPONSE id=27  (Page.getFrameTree on pw-tab-…-11)
+  //
+  // The two sessions whose getFrameTree response won the race (responses at 1899 and 1931,
+  // contexts at 1978+ and 1999+) worked; only the inverted one broke.
+  //
+  // The inversion is fatal because of two things in the pinned playwright-core 1.59.10:
+  //   - FrameSession._initialize registers its Runtime.executionContextCreated listener
+  //     INSIDE the Page.getFrameTree().then() callback (crPage.ts:457-461, via
+  //     _addRendererListeners), so a context event that arrives first has no listener; and
+  //   - _onExecutionContextCreated (crPage.ts:654) returns early when
+  //     auxData.frameId is not yet a known frame, which is also only true after the frame
+  //     tree has been handled.
+  // Chrome emits executionContextCreated exactly once per Runtime.enable, so a dropped one
+  // never comes back. frame._context('main') then never resolves, and page.evaluate on that
+  // target waits forever: Playwright's dispatcher calls ProgressController.run with
+  // `params?.timeout` (dispatcher.ts:107) and frame.evaluateExpression sends no timeout, so
+  // the deadline is 0 = none. That is the whole "a second connected target hangs" symptom.
+  //
+  // THE FIX restores exactly the violated half of the CDP guarantee and nothing wider:
+  // while a client has commands in flight on a session that it sent BEFORE a Runtime.enable
+  // on that same session, the execution-context events that Runtime.enable produces are
+  // held for that client and flushed, in arrival order, once those earlier commands have
+  // been answered.
+  //
+  // Deliberately NOT a general "hold every event while any command is in flight" gate:
+  // that deadlocks. Runtime.evaluate with awaitPromise on a page awaiting an exposed
+  // binding needs Runtime.bindingCalled delivered WHILE the evaluate is outstanding.
+  // Deliberately NOT full per-session command serialization either, for the same reason in
+  // the other direction: Chrome does not block a session's other commands behind a
+  // long-running Runtime.evaluate, so serializing would wedge
+  // `Promise.all([page.evaluate(slow), page.click(...)])`. The fence exists only inside a
+  // Runtime.enable window, only holds Runtime.executionContext* events, and only waits on
+  // commands that were ALREADY outstanding when the Runtime.enable arrived — every one of
+  // which is independently bounded by sendToExtension's own timeout.
+
+  /**
+   * Ceiling on how long a fence may hold execution-context events. Every command it waits
+   * on is already bounded (sendToExtension rejects after 30s, the extension's own
+   * per-command timeouts are shorter), so this only fires when something upstream is
+   * already broken. It then flushes rather than swallowing, and says so loudly.
+   */
+  const ORDERING_FENCE_TIMEOUT_MS = 35000
+
+  /**
+   * The events whose ordering against earlier responses Playwright's page initialization
+   * depends on. Kept to exactly these three: they are the once-only, state-critical ones
+   * (crPage.ts:416-418), and holding anything else risks the deadlocks described above.
+   */
+  const CONTEXT_LIFECYCLE_EVENTS: ReadonlySet<string> = new Set([
+    'Runtime.executionContextCreated',
+    'Runtime.executionContextDestroyed',
+    'Runtime.executionContextsCleared',
+  ])
+
+  type OrderingFence = {
+    /** Command ids this client had outstanding on the session when Runtime.enable arrived. */
+    waitingFor: Set<number>
+    /** Already-serialized messages held back, in arrival order. */
+    queued: string[]
+    timer: ReturnType<typeof setTimeout>
+  }
+
+  type ClientOrdering = {
+    /** sessionId -> ids of this client's commands that have not been answered yet. */
+    inFlight: Map<string, Set<number>>
+    /** sessionId -> the open fence for that session, if any. */
+    fences: Map<string, OrderingFence>
+  }
+
+  const clientOrdering = new Map<string, ClientOrdering>()
+
+  const getClientOrdering = (clientId: string): ClientOrdering => {
+    const existing = clientOrdering.get(clientId)
+    if (existing) {
+      return existing
+    }
+    const created: ClientOrdering = { inFlight: new Map(), fences: new Map() }
+    clientOrdering.set(clientId, created)
+    return created
+  }
+
+  /** Names a target the way a human debugging a stall needs it named: which tab, which URL. */
+  const describeCdpSession = (sessionId: string): string => {
+    const extensionId = findExtensionIdByCdpSession(sessionId)
+    const target = extensionId
+      ? store.getState().extensions.get(extensionId)?.connectedTargets.get(sessionId)
+      : undefined
+    if (!target) {
+      return `sessionId=${sessionId} (no connected target)`
+    }
+    return `sessionId=${sessionId} targetId=${target.targetId} url=${target.targetInfo.url || '<empty>'}`
+  }
+
+  /**
+   * Write out everything a fence held and forget the fence.
+   *
+   * The flush is deferred one event-loop turn on purpose. The response that released the
+   * fence was written in THIS turn; writing the held events in the same turn lets them
+   * coalesce into one TCP segment, and the client's `ws` receiver emits a batched segment's
+   * frames synchronously (allowSynchronousEvents defaults to true in the bundled ws 8.17.1),
+   * which means no microtask runs between them — and Playwright registers the listener a few
+   * microtasks after processing the response (crConnection dispatches events through
+   * Promise.resolve().then, while CRSession.send's promise adoption costs extra ticks). One
+   * turn of separation is what keeps the ordering we just paid for from being undone by
+   * batching. Deferring is safe: nothing waits on the flush, and the fence is already gone
+   * from the map so no later event can jump ahead of the queue.
+   */
+  const flushOrderingFence = ({
+    clientId,
+    sessionId,
+    fence,
+  }: {
+    clientId: string
+    sessionId: string
+    fence: OrderingFence
+  }): void => {
+    clearTimeout(fence.timer)
+    const ordering = clientOrdering.get(clientId)
+    if (ordering?.fences.get(sessionId) === fence) {
+      ordering.fences.delete(sessionId)
+    }
+    if (fence.queued.length === 0) {
+      return
+    }
+    const held = fence.queued.splice(0, fence.queued.length)
+    setImmediate(() => {
+      const client = store.getState().playwrightClients.get(clientId)
+      if (!client) {
+        return
+      }
+      for (const message of held) {
+        try {
+          client.ws.send(message)
+        } catch (e) {
+          logger?.log(
+            pc.gray(`[Relay] Skipped flushing held event to closing client ${clientId}: ${(e as Error).message}`),
+          )
+        }
+      }
+    })
+  }
+
+  /** Record that a client sent a command on a session and is waiting for its response. */
+  const noteCommandStarted = ({
+    clientId,
+    sessionId,
+    id,
+  }: {
+    clientId: string
+    sessionId: string
+    id: number
+  }): void => {
+    const ordering = getClientOrdering(clientId)
+    const inFlight = ordering.inFlight.get(sessionId)
+    if (inFlight) {
+      inFlight.add(id)
+      return
+    }
+    ordering.inFlight.set(sessionId, new Set([id]))
+  }
+
+  /**
+   * Record that a command's response has been WRITTEN to the client (callers must do this
+   * after sendToPlaywright, never before), and release any fence that was waiting on it.
+   */
+  const noteCommandFinished = ({
+    clientId,
+    sessionId,
+    id,
+  }: {
+    clientId: string
+    sessionId: string
+    id: number
+  }): void => {
+    const ordering = clientOrdering.get(clientId)
+    if (!ordering) {
+      return
+    }
+    const inFlight = ordering.inFlight.get(sessionId)
+    inFlight?.delete(id)
+    const fence = ordering.fences.get(sessionId)
+    if (fence) {
+      fence.waitingFor.delete(id)
+      if (fence.waitingFor.size === 0) {
+        flushOrderingFence({ clientId, sessionId, fence })
+      }
+    }
+    // Forget a quiet session so a long-lived client that cycles through many tabs does not
+    // accumulate one empty Set per session it ever touched.
+    if (inFlight && inFlight.size === 0 && !ordering.fences.has(sessionId)) {
+      ordering.inFlight.delete(sessionId)
+    }
+  }
+
+  /**
+   * Open a fence for a Runtime.enable, capturing the commands this client already had
+   * outstanding on the same session. No fence is opened when there is nothing to wait for —
+   * the common case, and the one that must stay free.
+   */
+  const openOrderingFence = ({
+    clientId,
+    sessionId,
+    runtimeEnableId,
+  }: {
+    clientId: string
+    sessionId: string
+    runtimeEnableId: number
+  }): void => {
+    const ordering = getClientOrdering(clientId)
+    const outstanding = ordering.inFlight.get(sessionId)
+    const waitingFor = new Set(
+      Array.from(outstanding ?? []).filter((pendingId) => {
+        return pendingId !== runtimeEnableId
+      }),
+    )
+    if (waitingFor.size === 0) {
+      return
+    }
+    // A second Runtime.enable on the same session supersedes the first; release the old
+    // fence's queue rather than stranding it behind ids that may already be answered.
+    const previous = ordering.fences.get(sessionId)
+    if (previous) {
+      flushOrderingFence({ clientId, sessionId, fence: previous })
+    }
+    const fence: OrderingFence = {
+      waitingFor,
+      queued: [],
+      timer: setTimeout(() => {
+        logger?.log(
+          pc.yellow(
+            `IMPORTANT: CDP ordering fence timed out after ${ORDERING_FENCE_TIMEOUT_MS}ms waiting for ` +
+              `${waitingFor.size} earlier command(s) (ids ${Array.from(waitingFor).join(', ')}) to be answered ` +
+              `before releasing ${fence.queued.length} held execution-context event(s) for client ${clientId} on ` +
+              `${describeCdpSession(sessionId)}. Releasing them anyway — if Playwright had not yet handled ` +
+              `Page.getFrameTree for this session, page.evaluate against it will never return.`,
+          ),
+        )
+        flushOrderingFence({ clientId, sessionId, fence })
+      }, ORDERING_FENCE_TIMEOUT_MS),
+    }
+    ordering.fences.set(sessionId, fence)
+  }
+
+  /** Drop all ordering bookkeeping for a client that has gone away. */
+  const dropClientOrdering = (clientId: string): void => {
+    const ordering = clientOrdering.get(clientId)
+    if (!ordering) {
+      return
+    }
+    for (const fence of ordering.fences.values()) {
+      clearTimeout(fence.timer)
+    }
+    clientOrdering.delete(clientId)
+  }
+
   const getPageTargetForFrameId = ({
     extensionState,
     frameId,
@@ -350,6 +642,20 @@ export async function startPlayWriterCDPRelayServer({
     // This can cause "Assertion error" in Playwright's crConnection.js if a response
     // arrives after callbacks were cleared. We wrap in try-catch to handle this gracefully.
     const safeSend = (client: relayState.PlaywrightClient) => {
+      // CDP ordering (see the Runtime.enable fence above): a client whose page session is
+      // mid-initialization must not see this session's execution-context events before the
+      // responses to the commands it sent earlier on that session. When such a fence is
+      // open, queue instead of sending; the queue is flushed in arrival order the moment
+      // the last of those responses has been written.
+      const fencedMethod = 'method' in message ? message.method : null
+      const fencedSessionId = typeof message.sessionId === 'string' ? message.sessionId : null
+      if (fencedMethod && fencedSessionId && CONTEXT_LIFECYCLE_EVENTS.has(fencedMethod)) {
+        const fence = clientOrdering.get(client.id)?.fences.get(fencedSessionId)
+        if (fence) {
+          fence.queued.push(messageStr)
+          return
+        }
+      }
       try {
         client.ws.send(messageStr)
       } catch (e) {
@@ -821,6 +1127,16 @@ export async function startPlayWriterCDPRelayServer({
       // Target.setAutoAttach is a CDP command Playwright sends on first connection.
       // We use it as the hook to auto-create an initial tab. If Playwright changes
       // its initialization sequence in the future, this could be moved to a different command.
+      //
+      // VERIFIED against the pinned playwright-core 1.59.10 source: `Target.setAutoAttach` is sent from
+      // crBrowser.ts:82 and :87 during browser connect (the sessionless call this branch handles), and
+      // again per-page from crPage.ts:500 and per-worker from crPage.ts:734 — those carry a sessionId
+      // and are filtered out by the `if (sessionId) break` above. So the sessionless one really is the
+      // connect-time signal, and there is exactly one of it per client.
+      //
+      // The fragility is real and worth keeping stated: this is a behavioural coupling to Playwright's
+      // startup order, not a contract Playwright offers. If it ever stops sending a sessionless
+      // setAutoAttach, auto-create silently stops happening and a client connects to no tab.
       case 'Target.setAutoAttach': {
         if (sessionId) {
           break
@@ -972,7 +1288,10 @@ export async function startPlayWriterCDPRelayServer({
             emitter.off('cdp:event', handler)
             logger?.log(
               pc.yellow(
-                `IMPORTANT: Runtime.enable timed out waiting for main frame executionContextCreated (sessionId: ${sessionId}). This may cause pages to not be visible immediately.`,
+                `IMPORTANT: Runtime.enable timed out after 3000ms waiting for the main-frame ` +
+                  `Runtime.executionContextCreated (auxData.isDefault) on ${describeCdpSession(sessionId)}. ` +
+                  `Answering Runtime.enable anyway. If the event never arrives at all, page.evaluate against ` +
+                  `this target will never return — Playwright waits for a frame's execution context with no deadline.`,
               ),
             )
             resolve()
@@ -1378,6 +1697,18 @@ export async function startPlayWriterCDPRelayServer({
 
           emitter.emit('cdp:command', { clientId, command: message })
 
+          // CDP ordering bookkeeping (see the Runtime.enable fence near the top of this
+          // file). Only session-scoped, id-bearing commands take part: a browser-level
+          // command has no session whose event stream it could be ordered against.
+          const orderingSessionId = typeof sessionId === 'string' && sessionId ? sessionId : null
+          const orderingId = typeof id === 'number' ? id : null
+          if (orderingSessionId !== null && orderingId !== null) {
+            noteCommandStarted({ clientId, sessionId: orderingSessionId, id: orderingId })
+            if (method === 'Runtime.enable') {
+              openOrderingFence({ clientId, sessionId: orderingSessionId, runtimeEnableId: orderingId })
+            }
+          }
+
           const boundExtensionId = getBoundExtensionIdForClient()
           const extensionConn = getExtensionConnection(boundExtensionId)
           if (!extensionConn) {
@@ -1389,6 +1720,9 @@ export async function startPlayWriterCDPRelayServer({
               },
               clientId,
             })
+            if (orderingSessionId !== null && orderingId !== null) {
+              noteCommandFinished({ clientId, sessionId: orderingSessionId, id: orderingId })
+            }
             return
           }
 
@@ -1581,11 +1915,21 @@ export async function startPlayWriterCDPRelayServer({
             }
             sendToPlaywright({ message: errorResponse, clientId })
             emitter.emit('cdp:response', { clientId, response: errorResponse, command: message })
+          } finally {
+            // AFTER the response has been written, never before: releasing a fence is what
+            // lets the held execution-context events go out, and they must follow the
+            // response they were ordered behind. The finally also covers the early returns
+            // inside the try (the disconnect-race paths), so a vanished client cannot strand
+            // a fence.
+            if (orderingSessionId !== null && orderingId !== null) {
+              noteCommandFinished({ clientId, sessionId: orderingSessionId, id: orderingId })
+            }
           }
         },
 
         onClose() {
           store.setState((s) => relayState.removePlaywrightClient(s, { clientId }))
+          dropClientOrdering(clientId)
           logger?.log(pc.yellow(`Playwright client disconnected: ${clientId} (${store.getState().playwrightClients.size} remaining)`))
         },
 
@@ -1874,6 +2218,24 @@ export async function startPlayWriterCDPRelayServer({
                     // The frameId mapping is racy: Target.attachedToTarget can arrive before Page.frameAttached/Page.frameNavigated populate frameIds.
                     // When iframeOwnerSessionId is missing we must fall back to incomingSessionId, otherwise Playwright receives the attach on the root
                     // session, detaches it, and the iframe stays paused (waitingForDebugger) which can hang navigations.
+                    //
+                    // The CONSEQUENCE half of that is VERIFIED against the pinned playwright-core 1.59.10 source,
+                    // not inferred. Two different handlers read Target.attachedToTarget:
+                    //   - crBrowser.ts `_onAttachedToTarget` (the ROOT/browser session). `type: 'iframe'` matches
+                    //     none of its branches — browser, devtools 'other', page, service_worker — so it reaches
+                    //     the final `session.detach().catch(() => {})` at crBrowser.ts:209. The attach is dropped.
+                    //   - crPage.ts `_onAttachedToTarget` (the PAGE session). Its `type === 'iframe'` branch at
+                    //     crPage.ts:691 builds a FrameSession and calls `_initialize`, which is what sends
+                    //     `Runtime.runIfWaitingForDebugger` (crPage.ts:534) and unpauses the iframe.
+                    // So delivering the attach on the root session really does mean detached-and-still-paused,
+                    // and the fallback is what keeps it on the page session.
+                    //
+                    // The RACE half — that the extension can emit Target.attachedToTarget before
+                    // Page.frameAttached/Page.frameNavigated have populated `frameIds` — is NOT MEASURED and has
+                    // no test. It needs the packed extension driving a real Chrome, which this repo's test
+                    // environment cannot do. Treat it as an assumption about extension event ordering. What would
+                    // settle it: log the arrival order of these three events for an OOPIF across many loads and
+                    // check whether `getPageTargetForFrameId` ever misses.
                     sessionId: iframeOwnerSessionId ?? incomingSessionId,
                     method: 'Target.attachedToTarget',
                     params: targetParams,
@@ -2758,6 +3120,7 @@ export async function startPlayWriterCDPRelayServer({
 
       for (const client of playwrightClients.values()) {
         client.ws.close(1000, 'Server stopped')
+        dropClientOrdering(client.id)
       }
 
       for (const ext of extensions.values()) {

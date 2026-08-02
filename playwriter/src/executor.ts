@@ -26,8 +26,8 @@ import { getStylesForLocator, formatStylesAsText, fetchNormalizedStyles, type St
 import { resolveCascade, formatCascadeReport, type DeclRef, type NormalizedRule } from './css-cascade.js'
 import { codeFrameColumns } from '@babel/code-frame'
 import { getReactSource, getReactComponentInfo, type ReactSourceLocation } from './react-source.js'
-import { buildPageModel, type PageModel } from './page-model.js'
-import { buildModuleGraph, type ModuleGraph } from './module-graph.js'
+import { buildPageModel, type PageModel, type PageModelHandle, type QueryOptions } from './page-model.js'
+import { buildModuleGraph, type ModuleGraph, type ModuleGraphSummary } from './module-graph.js'
 import {
   traceValue,
   readLogpoints,
@@ -37,25 +37,43 @@ import {
   fiberSnapshot,
   fiberDiff,
   replayPure,
+  replayPureAsync,
+  listTraceProbes,
+  getTraceProbe,
+  readTraceProbe,
+  stopTraceProbe,
+  stopAllTraceProbes,
+  tracePerturbationWarnings,
   type TraceDeps,
+  type RenderOptions,
+  type NetEntry,
 } from './trace.js'
+import {
+  inspectBinding,
+  evaluateBinding,
+  findMissingDeps,
+  isPureFunctionSource,
+  backwardSlice,
+} from './static-analysis.js'
 import { ScopedFS } from './scoped-fs.js'
 import {
   screenshotWithAccessibilityLabels,
   getAriaSnapshot,
   resizeImageForAgent,
+  DEFAULT_SNAPSHOT_FORMAT,
   type ScreenshotResult,
   type SnapshotFormat,
 } from './aria-snapshot.js'
 import { createGhostBrowserChrome, type GhostBrowserCommandResult } from './ghost-browser.js'
 export type { SnapshotFormat }
-import { getCleanHTML, type GetCleanHTMLOptions } from './clean-html.js'
-import { getPageMarkdown, type GetPageMarkdownOptions } from './page-markdown.js'
+import { getCleanHTML, type GetCleanHTMLOptions, type HtmlDiffStore } from './clean-html.js'
+import { getPageMarkdown, type GetPageMarkdownOptions, type MarkdownDiffStore } from './page-markdown.js'
 import { createRecordingApi } from './screen-recording.js'
-import { startCdpScreencast, type CdpScreencastHandle } from './cdp-screencast.js'
+import { startCdpScreencast, type CdpScreencastHandle, type CdpScreencastOptions, type InputAction } from './cdp-screencast.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
+import { createHumanMouseApi } from './human-mouse-driver.js'
 
 
 const __filename = fileURLToPath(import.meta.url)
@@ -85,7 +103,10 @@ const usefulGlobals = {
   AbortController,
   AbortSignal,
   structuredClone,
-  process,
+  // `process` is DELIBERATELY absent here. The sandbox gets a hardened Proxy over it
+  // (see buildSandboxContext), and that proxy is installed AFTER `...usefulGlobals` is
+  // spread into the context object. Listing the raw `process` here as well made the
+  // whole boundary depend on nothing ever reordering two lines in an object literal.
 } as const
 
 /**
@@ -247,6 +268,67 @@ const ALLOWED_MODULES = new Set([
   'node:fs',
 ])
 
+/**
+ * The single refusal used by EVERY module-loading entry point the sandbox has.
+ *
+ * There is more than one such entry point, which is the whole reason this is shared:
+ * `require(id)`, `require.resolve(id)` and `process.getBuiltinModule(id)` all reach the
+ * host module system, and until this existed only the first of them consulted
+ * ALLOWED_MODULES.
+ */
+function moduleNotAllowedError(id: string): Error {
+  const error = new Error(
+    `Module "${id}" is not allowed in the sandbox. ` +
+      `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+  )
+  error.name = 'ModuleNotAllowedError'
+  return error
+}
+
+/**
+ * `process` members the sandbox may not CALL. Reading them yields a function that
+ * throws, so the refusal is loud and names itself instead of surfacing as a mystery
+ * crash somewhere downstream.
+ *
+ * Three groups, all of which were reachable before:
+ *   - ending or re-privileging the host process. `exit` was already blocked "to prevent
+ *     killing the relay server", but `abort`, `reallyExit`, `kill(process.pid)` and
+ *     `_kill` all do the same thing, so blocking only `exit` blocked nothing.
+ *   - loading native code or raw internal bindings: `process.binding('spawn_sync').spawn`
+ *     IS a shell, and `dlopen` loads any .node file on disk into this process.
+ *   - reading the filesystem outside the ScopedFS jail: `loadEnvFile(path)` parses ANY
+ *     file into `process.env`, from where sandbox code reads it back.
+ */
+const DENIED_PROCESS_METHODS = new Set([
+  'abort',
+  'reallyExit',
+  'kill',
+  '_kill',
+  '_debugProcess',
+  '_debugEnd',
+  'umask',
+  'setuid',
+  'setgid',
+  'seteuid',
+  'setegid',
+  'setgroups',
+  'initgroups',
+  'binding',
+  '_linkedBinding',
+  'dlopen',
+  'loadEnvFile',
+])
+
+/**
+ * `process` members the sandbox reads as `undefined`, because they are objects rather
+ * than callables and the capability is reached by walking INTO them:
+ *   - `mainModule.require` is the UNRESTRICTED host require. Already undefined under an
+ *     ESM entry point; pinned so moving to a CJS entry point cannot silently re-open it.
+ *   - `report.writeReport(path)` writes a diagnostic dump — full environment, argv,
+ *     loaded libraries — to any path on disk, past the ScopedFS jail in both directions.
+ */
+const DENIED_PROCESS_PROPERTIES = new Set(['mainModule', 'report'])
+
 export interface ExecuteScreenshot {
   path: string
   base64: string
@@ -357,6 +439,267 @@ export function isPlaywrightChannelOwner(value: any): boolean {
   )
 }
 
+/* ------------------------------------ input overlay: where the events come from */
+
+/**
+ * Feed the recorder's on-screen input overlay from Playwright's own client
+ * instrumentation.
+ *
+ * THREE CANDIDATE SOURCES WERE EVALUATED. This is the one that survives:
+ *
+ * 1. **In-page `addEventListener('keydown', …)` via `addInitScript`.** Dead on arrival
+ *    for the most common action in any repro. `page.fill()` reaches
+ *    `keyboard.insertText` (playwright-core `server/dom.ts` → `server/input.ts`), and
+ *    `insertText` dispatches `Input.insertText` — NO keydown, NO keyup. An in-page
+ *    listener sees nothing at all for a `fill()`. It also cannot see a click that hits no
+ *    listener-bearing element, and it perturbs the page under test.
+ * 2. **A tap on the relay's CDP command stream.** Ground truth for everything including
+ *    `insertText`, and unreachable from here: the relay is a DETACHED singleton daemon
+ *    (`relay-client.ts` `spawn(..., { detached: true })`), and this process reaches it as
+ *    a websocket CDP client via `getCdpUrl()` + `connectOverCDP`. Its `cdp:command`
+ *    emitter is closure-scoped inside `startPlayWriterCDPRelayServer`, obtainable only by
+ *    whoever called it — the daemon, `playwriter serve`, and tests. Worse, direct-CDP mode
+ *    bypasses the relay entirely, so the source would not even exist there.
+ * 3. **This: `ClientInstrumentation.onApiCallBegin/End`** (playwright-core
+ *    `client/clientInstrumentation.ts`, fired from `client/channelOwner.ts`). Every
+ *    Playwright input, from any object, funnels through one channel call and is reported
+ *    once with `{ type, method, params }`. Verified by running it: `page.fill`,
+ *    `locator.fill`, `page.click`, `locator.click({button:'right'})`, `locator.dblclick`,
+ *    `keyboard.press('Control+A')`, `keyboard.type`, `keyboard.insertText`,
+ *    `mouse.wheel`, `locator.pressSequentially`, `elementHandle.click` all appear, each
+ *    exactly once, with the arguments intact. It is client-side, so it works identically
+ *    in extension, direct-CDP and headless modes.
+ *
+ * WHAT THIS DOES NOT SEE, and cannot:
+ *   - a REAL HUMAN typing or clicking in the browser — nothing reaches this process;
+ *   - input synthesised by the page itself (`el.dispatchEvent(new KeyboardEvent(…))`);
+ *   - raw CDP the sandbox sends itself (`cdp.send('Input.dispatchKeyEvent', …)`), which
+ *     bypasses the Playwright client entirely;
+ *   - `page.mouse.move()`, deliberately: movement is not a press, and the ghost cursor
+ *     already draws it. `mouseDown`/`mouseUp`/`click` are captured.
+ *
+ * The instrumentation object is per-CONNECTION, not per-page, so a recording that drives
+ * two pages at once will show chips for both. One page is the normal case and the chips
+ * are still a true account of what the code did.
+ */
+const PAGE_INPUT_METHODS = new Set([
+  'keyboardDown',
+  'keyboardUp',
+  'keyboardInsertText',
+  'keyboardType',
+  'keyboardPress',
+  'mouseDown',
+  'mouseUp',
+  'mouseClick',
+  'mouseWheel',
+  'touchscreenTap',
+])
+
+const ELEMENT_INPUT_METHODS = new Set([
+  'click',
+  'dblclick',
+  'tap',
+  'dragAndDrop',
+  'hover',
+  'fill',
+  'type',
+  'press',
+  'check',
+  'uncheck',
+  'focus',
+  'selectOption',
+  'selectText',
+  'setInputFiles',
+])
+
+/**
+ * One Playwright channel call -> one chip, or `null` for everything that is not input.
+ *
+ * Pure and exported so the mapping can be tested without a browser: the failure mode here
+ * is a silently unhandled method, which no end-to-end test would notice.
+ */
+export function playwrightChannelToInputAction(channel: {
+  type: string
+  method: string
+  params?: Record<string, any>
+}): InputAction | null {
+  const p = channel.params ?? {}
+  const target: string | undefined = typeof p.selector === 'string' ? p.selector : undefined
+
+  if (channel.type === 'Page') {
+    if (!PAGE_INPUT_METHODS.has(channel.method)) return null
+    switch (channel.method) {
+      case 'keyboardPress':
+        return { kind: 'key', key: String(p.key ?? '') }
+      case 'keyboardDown':
+        return { kind: 'key', key: String(p.key ?? ''), phase: 'down' }
+      case 'keyboardUp':
+        return { kind: 'key', key: String(p.key ?? ''), phase: 'up' }
+      case 'keyboardType':
+        return { kind: 'text', text: String(p.text ?? ''), via: 'type' }
+      case 'keyboardInsertText':
+        return { kind: 'text', text: String(p.text ?? ''), via: 'insertText' }
+      case 'mouseClick':
+        return { kind: 'mouse', action: 'click', button: p.button, clickCount: p.clickCount }
+      case 'mouseDown':
+        return { kind: 'mouse', action: 'down', button: p.button }
+      case 'mouseUp':
+        return { kind: 'mouse', action: 'up', button: p.button }
+      case 'mouseWheel':
+        return { kind: 'mouse', action: 'wheel', deltaX: p.deltaX, deltaY: p.deltaY }
+      case 'touchscreenTap':
+        return { kind: 'mouse', action: 'tap' }
+    }
+    return null
+  }
+
+  // Frame and ElementHandle share method names; only ElementHandle omits the selector.
+  if (channel.type !== 'Frame' && channel.type !== 'ElementHandle') return null
+  if (!ELEMENT_INPUT_METHODS.has(channel.method)) return null
+  switch (channel.method) {
+    case 'click':
+      return { kind: 'mouse', action: 'click', button: p.button, clickCount: p.clickCount, target }
+    case 'dblclick':
+      return { kind: 'mouse', action: 'dblclick', button: p.button, target }
+    case 'tap':
+      return { kind: 'mouse', action: 'tap', target }
+    case 'dragAndDrop':
+      return { kind: 'mouse', action: 'drag', target: typeof p.source === 'string' ? p.source : undefined }
+    case 'hover':
+      return { kind: 'action', verb: 'Hover', target }
+    case 'fill':
+      return { kind: 'text', text: String(p.value ?? ''), via: 'fill', target }
+    case 'type':
+      return { kind: 'text', text: String(p.text ?? ''), via: 'type', target }
+    case 'press':
+      return { kind: 'key', key: String(p.key ?? ''), target }
+    case 'check':
+      return { kind: 'action', verb: 'Check', target }
+    case 'uncheck':
+      return { kind: 'action', verb: 'Uncheck', target }
+    case 'focus':
+      return { kind: 'action', verb: 'Focus', target }
+    case 'selectText':
+      return { kind: 'action', verb: 'Select text', target }
+    case 'setInputFiles': {
+      const count = Array.isArray(p.localPaths)
+        ? p.localPaths.length
+        : Array.isArray(p.payloads)
+          ? p.payloads.length
+          : Array.isArray(p.streams)
+            ? p.streams.length
+            : 0
+      return { kind: 'action', verb: 'Upload', detail: count === 1 ? '1 file' : `${count} files`, target }
+    }
+    case 'selectOption': {
+      const first = Array.isArray(p.options) ? p.options[0] : undefined
+      const label = first?.valueOrLabel ?? first?.value ?? first?.label
+      // The chosen value is not typed text, but it is still user data, so it goes through
+      // the same length cap as everything else via formatInputLabel.
+      return { kind: 'action', verb: 'Select', detail: label === undefined ? undefined : `"${String(label)}"`, target }
+    }
+  }
+  return null
+}
+
+/**
+ * Subscribe to the instrumentation and hand every input to `onAction`.
+ *
+ * Emitted on `onApiCallEnd`, not `onApiCallBegin`, for two reasons that both matter:
+ *   - a `locator.click()` that spends three seconds waiting for actionability BEGINS three
+ *     seconds before the click actually lands, and a chip at the begin time would sit on
+ *     screen pointing at nothing;
+ *   - an action that THREW (timeout, strict-mode violation) never happened, and burning
+ *     "Click" into a video where no click occurred is a lie the viewer cannot check.
+ * `onApiCallBegin` carries the channel and `onApiCallEnd` carries the outcome, so the
+ * action is stashed against the (identical) apiCall object and emitted when it resolves.
+ */
+export function attachInputOverlayTap({
+  page,
+  onAction,
+}: {
+  page: Page
+  onAction: (action: InputAction) => void
+}): { detach: () => void; note?: string } {
+  const instrumentation = (page as any)?._instrumentation
+  if (!instrumentation || typeof instrumentation.addListener !== 'function' || typeof instrumentation.removeListener !== 'function') {
+    return {
+      detach: () => {},
+      note:
+        'The input overlay found no Playwright client instrumentation on this page, so nothing will be ' +
+        'captured. The recording is otherwise unaffected.',
+    }
+  }
+
+  const pending = new Map<object, InputAction>()
+  const listener = {
+    onApiCallBegin(apiCall: object, channel: { type: string; method: string; params?: Record<string, any> }) {
+      try {
+        const action = playwrightChannelToInputAction(channel)
+        if (action) pending.set(apiCall, action)
+      } catch {
+        // The tap observes; it must never be able to fail the call it is observing.
+      }
+    },
+    onApiCallEnd(apiCall: { error?: Error } & object) {
+      const action = pending.get(apiCall)
+      if (!action) return
+      pending.delete(apiCall)
+      if (apiCall.error) return
+      try {
+        onAction(action)
+      } catch {
+        // Same: a full event cap or a stopped recorder must not break page.click().
+      }
+    },
+  }
+  instrumentation.addListener(listener)
+  return {
+    detach: () => {
+      try {
+        instrumentation.removeListener(listener)
+      } catch {
+        // Connection already torn down; the listener died with it.
+      }
+      pending.clear()
+    },
+  }
+}
+
+/**
+ * An OPAQUE reference to a parsed module graph.
+ *
+ * A `ModuleGraph` holds live Babel `NodePath`s (and, through them, the whole AST with
+ * its parent pointers). Handing one to sandbox code would let it be `return`ed, and
+ * `util.inspect` would then either explode on the cycles or dump tens of thousands of
+ * lines. So the sandbox never sees the graph: it gets this handle, which carries only
+ * the bounded digest, and every helper that needs the real graph looks it up in the
+ * module-private `graphByHandle` map below.
+ */
+export interface ModuleGraphHandle {
+  /** Absolute root the graph was built over. */
+  root: string
+  /** How many files were indexed. The file LIST is on `summary()`, not here. */
+  fileCount: number
+  /** Bounded, serialisable digest — this is the only thing safe to return. */
+  summary(): ModuleGraphSummary
+}
+
+/** handle -> live graph. Module-private on purpose: nothing in the sandbox can reach it. */
+const graphByHandle = new WeakMap<ModuleGraphHandle, ModuleGraph>()
+
+/** Resolve a sandbox-supplied `graph` argument (a handle) to the live graph. */
+function unwrapGraph(graph: unknown, who: string): ModuleGraph {
+  if (graph && typeof graph === 'object') {
+    const live = graphByHandle.get(graph as ModuleGraphHandle)
+    if (live) return live
+  }
+  throw new Error(
+    `${who}: \`graph\` must be a handle from moduleGraph({ root }). ` +
+      'The live module graph is never exposed to the sandbox — it holds Babel NodePaths.',
+  )
+}
+
 export class PlaywrightExecutor {
   private isConnected = false
   private page: Page | null = null
@@ -371,18 +714,57 @@ export class PlaywrightExecutor {
   // are decremented so they stay in sync with the array.
   private pageLogCursor: Map<Page, number> = new Map()
   private lastSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
+  /**
+   * Diff baselines for the other two readers, held HERE rather than in their modules.
+   *
+   * `prompt.md` promises `getCleanHTML`, `getPageMarkdown` and `snapshot` the same
+   * `showDiffSinceLastCall` semantics, and they did not have them: `snapshot`'s baseline
+   * was per-executor (above) while the other two were module-global. Two sessions in one
+   * relay process driving the same `Page` therefore shared a getCleanHTML baseline, so
+   * each was told "no changes since last call" about the other's edits. Same scope now.
+   */
+  private lastCleanHtml: HtmlDiffStore = new WeakMap()
+  private lastPageMarkdown: MarkdownDiffStore = new WeakMap()
   private lastRefToLocator: WeakMap<Page, Map<string, string>> = new WeakMap()
   // Per-page PageModel cache (same lifecycle as lastSnapshots). Used as the diff
   // baseline for `changedSince` markers on the next buildPageModel for the page.
   private lastPageModel: WeakMap<Page, PageModel> = new WeakMap()
   /** In-flight CDP screencast, if any. Survives across execute() calls. */
   cdpScreencast: CdpScreencastHandle | null = null
+  /**
+   * Removes the input-overlay tap on Playwright's client instrumentation.
+   *
+   * Lives beside `cdpScreencast` and for the same reason: the listener outlives the
+   * `execute()` call that armed it, and leaving it attached after `stopCdp` would keep
+   * every later `page.click()` walking a dead recorder.
+   */
+  private cdpScreencastInputDetach: (() => void) | null = null
   // Per-cwd module-graph cache (M4): traceValue/backwardSlice reuse the parsed
   // graph across turns instead of re-walking the source tree each call.
   private moduleGraphCache: Map<string, ModuleGraph> = new Map()
   // Per-page Debugger cache (M4): logpoint/script-source/trace closures reuse a
   // single Debugger per page instead of re-enabling on every call.
   private debuggerCache: WeakMap<Page, Debugger> = new WeakMap()
+  /**
+   * Per-page CDP adapter handed to `net.delay`.
+   *
+   * `getCDPSessionForPage` mints a NEW adapter object every call, and `netDelay`
+   * registers the adapter as the probe's `owner` and compares owners by identity — so
+   * without a stable per-page adapter its "refusing to start a second net.delay on this
+   * page" guard could never fire, and two interceptors would silently fight over
+   * `Fetch.enable`. Caching also gives teardown a handle to stop by.
+   */
+  private netDelayCdpCache: WeakMap<Page, ICDPSession> = new WeakMap()
+  /**
+   * Everything this executor has ever registered as a trace-probe `owner` (pages for
+   * `net.timeline`, CDP adapters for `net.delay`).
+   *
+   * The registry in trace.ts is MODULE-level, so an unfiltered `stopAllTraceProbes()`
+   * would also kill probes belonging to other sessions sharing this relay process.
+   * Teardown stops probes owner-by-owner instead, which is precise and never reaches
+   * across sessions.
+   */
+  private traceProbeOwners = new Set<unknown>()
   private warningEvents: WarningEvent[] = []
   private nextWarningEventId = 0
   private lastDeliveredWarningEventId = 0
@@ -432,16 +814,31 @@ export class PlaywrightExecutor {
     })
   }
 
+  /**
+   * The sandbox `require`: an allowlist gate in front of the host require, with `fs`
+   * swapped for the write-jailed ScopedFS.
+   *
+   * The properties hung off it are as much a part of the boundary as the function
+   * itself, and copying the host's straight across defeated the gate entirely:
+   *   - `cache` is `Module._cache`. Every value in it is a live `Module` carrying an
+   *     UNRESTRICTED `.require`, so `require.cache[anyKey].require('child_process')`
+   *     was a complete allowlist bypass — 923 entries were reachable in a plain test
+   *     run. The sandbox gets a frozen empty null-prototype object: nothing to walk.
+   *   - `extensions` is `Module._extensions`. READING it hands out host functions;
+   *     WRITING it rewrites how this entire host process loads every future `.js` file.
+   *     Also replaced with a frozen empty object.
+   *   - `resolve` probes the real filesystem and does NOT go through ScopedFS:
+   *     `require.resolve('/etc/passwd')` returned that path, and threw for paths that
+   *     do not exist — a whole-disk existence oracle. Gated by the same allowlist, and
+   *     `resolve.paths` no longer discloses the host's module search path.
+   *   - `main` is undefined under ESM `createRequire` today. Pinned to `undefined` so a
+   *     future CJS entry point cannot quietly re-expose `main.require`.
+   */
   private createSandboxedRequire(originalRequire: NodeRequire): NodeRequire {
     const scopedFs = this.scopedFs
     const sandboxedRequire = ((id: string) => {
       if (!ALLOWED_MODULES.has(id)) {
-        const error = new Error(
-          `Module "${id}" is not allowed in the sandbox. ` +
-            `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
-        )
-        error.name = 'ModuleNotAllowedError'
-        throw error
+        throw moduleNotAllowedError(id)
       }
       if (id === 'fs' || id === 'node:fs') {
         return scopedFs
@@ -449,10 +846,18 @@ export class PlaywrightExecutor {
       return originalRequire(id)
     }) as NodeRequire
 
-    sandboxedRequire.resolve = originalRequire.resolve
-    sandboxedRequire.cache = originalRequire.cache
-    sandboxedRequire.extensions = originalRequire.extensions
-    sandboxedRequire.main = originalRequire.main
+    const sandboxedResolve = ((id: string, options?: { paths?: string[] }) => {
+      if (!ALLOWED_MODULES.has(id)) {
+        throw moduleNotAllowedError(id)
+      }
+      return originalRequire.resolve(id, options)
+    }) as NodeRequire['resolve']
+    sandboxedResolve.paths = () => null
+
+    sandboxedRequire.resolve = sandboxedResolve
+    sandboxedRequire.cache = Object.freeze(Object.create(null))
+    sandboxedRequire.extensions = Object.freeze(Object.create(null))
+    sandboxedRequire.main = undefined
 
     return sandboxedRequire
   }
@@ -609,7 +1014,66 @@ export class PlaywrightExecutor {
     this.ghostCursorController.attachToPage({ page })
     page.on('close', () => {
       this.ghostCursorController.detachFromPage({ page })
+      // A live Fetch interceptor or request listener that outlives its page silently
+      // perturbs (or misattributes) every later measurement in the session, so probes
+      // die with the page they were armed on.
+      void this.stopTraceProbesFor([page, this.netDelayCdpCache.get(page)])
     })
+  }
+
+  /**
+   * Stop every live trace probe owned by one of `owners`. Owner-filtered rather than a
+   * blanket `stopAllTraceProbes()`: the probe registry is module-level and shared by
+   * every session in this relay process.
+   */
+  private async stopTraceProbesFor(owners: Array<unknown>): Promise<string[]> {
+    const stopped: string[] = []
+    for (const owner of owners) {
+      if (owner === undefined) continue
+      try {
+        stopped.push(...(await stopAllTraceProbes({ owner })))
+      } catch (e) {
+        this.logger.error('Failed to stop trace probes:', e)
+      }
+    }
+    return stopped
+  }
+
+  /**
+   * Release everything this session armed against the browser: live trace probes
+   * (`net.timeline` listeners, `net.delay`'s `Fetch` interception) and an in-flight CDP
+   * screencast. Called on session delete, on `reset()`, and on headless context close —
+   * every path where the executor stops driving its pages.
+   *
+   * Idempotent, and never throws: teardown must not be able to fail a session delete.
+   */
+  async disposeBrowserSideResources(): Promise<{ probesStopped: string[]; screencastCancelled: boolean }> {
+    const owners: unknown[] = [...this.traceProbeOwners]
+    this.traceProbeOwners.clear()
+    const probesStopped = await this.stopTraceProbesFor(owners)
+
+    // Always dropped, even with no screencast running: a listener on the client
+    // instrumentation would otherwise outlive the session that armed it.
+    const detachInput = this.cdpScreencastInputDetach
+    this.cdpScreencastInputDetach = null
+    try {
+      detachInput?.()
+    } catch (e) {
+      this.logger.error('Failed to detach the input overlay tap during teardown:', e)
+    }
+
+    let screencastCancelled = false
+    const screencast = this.cdpScreencast
+    if (screencast) {
+      this.cdpScreencast = null
+      try {
+        await screencast.cancel()
+        screencastCancelled = true
+      } catch (e) {
+        this.logger.error('Failed to cancel CDP screencast during teardown:', e)
+      }
+    }
+    return { probesStopped, screencastCancelled }
   }
 
   private setupPageCloseDetection(page: Page) {
@@ -1023,6 +1487,7 @@ export class PlaywrightExecutor {
     if (!this.isHeadlessMode()) {
       return
     }
+    await this.disposeBrowserSideResources()
     const context = this.context
     this.clearConnectionState()
 
@@ -1108,6 +1573,10 @@ export class PlaywrightExecutor {
 
   async reset(): Promise<{ page: Page; context: BrowserContext }> {
     this.suppressPageCloseWarnings = true
+    // Probes armed against the old pages must not survive the reconnect — their owners
+    // are about to become unreachable, which is exactly how a Fetch interceptor turns
+    // into an un-stoppable session-wide measurement poison.
+    await this.disposeBrowserSideResources()
     try {
       if (this.isHeadlessMode()) {
         // In headless mode, only close this session's context, not the shared browser.
@@ -1139,58 +1608,27 @@ export class PlaywrightExecutor {
     return { page, context }
   }
 
-  async execute(code: string, timeout = 10000): Promise<ExecuteResult> {
-    const consoleLogs: Array<{ method: string; args: any[] }> = []
-    const warningScope = this.beginWarningScope()
-
-    const formatConsoleLogs = (logs: Array<{ method: string; args: any[] }>, prefix = 'Console output') => {
-      if (logs.length === 0) {
-        return ''
-      }
-      let text = `${prefix}:\n`
-      logs.forEach(({ method, args }) => {
-        const formattedArgs = args
-          .map((arg) => {
-            if (typeof arg === 'string') return arg
-            return util.inspect(arg, {
-              depth: 4,
-              colors: false,
-              maxArrayLength: 100,
-              maxStringLength: 1000,
-              breakLength: 80,
-            })
-          })
-          .join(' ')
-        text += `[${method}] ${formattedArgs}\n`
-      })
-      return text + '\n'
-    }
-
-    try {
-      // Warn if cloud VM is approaching its hard timeout (deduped by minute bucket)
-      if (this.cloudSession?.timeoutAt) {
-        const remainingMs = this.cloudSession.timeoutAt - Date.now()
-        if (remainingMs <= 0) {
-          throw new Error(CLOUD_SESSION_EXPIRED_ERROR)
-        }
-        if (remainingMs < 5 * 60_000) {
-          const mins = Math.ceil(remainingMs / 60_000)
-          if (this.lastCloudTimeoutWarningMinute !== mins) {
-            this.lastCloudTimeoutWarningMinute = mins
-            this.enqueueWarning(
-              `Cloud browser expires in ~${mins} minute${mins === 1 ? '' : 's'}. ` +
-                `Create a new session soon with: playwriter session new --browser cloud`,
-            )
-          }
-        }
-      }
-
-      await this.ensureConnection()
-      const page = await this.getCurrentPage(timeout)
-      const context = this.context || page.context()
-
-      this.logger.log('Executing code:', code)
-
+  /**
+   * Build the object that becomes the `execute()` sandbox's global scope.
+   *
+   * Extracted from `execute()` deliberately: every helper below is only useful if it is
+   * actually REACHABLE as a sandbox global, and while this lived inline inside a method
+   * that first requires a live browser, nothing could assert that. `executor-sandbox.test.ts`
+   * calls this with stub page/context and checks every documented name is present.
+   */
+  buildSandboxContext({
+    page,
+    context,
+    consoleLogs,
+  }: {
+    page: Page
+    context: BrowserContext
+    consoleLogs: Array<{ method: string; args: any[] }>
+  }): {
+    vmContextObj: Record<string, any>
+    screenshotCollector: ScreenshotResult[]
+    resizedImageCollector: Array<{ data: string; mimeType: string }>
+  } {
       const customConsole = {
         log: (...args: any[]) => {
           consoleLogs.push({ method: 'log', args })
@@ -1217,9 +1655,15 @@ export class PlaywrightExecutor {
         locator?: Locator
         search?: string | RegExp
         showDiffSinceLastCall?: boolean
-        /** Snapshot format (currently raw only) */
+        /** Snapshot format. `'raw'` is the only one that exists; anything else THROWS. */
         format?: SnapshotFormat
-        /** Only include interactive elements (default: true) */
+        /**
+         * Only include interactive elements. Default **false** — the whole accessible
+         * tree, because a snapshot is usually read to find out what is on the page, not
+         * only what can be clicked. Note the sibling `screenshotWithAccessibilityLabels`
+         * genuinely defaults this to **true** (`aria-snapshot.ts`): a label overlay is
+         * for finding click targets, so labelling every static node is just clutter.
+         */
         interactiveOnly?: boolean
       }) => {
         const {
@@ -1229,8 +1673,37 @@ export class PlaywrightExecutor {
           search,
           showDiffSinceLastCall = !search,
           interactiveOnly = false,
+          format = DEFAULT_SNAPSHOT_FORMAT,
         } = options
-        const resolvedPage = targetPage || page
+        // `format` was accepted by the type and never read, so passing one type-checked,
+        // read as supported, and did nothing whatsoever. There is exactly one format; an
+        // unknown one is a caller expecting an output shape this cannot produce.
+        if (format !== DEFAULT_SNAPSHOT_FORMAT) {
+          throw new Error(
+            `snapshot: unsupported format ${JSON.stringify(format)}. The only snapshot format is ` +
+              `'${DEFAULT_SNAPSHOT_FORMAT}'. For a tree fused with tags/attributes use pm.renderText(), and for ` +
+              'article text use getPageMarkdown().',
+          )
+        }
+        /**
+         * Explicit `page` wins; otherwise take it from the `locator` or `frame` being
+         * scoped to, and only then fall back to the sandbox default.
+         *
+         * The middle step is not a convenience. `snapshot({ locator: state.page.locator('main') })`
+         * — exactly as the docs show it — used to resolve the locator against the DEFAULT
+         * page while the locator belonged to `state.page`, which is the silent-wrong-tab
+         * failure the `{ page: state.page }` rule exists to prevent. `debugStyle`,
+         * `whyOccluded` and `fiberSnapshot` already took their page from the locator; this
+         * makes `snapshot` agree with them. A `FrameLocator` has no `page()`, so it still
+         * falls through to the default.
+         */
+        const pageFromScope: Page | undefined =
+          typeof (locator as any)?.page === 'function'
+            ? (locator as any).page()
+            : typeof (frame as any)?.page === 'function'
+              ? (frame as any).page()
+              : undefined
+        const resolvedPage = targetPage || pageFromScope || page
         if (!resolvedPage) {
           throw new Error('snapshot requires a page')
         }
@@ -1324,6 +1797,18 @@ export class PlaywrightExecutor {
         }
         return result.join('\n')
       }
+
+      /**
+       * The other two diffing readers, pinned to this session's baseline store so all
+       * three agree on what "since last call" means. Everything else is theirs — the
+       * options object is forwarded whole, so neither wrapper can drop one, and the store
+       * is applied AFTER the spread so sandbox code cannot opt itself back out of the
+       * session scoping.
+       */
+      const getCleanHTMLFn = (options: GetCleanHTMLOptions) =>
+        getCleanHTML({ ...options, diffStore: this.lastCleanHtml })
+      const getPageMarkdownFn = (options: GetPageMarkdownOptions) =>
+        getPageMarkdown({ ...options, diffStore: this.lastPageMarkdown })
 
       const refToLocator = (options: { ref: string; page?: Page }): string | null => {
         const targetPage = options.page || page
@@ -1449,9 +1934,30 @@ export class PlaywrightExecutor {
       const createDebugger = (options: { cdp: ICDPSession }) => new Debugger(options)
       const createEditor = (options: { cdp: ICDPSession }) => new Editor(options)
 
-      const getStylesForLocatorFn = async (options: { locator: any }) => {
-        const cdp = await getCDPSession({ page: options.locator.page() })
-        return getStylesForLocator({ locator: options.locator, cdp })
+      /**
+       * Both of the options here used to be dropped on the floor, and each dropped one
+       * silently:
+       *   - `includeUserAgentStyles` is supported by `getStylesForLocator` itself and is
+       *     the entire point of the `getStylesWithUserAgent` example in
+       *     `styles-examples.ts` — with it discarded, that example produced output
+       *     identical to the one right above it;
+       *   - a caller-supplied `cdp` was replaced with a freshly minted one, so the
+       *     documented `cdp: await getCDPSession({ page })` argument taught a round-trip
+       *     that bought nothing. It is reused when given.
+       */
+      const getStylesForLocatorFn = async (options: {
+        locator: any
+        /** Reused when supplied; otherwise one is opened for the locator's page. */
+        cdp?: ICDPSession
+        /** Include browser default (user-agent) rules in `rules`. Default false. */
+        includeUserAgentStyles?: boolean
+      }) => {
+        const cdp = options.cdp ?? (await getCDPSession({ page: options.locator.page() }))
+        return getStylesForLocator({
+          locator: options.locator,
+          cdp,
+          includeUserAgentStyles: options.includeUserAgentStyles,
+        })
       }
 
       const getReactSourceFn = async (options: { locator: any }) => {
@@ -1572,9 +2078,124 @@ export class PlaywrightExecutor {
         return { properties: propertiesReport, text }
       }
 
-      // whyOccluded: best-effort stacking-context report for an element. M2 emits
-      // the element's own stacking-relevant declarations + source locations.
-      // TODO(M3): full paint-order hit-testing to name the actual occluding element.
+      /**
+       * Build (or rebuild) the PageModel for a page, diffing against the previous
+       * per-page model so `changedSince` markers are populated. Caches on lastPageModel.
+       *
+       * `rootSelector` is a **Playwright** selector and scopes what is FETCHED. It is a
+       * different language from `query({ within })`, a page-path selector over the tree
+       * that already exists. `scope` is the deprecated alias each layer still accepts;
+       * it is passed straight through so `buildPageModel`'s own disagreement check (not a
+       * silent pick here) is the thing that reports a conflict.
+       */
+      type BuildPageModelOptions = { page?: Page; rootSelector?: string; scope?: string }
+      const buildPageModelFn = async (options?: BuildPageModelOptions): Promise<PageModel> => {
+        const p = options?.page || page
+        const cdp = await getCDPSession({ page: p })
+        const model = await buildPageModel({
+          page: p,
+          cdp,
+          rootSelector: options?.rootSelector,
+          scope: options?.scope,
+        })
+        const prev = self.lastPageModel.get(p)
+        if (prev) model.diffAgainst(prev)
+        self.lastPageModel.set(p, model)
+        return model
+      }
+
+      /**
+       * `pm`: lazy per-execute accessor. Builds the page model once (per page + root
+       * selector) and reuses it across anchor/query/renderText/debugMode calls in the
+       * same turn. Returns only cycle-free projections (handles/rows/strings), never the
+       * live model.
+       *
+       * The cache is keyed by page AND `rootSelector`, because a root-scoped model is a
+       * DIFFERENT tree: keying by page alone would let the first call's scope silently
+       * decide what every later call in the turn can see.
+       */
+      const pmModels = new Map<string, PageModel>()
+      const pmPageKeys = new WeakMap<Page, number>()
+      let pmPageSeq = 0
+      const getPmModel = async (opts?: BuildPageModelOptions): Promise<PageModel> => {
+        const p = opts?.page || page
+        if (!p) {
+          throw new Error('pm requires a page')
+        }
+        let pageKey = pmPageKeys.get(p)
+        if (pageKey === undefined) {
+          pageKey = ++pmPageSeq
+          pmPageKeys.set(p, pageKey)
+        }
+        // NUL separates the two halves because neither a page id nor a selector can
+        // contain it, so no (page, selector) pair can collide with another. It MUST stay
+        // written as an escape: a raw NUL byte here makes the whole file read as binary,
+        // and grep then skips it in silence — which is exactly how one slipped in.
+        const cacheKey = `${pageKey}\u0000${opts?.rootSelector ?? opts?.scope ?? ''}`
+        const existing = pmModels.get(cacheKey)
+        if (existing) return existing
+        const model = await buildPageModelFn({ page: p, rootSelector: opts?.rootSelector, scope: opts?.scope })
+        pmModels.set(cacheKey, model)
+        return model
+      }
+
+      /** Everything `pm.*` accepts for choosing/scoping the model it builds. */
+      type PmModelOptions = { page?: Page; rootSelector?: string; scope?: string }
+      /**
+       * `pm.query`'s options. `within` scopes the QUERY (page-path, over the built tree);
+       * `rootSelector` scopes the BUILD (Playwright, before any tree exists). Both are
+       * exposed because they answer different questions and neither substitutes for the
+       * other.
+       *
+       * NOTE: an unmatched `within` THROWS, by design — the old behaviour was a silent
+       * widen to the whole document, which made a typo indistinguishable from a real
+       * empty result. Nothing here catches it: the error propagates out of `execute()`
+       * and is reported to the agent verbatim.
+       */
+      type PmQueryOptions = QueryOptions & PmModelOptions
+      /**
+       * Strip the build-layer `scope` alias before the options reach `model.query`.
+       *
+       * `scope` is ONE name for TWO incompatible selector languages, and the wrapper used
+       * to hand the same string to both layers: `buildPageModel({ scope })` reads it as
+       * `rootSelector`, a **Playwright** selector applied before any tree exists, while
+       * `model.query({ scope })` reads it as `within`, a **page-path** selector over the
+       * tree that was just built. No string is valid in both, so one of the two was always
+       * wrong — and since an unmatched `within` THROWS, a perfectly good
+       * `pm.query({ scope: 'main' })` died inside a query scope the caller never asked for.
+       *
+       * On `pm.*` the alias means `rootSelector`, which is what the docs say and what
+       * `pm.anchor` / `pm.renderText` / `pm.debugMode` already did. `within` is how a query
+       * is scoped, and it is passed through untouched.
+       */
+      const queryOptionsOnly = (opts?: PmQueryOptions): QueryOptions | undefined => {
+        if (!opts) return opts
+        const { scope: _buildScope, rootSelector: _rootSelector, page: _page, ...queryOpts } = opts
+        return queryOpts
+      }
+      const pm = {
+        anchor: async (
+          selector: string | { backendNodeId: number } | { x: number; y: number; frameId?: string },
+          options?: PmModelOptions,
+        ): Promise<PageModelHandle | null> => (await getPmModel(options)).anchor(selector),
+        /**
+         * Ground-truth point hit test (`DOM.getNodeForLocation`), as opposed to
+         * `anchor({x, y})`, which INFERS the topmost node from snapshot geometry.
+         * `point` is in document coordinates, the same space as `runtime.box`.
+         */
+        anchorAt: async (
+          point: { x: number; y: number },
+          options?: PmModelOptions,
+        ): Promise<PageModelHandle | null> => (await getPmModel(options)).anchorAt(point),
+        query: async (opts?: PmQueryOptions) => (await getPmModel(opts)).query(queryOptionsOnly(opts)),
+        renderText: async (
+          opts?: { visibleOnly?: boolean; inViewportOnly?: boolean; includeRemoved?: boolean } & PmModelOptions,
+        ) => (await getPmModel(opts)).renderText(opts),
+        debugMode: async (options?: PmModelOptions) => (await getPmModel(options)).debugMode(),
+      }
+      const queryPage = async (opts?: PmQueryOptions) => (await getPmModel(opts)).query(queryOptionsOnly(opts))
+
+      /** Stacking-relevant declarations, reported to EXPLAIN the ground-truth flag. */
       const STACKING_PROPS = [
         'z-index',
         'position',
@@ -1587,9 +2208,31 @@ export class PlaywrightExecutor {
         'pointer-events',
         'clip-path',
       ]
-      const whyOccluded = async (options: { locator?: any; node?: any }) => {
+      /** Declarations that mean an occluder's bounds rectangle is not the shape it paints. */
+      const SHAPE_DISTORTING_PROPS = ['clip-path', 'transform', 'filter', 'border-radius']
+
+      /**
+       * whyOccluded: is something painting over this element, and what?
+       *
+       * Three DIFFERENT kinds of evidence, kept separate on purpose rather than collapsed
+       * into one confident-sounding verdict:
+       *
+       *   1. `occluded` / `occludedBy` / `occludedFraction` — an INFERENCE from the layout
+       *      snapshot's paint order and bounds containment. It is wrong exactly when the
+       *      painted shape is not the bounds rectangle (`clip-path`, `border-radius`,
+       *      rotated/skewed transforms), when the covering node paints nothing, and for
+       *      overlays living in another frame (bounds are per-frame coordinates).
+       *   2. `hitTest` — GROUND TRUTH from `DOM.getNodeForLocation` at the element's box
+       *      centre. One point, so it cannot see partial coverage; but when it disagrees
+       *      with (1) it is the one that is right.
+       *   3. `stackingContext` / `stackingReasons` — the flag is Chromium's own, read off
+       *      the layout tree; the reasons (and `stacking` below) are the DECLARATIONS that
+       *      explain it. The declarations never decide the flag.
+       */
+      const whyOccluded = async (options: { locator?: any; node?: any; page?: Page }) => {
         const locator = resolveStyleTargetLocator(options)
-        const cdp = await getCDPSession({ page: locator.page() })
+        const targetPage: Page = options.page ?? locator.page()
+        const cdp = await getCDPSession({ page: targetPage })
         const { rules } = await fetchNormalizedStyles({ locator, cdp })
         const cascade = resolveCascade(rules)
 
@@ -1602,19 +2245,83 @@ export class PlaywrightExecutor {
           }
         }
 
-        const position = cascade.winnerFor['position']?.value
-        const zIndex = cascade.winnerFor['z-index']?.value
-        // Heuristic: does this element establish its own stacking context?
-        const createsStackingContext =
-          (zIndex != null && zIndex !== 'auto' && position != null && position !== 'static') ||
-          (cascade.winnerFor['opacity'] != null && cascade.winnerFor['opacity'].value !== '1') ||
-          cascade.winnerFor['transform'] != null ||
-          cascade.winnerFor['filter'] != null ||
-          cascade.winnerFor['mix-blend-mode'] != null ||
-          (cascade.winnerFor['isolation']?.value === 'isolate') ||
-          cascade.winnerFor['will-change'] != null
+        // Join the element to the measured model. A handle from THIS turn resolves by key;
+        // otherwise fall back to the locator string the model indexes nodes under.
+        const model = await getPmModel({ page: targetPage })
+        const handleKey = typeof options.node?.key === 'string' ? options.node.key : null
+        const selector: string | undefined =
+          (typeof options.node?.locator === 'string' ? options.node.locator : undefined) ??
+          (typeof locator.selector === 'function' ? locator.selector() : undefined)
+        const modelNode =
+          (handleKey ? model.byKey.get(handleKey as never) : undefined) ??
+          (selector ? (model.anchor(selector) ? model.byKey.get(model.anchor(selector)!.key) : undefined) : undefined)
 
-        const text = formatCascadeReport({
+        const runtime = modelNode?.runtime
+        const box = runtime?.box ?? null
+
+        // Ground-truth tiebreak: who actually receives a hit at the box centre?
+        let hitTest: { key: string; label: string; isTarget: boolean } | null = null
+        let hitTestError: string | null = null
+        if (box && box.width > 0 && box.height > 0) {
+          try {
+            const hit = await model.anchorAt({ x: box.x + box.width / 2, y: box.y + box.height / 2 })
+            if (hit) {
+              hitTest = {
+                key: hit.key,
+                label: `${hit.role ?? hit.tag}${hit.name ? ` "${hit.name}"` : ''}`,
+                isTarget: hit.key === modelNode!.key,
+              }
+            }
+          } catch (e) {
+            // A hit test that could not run is reported, never silently treated as "clear".
+            hitTestError = e instanceof Error ? e.message : String(e)
+          }
+        }
+
+        const occludedBy = runtime?.occludedBy ?? []
+        const occludedByLabels = runtime?.occludedByLabels ?? []
+        const distorting = SHAPE_DISTORTING_PROPS.filter((p) => {
+          const v = cascade.winnerFor[p]?.value
+          return v != null && v !== 'none' && v !== '0px'
+        })
+
+        const lines: string[] = []
+        if (!modelNode) {
+          lines.push(
+            'NOT IN THE PAGE MODEL: this element is not in the measured tree (a11y-only node, ' +
+              'user-agent shadow content, or a locator the model does not index), so occlusion ' +
+              'could not be computed. Only the declared stacking inputs below are real.',
+          )
+        } else if (runtime?.visible === undefined) {
+          lines.push('UNMEASURED: this node has no geometry, so occlusion is unknown — not "clear".')
+        } else if (runtime.occluded) {
+          lines.push(
+            `INFERRED ${runtime.occluded.toUpperCase()} occlusion — ~${Math.round((runtime.occludedFraction ?? 0) * 100)}% of the box is covered by: ` +
+              (occludedByLabels.length ? occludedByLabels.join(', ') : occludedBy.join(', ')),
+          )
+        } else {
+          lines.push('No covering node found by the geometric pass.')
+        }
+        if (hitTest) {
+          lines.push(
+            hitTest.isTarget
+              ? `HIT TEST (ground truth) at the box centre lands on the element itself.`
+              : `HIT TEST (ground truth) at the box centre lands on ${hitTest.label} [${hitTest.key}] — that is what a click hits.`,
+          )
+        } else if (hitTestError) {
+          lines.push(`HIT TEST could not run: ${hitTestError}`)
+        }
+        if (distorting.length) {
+          lines.push(
+            `CAUTION: ${distorting.join(', ')} present — the painted shape is not the bounds rectangle, ` +
+              'so the geometric occlusion inference above can be wrong in either direction. Trust the hit test.',
+          )
+        }
+        lines.push(
+          `stacking context: ${runtime?.stackingContext === undefined ? 'unmeasured' : runtime.stackingContext}` +
+            (runtime?.stackingReasons?.length ? ` (${runtime.stackingReasons.join(', ')})` : ''),
+        )
+        const cascadeText = formatCascadeReport({
           element: 'stacking-relevant declarations',
           winnerFor: cascade.winnerFor,
           losersFor: cascade.losersFor,
@@ -1622,53 +2329,33 @@ export class PlaywrightExecutor {
         })
 
         return {
+          /** INFERENCE: `'partial'` | `'full'` | null. null also covers "unmeasured". */
+          occluded: runtime?.occluded ?? null,
+          /** INFERENCE: keys of the covering nodes, topmost first. */
+          occludedBy,
+          /** `tag#id.class` for each `occludedBy` entry, same order. */
+          occludedByLabels,
+          /** INFERENCE: estimated covered fraction of the box (0..1). */
+          occludedFraction: runtime?.occludedFraction ?? null,
+          /** GROUND TRUTH: what `DOM.getNodeForLocation` returns at the box centre. */
+          hitTest,
+          hitTestError,
+          /** GROUND TRUTH from the layout tree; `null` when the node was not measured. */
+          stackingContext: runtime?.stackingContext ?? null,
+          /** The declarations that EXPLAIN `stackingContext`. They do not decide it. */
+          stackingReasons: runtime?.stackingReasons ?? [],
+          /** Declared props that make the bounds rectangle an unreliable proxy for the paint. */
+          shapeDistortingProps: distorting,
+          /** The element's own stacking-relevant declarations, with source locations. */
           stacking,
-          createsStackingContext,
-          position: position ?? null,
-          zIndex: zIndex ?? null,
-          // Full paint-order hit-testing (naming the actual element on top) is a
-          // later milestone; this reports the element's own stacking inputs only.
-          occludedBy: null as null,
-          note: 'M2: element stacking inputs only. Paint-order hit-testing is a later milestone.',
-          text,
+          position: cascade.winnerFor['position']?.value ?? null,
+          zIndex: cascade.winnerFor['z-index']?.value ?? null,
+          box,
+          /** false when the element could not be joined to the measured model at all. */
+          measured: !!runtime,
+          text: `${lines.join('\n')}\n\n${cascadeText}`,
         }
       }
-
-      // Build (or rebuild) the PageModel for a page, diffing against the previous
-      // per-page model so `changedSince` markers are populated. Caches on lastPageModel.
-      const buildPageModelFn = async (options?: { page?: Page; scope?: string }): Promise<PageModel> => {
-        const p = options?.page || page
-        const cdp = await getCDPSession({ page: p })
-        const model = await buildPageModel({ page: p, cdp, scope: options?.scope })
-        const prev = self.lastPageModel.get(p)
-        if (prev) model.diffAgainst(prev)
-        self.lastPageModel.set(p, model)
-        return model
-      }
-
-      // `pm`: lazy per-execute accessor. Builds the page model once (per page) and
-      // reuses it across anchor/query/renderText/debugMode calls in the same turn.
-      // Returns only cycle-free projections (handles/rows/strings), never the live model.
-      const pmModels = new Map<Page, PageModel>()
-      const getPmModel = async (targetPage?: Page): Promise<PageModel> => {
-        const p = targetPage || page
-        if (!p) {
-          throw new Error('pm requires a page')
-        }
-        const existing = pmModels.get(p)
-        if (existing) return existing
-        const model = await buildPageModelFn({ page: p })
-        pmModels.set(p, model)
-        return model
-      }
-      const pm = {
-        anchor: async (selector: any, options?: { page?: Page }) =>
-          (await getPmModel(options?.page)).anchor(selector),
-        query: async (opts?: any) => (await getPmModel(opts?.page)).query(opts),
-        renderText: async (opts?: any) => (await getPmModel(opts?.page)).renderText(opts),
-        debugMode: async (options?: { page?: Page }) => (await getPmModel(options?.page)).debugMode(),
-      }
-      const queryPage = async (opts?: any) => (await getPmModel(opts?.page)).query(opts)
 
       const inspectPinnedElement = async (pageUrl: string, elementExpression: string) => {
         const targetPage = context.pages().find((candidate) => candidate.url() === pageUrl) || context.pages()[0]
@@ -1748,6 +2435,13 @@ export class PlaywrightExecutor {
         await ghostCursorController.hide({ page: targetPage })
       }
 
+      // Human pointer motion. OFF unless called: a real trajectory fires mouseover on
+      // everything it crosses, which is a behaviour change, not a visual nicety.
+      const humanMouse = createHumanMouseApi({
+        defaultPage: page,
+        getCdpSession: getCDPSession,
+      })
+
       const recordingApi = createRecordingApi({
         context,
         defaultPage: page,
@@ -1791,9 +2485,18 @@ export class PlaywrightExecutor {
         return dbg
       }
 
+      /**
+       * The root a module graph is built over when the caller does not name one.
+       *
+       * `traceValue` in trace.ts falls back to `process.cwd()`, which is the RELAY
+       * SERVER's directory, not the session's — so the default is resolved here, before
+       * the option ever reaches trace.ts, and the session cwd wins.
+       */
+      const defaultGraphRoot = (): string => self.sessionCwd ?? process.cwd()
+
       // Lazily build + cache the module graph for a root (defaults to session cwd).
       const getModuleGraph = (root?: string): ModuleGraph => {
-        const key = root ?? self.sessionCwd ?? process.cwd()
+        const key = root ?? defaultGraphRoot()
         const cached = self.moduleGraphCache.get(key)
         if (cached) return cached
         const graph = buildModuleGraph({ root: key })
@@ -1801,9 +2504,54 @@ export class PlaywrightExecutor {
         return graph
       }
 
-      const setLogpointFn = async (options: { page?: Page; file: string; line: number; expr: string; tag?: string }) => {
+      /**
+       * Hand the sandbox an OPAQUE handle to the (cached) module graph. Reuses
+       * `moduleGraphCache`, so a graph parsed by `traceValue` earlier in the session is
+       * the same object `backwardSlice` / `inspectBinding` get here.
+       */
+      const handlesByRoot = new Map<string, ModuleGraphHandle>()
+      const moduleGraphFn = (options?: { root?: string }): ModuleGraphHandle => {
+        const root = options?.root ?? defaultGraphRoot()
+        const existing = handlesByRoot.get(root)
+        if (existing) return existing
+        const graph = getModuleGraph(root)
+        const handle: ModuleGraphHandle = {
+          root: graph.root,
+          fileCount: graph.files.length,
+          summary: () => graph.summary(),
+        }
+        graphByHandle.set(handle, graph)
+        handlesByRoot.set(root, handle)
+        return handle
+      }
+
+      /** `{ code }` or `{ file, graph }` — the source the static helpers analyse. */
+      type SandboxSourceRef = { code?: string; file?: string; graph?: unknown }
+      const resolveSourceRef = (opts: SandboxSourceRef, who: string): { code?: string; file?: string; graph?: ModuleGraph } => {
+        if (opts.code != null) return { code: opts.code, file: opts.file }
+        return { file: opts.file, graph: unwrapGraph(opts.graph, who) }
+      }
+
+      const setLogpointFn = async (options: {
+        page?: Page
+        file: string
+        line: number
+        expr: string
+        tag?: string
+        /** Cap on the JSON payload, applied IN the page. Over-cap payloads log a visible cut. */
+        maxPayload?: number
+      }) => {
         const dbg = await getDebuggerForPage(options.page)
-        return dbg.setLogpoint({ file: options.file, line: options.line, expr: options.expr, tag: options.tag })
+        // setLogpoint THROWS when `expr` cannot be assembled into a provably non-pausing
+        // condition. That error is the whole point of the check, so it propagates
+        // untouched — a swallowed refusal here would install nothing and read as success.
+        return dbg.setLogpoint({
+          file: options.file,
+          line: options.line,
+          expr: options.expr,
+          tag: options.tag,
+          maxPayload: options.maxPayload,
+        })
       }
 
       const getScriptSourceByUrlFn = async (options: { page?: Page; url: string }) => {
@@ -1811,39 +2559,199 @@ export class PlaywrightExecutor {
         return dbg.getScriptSourceByUrl({ url: options.url })
       }
 
-      const readLogpointsFn = async (options?: { page?: Page; tag?: string; sinceCursor?: number }) => {
+      /**
+       * Returns the full `LogpointRead` — `{ hits, totalHits, droppedHits, malformedHits,
+       * unparsableLines, caps, linesScanned, cursor }`, NOT a bare array. The accounting
+       * fields are what make a capped window honest, so the wrapper never strips them
+       * down to `hits`.
+       */
+      const readLogpointsFn = async (options?: {
+        page?: Page
+        tag?: string
+        sinceCursor?: number
+        maxHits?: number
+        maxLen?: number
+      }) => {
         return readLogpoints({
           getLogs: async () => getLatestLogs({ page: options?.page }),
           tag: options?.tag,
           sinceCursor: options?.sinceCursor,
+          maxHits: options?.maxHits,
+          maxLen: options?.maxLen,
         })
       }
 
+      /**
+       * Returns the discriminated union verbatim. The `measured: false` arm has NO
+       * `sameReference` field, and it must stay that way: flattening the two arms into one
+       * shape is exactly how "I never found your store" used to read as "your store
+       * correctly produced a new reference".
+       */
       const storeIdentityFn = async (options: { page?: Page; action: () => Promise<void> | void; storeExpr?: string }) => {
         const p = options.page || page
         return storeIdentity({ page: p, action: options.action, storeExpr: options.storeExpr })
       }
 
-      const netFns = {
-        timeline: (options?: { page?: Page; urlPattern?: string | RegExp }) => {
-          const p = options?.page || page
-          return netTimeline({ page: p, urlPattern: options?.urlPattern })
-        },
-        delay: async (options: { page?: Page; urlPattern: string; ms: number }) => {
-          const p = options.page || page
-          const cdp = await getCDPSession({ page: p })
-          return netDelay({ cdp, urlPattern: options.urlPattern, ms: options.ms })
-        },
+      /** Stable per-page CDP adapter, so `net.delay`'s owner-identity guard can work. */
+      const getNetDelayCdp = async (p: Page): Promise<ICDPSession> => {
+        const existing = self.netDelayCdpCache.get(p)
+        if (existing) return existing
+        const cdp = await getCDPSession({ page: p })
+        self.netDelayCdpCache.set(p, cdp)
+        return cdp
       }
 
-      const fiberSnapshotFn = async (options: { locator: Locator | ElementHandle }) => {
+      const netFns = {
+        timeline: (options?: {
+          page?: Page
+          urlPattern?: string | RegExp
+          /**
+           * Fill THIS array instead of a private one. The probe pushes into it in place,
+           * so `state.entries = []; net.timeline({ page, buffer: state.entries })` keeps
+           * the capture readable from later execute() calls without going through the
+           * registry. `netTimeline` has always supported it; the wrapper dropped it.
+           */
+          buffer?: NetEntry[]
+          maxEntries?: number
+        }) => {
+          const p = options?.page || page
+          self.traceProbeOwners.add(p)
+          return netTimeline({
+            page: p,
+            urlPattern: options?.urlPattern,
+            buffer: options?.buffer,
+            maxEntries: options?.maxEntries,
+          })
+        },
+        delay: async (options: {
+          page?: Page
+          /**
+           * A SUBSTRING of the url, or a RegExp — exactly what `net.timeline` means by
+           * the same option name. It is NOT a `Fetch.enable` glob: passing `'/api/'`
+           * used to intercept ZERO requests while the probe still announced itself
+           * LIVE and PERTURBING, so a race-class measurement reported clean having
+           * perturbed nothing. `stats().interceptedNothing` now reports that case.
+           */
+          urlPattern: string | RegExp
+          ms: number
+          /** Auto-stop after this long. `0` disables the expiry and is recorded as unbounded. */
+          ttlMs?: number
+          /** Take over from a live `net.delay` on the same page instead of being refused. */
+          force?: boolean
+        }) => {
+          const p = options.page || page
+          const cdp = await getNetDelayCdp(p)
+          self.traceProbeOwners.add(cdp)
+          return netDelay({
+            cdp,
+            urlPattern: options.urlPattern,
+            ms: options.ms,
+            ttlMs: options.ttlMs,
+            force: options.force,
+          })
+        },
+        /**
+         * The session probe registry. A controller that went out of scope at the end of an
+         * `execute()` call is still listed here, still readable, and still stoppable —
+         * which is the trap the registry exists to remove.
+         */
+        active: (opts?: { live?: boolean; kind?: 'net.timeline' | 'net.delay' }) => listTraceProbes(opts),
+        /**
+         * One probe's accounting by id — spec, stats, live/stopped and why it stopped.
+         * `net.active()` had to be filtered by hand to answer that, and the only direct
+         * route to it was `traceProbes.get`, an exported namespace nothing ever imported.
+         * Returns null for an unknown id rather than throwing: asking about a probe that
+         * no longer exists is a normal question.
+         */
+        get: (id: string) => getTraceProbe(id),
+        read: (id: string) => readTraceProbe(id),
+        stop: (id: string) => stopTraceProbe(id),
+        /**
+         * Stops only the probes THIS session armed. The registry is module-level and
+         * shared by every session in the relay process, so an unfiltered stopAll would
+         * silently disarm another agent's measurement mid-run.
+         */
+        stopAll: async (opts?: { kind?: 'net.timeline' | 'net.delay' }) => {
+          const stopped: string[] = []
+          for (const owner of self.traceProbeOwners) {
+            stopped.push(...(await stopAllTraceProbes({ owner, kind: opts?.kind })))
+          }
+          return stopped
+        },
+        /** One line per live PERTURBING probe — read this before trusting any timing. */
+        warnings: () => tracePerturbationWarnings(),
+      }
+
+      /**
+       * `identity: true` adds page-side identity tokens for every object/function prop.
+       * That is the ONLY way handler-identity churn survives the process boundary: the
+       * default serialisation renders every function as `[function]`, so two different
+       * arrows look identical to `fiberDiff`.
+       */
+      const fiberSnapshotFn = async (options: {
+        locator: Locator | ElementHandle
+        identity?: boolean
+        maxKeys?: number
+        maxDepth?: number
+      }) => {
         const targetPage = await (async (): Promise<Page | null> => {
           if ('page' in options.locator) return options.locator.page()
           return (await options.locator.ownerFrame())?.page() ?? null
         })()
         if (!targetPage) throw new Error('Could not get page from locator')
         const cdp = await getCDPSession({ page: targetPage })
+        if (options.identity) {
+          return fiberSnapshot({
+            locator: options.locator,
+            cdp,
+            identity: true,
+            maxKeys: options.maxKeys,
+            maxDepth: options.maxDepth,
+          })
+        }
         return fiberSnapshot({ locator: options.locator, cdp })
+      }
+
+      // ---- static-analysis lane -------------------------------------------
+      // The NodePath-level primitives (analyzeBinding, probeValue, exhaustiveDeps,
+      // classifyDeopt, …) stay unexposed: they take and return live Babel objects. These
+      // six are the serialisable entry points built over them.
+
+      const inspectBindingFn = (opts: SandboxSourceRef & { name: string; occurrence?: number }) =>
+        inspectBinding({ ...resolveSourceRef(opts, 'inspectBinding'), name: opts.name, occurrence: opts.occurrence })
+
+      const evaluateBindingFn = (opts: SandboxSourceRef & { name: string; occurrence?: number }) =>
+        evaluateBinding({ ...resolveSourceRef(opts, 'evaluateBinding'), name: opts.name, occurrence: opts.occurrence })
+
+      const findMissingDepsFn = (
+        opts: SandboxSourceRef & { hooks?: string[]; max?: number; withCodeFrames?: boolean },
+      ) =>
+        findMissingDeps({
+          ...resolveSourceRef(opts, 'findMissingDeps'),
+          hooks: opts.hooks,
+          max: opts.max,
+          withCodeFrames: opts.withCodeFrames,
+        })
+
+      const backwardSliceFn = (opts: {
+        graph?: unknown
+        root?: string
+        startFile: string
+        /** A variable NAME (`'count'`), never a path or an expression. */
+        startExpr: string
+        maxHops?: number
+        maxBreadth?: number
+      }) => {
+        // `graph` is optional here (unlike the primitive) so the common case is one call:
+        // omitting it builds/reuses the graph for the session cwd.
+        const graph = opts.graph ? unwrapGraph(opts.graph, 'backwardSlice') : getModuleGraph(opts.root)
+        return backwardSlice({
+          graph,
+          startFile: opts.startFile,
+          startExpr: opts.startExpr,
+          maxHops: opts.maxHops,
+          maxBreadth: opts.maxBreadth,
+        })
       }
 
       // traceValue: orchestrates anchor + static slice + probe arming, returning
@@ -1864,29 +2772,37 @@ export class PlaywrightExecutor {
           storeExpr: options.storeExpr,
           urlPattern: options.urlPattern,
         }
-        const result = await traceValue({ ...options, deps })
-        const compactHop = (hop: any) =>
-          hop && {
-            kind: hop.kind,
-            site: hop.site,
-            blockedBy: hop.blockedBy,
-            hazards: hop.hazards,
-            note: hop.note,
-            evaluated: hop.evaluated,
-            codeFrame: hop.codeFrame,
-            childCount: hop.children ? hop.children.length : 0,
-          }
+        // Default `root` HERE, not in trace.ts: its own fallback is `process.cwd()`, the
+        // relay server's directory, which would parse a module graph over the wrong tree.
+        const result = await traceValue({ ...options, root: options.root ?? defaultGraphRoot(), deps })
         return {
-          render: result.render(),
+          /**
+           * A METHOD, not a precomputed string — `render({ maxLines, codeFrames })`
+           * belongs to the caller. Rendering eagerly is also what forced two different
+           * docs to disagree about whether this was a property or a call.
+           */
+          render: (opts?: RenderOptions) => result.render(opts),
           anchor: result.anchor,
           blocked: result.blocked.map((b) => ({
             id: b.id,
             blockedBy: b.blockedBy,
             site: b.site,
+            hazards: b.hazards,
             note: b.note,
+            codeFrame: b.codeFrame,
             probe: b.probe ? { type: b.probe.type, passive: b.probe.passive, spec: b.probe.spec } : null,
           })),
-          expand: (hopId: string) => compactHop(result.expand(hopId)),
+          /**
+           * A BOUNDED SUBTREE in one call — `TraceSubtree` is already cycle-free, JSON-safe
+           * and depth/node-capped, and it reports `omittedChildren` / `complete` so a cut
+           * is never invisible. The old wrapper flattened children to a `childCount`, which
+           * cost one round-trip per level for no safety gain.
+           */
+          expand: (hopId: string, opts?: { depth?: number; maxNodes?: number }) => result.expand(hopId, opts),
+          /** Every hop id, so a hop can be addressed without walking the tree. */
+          hopIds: result.hopIds,
+          /** Live perturbing probes + unhandled blind spots. Read before trusting timings. */
+          warnings: result.warnings,
           runProbe: async (hopId: string) => {
             const leaf = result.blocked.find((b) => b.id === hopId)
             if (!leaf?.probe) throw new Error(`no probe armed at hop ${hopId}`)
@@ -1900,21 +2816,121 @@ export class PlaywrightExecutor {
       // `execute()` runs fresh per call, so a closure variable would be reset
       // between `startCdp` and `stopCdp`.
 
-      const startCdpRecording = async (options: { page?: Page; outputPath: string; quality?: number; fps?: number; maxWidth?: number; maxHeight?: number; maxDurationMs?: number }) => {
+      // `Omit<…, 'cdp'>` rather than a hand-copied option list: the previous inline type
+      // silently omitted `mode`, `probeMs` and everything added since, so the sandbox
+      // accepted them at runtime while TypeScript claimed they did not exist.
+      // `page` is narrowed back to a real Page because this wrapper also needs it to
+      // open the CDP session; the recorder itself only ever calls bringToFront() on it.
+      const startCdpRecording = async (options: Omit<CdpScreencastOptions, 'cdp' | 'page'> & { page?: Page }) => {
         if (self.cdpScreencast) throw new Error('A CDP screencast is already running; stop it first.')
         const p = options.page || page
         if (!p) throw new Error('No page available to record')
         const cdp = await getCDPSession({ page: p })
-        // Pass the page so screenshot mode can foreground the tab (a backgrounded
-        // tab has no compositor surface and captureScreenshot hangs).
-        self.cdpScreencast = await startCdpScreencast({ cdp, page: p, ...options })
-        return { started: true, outputPath: options.outputPath }
+        // Pass the page so the screenshot path can foreground the tab. It is always
+        // passed, so `mode: 'screenshot'` — and `mode: 'auto'`, the default, whenever it
+        // falls back — WILL bringToFront() this tab. The reason is measured, and it is not
+        // the "a backgrounded tab has no compositor surface" story this comment used to
+        // tell: captureScreenshot on a hidden tab neither fails nor returns stale pixels,
+        // it blocks, for up to 26 seconds at a time, collapsing a 10fps poll to ~0.1fps.
+        // See the table in `startScreenshotPolling`.
+        const handle = await startCdpScreencast({ cdp, page: p, ...options })
+        self.cdpScreencast = handle
+
+        // The overlay renders nothing on its own — it draws what this tap feeds it.
+        // Attached after the recorder exists so no event can arrive before it can be
+        // stamped, and torn down by stopCdp/cancelCdp/disposeBrowserSideResources.
+        let inputOverlayNote: string | undefined
+        if (options.inputOverlay) {
+          const tap = attachInputOverlayTap({
+            page: p,
+            onAction: (action: InputAction) => handle.inputEvent(action),
+          })
+          self.cdpScreencastInputDetach = tap.detach
+          inputOverlayNote = tap.note
+        }
+
+        return {
+          started: true,
+          outputPath: options.outputPath,
+          ...(options.inputOverlay ? { inputOverlay: true } : {}),
+          ...(inputOverlayNote ? { note: inputOverlayNote } : {}),
+        }
+      }
+
+      /** Drop the instrumentation listener. Idempotent; safe to call when none was armed. */
+      const detachInputOverlayTap = () => {
+        const detach = self.cdpScreencastInputDetach
+        self.cdpScreencastInputDetach = null
+        try {
+          detach?.()
+        } catch (e) {
+          self.logger.error('Failed to detach the input overlay tap:', e)
+        }
+      }
+
+      /**
+       * Narration is stamped against the LIVE recorder, so it has to reach the same
+       * instance `startCdp` created — hence the executor field, same reason as stopCdp.
+       * With no recording running there is nothing to attach a caption to, and quietly
+       * accepting one would leave the agent believing the video is narrated when it is not.
+       */
+      const captionCdpRecording = (text: string, opts?: { atMs?: number; durationMs?: number }) => {
+        if (!self.cdpScreencast) {
+          throw new Error(
+            'No CDP screencast is running, so there is nothing to caption. Call recording.startCdp({ outputPath }) first.',
+          )
+        }
+        return self.cdpScreencast.caption(text, opts)
+      }
+
+      const clearCdpCaption = (opts?: { atMs?: number }) => {
+        if (!self.cdpScreencast) {
+          throw new Error(
+            'No CDP screencast is running, so there is no caption to clear. Call recording.startCdp({ outputPath }) first.',
+          )
+        }
+        return self.cdpScreencast.clearCaption(opts)
+      }
+
+      /**
+       * Pace the recording from the narration itself. Throws with no recorder for the same
+       * reason `caption` does: a hold that silently did nothing would leave the agent
+       * believing it had spaced the beats out when the clip is still unwatchable.
+       */
+      const holdCdpRecording = (opts?: { minMs?: number; extraMs?: number }) => {
+        if (!self.cdpScreencast) {
+          throw new Error(
+            'No CDP screencast is running, so there is no caption to hold. Call recording.startCdp({ outputPath }) first.',
+          )
+        }
+        return self.cdpScreencast.hold(opts)
+      }
+
+      /**
+       * How many frames the live recorder has captured.
+       *
+       * The handle's `frameCount()` never escaped `startCdpRecording`, so the one
+       * question an agent actually asks mid-recording — "is this thing capturing
+       * anything at all, or am I about to hand over a `frames: 0` file?" — could only be
+       * answered by stopping. The sibling `captionCount()`/`inputEventCount()` stay
+       * unexposed on purpose: both are fully reported in `stopCdp()`'s result
+       * (`captions[]`, `inputEvents[]`), and neither changes what you would do next.
+       */
+      const cdpRecordingFrameCount = (): number => {
+        if (!self.cdpScreencast) {
+          throw new Error(
+            'No CDP screencast is running, so there are no frames to count. Call recording.startCdp({ outputPath }) first.',
+          )
+        }
+        return self.cdpScreencast.frameCount()
       }
 
       const stopCdpRecording = async () => {
         if (!self.cdpScreencast) throw new Error('No CDP screencast is running')
         const handle = self.cdpScreencast
         self.cdpScreencast = null
+        // Before stop(), so an action still in flight cannot stamp onto a stopped recorder.
+        detachInputOverlayTap()
         return handle.stop()
       }
 
@@ -1922,6 +2938,7 @@ export class PlaywrightExecutor {
         if (!self.cdpScreencast) return { cancelled: false }
         const handle = self.cdpScreencast
         self.cdpScreencast = null
+        detachInputOverlayTap()
         await handle.cancel()
         return { cancelled: true }
       }
@@ -1935,8 +2952,9 @@ export class PlaywrightExecutor {
         snapshot,
         accessibilitySnapshot: snapshot, // backward compat alias
         refToLocator,
-        getCleanHTML,
-        getPageMarkdown,
+        // Wrapped only to pin the diff baseline to THIS session — see `lastCleanHtml`.
+        getCleanHTML: getCleanHTMLFn,
+        getPageMarkdown: getPageMarkdownFn,
         getLocatorStringForElement,
         getLatestLogs,
         clearAllLogs,
@@ -1960,6 +2978,19 @@ export class PlaywrightExecutor {
         fiberSnapshot: fiberSnapshotFn,
         fiberDiff,
         replayPure,
+        replayPureAsync,
+        // M5 static-analysis lane: the six serialisable entry points. The NodePath-level
+        // primitives behind them stay unexposed — they take and return live Babel objects.
+        inspectBinding: inspectBindingFn,
+        evaluateBinding: evaluateBindingFn,
+        findMissingDeps: findMissingDepsFn,
+        isPureFunctionSource,
+        backwardSlice: backwardSliceFn,
+        moduleGraph: moduleGraphFn,
+        // NOTE: `buildPageModelFn` is deliberately NOT a sandbox global. It returns the
+        // LIVE PageModel (byKey map, full node tree), and `pm.*` exists precisely so
+        // sandbox code only ever sees bounded, cycle-free projections. `rootSelector` is
+        // reachable through every `pm.*` call instead.
         pm,
         queryPage,
         inspectPinnedElement,
@@ -1971,18 +3002,33 @@ export class PlaywrightExecutor {
           show: showGhostCursor,
           hide: hideGhostCursor,
         },
+        // Opt-in human pointer motion (Fitts + minimum-jerk + corrective submovements).
+        // Moves the REAL pointer along the path, so it fires mouseover/mouseenter on
+        // every element in between — see the skill docs before enabling it on a suite.
+        humanMouse,
         recording: {
           start: recordingApi.start,
           stop: recordingApi.stop,
           isRecording: recordingApi.isRecording,
           cancel: recordingApi.cancel,
           // Gesture-free recorder — no extension-icon click required. Works on
-          // extension-connected sessions as well as direct CDP. The real
-          // constraint is that the tab must be FOREGROUND (a backgrounded tab has
-          // no compositor surface); startCdp calls bringToFront() itself.
+          // extension-connected sessions as well as direct CDP, and does NOT need a
+          // foreground tab: measured through the extension, a backgrounded tab
+          // captured 31 frames against 30 in the foreground.
           startCdp: startCdpRecording,
           stopCdp: stopCdpRecording,
           cancelCdp: cancelCdpRecording,
+          // Narration for a repro nobody watched live. Burned into the pixels by
+          // default, because the players a clip gets pasted into show no soft track.
+          caption: captionCdpRecording,
+          clearCaption: clearCdpCaption,
+          // Pacing, taken from the caption text rather than from a guessed sleep. The
+          // reason the recorder owns this instead of the caller writing setTimeout: only
+          // the recorder knows how long the cue currently on screen needs to be read.
+          hold: holdCdpRecording,
+          // "Is it actually capturing?" — answerable mid-recording instead of only after
+          // stopCdp() hands back a file with frames: 0.
+          frameCount: cdpRecordingFrameCount,
         },
         // Backward-compatible aliases
         startRecording: recordingApi.start,
@@ -1998,23 +3044,140 @@ export class PlaywrightExecutor {
           return { page: newPage, context: newContext }
         },
         require: this.sandboxedRequire,
-        import: (specifier: string) => import(specifier),
+        // There is deliberately NO `import` global.
+        //
+        // A raw `import: (specifier) => import(specifier)` used to sit on this line, one
+        // line after the allowlisted `require`, with no allowlist of its own:
+        // `globalThis.import('node:child_process').execSync('id -un')` ran a shell, and
+        // `globalThis.import('node:fs')` returned the RAW fs module, past the ScopedFS
+        // write jail. It is gone rather than allowlisted because it was never callable
+        // by ordinary sandbox code in the first place:
+        //   - `import` is a reserved word, so it cannot be written as a bare identifier;
+        //   - `import(specifier)` in sandbox source parses as the syntactic dynamic-import
+        //     form, which never consults the globals and fails in a vm context with
+        //     "A dynamic import callback was not specified";
+        // so the ONLY expression that ever reached it was `globalThis.import(...)`, which
+        // is the escape spelling and nothing else. Nothing in this repo — src, tests,
+        // docs, skill.md — referenced it, and every entry in ALLOWED_MODULES is a Node
+        // built-in that `require` already loads, so removing it costs no capability.
+        // `src/skill.md` has always documented `import` as unavailable; now that is true.
         // Ghost Browser API - only works in Ghost Browser, mirrors chrome.ghostPublicAPI etc
         chrome: chromeGhostBrowser,
         ...usefulGlobals,
-        // Expose process with safety overrides:
-        // - cwd() returns the session's cwd instead of the relay server's cwd
-        // - exit() is blocked to prevent killing the relay server
-        // - chdir() is blocked to prevent affecting other sessions
+        /**
+         * `process`, exposed because scripts legitimately read `env`, `platform`, `argv`
+         * and `version` — and simultaneously the richest single source of host capability
+         * in the sandbox, so the proxy is a DENY LIST, not the two overrides it began as.
+         *
+         * Kept from before: `cwd()` reports the SESSION's cwd (the raw one is the relay
+         * server's), `exit()` and `chdir()` are refused.
+         *
+         * Added because each was a live escape, verified by running it:
+         *   - `getBuiltinModule(id)` is a module loader that consulted no allowlist at
+         *     all: `process.getBuiltinModule('child_process')` ran a shell and
+         *     `process.getBuiltinModule('fs')` returned the raw, unjailed fs. It now
+         *     routes through `sandboxedRequire`, so an allowed module comes back as the
+         *     SAME object `require` hands out — `fs` is the one ScopedFS instance, never
+         *     the real module.
+         *   - everything in DENIED_PROCESS_METHODS / DENIED_PROCESS_PROPERTIES above.
+         *
+         * Writes are refused outright. Only `get` was trapped before, so the default
+         * traps reached the real process object: `delete process.exit` removed the HOST's
+         * own exit function, and `process.exitCode = 1` set the relay's exit status.
+         *
+         * `process.env` is deliberately still the live host object — sandbox scripts read
+         * it, and it is data rather than capability. It stays readable AND writable, and
+         * `src/skill.md` says so; do not mistake this proxy for env isolation.
+         */
         process: new Proxy(process, {
           get(target, prop, receiver) {
             if (prop === 'cwd') return () => self.sessionCwd || target.cwd()
             if (prop === 'exit') return () => { throw new Error('process.exit() is not allowed in the sandbox') }
             if (prop === 'chdir') return () => { throw new Error('process.chdir() is not allowed in the sandbox, use a new session with a different cwd instead') }
+            if (prop === 'getBuiltinModule') return (id: string) => self.sandboxedRequire(id)
+            if (typeof prop === 'string' && DENIED_PROCESS_PROPERTIES.has(prop)) return undefined
+            if (typeof prop === 'string' && DENIED_PROCESS_METHODS.has(prop)) {
+              return () => {
+                throw new Error(`process.${prop}() is not allowed in the sandbox`)
+              }
+            }
             return Reflect.get(target, prop, receiver)
+          },
+          set(_target, prop) {
+            throw new Error(
+              `Cannot assign to process.${String(prop)}: the sandbox process object is read-only. ` +
+                `(process.env is a live host object and is still writable.)`,
+            )
+          },
+          defineProperty(_target, prop) {
+            throw new Error(`Cannot define process.${String(prop)}: the sandbox process object is read-only`)
+          },
+          deleteProperty(_target, prop) {
+            throw new Error(`Cannot delete process.${String(prop)}: the sandbox process object is read-only`)
           },
         }),
       }
+
+    return { vmContextObj, screenshotCollector, resizedImageCollector }
+  }
+
+  async execute(code: string, timeout = 10000): Promise<ExecuteResult> {
+    const consoleLogs: Array<{ method: string; args: any[] }> = []
+    const warningScope = this.beginWarningScope()
+
+    const formatConsoleLogs = (logs: Array<{ method: string; args: any[] }>, prefix = 'Console output') => {
+      if (logs.length === 0) {
+        return ''
+      }
+      let text = `${prefix}:\n`
+      logs.forEach(({ method, args }) => {
+        const formattedArgs = args
+          .map((arg) => {
+            if (typeof arg === 'string') return arg
+            return util.inspect(arg, {
+              depth: 4,
+              colors: false,
+              maxArrayLength: 100,
+              maxStringLength: 1000,
+              breakLength: 80,
+            })
+          })
+          .join(' ')
+        text += `[${method}] ${formattedArgs}\n`
+      })
+      return text + '\n'
+    }
+
+    try {
+      // Warn if cloud VM is approaching its hard timeout (deduped by minute bucket)
+      if (this.cloudSession?.timeoutAt) {
+        const remainingMs = this.cloudSession.timeoutAt - Date.now()
+        if (remainingMs <= 0) {
+          throw new Error(CLOUD_SESSION_EXPIRED_ERROR)
+        }
+        if (remainingMs < 5 * 60_000) {
+          const mins = Math.ceil(remainingMs / 60_000)
+          if (this.lastCloudTimeoutWarningMinute !== mins) {
+            this.lastCloudTimeoutWarningMinute = mins
+            this.enqueueWarning(
+              `Cloud browser expires in ~${mins} minute${mins === 1 ? '' : 's'}. ` +
+                `Create a new session soon with: playwriter session new --browser cloud`,
+            )
+          }
+        }
+      }
+
+      await this.ensureConnection()
+      const page = await this.getCurrentPage(timeout)
+      const context = this.context || page.context()
+
+      this.logger.log('Executing code:', code)
+
+      const { vmContextObj, screenshotCollector, resizedImageCollector } = this.buildSandboxContext({
+        page,
+        context,
+        consoleLogs,
+      })
 
       const vmContext = vm.createContext(vmContextObj)
       const autoReturnExpr = getAutoReturnExpression(code)
@@ -2255,6 +3418,13 @@ export class ExecutorManager {
   }
 
   deleteExecutor(sessionId: string): boolean {
+    const executor = this.executors.get(sessionId)
+    // Fire-and-forget: the caller's contract is synchronous, and teardown must not be
+    // able to fail (or stall) a session delete. disposeBrowserSideResources swallows
+    // its own errors, so the only thing left to guard is the promise itself.
+    if (executor) {
+      void executor.disposeBrowserSideResources().catch(() => {})
+    }
     return this.executors.delete(sessionId)
   }
 

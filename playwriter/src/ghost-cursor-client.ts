@@ -29,6 +29,13 @@ interface GhostCursorAction {
   button: GhostCursorButton
 }
 
+/** One knot of a sampled trajectory. `tMs` is an offset from the start of playback. */
+interface GhostCursorPathSample {
+  tMs: number
+  x: number
+  y: number
+}
+
 export interface GhostCursorClientOptions {
   style?: GhostCursorStyle
   color?: string
@@ -68,6 +75,15 @@ interface GhostCursorApi {
   disable: () => void
   applyMouseAction: (action: GhostCursorAction) => void
   isEnabled: () => boolean
+  playPath: (options: { samples: GhostCursorPathSample[] }) => { playing: boolean; durationMs: number }
+  cancelPath: () => void
+  isPlayingPath: () => boolean
+  /**
+   * Last position the cursor was told about, by ANY route — `applyMouseAction` (so it
+   * tracks every Playwright mouse action, including ones the human-mouse driver never
+   * saw) or path playback. Null before the first position is known.
+   */
+  getPosition: () => { x: number; y: number } | null
 }
 
 declare global {
@@ -360,8 +376,117 @@ function wakeFromIdle(options: { x: number; y: number }): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sampled-path playback (human mouse motion)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS
+// ---------------
+// `moveCursor` animates A→B with ONE CSS transition. That is right for a teleporting
+// Playwright action, and wrong for a human trajectory: driving it per-sample means every
+// new sample restarts a fresh transition that the next sample interrupts ~16ms later, so
+// the overlay lags the real pointer by a whole transition and never traces the actual
+// curve. It also cannot show a corrective submovement at all — the dip and re-acceleration
+// get smeared into a single ease.
+//
+// So the whole polyline is handed over in ONE evaluate and played back here against the
+// page's own rAF clock with CSS transitions switched OFF. The overlay and the real CDP
+// pointer then follow the same sample table on two clocks that started within one CDP
+// round trip of each other (~4ms measured), which is well inside a frame.
+let pathPlaybackFrame: number | null = null
+let pathPlaybackActive = false
+
+function cancelPath(): void {
+  if (pathPlaybackFrame !== null) {
+    cancelAnimationFrame(pathPlaybackFrame)
+    pathPlaybackFrame = null
+  }
+  pathPlaybackActive = false
+}
+
+function playPath(options: { samples: GhostCursorPathSample[] }): { playing: boolean; durationMs: number } {
+  const samples = options.samples
+  if (!runtime.enabled || !Array.isArray(samples) || samples.length < 2) {
+    return { playing: false, durationMs: 0 }
+  }
+
+  cancelPath()
+  ensureCursorElement()
+
+  if (runtime.idleHidden) {
+    runtime.idleHidden = false
+    wakeFromIdle({ x: samples[0].x, y: samples[0].y })
+  }
+
+  const durationMs = samples[samples.length - 1].tMs
+
+  // Transitions off: each frame writes the exact modelled position. With a transition
+  // still armed the browser would ease between consecutive samples and re-smooth away the
+  // very features (the corrective dip, the tremor) the model went to the trouble of
+  // producing.
+  if (runtime.outerElement) {
+    runtime.outerElement.style.transitionDuration = '0ms'
+  }
+
+  runtime.x = samples[0].x
+  runtime.y = samples[0].y
+  runtime.hasPosition = true
+  applyTranslate()
+
+  const startedAt = performance.now()
+  pathPlaybackActive = true
+  let cursorIndex = 0
+
+  const step = (): void => {
+    if (!pathPlaybackActive || !runtime.enabled) {
+      cancelPath()
+      return
+    }
+
+    const elapsed = performance.now() - startedAt
+
+    if (elapsed >= durationMs) {
+      const last = samples[samples.length - 1]
+      runtime.x = last.x
+      runtime.y = last.y
+      applyTranslate()
+      pathPlaybackFrame = null
+      pathPlaybackActive = false
+      scheduleIdleHide()
+      return
+    }
+
+    // Samples are time-ordered, and rAF only moves forward, so the search is a walk.
+    while (cursorIndex < samples.length - 2 && samples[cursorIndex + 1].tMs <= elapsed) {
+      cursorIndex++
+    }
+
+    const a = samples[cursorIndex]
+    const b = samples[cursorIndex + 1]
+    const span = b.tMs - a.tMs
+    const fraction = span <= 0 ? 1 : Math.min(1, Math.max(0, (elapsed - a.tMs) / span))
+
+    runtime.x = a.x + (b.x - a.x) * fraction
+    runtime.y = a.y + (b.y - a.y) * fraction
+    applyTranslate()
+
+    pathPlaybackFrame = requestAnimationFrame(step)
+  }
+
+  pathPlaybackFrame = requestAnimationFrame(step)
+  return { playing: true, durationMs }
+}
+
 function moveCursor(options: { x: number; y: number }): void {
   if (!runtime.enabled) {
+    return
+  }
+
+  // Playback owns the cursor while it runs. Without this guard the trailing
+  // `page.mouse.move` that syncs Playwright's pointer state — and any unrelated action
+  // that lands mid-flight — would arm a multi-hundred-ms CSS transition on top of the
+  // per-frame writes, and the overlay would visibly disagree with the real pointer.
+  if (pathPlaybackActive) {
     return
   }
 
@@ -424,6 +549,7 @@ function disable(): void {
   runtime.hasPosition = false
   runtime.idleHidden = false
   clearIdleHideTimer()
+  cancelPath()
 
   if (runtime.outerElement) {
     runtime.outerElement.remove()
@@ -461,6 +587,14 @@ const api: GhostCursorApi = {
   applyMouseAction,
   isEnabled: () => {
     return runtime.enabled
+  },
+  playPath,
+  cancelPath,
+  isPlayingPath: () => {
+    return pathPlaybackActive
+  },
+  getPosition: () => {
+    return runtime.hasPosition ? { x: runtime.x, y: runtime.y } : null
   },
 }
 

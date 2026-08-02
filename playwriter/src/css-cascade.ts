@@ -44,6 +44,18 @@ export interface NormalizedRule {
   order: number
   /** CDP stylesheet id, when known — lets callers fetch source text for code-frames. */
   styleSheetId?: string
+  /**
+   * Declarations present in the rule that were NOT kept in `declarations`, as
+   * `"name: value"`, with the reason. Present only when something was dropped.
+   *
+   * The filter itself is deliberate — a `-webkit-` prefixed property and an `initial`
+   * value are both Chrome's own expansion noise rather than authored cascade input — but
+   * dropping them with no trace made `declarations` read as the rule's full content.
+   * Measured: a real `#wk { -webkit-line-clamp: 2; -webkit-box-orient: vertical; color:
+   * red }` arrives with all three, and only `color` survived, so "why is my
+   * `-webkit-line-clamp` not in the cascade" had no answer anywhere in the output.
+   */
+  droppedDeclarations?: string[]
 }
 
 /** A cycle-free reference to a single declaration (winner or loser). */

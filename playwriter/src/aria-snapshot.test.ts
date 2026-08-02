@@ -7,9 +7,16 @@ import path from 'node:path'
 import { getAriaSnapshot } from './aria-snapshot.js'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
-import { setupTestContext, cleanupTestContext, getExtensionServiceWorker, TEST_WORKSPACE, type TestContext } from './test-utils.js'
+import {
+  setupTestContext,
+  cleanupTestContext,
+  getExtensionServiceWorker,
+  TEST_WORKSPACE,
+  testRelayPort,
+  type TestContext,
+} from './test-utils.js'
 
-const TEST_PORT = 19986
+const TEST_PORT = testRelayPort(import.meta.url)
 const SNAPSHOTS_DIR = path.join(import.meta.dirname, 'aria-snapshots')
 const AX_DEBUG_DIR = path.join(import.meta.dirname, '__snapshots__', 'ax-debug')
 const SHOULD_DUMP_AX = process.env.PLAYWRITER_DUMP_AX === '1'
@@ -73,7 +80,7 @@ describe('aria-snapshot', () => {
   let page: Page
 
   beforeAll(async () => {
-    ctx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'aria-snapshot-test-', toggleExtension: true })
+    ctx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'aria-snapshot-test-', toggleExtension: true })
     page = await ctx.browserContext.newPage()
     const serviceWorker = await getExtensionServiceWorker(ctx.browserContext)
     await page.goto('about:blank')

@@ -654,10 +654,17 @@ function httpGet({ port, path, host }: { port: number; path: string; host: strin
 
 describe('Host header validation (DNS rebinding protection)', () => {
   let server: { close(): void } | null = null
-  const TEST_PORT = 19996
+  // Resolved in beforeAll rather than at module scope, and by the same lazy import cdp-relay
+  // already uses: everything above this describe is a pure state-transition unit test, and
+  // keeping the relay/test-utils graph out of the module's load path is what keeps it that way.
+  let TEST_PORT = 0
 
   beforeAll(async () => {
-    const { startPlayWriterCDPRelayServer } = await import('./cdp-relay.js')
+    const [{ startPlayWriterCDPRelayServer }, { testRelayPort }] = await Promise.all([
+      import('./cdp-relay.js'),
+      import('./test-utils.js'),
+    ])
+    TEST_PORT = testRelayPort(import.meta.url)
     server = await startPlayWriterCDPRelayServer({ port: TEST_PORT })
   })
 
@@ -673,7 +680,7 @@ describe('Host header validation (DNS rebinding protection)', () => {
     expect(res.body).toContain('Invalid Host header')
 
     // With port suffix
-    const res2 = await httpGet({ port: TEST_PORT, path: '/version', host: 'evil.com:19996' })
+    const res2 = await httpGet({ port: TEST_PORT, path: '/version', host: `evil.com:${TEST_PORT}` })
     expect(res2.status).toBe(403)
   })
 

@@ -2,6 +2,9 @@ import { Page, Locator } from '@xmorse/playwright-core'
 import { formatHtmlForPrompt } from './htmlrewrite.js'
 import { createSmartDiff } from './diff-utils.js'
 
+/** Page -> (snapshot key -> last HTML). The diff baseline for `showDiffSinceLastCall`. */
+export type HtmlDiffStore = WeakMap<Page, Map<string, string>>
+
 export interface GetCleanHTMLOptions {
   locator: Locator | Page
   search?: string | RegExp
@@ -9,10 +12,20 @@ export interface GetCleanHTMLOptions {
   includeStyles?: boolean
   maxAttrLen?: number
   maxContentLen?: number
+  /**
+   * Where the diff baseline lives. The executor passes its own per-session store.
+   *
+   * It has to be injectable because this cache used to be module-global while
+   * `snapshot`'s equivalent was per-executor — so two sessions in one relay process
+   * driving the same `Page` shared a getCleanHTML baseline and not a snapshot one, and
+   * each would see the other's edits as "no changes since last call". The docs promise
+   * the same diff semantics for all three readers, so they need the same scope.
+   */
+  diffStore?: HtmlDiffStore
 }
 
-// Store last HTML snapshots per locator/page for diffing
-const lastHtmlSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
+/** Fallback baseline for direct callers (tests, one-off scripts) that own no store. */
+const lastHtmlSnapshots: HtmlDiffStore = new WeakMap()
 
 function isPage(obj: any): obj is Page {
   return obj && typeof obj.content === 'function' && typeof obj.goto === 'function'
@@ -39,6 +52,7 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
     includeStyles = false,
     maxAttrLen = 200,
     maxContentLen = 500,
+    diffStore = lastHtmlSnapshots,
   } = options
 
   // Get raw HTML
@@ -65,10 +79,10 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
   let htmlStr = cleanedHtml.toWellFormed?.() ?? cleanedHtml
 
   // Store snapshot and handle diffing
-  let pageSnapshots = lastHtmlSnapshots.get(page)
+  let pageSnapshots = diffStore.get(page)
   if (!pageSnapshots) {
     pageSnapshots = new Map()
-    lastHtmlSnapshots.set(page, pageSnapshots)
+    diffStore.set(page, pageSnapshots)
   }
 
   const snapshotKey = getSnapshotKey(locator)

@@ -1,9 +1,10 @@
 # buggy-app fixture
 
 A tiny **Vite + React + TypeScript** app used as an end-to-end fixture for the
-trace/debug feature. Each of the four tabs exhibits exactly **one** canonical,
+trace/debug feature. Each of the nine tabs exhibits exactly **one** canonical,
 realistically-written bug so a static + runtime program slice has something real
-to trace back through source maps into the author's TypeScript.
+to trace back through source maps into the author's TypeScript. The bugs are
+catalogued in "The nine bugs" below.
 
 ## Not part of the pnpm workspace
 

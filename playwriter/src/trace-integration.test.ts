@@ -154,8 +154,14 @@ describe('static analysis over buggy-app fixture', () => {
 
   // (e) source-provenance: verify the source map actually maps
   it('resolves a bundle position through the fixture source map', async () => {
-    const mapPath = path.join(FIXTURE_DIST, 'assets', 'index-CfnJclZ8.js.map')
-    expect(fs.existsSync(mapPath), 'source map file should exist').toBe(true)
+    // Vite content-hashes the bundle name, so it changes on every fixture rebuild.
+    // Glob for it rather than pinning a hash that silently rots.
+    const assetsDir = path.join(FIXTURE_DIST, 'assets')
+    const maps = fs.existsSync(assetsDir)
+      ? fs.readdirSync(assetsDir).filter((f) => f.startsWith('index-') && f.endsWith('.js.map'))
+      : []
+    expect(maps, `expected a built source map in ${assetsDir} — run \`npm run build\` in the fixture`).not.toHaveLength(0)
+    const mapPath = path.join(assetsDir, maps[0])
     const raw = fs.readFileSync(mapPath, 'utf-8')
     const resolver = makeSourceMapResolver(raw)
     // Try a couple of likely line numbers in the bundle
@@ -178,8 +184,12 @@ describe('static analysis over buggy-app fixture', () => {
 // Skip in CI or headless-only environments that don't have the extension built.
 // The describe is conditional — only registered when a relay port env/arg
 // confirms the full integration setup is available.
-
-const INTEGRATION_PORT = 19995
+//
+// This suite's relay port is NOT declared here. It used to be `const INTEGRATION_PORT = 19995`,
+// the same literal popup-relocation.test.ts used, so in a full run whichever relay bound
+// second died with EADDRINUSE and took all 7 tests below with it — while both files passed
+// alone. The port now comes from TEST_RELAY_PORTS in test-utils.ts, keyed by this filename,
+// and reaches the test only as testCtx.port. See setupTestContext.
 
 describe('PageModel & traceValue integration (MCP execute pipeline)', () => {
   // These are lazy-imported to avoid pulling chromium into the static-analysis-only run.
@@ -235,12 +245,12 @@ describe('PageModel & traceValue integration (MCP execute pipeline)', () => {
     ])
 
     testCtx = await setupTestContext({
-      port: INTEGRATION_PORT,
+      suiteUrl: import.meta.url,
       tempDirPrefix: 'pw-trace-int-',
       toggleExtension: true,
     })
 
-    const result = await createMCPClient({ port: INTEGRATION_PORT })
+    const result = await createMCPClient({ port: testCtx.port })
     client = result.client
     cleanup = result.cleanup
   }, 600000)

@@ -14,10 +14,11 @@ import {
   type TestContext,
   type SimpleServer,
   js,
+  testRelayPort,
 } from './test-utils.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19995
+const TEST_PORT = testRelayPort(import.meta.url)
 
 describe('Popup window relocation', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
@@ -27,7 +28,7 @@ describe('Popup window relocation', () => {
 
   beforeAll(async () => {
     testCtx = await setupTestContext({
-      port: TEST_PORT,
+      suiteUrl: import.meta.url,
       tempDirPrefix: 'pw-popup-test-',
       toggleExtension: true,
     })

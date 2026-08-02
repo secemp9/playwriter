@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import WebSocket from 'ws'
 import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
+import { testRelayPort } from './test-utils.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TODO 24 — the decisive cross-workspace isolation test.
@@ -28,12 +29,13 @@ import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 // not, the test has no teeth.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TEST_PORT = 19771
+const TEST_PORT = testRelayPort(import.meta.url)
 const EXT_ORIGIN = 'chrome-extension://jfeammnjpkecdekppnclgkkffahnhfhe' // an allowlisted EXTENSION_ID
 
 const KEY_A = 'wt:aaa'
 const KEY_B = 'wt:bbb'
 const KEY_C = 'wt:ccc'
+const KEY_D = 'wt:ddd'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const quietLogger = { log: () => {}, error: () => {} }
@@ -272,23 +274,59 @@ describe('Cross-workspace isolation (Todo 24 — decisive)', () => {
     }
   }, 15000)
 
-  it('(5) a workspace with no tabs auto-creates its own tab and never adopts the freestyle tab', async () => {
-    // KEY_C owns nothing; a freestyle tab (sessFree) exists. On setAutoAttach the relay
-    // must auto-create a fresh tab owned by KEY_C (zero-click) and replay ONLY that tab —
-    // never the freestyle one.
-    const c = new KeyedClient('t24-autocreate-C', q(KEY_C, 'C'))
+  // This test used to be titled "auto-creates its own tab and never adopts the freestyle tab"
+  // and asserted exactly that. It was written at dbf282d (15:02) and contradicted two and a
+  // half hours later by 5de6b8e (17:36), "feat(relay): reuse an existing usable tab instead of
+  // auto-creating a blank one", whose commit message states the requirement in as many words:
+  // "a session must operate on the already-open tab (the molab tab) and never spawn the
+  // redundant about:blank workspace tab — whose attach is also what deterministically killed
+  // the extension worker." maybeAutoCreateInitialTab (cdp-relay.ts:626-659) implements it, and
+  // adopting the freestyle tab is the whole point of that block, not a leak.
+  //
+  // So the expectation was stale, not the relay. What survives from the original — and what is
+  // actually load-bearing — is that a fresh workspace gets a tab with zero human clicks, and
+  // that it is never handed a tab another real workspace owns. Both branches of the decision
+  // are covered here, in order, in one test so that neither depends on the other having run.
+  it('(5) a workspace with no tabs adopts the usable freestyle tab, and creates its own only when there is nothing to adopt', async () => {
+    // ── Branch 1: adoption. KEY_C owns nothing, and sessFree is a page target on a real URL
+    // owned by no workspace, so it is adoptable. KEY_C must take it over — no blank tab minted.
+    const c = new KeyedClient('t24-adopt-C', q(KEY_C, 'C'))
     try {
       await c.open()
       await c.autoAttachAndSettle()
-      await sleep(200) // auto-create round-trips to the fake extension before the replay
+      await sleep(200) // adoption/creation round-trips to the fake extension before the replay
 
-      const autoCreated = c.attachedSessionIds.filter((s) => s.startsWith('sess-auto-'))
-      expect(autoCreated.length).toBeGreaterThan(0) // got its own auto-created tab
-      expect(c.attachedSessionIds).not.toContain('sessFree') // never adopts freestyle
+      expect(c.attachedSessionIds).toContain('sessFree')
+      expect(
+        c.attachedSessionIds.filter((s) => s.startsWith('sess-auto-')),
+        'adopting a usable tab must not also spawn the redundant about:blank one',
+      ).toEqual([])
+      // Adoption is confined to freestyle tabs: a tab another real workspace owns is never taken.
       expect(c.attachedSessionIds).not.toContain('sessA')
       expect(c.attachedSessionIds).not.toContain('sessB')
     } finally {
       c.close()
+      await sleep(100)
+    }
+
+    // ── Branch 2: creation. sessFree now belongs to KEY_C (branch 1 re-stamped it), and sessA
+    // and sessB belong to other real workspaces, so KEY_D has nothing adoptable left. It must
+    // still get a tab without a human click — a freshly created one of its own.
+    const d = new KeyedClient('t24-autocreate-D', q(KEY_D, 'D'))
+    try {
+      await d.open()
+      await d.autoAttachAndSettle()
+      await sleep(200)
+
+      const autoCreated = d.attachedSessionIds.filter((s) => s.startsWith('sess-auto-'))
+      expect(autoCreated.length, 'zero-click: a workspace with nothing to adopt gets its own tab').toBeGreaterThan(0)
+      // The three tabs that already have owners stay with their owners — including sessFree,
+      // which stopped being freestyle the moment KEY_C adopted it.
+      expect(d.attachedSessionIds).not.toContain('sessFree')
+      expect(d.attachedSessionIds).not.toContain('sessA')
+      expect(d.attachedSessionIds).not.toContain('sessB')
+    } finally {
+      d.close()
       await sleep(100)
     }
   }, 15000)

@@ -30,12 +30,22 @@ export interface PageMarkdownResult {
   wordCount: number
 }
 
+/** Page -> last extracted markdown. The diff baseline for `showDiffSinceLastCall`. */
+export type MarkdownDiffStore = WeakMap<Page, string>
+
 export interface GetPageMarkdownOptions {
   page: Page
   /** String or regex to filter content (returns matching lines with context) */
   search?: string | RegExp
   /** Return diff since last call for this page */
   showDiffSinceLastCall?: boolean
+  /**
+   * Where the diff baseline lives. The executor passes its own per-session store, for
+   * the same reason `getCleanHTML` takes one: a module-global baseline is shared by every
+   * session in the relay process, so two agents driving the same `Page` would each be
+   * told "no changes since last call" about the other's work.
+   */
+  diffStore?: MarkdownDiffStore
 }
 
 // Cache for the bundled readability code
@@ -51,8 +61,8 @@ function getReadabilityCode(): string {
   return readabilityCode
 }
 
-// Store last snapshots per page for diffing
-const lastMarkdownSnapshots: WeakMap<Page, string> = new WeakMap()
+/** Fallback baseline for direct callers (tests, one-off scripts) that own no store. */
+const lastMarkdownSnapshots: MarkdownDiffStore = new WeakMap()
 
 function isRegExp(value: unknown): value is RegExp {
   return (
@@ -70,7 +80,7 @@ function isRegExp(value: unknown): value is RegExp {
  * the main content. Returns plain text content (no HTML).
  */
 export async function getPageMarkdown(options: GetPageMarkdownOptions): Promise<string> {
-  const { page, search, showDiffSinceLastCall = !search } = options
+  const { page, search, showDiffSinceLastCall = !search, diffStore = lastMarkdownSnapshots } = options
 
   // Check if readability is already injected
   const hasReadability = await page.evaluate(() => !!(globalThis as any).__readability)
@@ -169,8 +179,8 @@ export async function getPageMarkdown(options: GetPageMarkdownOptions): Promise<
   markdown = markdown.toWellFormed?.() ?? markdown
 
   // Store snapshot and handle diffing
-  const previousSnapshot = lastMarkdownSnapshots.get(page)
-  lastMarkdownSnapshots.set(page, markdown)
+  const previousSnapshot = diffStore.get(page)
+  diffStore.set(page, markdown)
 
   // Diff defaults off when search is provided, but agent can explicitly enable both
   if (showDiffSinceLastCall && previousSnapshot) {

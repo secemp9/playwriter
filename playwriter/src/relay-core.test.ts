@@ -2,7 +2,8 @@ import { createMCPClient } from './mcp-client.js'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium } from '@xmorse/playwright-core'
 import { getCDPSessionForPage } from './cdp-session.js'
-import { getCdpUrl, LOG_CDP_FILE_PATH } from './utils.js'
+import { getCdpUrl } from './utils.js'
+import type { CDPCommand } from './cdp-types.js'
 import fs from 'node:fs'
 import {
   setupTestContext,
@@ -13,12 +14,15 @@ import {
   js,
   tryJsonParse,
   createSimpleServer,
+  readPageFixture,
+  INERT_REQUEST_URL_PREFIXES,
   safeCloseCDPBrowser,
   TEST_WORKSPACE,
+  testRelayPort,
 } from './test-utils.js'
 import './test-declarations.js'
 
-const TEST_PORT = 19987
+const TEST_PORT = testRelayPort(import.meta.url)
 
 describe('Relay Core Tests', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
@@ -26,7 +30,7 @@ describe('Relay Core Tests', () => {
   let testCtx: TestContext | null = null
 
   beforeAll(async () => {
-    testCtx = await setupTestContext({ port: TEST_PORT, tempDirPrefix: 'pw-test-', toggleExtension: true })
+    testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-test-', toggleExtension: true })
 
     const result = await createMCPClient({ port: TEST_PORT })
     client = result.client
@@ -134,7 +138,13 @@ describe('Relay Core Tests', () => {
   it('should emit download events for both Browser and Page domains in extension mode', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-    const logFilePath = LOG_CDP_FILE_PATH
+    // This suite's OWN CDP wire log, not the shared ~/.playwriter/cdp.jsonl this used to read.
+    // createCdpLogger() truncates its file on construction, so every other browser suite that
+    // started a relay wiped the file mid-measurement; slicing from a line count taken before
+    // the wipe then yielded nothing, and every flag in the summary below came out false in a
+    // full run while the test passed alone. setupTestContext now gives each suite its own file.
+    const cdpLogger = testCtx!.cdpLogger
+    const logFilePath = cdpLogger.logFilePath
     const logLineCountBefore = fs.existsSync(logFilePath)
       ? fs
           .readFileSync(logFilePath, 'utf-8')
@@ -210,16 +220,23 @@ describe('Relay Core Tests', () => {
       connectedPage.click('#download-button'),
     ])
 
-    expect(downloadResult[0]).toMatchInlineSnapshot(`
-      {
-        "suggestedFilename": "playwriter-download-test.txt",
-        "timedOut": false,
-      }
-    `)
+    // toEqual, not toMatchInlineSnapshot: `pnpm test` is `vitest run -u`, which rewrites an
+    // inline snapshot to whatever the code currently produces. A regression that stopped
+    // downloads reaching Playwright would have been recorded as the new expectation — silently,
+    // and in exactly the assertion whose job is to catch it.
+    expect(downloadResult[0]).toEqual({
+      suggestedFilename: 'playwriter-download-test.txt',
+      timedOut: false,
+    })
 
     await directBrowser.close()
     await page.close()
     await server.close()
+
+    // createCdpLogger batches for 500ms before touching disk, so without this the last events
+    // of the download — the very ones under test — are still sitting in its buffer when the
+    // file is read back.
+    await cdpLogger.flush()
 
     const logLinesAfter = fs
       .readFileSync(logFilePath, 'utf-8')
@@ -273,22 +290,33 @@ describe('Relay Core Tests', () => {
       }),
     }
 
-    expect(summary).toMatchInlineSnapshot(`
-      {
-        "hasBrowserDownloadProgress": true,
-        "hasBrowserDownloadWillBegin": true,
-        "hasBrowserSetDownloadBehavior": true,
-        "hasPageDownloadProgress": true,
-        "hasPageDownloadWillBegin": true,
-        "hasPageSetDownloadBehavior": true,
-      }
-    `)
+    // Also toEqual rather than an inline snapshot, and for a sharper reason than the one above:
+    // when the shared cdp.jsonl was wiped by a concurrent suite every flag here read false, and
+    // `vitest run -u` would have written that all-false object in as the expected result — a
+    // green test asserting that downloads emit nothing. All six must be true: Playwright asks
+    // once at the browser level, cdp-relay rewrites that to a per-page Page.setDownloadBehavior
+    // (cdp-relay.ts:741-783), and each Page.download* event is mirrored back up to its
+    // Browser.download* form for Playwright's benefit (maybeEmitBrowserDownloadCompatEvent,
+    // cdp-relay.ts:713).
+    expect(summary).toEqual({
+      hasBrowserSetDownloadBehavior: true,
+      hasPageSetDownloadBehavior: true,
+      hasPageDownloadWillBegin: true,
+      hasPageDownloadProgress: true,
+      hasBrowserDownloadWillBegin: true,
+      hasBrowserDownloadProgress: true,
+    })
   }, 120000)
 
   it('should ignore duplicate dialog dismissals from multiple CDP clients', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
-    const logFilePath = `${process.cwd()}/relay-server.log`
+    // Same reason as the download test above: this suite's own relay log, not the shared
+    // playwriter/relay-server.log every suite used to truncate and append to. Here the sharing
+    // was worse than a failure — a wipe by a concurrent suite makes the slice empty, so the
+    // "no unhandled rejections" assertion below passed by having nothing to look at.
+    const relayLogger = testCtx!.logger
+    const logFilePath = relayLogger.logFilePath
     const logLineCountBefore = fs.existsSync(logFilePath)
       ? fs
           .readFileSync(logFilePath, 'utf-8')
@@ -389,6 +417,11 @@ describe('Relay Core Tests', () => {
       await server.close()
     }
 
+    // createFileLogger batches for 500ms too — an unhandled rejection logged in the last
+    // moments of the dialog exchange would otherwise never reach disk before this read, and
+    // the assertion would pass by missing it.
+    await relayLogger.flush()
+
     const logLinesAfter = fs
       .readFileSync(logFilePath, 'utf-8')
       .split('\n')
@@ -402,6 +435,10 @@ describe('Relay Core Tests', () => {
     })
 
     expect(unexpectedRelayCrashes).toEqual([])
+    // Guard the guard: if the slice is empty the filter above trivially passes, which is
+    // exactly how the shared-log version of this test used to go green after another suite
+    // truncated the file underneath it.
+    expect(logLinesAfter.length, 'expected relay activity in this suite\'s log to inspect').toBeGreaterThan(0)
   }, 60000)
 
   it('should execute code and capture console output', async () => {
@@ -603,10 +640,31 @@ describe('Relay Core Tests', () => {
     })
   }, 30000)
 
+  // ── Aria snapshots of complex real-world DOMs ────────────────────────────────────────
+  //
+  // These two used to navigate to https://news.ycombinator.com/item?id=1 and
+  // https://ui.shadcn.com/ and snapshot whatever came back. That is not a test of an accessible
+  // tree, it is a test of two websites being up and unchanged, and both halves failed:
+  //
+  //   - shadcn-ui timed out inside the sandbox's 10s execute budget on a slow fetch, and the
+  //     committed file snapshot had been overwritten (by `pnpm test`, which is `vitest run -u`)
+  //     with the literal text "Error executing code: Code execution timed out after 10000ms".
+  //     Its `waitFor('text=shadcn/ui')` had also stopped matching — the site was redesigned.
+  //   - hacker-news passed, but only because its committed snapshot still happened to contain
+  //     the YC banner of the week ("Applications are open till July 27"). It was one banner
+  //     change from failing.
+  //
+  // What they were actually worth is the DOM: hundreds of nodes, nesting 20+ deep, dozens of
+  // same-named links that force `>> nth=` disambiguation, names that come from title/alt/
+  // aria-label rather than text. Hand-written test HTML does not produce that, which is why the
+  // fix is a captured fixture rather than a deleted test — see scripts/capture-page-fixture.ts
+  // for how they were captured and how to regenerate them.
   const snapshotTestCases = [
     {
       name: 'hacker-news',
-      url: 'https://news.ycombinator.com/item?id=1',
+      // A comment thread, not the front page: nested layouttables and repeated author/date
+      // links are what exercise the `>> nth=` disambiguation in the snapshot writer.
+      fixture: 'hacker-news-item',
       expectedContent: ['role=link', 'Hacker News'],
       waitForCode: js`
         await state.page.locator('a[href="news"]').first().waitFor({ timeout: 10000 });
@@ -615,74 +673,116 @@ describe('Relay Core Tests', () => {
     },
     {
       name: 'shadcn-ui',
-      url: 'https://ui.shadcn.com/',
-      expectedContent: ['shadcn'],
+      // A completely different tree shape from Hacker News's table markup: ~1500 elements of
+      // Tailwind/RSC divs, 150+ interactive elements, 96 aria-* attributes, and controls whose
+      // accessible name exists only as an aria-label.
+      fixture: 'shadcn-ui',
+      expectedContent: ['role=link', 'shadcn'],
       waitForCode: js`
-        await state.page.locator('text=shadcn/ui').first().waitFor({ timeout: 10000 });
+        await state.page.locator('h1').first().waitFor({ timeout: 10000 });
+        await state.page.locator('a[href="/blocks"]').first().waitFor({ timeout: 10000 });
       `,
     },
   ]
 
   for (const testCase of snapshotTestCases) {
     it(`should get accessibility snapshot of ${testCase.name}`, async () => {
-      await client.callTool({
-        name: 'execute',
-        arguments: {
-          code: js`
+      const server = await createSimpleServer({ routes: { '/': readPageFixture(testCase.fixture) } })
+
+      try {
+        // The request log is collected in the sandbox because the page under test is created
+        // there. It is what turns "the fixture should be hermetic" into something the suite
+        // checks on every run instead of something the capture script promised once.
+        await client.callTool({
+          name: 'execute',
+          arguments: {
+            code: js`
               const newPage = await context.newPage();
               state.page = newPage;
+              state.requestedUrls = [];
+              newPage.on('request', (request) => { state.requestedUrls.push(request.url()); });
               if (!state.pages) state.pages = [];
               state.pages.push(newPage);
             `,
-        },
-      })
+          },
+        })
 
-      // Capture interactiveOnly=true snapshot (default)
-      const interactiveResult = await client.callTool({
-        name: 'execute',
-        arguments: {
-          code: js`
-              // External pages can expose a partial AX tree right after domcontentloaded,
-              // so wait for stable page-specific content before snapshotting.
-              await state.page.goto('${testCase.url}', { waitUntil: 'domcontentloaded' });
+        // Capture interactiveOnly=true snapshot (default)
+        const interactiveResult = await client.callTool({
+          name: 'execute',
+          arguments: {
+            code: js`
+              // The fixture is static, but the aria snapshot is computed from the AX tree, which
+              // is only complete once layout is — so still wait for page-specific content.
+              await state.page.goto('${server.baseUrl}/', { waitUntil: 'domcontentloaded' });
               ${testCase.waitForCode}
               const snap = await snapshot({ page: state.page, showDiffSinceLastCall: false, interactiveOnly: true });
               return snap;
             `,
-        },
-      })
+            timeout: 60000,
+          },
+        })
 
-      const interactiveData =
-        typeof interactiveResult === 'object' && interactiveResult.content?.[0]?.text
-          ? tryJsonParse(interactiveResult.content[0].text)
-          : interactiveResult
-      await expect(interactiveData).toMatchFileSnapshot(`snapshots/${testCase.name}-accessibility-interactive.md`)
-      expect(interactiveResult.content).toBeDefined()
-      for (const expected of testCase.expectedContent) {
-        expect(interactiveData).toContain(expected)
-      }
+        const interactiveData =
+          typeof interactiveResult === 'object' && interactiveResult.content?.[0]?.text
+            ? tryJsonParse(interactiveResult.content[0].text)
+            : interactiveResult
+        await expect(interactiveData).toMatchFileSnapshot(`snapshots/${testCase.name}-accessibility-interactive.md`)
+        expect(interactiveResult.content).toBeDefined()
+        for (const expected of testCase.expectedContent) {
+          expect(interactiveData).toContain(expected)
+        }
 
-      // Capture interactiveOnly=false snapshot (full tree)
-      const fullResult = await client.callTool({
-        name: 'execute',
-        arguments: {
-          code: js`
+        // Capture interactiveOnly=false snapshot (full tree)
+        const fullResult = await client.callTool({
+          name: 'execute',
+          arguments: {
+            code: js`
               const snap = await snapshot({ page: state.page, showDiffSinceLastCall: false, interactiveOnly: false });
               return snap;
             `,
-        },
-      })
+            timeout: 60000,
+          },
+        })
 
-      const fullData =
-        typeof fullResult === 'object' && fullResult.content?.[0]?.text
-          ? tryJsonParse(fullResult.content[0].text)
-          : fullResult
-      await expect(fullData).toMatchFileSnapshot(`snapshots/${testCase.name}-accessibility-full.md`)
-      expect(fullResult.content).toBeDefined()
-      for (const expected of testCase.expectedContent) {
-        expect(fullData).toContain(expected)
+        const fullData =
+          typeof fullResult === 'object' && fullResult.content?.[0]?.text
+            ? tryJsonParse(fullResult.content[0].text)
+            : fullResult
+        await expect(fullData).toMatchFileSnapshot(`snapshots/${testCase.name}-accessibility-full.md`)
+        expect(fullResult.content).toBeDefined()
+        for (const expected of testCase.expectedContent) {
+          expect(fullData).toContain(expected)
+        }
+
+        // The verdict is computed in the sandbox and raised as an exception there, so a
+        // non-local request fails the test with the offending URLs in the message rather than
+        // having to survive util.inspect on the way back out.
+        const requestsResult = await client.callTool({
+          name: 'execute',
+          arguments: {
+            code: js`
+              const baseUrl = ${JSON.stringify(server.baseUrl)};
+              const inertPrefixes = ${JSON.stringify(INERT_REQUEST_URL_PREFIXES)};
+              const external = state.requestedUrls.filter((url) => {
+                return !url.startsWith(baseUrl) && !inertPrefixes.some((prefix) => url.startsWith(prefix));
+              });
+              if (external.length > 0) {
+                throw new Error('fixture page made external requests: ' + external.join(', '));
+              }
+              return { requestCount: state.requestedUrls.length, sawFixture: state.requestedUrls.includes(baseUrl + '/') };
+            `,
+          },
+        })
+        const requestsText = (requestsResult.content as any)?.[0]?.text ?? ''
+        expect(requestsResult.isError, requestsText).toBeFalsy()
+        // Guard the guard: if the relay never delivered request events the external filter above
+        // would pass by having seen nothing at all.
+        expect(requestsText).toContain('sawFixture: true')
+      } finally {
+        await server.close()
       }
-    }, 60000)
+    }, 120000)
   }
 
   it('should close all created pages', async () => {
@@ -1125,35 +1225,86 @@ describe('Relay Core Tests', () => {
     }
   }, 60000)
 
+  // ── What this test is actually about ─────────────────────────────────────────────────
+  //
+  // Upstream playwright-core defaults `colorScheme` to 'light', which makes every page a
+  // Playwright client attaches to report light mode. This fork changes the default to
+  // 'no-override' (playwright-core/src/server/page.ts:598-606) precisely because playwriter
+  // attaches to a browser the user is already looking at: forcing light there would recolour
+  // the user's own tab. So the subject is "playwriter does not impose a colour scheme", not
+  // "the page is dark".
+  //
+  // The previous version pinned `matchesDark: true` as an inline snapshot. That number is the
+  // HOST's desktop theme, not a property of playwriter: `Emulation.setEmulatedMedia` overrides
+  // are per-target and last-writer-wins across CDP sessions, so when the MCP client sends its
+  // own no-override call it lifts the launch-time colorScheme:'dark' emulation, and the tab
+  // falls back to whatever the machine says. On a dark-themed machine that is dark and the
+  // snapshot passed; on a light-themed one it is light and the snapshot failed — with nothing
+  // about playwriter having changed.
+  //
+  // So both halves are asserted against something measured:
+  //   1. on the wire: every Emulation.setEmulatedMedia the MCP client sends must carry
+  //      prefers-color-scheme with the empty value, i.e. "remove the override". Host-independent.
+  //   2. in the page: what the tab reports through MCP must equal what this browser reports
+  //      with no emulation in force, measured on a throwaway tab in the same browser.
   it(
     'should preserve system color scheme instead of forcing light mode',
     async () => {
       const browserContext = getBrowserContext()
       const serviceWorker = await getExtensionServiceWorker(browserContext)
 
+      // Ground truth for "what the system says". A fresh Playwright page cannot be asked
+      // directly — setupTestContext launches with colorScheme: 'dark' and Playwright installs
+      // that as an emulation override on every page it creates — so the override is lifted
+      // first, using the same empty `value` Playwright itself uses to mean no-override
+      // (playwright-core/src/server/chromium/crPage.ts:966-981).
+      const probePage = await browserContext.newPage()
+      const probeSession = await browserContext.newCDPSession(probePage)
+      await probeSession.send('Emulation.setEmulatedMedia', {
+        media: '',
+        features: [{ name: 'prefers-color-scheme', value: '' }],
+      })
+      const systemPrefersDark = await probePage.evaluate(() => {
+        return window.matchMedia('(prefers-color-scheme: dark)').matches
+      })
+      await probeSession.detach()
+      await probePage.close()
+      console.log('System color scheme with no emulation in force:', systemPrefersDark ? 'dark' : 'light')
+
       const page = await browserContext.newPage()
       await page.goto('https://example.com')
       await page.bringToFront()
 
-      // test-utils launches with colorScheme: 'dark', so before MCP connection
-      // the browser should report dark mode
+      // test-utils launches with colorScheme: 'dark', so before the MCP client touches this tab
+      // Playwright's own override is in force. Asserted so that a later "the tab reports the
+      // system scheme" cannot be satisfied by the override never having existed.
       const colorSchemeBefore = await page.evaluate(() => {
         return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
       })
       expect(colorSchemeBefore).toBe('dark')
 
-      await serviceWorker.evaluate(
-        async ([k, l]) => {
-          await globalThis.toggleExtensionForActiveTab(k, l)
-        },
-        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
-      )
-      await new Promise((r) => setTimeout(r, 500))
+      const emulateMediaCommands: CDPCommand[] = []
+      const commandHandler = ({ command }: { clientId: string; command: CDPCommand }) => {
+        if (command.method === 'Emulation.setEmulatedMedia') {
+          emulateMediaCommands.push(command)
+        }
+      }
+      testCtx!.relayServer.on('cdp:command', commandHandler)
 
-      const result = await client.callTool({
-        name: 'execute',
-        arguments: {
-          code: js`
+      let result: Awaited<ReturnType<typeof client.callTool>>
+      try {
+        await serviceWorker.evaluate(
+          async ([k, l]) => {
+            await globalThis.toggleExtensionForActiveTab(k, l)
+          },
+          [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+        )
+        await new Promise((r) => setTimeout(r, 500))
+
+        result = await client.callTool({
+          name: 'execute',
+          arguments: {
+            code: js`
                     const pages = context.pages();
                     const urls = pages.map(p => p.url());
                     const targetPage = pages.find(p => p.url().includes('example.com'));
@@ -1164,22 +1315,40 @@ describe('Relay Core Tests', () => {
                     const isLight = await targetPage.evaluate(() => window.matchMedia('(prefers-color-scheme: light)').matches);
                     return { matchesDark: isDark, matchesLight: isLight };
                 `,
-        },
-      })
+          },
+        })
+      } finally {
+        testCtx!.relayServer.off('cdp:command', commandHandler)
+      }
 
       console.log('Color scheme after MCP connection:', result.content)
 
-      // After MCP connection, color scheme should NOT be forced to light.
-      // The page.ts default is now 'no-override', so the browser's actual
-      // color scheme (dark, from test-utils launch config) should be preserved.
-      expect(result.content).toMatchInlineSnapshot(`
-        [
-          {
-            "text": "[return value] { matchesDark: true, matchesLight: false }",
-            "type": "text",
-          },
-        ]
-      `)
+      // (1) On the wire. crPage._updateEmulateMedia always sends all four media features, so a
+      // regression to a 'light' default shows up here as value: 'light' on every machine.
+      const colorSchemeFeatures = emulateMediaCommands.flatMap((command) => {
+        const features = (command.params as { features?: Array<{ name: string; value: string }> } | undefined)
+          ?.features
+        return (features ?? []).filter((feature) => {
+          return feature.name === 'prefers-color-scheme'
+        })
+      })
+      console.log(
+        `Emulation.setEmulatedMedia seen on the wire: ${emulateMediaCommands.length}, ` +
+          `prefers-color-scheme values: ${JSON.stringify(colorSchemeFeatures.map((feature) => feature.value))}`,
+      )
+      expect(
+        colorSchemeFeatures.length,
+        'expected the MCP client to send Emulation.setEmulatedMedia for the new tab',
+      ).toBeGreaterThan(0)
+      expect([...new Set(colorSchemeFeatures.map((feature) => feature.value))]).toEqual([''])
+
+      // (2) In the page: exactly the system answer measured above, and internally consistent
+      // (dark and light are complementary, so "both false" — a page that observes no scheme at
+      // all — cannot slip through).
+      const resultText = (result.content as any)?.[0]?.text
+      expect(resultText).toBe(
+        `[return value] { matchesDark: ${systemPrefersDark}, matchesLight: ${!systemPrefersDark} }`,
+      )
 
       await page.close()
     },
@@ -1468,6 +1637,36 @@ describe('Relay Core Tests', () => {
     await page2.close()
   }, 60000)
 
+  // The exact sentence playwright-core attaches for a non-visible target
+  // (playwright-core/src/server/dom.ts:324 and :360). Shared by the two tests that expect it, so a
+  // reword in the fork has to be made once here and cannot be half-applied.
+  const NOT_VISIBLE_REASON =
+    'Element is not visible — it may be hidden by CSS, inside a collapsed <details>, inactive tab, or closed accordion. Try: interact with the page to reveal it first, or use { force: true } to skip visibility checks'
+
+  // ── The three click-error tests below ────────────────────────────────────────────────
+  //
+  // What they are about is the ENRICHED failure reason ("Element is not visible — it may be
+  // hidden by CSS…", "<div id=\"overlay\">Overlay</div> intercepts pointer events"), which the
+  // pinned playwright-core produces in ElementHandle._retryAction: it runs one action attempt,
+  // gets back error:notvisible / a hitTargetDescription, and only then records the sentence on
+  // progress.metadata.lastActionError, which the eventual TimeoutError picks up
+  // (playwright-core/src/server/dom.ts:320-362). No completed attempt, no sentence.
+  //
+  // They used to run with `{ timeout: 100 }` and assert the whole call log as an inline
+  // snapshot. Both halves were wrong for the same reason — machine speed. Every step of the
+  // loop is a CDP round trip through relay -> extension -> chrome.debugger -> tab, so 100ms did
+  // not reliably cover even the locator resolution: the observed failure is a bare
+  // "Timeout 100ms exceeded." with a call log that stops at "waiting for locator". And the log's
+  // tail records how many retries fitted before the deadline (waits of 0/20/100/100/500ms,
+  // dom.ts:300), which is a stopwatch reading, not a behaviour.
+  //
+  // So: resolve the locator up front, so the click budget covers only the actionability loop;
+  // give that loop 5000ms, ~25x the round trips one attempt needs and still well inside both
+  // the sandbox's 10s execute ceiling and the 30s test timeout; and assert the message plus the
+  // deterministic head of the call log, leaving the retry tail alone. Written as explicit
+  // assertions rather than snapshots on purpose — `pnpm test` is `vitest run -u`, which would
+  // rewrite a snapshot to match whatever the code now does (see the note in source-bytes.test.ts).
+
   it('should show descriptive error when clicking a hidden element', async () => {
     await ensureConnectedTabForExecute()
 
@@ -1483,6 +1682,7 @@ describe('Relay Core Tests', () => {
               <button id="hidden-btn">Hidden Button</button>
             </details>
           \`);
+          await state.errorTestPage.waitForSelector('#hidden-btn', { state: 'attached' });
         `,
       },
     })
@@ -1490,35 +1690,22 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          await state.errorTestPage.click('#hidden-btn', { timeout: 100 });
+          await state.errorTestPage.click('#hidden-btn', { timeout: 5000 });
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
-      Error executing code: page.click: Timeout 100ms exceeded. Element is not visible — it may be hidden by CSS, inside a collapsed <details>, inactive tab, or closed accordion. Try: interact with the page to reveal it first, or use { force: true } to skip visibility checks
-      Call log:
-      [2m  - waiting for locator('#hidden-btn')[22m
-      [2m    - locator resolved to <button id="hidden-btn">Hidden Button</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is not visible[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is not visible[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
-    `)
+    const text = (result as any).content[0].text as string
+    expect((result as any).isError).toBe(true)
+    // The enriched reason — the whole point of this test.
+    expect(text).toContain(
+      `page.click: Timeout 5000ms exceeded. ${NOT_VISIBLE_REASON}`,
+    )
+    // The deterministic head of the call log. The tail (how many retries fitted before the
+    // deadline) is deliberately not asserted — that is a stopwatch reading.
+    expect(text).toContain("- waiting for locator('#hidden-btn')")
+    expect(text).toContain('- locator resolved to <button id="hidden-btn">Hidden Button</button>')
+    expect(text).toContain('- attempting click action')
+    expect(text).toContain('- element is not visible')
     // Cleanup
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
   }, 30000)
@@ -1537,6 +1724,7 @@ describe('Relay Core Tests', () => {
               <div id="overlay" style="position:absolute;top:0;left:0;width:200px;height:200px;background:red;z-index:10">Overlay</div>
             </div>
           \`);
+          await state.errorTestPage.waitForSelector('#covered-btn', { state: 'attached' });
         `,
       },
     })
@@ -1544,41 +1732,23 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          await state.errorTestPage.click('#covered-btn', { timeout: 100 });
+          await state.errorTestPage.click('#covered-btn', { timeout: 5000 });
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
-      Error executing code: page.click: Timeout 100ms exceeded. <div id="overlay">Overlay</div> intercepts pointer events
-      Call log:
-      [2m  - waiting for locator('#covered-btn')[22m
-      [2m    - locator resolved to <button id="covered-btn">Covered</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is visible, enabled and stable[22m
-      [2m      - scrolling into view if needed[22m
-      [2m      - done scrolling[22m
-      [2m      - <div id="overlay">Overlay</div> intercepts pointer events[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is visible, enabled and stable[22m
-      [2m    - scrolling into view if needed[22m
-      [2m    - done scrolling[22m
-      [2m    - <div id="overlay">Overlay</div> intercepts pointer events[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
-    `)
+    const text = (result as any).content[0].text as string
+    expect((result as any).isError).toBe(true)
+    // The enriched reason — the whole point of this test.
+    expect(text).toContain(
+      'page.click: Timeout 5000ms exceeded. <div id="overlay">Overlay</div> intercepts pointer events',
+    )
+    // The deterministic head of the call log. The tail (how many retries fitted before the
+    // deadline) is deliberately not asserted — that is a stopwatch reading.
+    expect(text).toContain("- waiting for locator('#covered-btn')")
+    expect(text).toContain('- locator resolved to <button id="covered-btn">Covered</button>')
+    expect(text).toContain('- attempting click action')
+    expect(text).toContain('- element is visible, enabled and stable')
+    expect(text).toContain('- <div id="overlay">Overlay</div> intercepts pointer events')
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
   }, 30000)
 
@@ -1591,6 +1761,7 @@ describe('Relay Core Tests', () => {
         code: js`
           state.errorTestPage = await context.newPage();
           await state.errorTestPage.setContent('<button id="invisible" style="display:none">Invisible</button>');
+          await state.errorTestPage.waitForSelector('#invisible', { state: 'attached' });
         `,
       },
     })
@@ -1598,35 +1769,22 @@ describe('Relay Core Tests', () => {
       name: 'execute',
       arguments: {
         code: js`
-          await state.errorTestPage.click('#invisible', { timeout: 100 });
+          await state.errorTestPage.click('#invisible', { timeout: 5000 });
         `,
       },
     })
-    expect(result).toMatchInlineSnapshot(`
-      {
-        "content": [
-          {
-            "text": "
-      Error executing code: page.click: Timeout 100ms exceeded. Element is not visible — it may be hidden by CSS, inside a collapsed <details>, inactive tab, or closed accordion. Try: interact with the page to reveal it first, or use { force: true } to skip visibility checks
-      Call log:
-      [2m  - waiting for locator('#invisible')[22m
-      [2m    - locator resolved to <button id="invisible">Invisible</button>[22m
-      [2m  - attempting click action[22m
-      [2m    2 × waiting for element to be visible, enabled and stable[22m
-      [2m      - element is not visible[22m
-      [2m    - retrying click action[22m
-      [2m    - waiting 20ms[22m
-      [2m    - waiting for element to be visible, enabled and stable[22m
-      [2m    - element is not visible[22m
-      [2m  - retrying click action[22m
-      [2m    - waiting 100ms[22m
-      ",
-            "type": "text",
-          },
-        ],
-        "isError": true,
-      }
-    `)
+    const text = (result as any).content[0].text as string
+    expect((result as any).isError).toBe(true)
+    // The enriched reason — the whole point of this test.
+    expect(text).toContain(
+      `page.click: Timeout 5000ms exceeded. ${NOT_VISIBLE_REASON}`,
+    )
+    // The deterministic head of the call log. The tail (how many retries fitted before the
+    // deadline) is deliberately not asserted — that is a stopwatch reading.
+    expect(text).toContain("- waiting for locator('#invisible')")
+    expect(text).toContain('- locator resolved to <button id="invisible">Invisible</button>')
+    expect(text).toContain('- attempting click action')
+    expect(text).toContain('- element is not visible')
     await client.callTool({ name: 'execute', arguments: { code: js`await state.errorTestPage.close(); delete state.errorTestPage;` } })
   }, 30000)
 
