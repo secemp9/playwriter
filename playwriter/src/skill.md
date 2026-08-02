@@ -28,6 +28,8 @@ playwriter session new
 
 **Always use your own session** - pass `-s <id>` to all commands. Using the same session preserves your `state` between calls. Using a different session gives you a fresh `state`.
 
+Don't create new sessions to "fix" a problem — reuse the same `-s` number. A fresh session throws away the `state` you built up and reconnects to the same browser, so it fixes nothing that `resetPlaywright()` would not fix in place.
+
 List all active sessions with their state keys:
 
 ```bash
@@ -43,6 +45,8 @@ Reset a session if the browser connection is stale or broken:
 ```bash
 playwriter session reset <sessionId>
 ```
+
+The in-sandbox equivalent is `resetPlaywright()` — the same reconnect, and it clears `state` the same way. See "context variables".
 
 ### Remote access (control browser from another machine)
 
@@ -186,7 +190,9 @@ Cloud sessions auto-stop after 10 minutes of inactivity. When proxy is enabled, 
 playwriter -s <sessionId> -e "<code>"
 ```
 
-The `-s` flag specifies a session ID (required). Get one with `playwriter session new`. Use the same session to persist state across commands.
+The `-s` flag specifies a session ID (required). Get one with `playwriter session new`. Use the same session to persist state across commands. The session's cwd is the directory you run `playwriter` from — that is the cwd `process.cwd()` reports inside the sandbox, and the one that scopes `fs` writes (see "context variables").
+
+`--timeout` raises the execution timeout in milliseconds from its 10000 default. Anything that shells out to ffmpeg — `createDemoVideo` in particular — needs `--timeout 120000` or higher.
 
 **Examples:**
 
@@ -210,7 +216,7 @@ playwriter -s 1 -e 'await snapshot({ page: state.page })'
 playwriter -s 1 -e 'const frame = await state.page.locator("iframe").contentFrame(); await snapshot({ frame })'
 ```
 
-**Why single quotes?** Always wrap `-e` code in single quotes (`'...'`) to prevent bash from interpreting `$`, backticks, and other special characters inside your JS code. Use double quotes or backtick template literals for strings inside the JS code.
+**Why single quotes?** Always wrap `-e` code in single quotes (`'...'`) to prevent bash from interpreting `$`, backticks, and other special characters inside your JS code. Bash rewrites those *inside double quotes* before playwriter ever sees them, so double-quoting silently corrupts the code you meant to run rather than failing. Use double quotes or backtick template literals for strings inside the JS code.
 
 **Multiline code:**
 
@@ -249,22 +255,11 @@ The file is read from disk and executed in the same sandbox as `-e`. All context
 
 ### Debugging playwriter issues
 
-If some internal critical error happens you can read the relay server logs to understand the issue. The log file is located in the user home directory:
-
 ```bash
-playwriter logfile  # prints the log file path
-# typically: ~/.playwriter/relay-server.log
+playwriter logfile  # prints the relay log path, and the CDP JSONL path beside it
 ```
 
-The relay log contains logs from the extension, MCP and WS server. A separate CDP JSONL log is created alongside it (see `playwriter logfile`) with all CDP commands/responses and events, with long strings truncated. Both files are recreated every time the server starts. For debugging internal playwriter errors, read these files with grep/rg to find relevant lines.
-
-Example: summarize CDP traffic counts by direction + method:
-
-```bash
-jq -r '.direction + "\t" + (.message.method // "response")' ~/.playwriter/cdp.jsonl | uniq -c
-```
-
-If you find a bug, you can create a gh issue using `gh issue create -R remorses/playwriter --title title --body body`. Ask for user confirmation before doing this.
+What is in those logs, how to triage them, and where to report a bug: see "debugging playwriter itself" at the end of this document.
 
 ---
 
@@ -323,6 +318,8 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 
 `PLAYWRITER_DIRECT` accepts `1` (auto-discover Chrome on port 9222), a `ws://` or `wss://` endpoint (including cloud browser providers), or `host:port`.
 
+**Remote relay (the browser is on another machine):** Chrome, the extension and the relay can all live somewhere else — a desktop, a LAN box, the far end of a tunnel — while you run here. Set `PLAYWRITER_HOST` to that machine's relay URL in the same MCP client `env` block as above, plus `PLAYWRITER_TOKEN` when the relay is exposed beyond localhost. Both are read in MCP mode, not only by the CLI, so this is a real deployment and not a CLI-only trick. The other machine is the one that runs `playwriter serve`. Full guide (Docker, LAN, security): https://playwriter.dev/docs/remote-access
+
 **Screen recording IS available in direct CDP mode — but only one of the two recorders.** `recording.start`/`recording.stop` are unavailable, because they rely on the extension's `chrome.tabCapture` API. `recording.startCdp`/`stopCdp` work in direct CDP and extension sessions alike and need no extension-icon click; see the recording section.
 
 ## context variables
@@ -335,7 +332,7 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 - `require` - load Node.js modules (e.g., `const fs = require('node:fs')`). ESM `import` is not available in the sandbox
 - Node.js globals: `setTimeout`, `setInterval`, `fetch`, `URL`, `Buffer`, `crypto`, `process`, etc.
 
-**resetPlaywright()** - drop the browser connection and reconnect, from inside the sandbox. It is the same thing `playwriter session reset` does, and it clears **all** of `state`, so treat it as a last resort when the connection is wedged mid-task rather than a routine retry:
+**resetPlaywright()** - drop the browser connection and reconnect, from inside the sandbox. It is a full reconnect and it clears **all** of `state`, so treat it as a last resort when the connection is wedged mid-task rather than a routine retry:
 
 ```js
 const { page: fresh } = await resetPlaywright()
@@ -351,7 +348,7 @@ state.page = fresh
 **Important:** `state` is **session-isolated**, and browser tabs are **isolated per git worktree** — `context.pages()` only ever returns your own worktree's tabs. Two sessions in the *same* worktree deliberately share tabs; sessions in different worktrees never see each other's tabs. See "working with pages".
 
 **Sandboxed `fs` write restrictions:** `require('node:fs')` is scoped. Writes (writeFileSync, mkdirSync, etc.) only succeed in:
-- The **directory where `playwriter` CLI was invoked** (the session's cwd)
+- The **session's cwd** — what `process.cwd()` reports inside the sandbox
 - `/tmp`
 - The OS temp directory (`os.tmpdir()`, e.g. `/var/folders/.../T/` on macOS)
 
@@ -595,7 +592,6 @@ backwardSlice({ startFile, startExpr: 'total', maxHops: 16 })  // the static sli
 - `replayPure` runs in the **Node executor process** — no window, no document, no page network. Pass what the function needs via `args` / `bindings`. `console` is **virtualised**, not blocked: logging code replays fine and the calls come back in `logs`. Refusals split offenders into `admissible` (supply via `bindings`) and `categoricallyUnsafe` (nothing here can supply them honestly), each with a source position.
 - **`fiberDiff` only sees handler churn when both snapshots were taken with `identity: true`.** Without it every function serialises to `[function]` and two different arrows compare equal. With it, `identityChangedKeys` is the list of deep-equal-but-new-reference props — the ones that defeat `React.memo`. A comparison it could not make lands in `unobservableKeys`, never in `unchangedKeys`.
 - **Real limits of the static lane:** callee resolution leaves large **typed-unresolved buckets** — read `summary().unresolvedByReason` before concluding "nothing calls this". Escape analysis stays at **chain depth 0**: it sees `ref.push(x)` and `obj.x =`, not a value handed three functions deep. Async boundaries stop the slice by design.
-- Don't create new sessions to "fix" a problem — reuse the same `-s` number.
 
 ## common mistakes to avoid
 
@@ -646,29 +642,14 @@ await state.page.keyboard.press('Enter')
 await state.page.keyboard.type('Line 2')
 ```
 
-**6. Quote escaping in bash**
-Bash parses `$`, backticks, and `\` inside double-quoted strings. This silently corrupts JS code. Always use single quotes or heredoc:
-
-```bash
-# single quotes — bash passes everything through literally
-playwriter -s 1 -e 'await state.page.locator(`[id="_r_a_"]`).click()'
-
-# heredoc for complex code with mixed quotes
-playwriter -s 1 -e "$(cat <<'EOF'
-await state.page.locator('[id="_r_a_"]').click()
-const match = html.match(/\$[\d.]+/g)
-EOF
-)"
-```
-
-**7. Using screenshots when snapshots suffice**
+**6. Using screenshots when snapshots suffice**
 Screenshots + image analysis is expensive and slow. Only use screenshots for visual/CSS issues. Use snapshot for text checks:
 
 ```js
 await snapshot({ page: state.page, search: /expected text/i })
 ```
 
-**8. Assuming page content loaded**
+**7. Assuming page content loaded**
 Even after `goto()`, dynamic content may not be ready:
 
 ```js
@@ -679,7 +660,7 @@ await state.page.waitForSelector('article', { timeout: 10000 })
 await waitForPageLoad({ page: state.page, timeout: 5000 })
 ```
 
-**9. Not using playwriter for JS-rendered sites**
+**8. Not using playwriter for JS-rendered sites**
 Do NOT waste context trying webfetch, curl, or Playwright CLI screenshots on SPAs (Instagram, Twitter, etc.). These return empty HTML shells. Use playwriter directly:
 
 ```js
@@ -689,7 +670,7 @@ await waitForPageLoad({ page: state.page, timeout: 8000 })
 await snapshot({ page: state.page, search: /cookie|consent|accept/i }).then(console.log)
 ```
 
-**10. Login buttons that open popups**
+**9. Login buttons that open popups**
 Popup windows (`window.open` with features, OAuth buttons) are auto-relocated to tabs in the main window by the Playwriter extension. The new tab appears in `context.pages()` and is fully controllable. You will receive a `[WARNING] New page opened from current page (index N, initial url: ...)` message pointing to the new tab — the `initial url` may be `about:blank` for blank-then-scripted popups, so check `context.pages()[N].url()` for the final URL:
 
 ```js
@@ -706,7 +687,7 @@ await loginPage.waitForURL('**/callback**')
 // Original page should now be authenticated
 ```
 
-**11. Click times out or does nothing — ask what is on top, don't guess**
+**10. Click times out or does nothing — ask what is on top, don't guess**
 When a click times out, a **modal or overlay** is likely intercepting pointer events. Do not retry with different selectors or `{ force: true }` — name the blocker:
 
 ```js
@@ -718,14 +699,14 @@ await snapshot({ page: state.page, search: /dialog|modal/i })  // then interact 
 await state.page.getByRole('radio', { name: 'Nope, Vanilla' }).click()
 ```
 
-**12. Never use `dispatchEvent` or `{ force: true }` to bypass blockers**
+**11. Never use `dispatchEvent` or `{ force: true }` to bypass blockers**
 `dispatchEvent(new MouseEvent(...))`, `{ force: true }`, and `element.click()` inside `page.evaluate()` bypass Playwright checks but **do not trigger React/Vue/Svelte handlers** — state won't update. Use snapshot to find the real interactive element:
 
 ```js
 await state.page.getByRole('radio', { name: 'Node.js' }).click()
 ```
 
-**13. Over-investigating instead of just interacting**
+**12. Over-investigating instead of just interacting**
 When something doesn't respond to a click, do NOT start hand-walking CDP event listeners, reading canvas pixel data, or writing `page.evaluate()` to dump class names and bounding boxes. That wastes massive context. (If the question genuinely is "what props did React render here", use `fiberSnapshot({ locator })` or a `pm.anchor` handle's `reactFiber()` — those are cheap and token-capped. What is wasteful is reconstructing them by hand.) Instead:
 
 1. Take a `snapshot()` — it shows every interactive element and what to click
@@ -737,7 +718,7 @@ When something doesn't respond to a click, do NOT start hand-walking CDP event l
 3. Take another `snapshot()` to see what changed
 4. Only investigate DOM internals if correct interaction patterns produce zero response after 2–3 attempts
 
-**14. Asserting about CSS, React, or source code instead of running the tool that knows**
+**13. Asserting about CSS, React, or source code instead of running the tool that knows**
 Each of these is a guess you can replace with an answer (see "reading a page: pick the narrowest tool"):
 
 - Never claim "that `!important` is overriding it", or compute specificity in your head. `debugStyle` returns the winning declaration **plus every overridden loser** with `file:line`, using real specificity (`:where()` counts 0; `:not/:is/:has` take their argument's maximum) and the full origin/importance ordering.
@@ -1325,11 +1306,12 @@ const r = await recording.stopCdp()                    // r.inputEvents[] in VID
 - **Captures** every input this session drives through Playwright — `click`/`dblclick`/`hover`/`fill`/`type`/`press`/`check`/`selectOption`/`setInputFiles`/`focus` on `page`, `locator`, `frame` or `ElementHandle`, plus all of `page.keyboard.*` and `page.mouse.*`. A chip appears only when the action SUCCEEDS; one that timed out or threw gets none, because it never happened.
 - **Does NOT capture**: a real human typing or clicking in the browser (nothing reaches this process); input the page synthesises itself (`el.dispatchEvent(new KeyboardEvent(…))`); raw `cdp.send('Input.dispatch…')`; and `page.mouse.move()`, which is movement, not a press — the ghost cursor already shows it.
 - **Layout**: a single row in the **bottom-right**, lifted above the caption block. Bottom-right because page content is top- and left-anchored — a top-left overlay lands on the nav, the heading and the first form field. The lift is computed from the caption's real font size, margin and line count, so chips and captions can never overlap; `inputOverlayNote` says so if a giant caption forced a compromise.
+- **The chip strip sits on an opaque merge plate**, for the same reason the caption sits on a band: overlay text landing beside or on top of page text makes the composite read as a word in NEITHER layer. The chips cannot have the caption's full-frame-width band — a bar behind a corner HUD would be worse than the defect — so they get three narrower guarantees instead. The plate is **opaque**, so nothing of the page survives under a chip. It runs to the **frame edge it is anchored to**, so on a chip's own scanlines there is no page pixel on that side at all. And it extends a **measured clear distance inboard** (1.5 chip faces; measured, two glyph runs stop reading as one word at about twice the page's own inter-word gap, and the 3px that shipped is narrower than a 12px page's 4px space). The first two are proofs; the third holds for page text up to about 2.1x the chip face. Lowering `boxOpacity` gives that up.
 - **Use `mode: 'screenshot'`, and know that it foregrounds the tab.** A burned overlay only exists on frames that exist, and typing into a field that renders nothing produces no screencast frame at all. The overlay compensates by forcing one `captureScreenshot` per event (`captureFrameOnEvent`, on by default, reported in `note`), but polling is what actually keeps the clip moving. The cost is that this mode calls `bringToFront()` once before polling — it has to, see the foreground table above. If the user must not lose focus, keep `mode: 'screencast'` and accept that chips land only on frames the page itself produced, plus the one forced per event.
 - **Typed text is HIDDEN by default** — `fill`/`type`/`insertText` render as `Fill ••••••`, a fixed six dots, so not even the length leaks. `inputOverlayOptions.revealTypedText: true` shows it, and even then a target that looks like a secret (`#password`, `[name=otp]`, `#api_key`, …) stays masked. Every mask is named in that event's `adjustments`.
 - **Rapid sequences**: consecutive single-character keys within `coalesceWindowMs` (400) merge into one chip (`abcdefghij`). Beyond that the row holds at most `maxVisible` (4) chips — fewer if they would not fit across the frame — and retires the oldest early. Chords are one chip (`Ctrl+Shift+K`), never three. A chip stays up `dwellMs` (1600) — less than a caption, because a key name is a glance and not prose. Four inputs in one beat (fill, fill, click, press) fit without shedding; cram in more and the retired chip's `adjustments` say whether anyone could have seen it.
 - `stopCdp()` adds `inputEvents[]` — `{ index, kind, label, startMs, endMs, atMs, coalescedCount?, dropped?, adjustments[] }` — plus `inputOverlayNote`. Read `adjustments` for coalescing, truncation, redaction, early retirement and drops.
-- `inputOverlayOptions`, complete with defaults: `position` (`'bottom-right'`), `layout` (`'row'`; `'stack'` puts one chip per line when labels are long), `fontName` (the caption font, so one recording reads as one thing), `fontSizePct` (2.4, against the caption's 5), `textColor` (`#FFFFFF`), `boxColor` (`#000000`), `boxOpacity` (0.65 — translucent so page content still shows through), `marginPct` (3), `dwellMs` (1600), `maxVisible` (4), `coalesceWindowMs` (400), `maxLabelChars` (26, then the chip is elided and says so in `adjustments`), `maxEvents` (300 — further events are **refused**, not silently dropped), `revealTypedText` (false), `captureFrameOnEvent` (true whenever the overlay is on and the path is screencast).
+- `inputOverlayOptions`, complete with defaults: `position` (`'bottom-right'`), `layout` (`'row'`; `'stack'` puts one chip per line when labels are long), `fontName` (the caption font, so one recording reads as one thing), `fontSizePct` (2.4, against the caption's 5), `textColor` (`#FFFFFF`), `boxColor` (`#000000`), `boxOpacity` (**1** — the plate has to cover the page, not tint it; see the merge plate above), `marginPct` (3, the distance from the anchored edges to the chip's LETTERS — the plate itself runs to the edge), `dwellMs` (1600), `maxVisible` (4), `coalesceWindowMs` (400), `maxLabelChars` (26, then the chip is elided and says so in `adjustments`), `maxEvents` (300 — further events are **refused**, not silently dropped), `revealTypedText` (false), `captureFrameOnEvent` (true whenever the overlay is on and the path is screencast).
 - The overlay is pixels only — there is no soft or sidecar form — so it needs an ffmpeg with libass regardless of `captionOptions.render`.
 
 **When to use the other recorder instead:** `recording.start` (tabCapture) gives true compositor output at a higher, fixed frame rate and survives navigation. It needs one extension-icon click per tab, so prefer it when a human is present and picture quality matters; prefer `startCdp` when nothing can click.
@@ -1422,12 +1404,12 @@ The result always carries `fittsDurationMs` (what the law asked for), `plannedDu
 
 There is deliberately **no** "route around this element" option. A real user's hand does not dodge invisible rectangles, so a dodging path is less human, not more. If a hover hazard sits on the line, either start the move somewhere else (`from`) or do not use human motion for that action.
 
-**createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, always pass `--timeout 120000` or higher.
+**createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, so always send `timeout: 120000` (or higher) alongside `code` in this `execute` call — `timeout` is the second parameter of the `execute` tool, and its 10000ms default will kill the encode midway.
 
 Save the whole `recording.stop()` result to `state` (shown above) — its `executionTimestamps` are what drive idle detection.
 
 ```js
-// SEPARATE execute call, with --timeout 120000:
+// SEPARATE execute call, sent with timeout: 120000 in the execute arguments:
 const demoPath = await createDemoVideo({
   recordingPath: state.recordingResult.path,
   durationMs: state.recordingResult.duration,
@@ -1456,7 +1438,7 @@ await state.page.screenshot({ path: '/absolute/path/to/shot.png', scale: 'css' }
 If you want to read back the image file into context, resize it first so it consumes fewer tokens:
 
 ```js
-await resizeImageForAgent({ input: './shot.png' })
+await resizeImageForAgent({ input: '/absolute/path/to/shot.png' })
 ```
 
 ## page.evaluate
@@ -1640,3 +1622,18 @@ Prefer locator-based actions over coordinates — locators are stable across scr
 ## Ghost Browser integration
 
 When running in [Ghost Browser](https://ghostbrowser.com/), the `chrome` object exposes APIs for multi-identity automation (identities, proxies, sessions). See `extension/src/ghost-browser-api.d.ts` for full API reference. Only works in Ghost Browser — calls fail in regular Chrome.
+
+## debugging playwriter itself
+
+When the failure is in playwriter rather than in the page — an internal error, a call that never returns, an extension that will not attach — the relay writes two logs into the user's home directory. Both are recreated every time the server starts, so they describe the current run only:
+
+- `~/.playwriter/relay-server.log` — the extension, the MCP server and the WS server, interleaved. Read it with grep/rg rather than whole.
+- `~/.playwriter/cdp.jsonl` — every CDP command, response and event, with long strings truncated.
+
+(`playwriter logfile` prints both paths if the CLI is on PATH.) To summarise CDP traffic by direction and method:
+
+```bash
+jq -r '.direction + "\t" + (.message.method // "response")' ~/.playwriter/cdp.jsonl | uniq -c
+```
+
+If it turns out to be a playwriter bug, report it with `gh issue create -R remorses/playwriter --title title --body body`. Ask the user to confirm before opening one.

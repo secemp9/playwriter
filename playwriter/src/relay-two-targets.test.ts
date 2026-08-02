@@ -244,7 +244,7 @@ describe('CDP per-session ordering around Runtime.enable', () => {
 
   afterAll(async () => {
     ext?.close()
-    server?.close()
+    await server?.close()
     await sleep(100)
   })
 

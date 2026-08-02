@@ -19,7 +19,7 @@ describe('Security Tests', () => {
 
   afterEach(async () => {
     if (server) {
-      server.close()
+      await server.close()
       server = null
     }
     await killProcessOnPort(TEST_PORT)

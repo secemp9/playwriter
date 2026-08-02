@@ -52,16 +52,20 @@ export async function startServer({
   console.log('Logs are being written to:', logger.logFilePath)
   console.log('CDP logs are being written to:', LOG_CDP_FILE_PATH)
 
-  process.on('SIGINT', () => {
+  // close() is awaited before exit(): it closes the shared headless browser, and
+  // process.exit(0) fired in the same tick would orphan that Chrome process.
+  const shutdown = async () => {
     console.log('\nShutting down...')
-    server.close()
+    await server.close()
     process.exit(0)
+  }
+
+  process.on('SIGINT', () => {
+    void shutdown()
   })
 
   process.on('SIGTERM', () => {
-    console.log('\nShutting down...')
-    server.close()
-    process.exit(0)
+    void shutdown()
   })
 
   return server

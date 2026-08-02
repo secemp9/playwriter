@@ -38,6 +38,7 @@ import {
   observedOptionsOf,
   type DocumentedApi,
 } from './sandbox-api-oracle.js'
+import { splitSkillOnCliSection } from './strip-cli-sections.js'
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const EXECUTOR_FILE = path.join(PACKAGE_ROOT, 'src', 'executor.ts')
@@ -193,15 +194,15 @@ describe('the doc parser itself works', () => {
     // documented ONLY in there is invisible to every MCP agent. Computed from skill.md
     // itself rather than from the built artifact, so it can never pass on a stale dist/
     // nor fail merely because dist/ has not been rebuilt yet.
+    //
+    // The boundary comes from the SAME function the build calls. It used to be re-derived
+    // here by cutting at the next `\n## `, which found a different boundary than the build
+    // does — the build stops at any heading of depth <= 2, so the hand-rolled version also
+    // discarded the `# playwriter best practices` h1 section that really does ship. It
+    // happened to stay green, but a guard computing a different answer than the thing it
+    // guards is only ever accidentally right.
     const skill = fs.readFileSync(path.join(PACKAGE_ROOT, 'src', 'skill.md'), 'utf8')
-    // It is the very first line of the file today, so the leading-newline form alone
-    // would miss it — and "missed it" must not be indistinguishable from "found it at 0".
-    const embedded = skill.indexOf('\n## CLI Usage\n')
-    const start = skill.startsWith('## CLI Usage\n') ? 0 : embedded === -1 ? -1 : embedded + 1
-    expect(start, 'the `## CLI Usage` heading build-resources.ts strips has been renamed').toBeGreaterThan(-1)
-    const rest = skill.slice(start)
-    const end = rest.indexOf('\n## ', 1)
-    const withoutCli = skill.slice(0, start) + (end === -1 ? '' : rest.slice(end))
+    const withoutCli = splitSkillOnCliSection(skill).shipped
     const tmp = path.join(PACKAGE_ROOT, 'src', '.skill-without-cli.tmp.md')
     fs.writeFileSync(tmp, withoutCli)
     try {
@@ -233,6 +234,281 @@ describe('the doc parser itself works', () => {
     const skillOnly = extractDocumentedApi({ root: PACKAGE_ROOT, markdownFiles: DOC_MARKDOWN, sourceFiles: [] })
     const invented = [...fromPrompt.globals.keys()].filter((g) => !skillOnly.globals.has(g))
     expect(invented, 'the MCP prompt documents something skill.md does not — it is no longer generated from it').toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The strip, and what it strands
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THIS EXISTS, AND WHY THE CHECK ABOVE WAS NOT ENOUGH.
+ *
+ * The check above asks whether any API NAME is documented only inside the stripped
+ * `## CLI Usage` section. That is a real question, but it is the wrong grain, and an audit
+ * proved it: `recording.startCdp` is documented in several places OUTSIDE the CLI section,
+ * so nothing was ever "lost" by that measure — yet the one sentence saying it is the
+ * recorder that survives direct-CDP mode sat inside the stripped section, and no MCP agent
+ * could read it. Nothing was missing. Something correct was simply unreachable.
+ *
+ * Three more facts sat there the same way, each appearing exactly once in `skill.md` and
+ * zero times in `dist/prompt.md`: `PLAYWRITER_HOST` (honoured in MCP mode by
+ * `getRemoteConfig` in `mcp.ts`, so MCP-over-tunnel is a real deployment), the
+ * `~/.playwriter/relay-server.log` triage route, and `gh issue create -R remorses/playwriter`.
+ *
+ * So this guard drops below the level of "API name" to the level of VOCABULARY. It pulls
+ * every hard token out of the stripped section — env vars, file paths, long flags, shell
+ * command heads, and backticked spans — and asks the blunt question the name check never
+ * asked: does this string appear ANYWHERE in the text that ships? A token that does not is
+ * either genuinely CLI-only, in which case it is listed below with a written reason, or it
+ * is stranded and has to be moved or duplicated into the shipped text.
+ *
+ * WHAT IT CATCHES: stranded vocabulary. Any env var, path, flag, command or backticked
+ * identifier whose only occurrence in the whole file is inside the stripped section.
+ *
+ * WHAT IT DOES NOT CATCH, stated plainly because an overclaimed guard is worse than none —
+ * that is the lesson of the name-level check it supplements:
+ *
+ *   1. A stranded CLAIM built entirely from vocabulary used elsewhere. The
+ *      `recording.startCdp` sentence that motivated this file is exactly that shape: every
+ *      token in it appears in the shipped text, so this guard would NOT have flagged it.
+ *      (It is un-stranded today, by duplication, but by hand — not by this check.)
+ *   2. Prose with no hard token at all — an ordering constraint, a caveat, a "prefer X to Y".
+ *   3. A token that appears in the shipped text in an unrelated or contradictory sense.
+ *      This is string containment, not meaning.
+ *   4. The reverse leak: CLI-only prose that ships. This guard runs one way only — it asks
+ *      whether a stripped token is unreachable, never whether a shipped one is useless.
+ *      When it was written `dist/prompt.md` still carried `playwriter -s 1 -e` examples
+ *      under "common mistakes" and nothing here objected; those are gone now, removed by
+ *      hand, and nothing here would object if they came back. Worse, the leak had been
+ *      *suppressing* this guard: the deleted heredoc example was the only shipped
+ *      occurrence of `<<'EOF'` and `'EOF'`, so those tokens read as reachable until it
+ *      went. A reverse leak keeps this check green on precisely the vocabulary it leaks.
+ *      The mirror check is not built, deliberately — see the note below.
+ *
+ * It is a lexical net with a stated mesh size. It would have caught three of the four
+ * stranded items, which is three more than the name check caught.
+ *
+ * WHY THERE IS NO MIRROR OF THIS CHECK. The obvious symmetry — flag every hard token in
+ * the SHIPPED half that looks like argv — does not survive contact with the file. The
+ * shipped half legitimately contains `--profile-directory`, `--remote-debugging-port` and
+ * `--allowlisted-extension-id` (how you start the user's Chrome), `gh issue create
+ * -R remorses/playwriter --title` (how you file the bug), a `jq` pipeline over
+ * `~/.playwriter/cdp.jsonl`, and the word `playwriter` in almost every section. Every one
+ * of those is a shell string an agent with a Bash tool should absolutely read. What makes
+ * `playwriter -s 1 -e` different is not its shape but its SUBJECT: it drives the CLI the
+ * agent is not using. No lexical rule separates those two sets, and a check that fires on
+ * `--profile-directory` would be trained away inside a week — which is exactly how the
+ * name-level check above stopped catching anything. The honest guard here is a periodic
+ * read of the shipped half, not a regex.
+ */
+const CLI_ONLY_BY_DESIGN: Record<string, string> = {
+  // --- headless and cloud: genuinely unreachable from MCP, so not "lost" ---
+  // There is no PLAYWRITER_BROWSER env var and mcp.ts has no headless or cloud branch —
+  // `getOrCreateExecutor` resolves to direct CDP, remote relay, or local relay and nothing
+  // else. An MCP session cannot enter either mode, so documenting them would be dead text.
+  '--browser': 'selects headless/cloud, which an MCP session has no way to enter (no PLAYWRITER_BROWSER env var)',
+  'playwriter session new --browser headless': 'headless mode is CLI-only; MCP has no branch that reaches it',
+  'playwriter browser install': 'downloads Chrome for Testing for headless mode, which MCP cannot enter',
+  'playwriter browser start': 'launches a debugging-enabled Chrome; the MCP equivalent is pointing PLAYWRITER_DIRECT at one',
+  '--proxy': 'cloud-browser residential proxy region, and cloud mode is unreachable from MCP',
+  '--proxy <region>': 'cloud-browser residential proxy region, and cloud mode is unreachable from MCP',
+  '--custom-proxy': 'cloud-browser option, and cloud mode is unreachable from MCP',
+  '--disable-proxy-bandwidth-acceleration': 'cloud-browser option, and cloud mode is unreachable from MCP',
+  PLAYWRITER_API_KEY: 'authenticates cloud browsers, which an MCP session cannot start',
+  'navigator.webdriver': 'names a stealth patch cloud Chromium applies; cloud is unreachable from MCP',
+
+  // --- the CLI's own surface: an MCP agent drives `execute`, not argv ---
+  'playwriter session new': 'the MCP server owns session lifecycle; an agent never runs this',
+  '-s <id>': 'the CLI session flag; MCP sessions are not addressed by argv',
+  '--direct': 'the CLI spelling of PLAYWRITER_DIRECT, which is documented in the shipped text',
+  '--token': 'the CLI spelling of PLAYWRITER_TOKEN, which is documented in the shipped text',
+  '--timeout':
+    'the CLI spelling of the `timeout` parameter on the MCP `execute` tool. The agent sees that parameter in the tool schema, and the shipped createDemoVideo note now names the key outright — `timeout: 120000` — so naming a flag it cannot pass would only mislead it',
+  '--timeout 120000':
+    'the same flag with the createDemoVideo value; the shipped text gives that value as `timeout: 120000` against the 10000ms default, without the argv spelling',
+  npm: 'global install of the CLI',
+  bunx: 'runs the CLI without installing it',
+  export: 'shell syntax for setting the env vars; an MCP client sets them in its own config block',
+  MY_SECRET_TOKEN: 'placeholder value in the `playwriter serve` example, not an identifier',
+  '//traforo.dev': 'the tunnel the HOST machine runs; the agent only ever sees the resulting URL in PLAYWRITER_HOST',
+  'chrome://inspect/#remote-debugging':
+    'a human action in a browser UI, and mcp.ts:124 already puts this exact string in the error an MCP agent gets when PLAYWRITER_DIRECT finds no Chrome',
+
+  // --- bash quoting: about argv, and there is no argv in MCP ---
+  //
+  // These were reachable from the shipped half until the "Quote escaping in bash"
+  // block was deleted from `## common mistakes to avoid` — a leak in the OTHER direction,
+  // fourteen lines of argv advice riding in every agent's context. Their entries only had
+  // to be written once that leak was closed, which is worth noticing: a reverse leak keeps
+  // this guard green on exactly the vocabulary it is leaking.
+  //
+  // `\t`, the other escape named in that quoting sentence, is deliberately NOT here: the shipped
+  // half's `jq -r '.direction + "\t" + …'` triage pipeline contains that exact string, so the
+  // token check already reads it as reachable and an entry for it would excuse nothing. That
+  // it is reachable in a completely unrelated sense is caveat 3 above, not something an
+  // allowlist entry can fix — and the liveness test below now refuses entries like it.
+  "$'...'": 'a bash quoting form; MCP code is passed as a JSON string with no shell in between',
+  "<<'EOF'": 'the bash heredoc opener; there is no shell between an MCP agent and `execute`, so nothing to quote against',
+  "'EOF'": 'the quoted heredoc delimiter, and quoting it is what disables bash expansion — a bash-only concern',
+  "\\'": 'bash escaping inside $\'...\'',
+  '\\\\': 'bash escaping inside $\'...\'',
+}
+
+/**
+ * Hard tokens: strings specific enough that appearing in one half of the file and not the
+ * other is evidence, rather than coincidence. Deliberately NOT bare English words.
+ */
+function hardTokens(text: string): Map<string, string> {
+  const found = new Map<string, string>()
+  const add = (token: string, kind: string) => {
+    if (!found.has(token)) found.set(token, kind)
+  }
+
+  // SCREAMING_SNAKE_CASE — env vars and placeholder values.
+  for (const m of text.matchAll(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g)) add(m[0], 'env var')
+  // Absolute, home-relative and protocol-relative paths that carry an extension or a host.
+  for (const m of text.matchAll(/(?:~|\.)?\/[\w.\-/]*\.\w{2,6}\b/g)) add(m[0], 'path')
+  // Long CLI flags.
+  for (const m of text.matchAll(/(?<![\w-])--[a-z][a-z0-9-]{2,}\b/g)) add(m[0], 'flag')
+  // The command each line of a shell fence actually runs.
+  for (const fence of text.matchAll(/^[ \t]*```(\w*)[ \t]*\n([\s\S]*?)^[ \t]*```/gm)) {
+    if (fence[1] !== 'bash' && fence[1] !== 'sh' && fence[1] !== 'shell') continue
+    for (const line of fence[2].split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const head = trimmed.match(/^([a-z][\w.-]*)\b/)
+      if (head) add(head[1], 'shell command')
+    }
+  }
+  // Backticked spans — the identifiers, commands and invocations the prose points at.
+  // Capped at 100 chars so a whole sentence in backticks does not become one token.
+  for (const m of text.matchAll(/`([^`\n]{2,100})`/g)) add(m[1], 'code span')
+
+  return found
+}
+
+describe('the CLI strip does not strand MCP-relevant facts', () => {
+  const skill = fs.readFileSync(path.join(PACKAGE_ROOT, 'src', 'skill.md'), 'utf8')
+  const { shipped, stripped } = splitSkillOnCliSection(skill)
+
+  it('splits skill.md where the build splits it', () => {
+    // The floors that make the token check below meaningful. A split that produced an
+    // empty stripped half would report zero stranded tokens forever — green, and checking
+    // nothing. This is the `splitBands` failure mode, so it gets an explicit floor.
+    expect(stripped, 'the stripped half does not start at the CLI heading').toContain('## CLI Usage')
+    expect(stripped.length, 'the stripped CLI section is implausibly small — is the split still working?').toBeGreaterThan(2000)
+    expect(shipped.length, 'the shipped half is implausibly small — the strip ran off the end').toBeGreaterThan(
+      skill.length * 0.5,
+    )
+    expect(shipped, 'the CLI section survived the split').not.toContain('\n## CLI Usage\n')
+  })
+
+  it('refuses to strip nothing when the heading is renamed', () => {
+    // Fragility #1. The strip matched `heading.text === 'CLI Usage'` exactly and did
+    // nothing at all when it did not match — so renaming the heading would have shipped
+    // the whole CLI section into every agent's context, silently. Nothing anywhere said
+    // "the strip found no section". Now it throws, and the build fails loudly.
+    const renamed = skill.replace('## CLI Usage\n', '## Using the CLI\n')
+    expect(renamed, 'the heading this test rewrites is no longer in skill.md').not.toEqual(skill)
+    expect(() => splitSkillOnCliSection(renamed)).toThrow(/no "## CLI Usage" heading/)
+  })
+
+  it('refuses to strip the whole document when the section never terminates', () => {
+    // Fragility #1's twin: stripping too much is as silent as stripping too little. With
+    // no heading of depth <= 2 left after it, the section runs to EOF and prompt.md
+    // becomes a valid, almost content-free document that nothing downstream can question.
+    const start = skill.indexOf('## CLI Usage')
+    const runaway = skill.slice(0, start) + skill.slice(start).replace(/^(#{1,2}) (?!CLI Usage)/gm, '#### ')
+    expect(() => splitSkillOnCliSection(runaway)).toThrow(/removed .* of skill\.md/)
+  })
+
+  it('the token check is sensitive — a swallowed section makes it fire', () => {
+    // The ceiling above only sees a TOTAL runaway. The realistic accident is smaller and
+    // just as damaging: demote the heading that terminates the CLI section and the strip
+    // quietly swallows the section after it — here `# playwriter best practices`, the
+    // opening ~60 lines of the agent's own instructions — then stops at the next h2,
+    // landing around 12% of the file. That is under any ceiling loose enough to let CLI
+    // docs grow, and no structural rule separates an absorbed h3 from a real
+    // `### Session management`. The token check is the thing that catches it.
+    //
+    // This test exists because a guard nobody has watched fail proves nothing. It pins the
+    // SENSITIVITY, not the content: if someone weakens `hardTokens` into a no-op, the
+    // stranding check above would still pass on a healthy file and only this would notice.
+    const demoted = skill.replace('\n# playwriter best practices\n', '\n### playwriter best practices\n')
+    expect(demoted, 'the heading this test demotes is no longer in skill.md').not.toEqual(skill)
+    const bad = splitSkillOnCliSection(demoted)
+    const swallowed = [...hardTokens(bad.stripped)]
+      .filter(([token]) => !bad.shipped.includes(token))
+      .filter(([token]) => !(token in CLI_ONLY_BY_DESIGN))
+    expect(swallowed.length, 'a whole section was absorbed into the strip and the token check said nothing').toBeGreaterThan(
+      10,
+    )
+  })
+
+  it('the allowlist is live — every entry excuses a token that is really stranded', () => {
+    // An allowlist that outlives the text it excuses is how a check quietly stops
+    // checking. There are TWO ways an entry can stop excusing anything, and asking only
+    // the first question let two of twenty-nine entries sit here inert:
+    //
+    //   1. the token is no longer produced by the split at all — a stale excuse, or a typo
+    //      that never matched;
+    //   2. the token IS in the stripped half, but it also appears in the SHIPPED half, so
+    //      the stranding check below would have skipped it anyway. The entry reads as the
+    //      reason a fact is unreachable when the fact is perfectly reachable.
+    //
+    // Both are inert, and inert entries are worse than absent ones: each is a written
+    // sentence asserting that MCP agents cannot reach something they can, and the next
+    // reader has no way to tell an excuse that is load-bearing from one that is decoration.
+    // `playwriter serve` and `\t` were exactly this, and removing them cost nothing —
+    // `playwriter serve` is named in the shipped remote-relay paragraph, and `\t` sits in
+    // the shipped `jq` triage pipeline.
+    //
+    // The direction matters: an entry is needed when the token appears in the stripped half
+    // and NOWHERE in the shipped half. Anything else and the entry is excusing a strand
+    // that does not exist.
+    const inStripped = hardTokens(stripped)
+
+    const stale = Object.keys(CLI_ONLY_BY_DESIGN).filter((token) => !inStripped.has(token))
+    expect(stale, 'listed as CLI-only but no longer a token of the stripped section — delete these entries').toEqual([])
+
+    const notStranded = Object.keys(CLI_ONLY_BY_DESIGN).filter((token) => shipped.includes(token))
+    expect(
+      notStranded,
+      'listed as CLI-only, but the shipped half contains this exact string — the stranding check never ' +
+        'consults these entries, so each is an excuse for a strand that does not exist. Delete them. If the ' +
+        'shipped occurrence is in an unrelated sense, that is caveat 3 on this guard and still not something ' +
+        'an allowlist entry fixes.',
+    ).toEqual([])
+  })
+
+  it('no hard token is reachable only from the stripped CLI section', () => {
+    const inStripped = hardTokens(stripped)
+    const stranded = [...inStripped]
+      .filter(([token]) => !shipped.includes(token))
+      .filter(([token]) => !(token in CLI_ONLY_BY_DESIGN))
+      .map(([token, kind]) => `${kind}: ${token}`)
+      .sort()
+    expect(
+      stranded,
+      'these appear ONLY in the `## CLI Usage` section, so dist/prompt.md never carries them and no MCP ' +
+        'agent can read them. Either move/duplicate the fact into the shipped text, or add the token to ' +
+        'CLI_ONLY_BY_DESIGN with a sentence saying why an MCP session can never reach it.',
+    ).toEqual([])
+  })
+
+  it('what the build actually shipped carries those same tokens', () => {
+    // The check above is computed from skill.md, so it cannot be fooled by a stale dist/.
+    // This one closes the other half: that the artifact on disk really is that shipped text.
+    // Weaker on purpose — dist/ may lag an uncommitted edit, so it only asserts the tokens
+    // skill.md's OWN shipped half already contains.
+    if (!fs.existsSync(PROMPT_MD)) {
+      throw new Error('dist/prompt.md is missing — run `pnpm build`. The MCP serves that file.')
+    }
+    const prompt = fs.readFileSync(PROMPT_MD, 'utf8')
+    const mustReach = ['PLAYWRITER_HOST', '~/.playwriter/relay-server.log', 'gh issue create -R remorses/playwriter']
+    const absent = mustReach.filter((token) => shipped.includes(token) && !prompt.includes(token))
+    expect(absent, 'skill.md un-stranded these but dist/prompt.md does not have them — run `pnpm build`').toEqual([])
   })
 })
 

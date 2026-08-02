@@ -443,7 +443,23 @@ export interface InputOverlayOptions {
   textColor?: string
   /** `#RRGGBB` for the chip background (default black). */
   boxColor?: string
-  /** Chip background opacity 0..1 (default 0.65). Translucent so page content still shows. */
+  /**
+   * Chip background opacity 0..1. **Default 1, and that is load-bearing rather than
+   * cosmetic** — see `chipStripMetrics` for the whole chip-merge argument.
+   *
+   * IT WAS 0.65, "translucent so page content still shows", and that is exactly what made
+   * the worst case possible. A translucent plate does not cover the page: a page glyph
+   * UNDER a chip stays visible at `1 - opacity` of its contrast and composites directly
+   * with the chip's own letters, which is a merge at zero separation — strictly worse than
+   * anything adjacency can produce. The original `Clickkout` was that: a `Click` chip over
+   * the word `Checkout`, not beside it.
+   *
+   * At 1 the covered region is a proof rather than an attenuation: no page pixel inside the
+   * plate survives at all, whatever the page is. Lowering it reinstates the defect in
+   * exactly the way `captionOptions.backdrop: false` does for the caption, and the visual
+   * suite's chip merge shield goes red when it is lowered on a page that is not already the
+   * box colour.
+   */
   boxOpacity?: number
   /** Distance from the two anchored edges, as a percentage of video height (default 3). */
   marginPct?: number
@@ -504,7 +520,7 @@ const INPUT_DEFAULTS = {
   fontSizePct: 2.4,
   textColor: '#FFFFFF',
   boxColor: '#000000',
-  boxOpacity: 0.65,
+  boxOpacity: 1,
   marginPct: 3,
   dwellMs: 1600,
   maxVisible: 4,
@@ -551,6 +567,170 @@ const ROW_SEPARATOR = ' · '
  * early trim into an unreported overflow.
  */
 const CHIP_CHAR_WIDTH_RATIO = 0.58
+
+/**
+ * Advance of one ASS hard space (`\h`), as a fraction of the font size.
+ *
+ * MEASURED against this machine's libass 0.15.2 + DejaVu Sans by rendering a BorderStyle-3
+ * chip with n hard spaces at each end and differencing the drawn box width. It is the
+ * mechanism the chip plate is widened with, so it is measured on the box rather than on the
+ * glyphs:
+ *
+ *     fontSize      10      12      17      24      36
+ *     px per \h     2.750   3.250   4.625   6.500   9.813
+ *     / fontSize    0.2750  0.2708  0.2721  0.2708  0.2726
+ *
+ * Two facts fall out of that table and both are load-bearing. libass does NOT trim a hard
+ * space at either end of a line — leading and trailing runs each widened the box by the same
+ * amount — and the ratio is size-invariant, so a fixed NUMBER of hard spaces buys a clearance
+ * that scales with the face instead of a pixel count that stops meaning anything at another
+ * frame size. 0.271 is below every measured value, which is the safe direction here: the
+ * clearance `chipStripMetrics` CLAIMS is then a lower bound on the one libass draws.
+ */
+const CHIP_HARD_SPACE_RATIO = 0.271
+
+/**
+ * Clear pixels the chip plate must put between chip ink and any page glyph beside it,
+ * as a multiple of the chip face.
+ *
+ * MEASURED, perceptually, and the measurement is reported as a range rather than a point
+ * because the question genuinely is one. Rendering the real geometry — a white page, black
+ * page text, and an opaque black plate carrying white overlay text ending G clear pixels
+ * short of it — and reading the result at 1x and 6x, over `Click`+`out`, `charge`+`s`, and
+ * chip/page face pairs 10/12, 12/12, 17/15:
+ *
+ *     clear px between the two ink runs      2   3   4   5   6   7   8   9   10+
+ *     reads as one word                      Y   Y   Y   ?   ?   ?   n   n   n
+ *
+ * 3px is the documented `charges` failure and it reproduces exactly, which is what says the
+ * rig is measuring the right thing.
+ *
+ * THE PIXEL COUNT IS NOT THE ANSWER, THOUGH, AND THIS IS THE PART THAT MAKES THE RULE
+ * TRANSPORTABLE. Word segmentation is not done in pixels, it is done in spaces, so the same
+ * sweep measured what a space actually looks like in DejaVu Sans — the CLEAR run between two
+ * inked columns:
+ *
+ *     fontSize          10   12   15   17   22   36
+ *     between letters    1    1  1-2  1-2    2  3-4
+ *     between words      3    4  5-6    6    8  13-14      (= 0.36 of the face)
+ *
+ * So the reason 3px failed is not perceptual at all: at 12px page text a SPACE is 4 clear
+ * pixels, and 3px is narrower than a space. Nothing separated by less than the page's own
+ * word gap can read as a word break. Lining the two tables up, the pairs stop reading as one
+ * word at about TWICE the page's inter-word gap — 8px against 4px at 12px text, 9-10px
+ * against 6px at 15-17px text — i.e. at roughly `0.72 * pageFontSize`.
+ *
+ * The page's font size is not knowable here, so the rule is expressed against the one face
+ * this file does know. 1.5 chip faces of clearance is therefore proof against page text up
+ * to `1.5 / 0.72 = 2.08` times the chip face: 20px page text on a 480x320 frame, 35px on
+ * 1280x720, 41px on 390x844. Above that it stops being proof — and the same sweep is why the
+ * residual is small rather than merely unmeasured: rendered at 22px page text against a 10px
+ * chip, the pair did not read as one word even at ZERO separation, because a 2:1 size step is
+ * itself a word boundary. The band where a merge is possible is bounded on both sides.
+ */
+export const CHIP_MIN_CLEAR_RATIO = 1.5
+
+/**
+ * Hard spaces put inboard of the chip labels, which is what buys the clearance above.
+ *
+ * Six rather than a computed count, because `CHIP_HARD_SPACE_RATIO` is size-invariant and so
+ * the arithmetic gives the same answer at every face: reaching `CHIP_MIN_CLEAR_RATIO` needs
+ * `(1.5 - pad/fontSize) / 0.271` of them, which is 4.80 at fontSize 10, 4.88 at 17 and 4.98
+ * at 20. Five would meet the requirement with under a pixel to spare at every size, which is
+ * close enough to the rounding to be luck; six clears it by roughly a third of a face.
+ *
+ * They go INBOARD only. The outboard side needs no clearance at all because it is given
+ * something better — see `chipStripMetrics`.
+ */
+const CHIP_INBOARD_CLEAR_SPACES = 6
+
+/**
+ * The chip strip's resolved geometry, in one place because two functions need it and they
+ * must not disagree: `buildInputChips` budgets a row against it and `formatAss` draws it.
+ *
+ * WHY THE CHIP CANNOT MERGE, AND WHERE THAT STOPS BEING A PROOF.
+ *
+ * A composite reads as a word that is in neither layer only when two glyph runs sit side by
+ * side on the rows they share. `captionOptions.backdrop` kills that for the caption by
+ * spanning the whole frame width, so on a caption row there is no page pixel to be beside.
+ * The chips cannot have that: a full-frame-width bar behind a corner HUD is a worse artifact
+ * than the defect it prevents. So the strip is given the strongest thing that is not a bar,
+ * and it is three separate properties:
+ *
+ *   1. **UNDER the plate: absolute.** The box is opaque (`boxOpacity` defaults to 1). No page
+ *      pixel inside the plate survives, so a chip cannot composite with the page glyph it is
+ *      drawn on top of. That was the original `Clickkout` — a chip over a word, not next to
+ *      one — and a translucent box is what allowed it.
+ *
+ *   2. **OUTBOARD of the ink: absolute.** The strip's anchored horizontal margin is ZERO and
+ *      the ink is held off the edge by hard spaces instead, so the plate runs continuously
+ *      from the chip's ink to the frame edge it is anchored to. On a chip-ink scanline there
+ *      is no page pixel on that side AT ALL — the same argument the caption band makes, made
+ *      by reaching one edge instead of two. It also costs less than clearance would: the
+ *      plate grows by the old margin, which is smaller than `CHIP_MIN_CLEAR_RATIO` faces.
+ *
+ *   3. **INBOARD of the ink: measured, not absolute.** `CHIP_INBOARD_CLEAR_SPACES` hard
+ *      spaces put `clearPx` of opaque plate between the ink and the nearest page pixel. See
+ *      `CHIP_MIN_CLEAR_RATIO` for what that distance was measured against and for the page
+ *      face above which it stops being a proof.
+ *
+ * AND (3) CANNOT BE MADE ABSOLUTE WITHOUT THE BAR. On a row carrying chip ink, either the
+ * whole row is overlay — which is the full-width bar — or some page pixel is on it, at some
+ * distance, and whether that distance reads as a word break is a perceptual question. There
+ * is no third option, so this is a limit of the geometry and not of the effort spent on it.
+ * What can be done is what is done here: make two of the three sides proofs, put a measured
+ * number on the third, and CHECK all three on pixels — `chipMergeShieldFindings` in
+ * `video-invariants.ts` asserts every one of them on every scene at every frame size.
+ */
+export interface ChipStripMetrics {
+  /** Chip face in px, floored at `MIN_INPUT_FONT_PX`. */
+  fontSize: number
+  /** Box padding: the ASS `Outline` field under BorderStyle 3. */
+  pad: number
+  /**
+   * `marginPct` in pixels. It is now the distance the INK is held off the anchored edge
+   * rather than the distance the BOX is — the box runs to the edge — and it is still the
+   * inboard style margin and the base for the vertical one before the caption lift.
+   */
+  margin: number
+  /** Hard spaces inboard of the labels: the measured merge clearance. */
+  inboardSpaces: number
+  /** Hard spaces outboard of the labels: what `margin` used to do, now that it is zero. */
+  outboardSpaces: number
+  /** Total width the hard spaces add to a line, in px. Charged against the row budget. */
+  hardSpaceWidthPx: number
+  /** Opaque plate guaranteed inboard of the ink. A LOWER bound on what libass draws. */
+  clearPx: number
+  /** What `clearPx` has to reach. `clearPx >= requiredClearPx` is the invariant. */
+  requiredClearPx: number
+}
+
+export function chipStripMetrics(
+  video: { width: number; height: number },
+  options?: InputOverlayOptions,
+): ChipStripMetrics {
+  const fontSize = Math.max(
+    MIN_INPUT_FONT_PX,
+    Math.round((video.height * (options?.fontSizePct ?? INPUT_DEFAULTS.fontSizePct)) / 100),
+  )
+  const pad = Math.max(2, Math.round(fontSize / 6))
+  const margin = Math.max(4, Math.round((video.height * (options?.marginPct ?? INPUT_DEFAULTS.marginPct)) / 100))
+  const space = CHIP_HARD_SPACE_RATIO * fontSize
+  // Enough hard spaces to hold the ink where the margin used to hold it, now that the margin
+  // itself is zero on that side. At least one, so the ink is never flush against the edge.
+  const outboardSpaces = Math.max(1, Math.round((margin - pad) / space))
+  return {
+    fontSize,
+    pad,
+    margin,
+    inboardSpaces: CHIP_INBOARD_CLEAR_SPACES,
+    outboardSpaces,
+    hardSpaceWidthPx: Math.ceil((CHIP_INBOARD_CLEAR_SPACES + outboardSpaces) * space),
+    // floor, not round: this number is asserted as a lower bound on the rendered geometry.
+    clearPx: pad + Math.floor(CHIP_INBOARD_CLEAR_SPACES * space),
+    requiredClearPx: Math.round(CHIP_MIN_CLEAR_RATIO * fontSize),
+  }
+}
 
 /**
  * Advance width of the CAPTION font, as a fraction of its size, used only to predict how
@@ -2222,17 +2402,25 @@ export function buildInputChips({
    *
    * `Infinity` for a stack (each chip is its own line and is already capped by
    * `maxLabelChars`) and when no video size is known.
+   *
+   * The two subtractions are the strip's own furniture, and both moved when the merge plate
+   * arrived. Only ONE margin is charged, because the anchored side's margin is now zero — the
+   * plate runs to that frame edge instead. Against that, the hard spaces that hold the ink off
+   * that edge and provide the inboard clearance are charged in full: they are part of the
+   * line libass lays out, and a budget that ignored them would let a row that "fits" be
+   * wrapped by the padding, which is the one failure `singleRowFindings` exists to catch.
+   * Charged at their MEASURED advance rather than at `CHIP_CHAR_WIDTH_RATIO`; over-charging
+   * a fixed ten-space overhead by 2x would retire a chip on every narrow frame for nothing.
    */
   const rowCharBudget =
     layout === 'row' && video
-      ? Math.max(
-          maxLabelChars,
-          Math.floor(
-            (video.width - 2 * Math.max(4, Math.round((video.height * (options?.marginPct ?? INPUT_DEFAULTS.marginPct)) / 100))) /
-              (Math.max(MIN_INPUT_FONT_PX, Math.round((video.height * (options?.fontSizePct ?? INPUT_DEFAULTS.fontSizePct)) / 100)) *
-                CHIP_CHAR_WIDTH_RATIO),
-          ),
-        )
+      ? (() => {
+          const m = chipStripMetrics(video, options)
+          return Math.max(
+            maxLabelChars,
+            Math.floor((video.width - m.margin - m.hardSpaceWidthPx) / (m.fontSize * CHIP_CHAR_WIDTH_RATIO)),
+          )
+        })()
       : Infinity
 
   if (events.length === 0) return { events: [], segments: [] }
@@ -2623,7 +2811,7 @@ export function validateVisualOptions(
       throw new Error(
         `inputOverlayOptions.textColor ${JSON.stringify(chipText)} and boxColor ${JSON.stringify(chipBox)} are the same ` +
           `colour at ${opacity} opacity, so every chip would render as a featureless block. The default pair is white ` +
-          'text on a translucent black box.',
+          'text on an opaque black box.',
       )
     }
   }
@@ -2670,16 +2858,22 @@ export function validateVisualOptions(
  * AFTER CHANGING ANY OF THE LAYOUT OR STYLING BELOW, LOOK AT THE RESULT.
  * `video-invariants.ts` automates what can be stated as a property of known pixel masks —
  * disjointness, edge clipping, per-glyph contrast, counter survival, single-row chips, chip
- * subordination, subject occlusion, golden-frame drift, and now the merge shield: every
- * scanline carrying caption ink is fully covered by the caption layer, which is exactly the
- * condition under which page text cannot end up beside caption text. That last one used to
- * be impossible to state — the "Clickkout" class fabricates a word out of two individually
- * perfect layers — and it became statable only because `backdrop` made the geometry
- * absolute instead of incidental.
+ * subordination, subject occlusion, golden-frame drift, and the two merge shields.
  *
- * It is still not the whole question. The CHIP strip has no such band (a full-width bar for
- * a corner HUD would be worse than the defect), so a chip can still land beside page text,
- * and nothing here will say so. That remains a person with eyes, and it has a harness:
+ *   CAPTION. Every scanline carrying caption ink is fully covered by the caption layer, from
+ *   one edge of the frame to the other, which is exactly the condition under which page text
+ *   cannot end up beside caption text. That used to be impossible to state — the "Clickkout"
+ *   class fabricates a word out of two individually perfect layers — and it became statable
+ *   only because `backdrop` made the geometry absolute instead of incidental.
+ *
+ *   CHIPS. A different formulation, because a full-width bar behind a corner HUD would be a
+ *   worse artifact than the defect it prevents, so the chips cannot copy the caption's
+ *   answer. Instead the plate is opaque (nothing under it survives), it runs to the frame
+ *   edge it is anchored to (nothing beside it on that side exists), and it extends a MEASURED
+ *   clear distance inboard. Two of those three are proofs; the third is a number, and
+ *   `chipStripMetrics` says how the number was measured and where it stops being a proof.
+ *
+ * Neither shield is a substitute for looking, and the harness for that is:
  *
  *     pnpm exec vite-node scripts/render-visual-frames.ts
  *
@@ -2765,21 +2959,23 @@ export function formatAss(
 
   if (input && input.segments.length > 0) {
     const io = input.options
-    // Floored at MIN_INPUT_FONT_PX for the same reason the caption face is floored at 16:
-    // below it the box swallows the glyphs and the chip reads as a grey tab.
-    const chipSize = Math.max(
-      MIN_INPUT_FONT_PX,
-      Math.round((video.height * (io?.fontSizePct ?? INPUT_DEFAULTS.fontSizePct)) / 100),
-    )
+    // The face, the padding, the margin and the two hard-space runs, all from one place —
+    // `buildInputChips` budgets the row against the same numbers and the two must agree.
+    // The face is floored at MIN_INPUT_FONT_PX for the same reason the caption face is
+    // floored at 16: below it the box swallows the glyphs and the chip reads as a grey tab.
+    const chip = chipStripMetrics(video, io)
+    const chipSize = chip.fontSize
     const opacity = Math.min(1, Math.max(0, io?.boxOpacity ?? INPUT_DEFAULTS.boxOpacity))
-    // ASS alpha is INVERTED — 0x00 is opaque — so a 0.65 opacity box is alpha 0x59.
+    // ASS alpha is INVERTED — 0x00 is opaque — so the default opacity 1 is alpha 0x00, and a
+    // caller-chosen 0.65 would be 0x59. Opacity is not decoration here: see `boxOpacity`.
     const boxAlpha = Math.round((1 - opacity) * 255)
     const chipText = assColor(io?.textColor ?? INPUT_DEFAULTS.textColor)
-    // BorderStyle 3 fills the box from OutlineColour. `Outline` becomes the box padding,
-    // and Shadow is 0 so the translucent box does not get an opaque twin behind it.
+    // BorderStyle 3 fills the box from OutlineColour — that fill IS the merge plate. `Outline`
+    // becomes its padding, and Shadow is 0 so the box does not get a second, offset twin
+    // behind it that would extend past the plate's own edge.
     const chipBox = assColor(io?.boxColor ?? INPUT_DEFAULTS.boxColor, boxAlpha)
-    const chipPad = Math.max(2, Math.round(chipSize / 6))
-    const chipMargin = Math.max(4, Math.round((video.height * (io?.marginPct ?? INPUT_DEFAULTS.marginPct)) / 100))
+    const chipPad = chip.pad
+    const chipMargin = chip.margin
     const position = io?.position ?? INPUT_DEFAULTS.position
     const alignment = { 'top-left': 7, 'top-right': 9, 'bottom-left': 1, 'bottom-right': 3 }[position]
     if (alignment === undefined) {
@@ -2833,8 +3029,36 @@ export function formatAss(
       }
     }
 
+    /**
+     * The merge plate, expressed as margins and hard spaces rather than as a rectangle.
+     *
+     * `chipStripMetrics` carries the argument for why these are the shape they are; this is
+     * the mechanism. BorderStyle 3 makes libass draw the opaque box around the line's TRUE
+     * extent, so the plate is the ink's own bounding box plus padding by construction — there
+     * is no advance-width estimate anywhere in it, and it cannot come out narrower than the
+     * glyphs the way a `\p1` rectangle sized from `CHIP_CHAR_WIDTH_RATIO` could.
+     *
+     * The two things that then have to be added are asymmetric, and ASS `Outline` is not:
+     * it pads all four sides at once, and paying the inboard clearance vertically as well
+     * would make a 14px strip a 46px one, cover three times the page for no merge benefit,
+     * and break the subordination the HUD depends on. Hard spaces are the asymmetric vehicle
+     * — MEASURED not to be trimmed at either end of a line, and to widen the box by exactly
+     * their advance (see `CHIP_HARD_SPACE_RATIO`), while adding no height at all.
+     *
+     *   outboard side  the anchored margin is ZERO, so the plate reaches the frame edge, and
+     *                  `outboardSpaces` holds the ink where the margin used to hold it;
+     *   inboard side   `inboardSpaces` of clearance between the ink and the page.
+     */
+    const leftAnchored = position === 'top-left' || position === 'bottom-left'
+    const inboardPad = '\\h'.repeat(chip.inboardSpaces)
+    const outboardPad = '\\h'.repeat(chip.outboardSpaces)
+    const leadPad = leftAnchored ? outboardPad : inboardPad
+    const trailPad = leftAnchored ? inboardPad : outboardPad
+    const marginL = leftAnchored ? 0 : chipMargin
+    const marginR = leftAnchored ? chipMargin : 0
+
     styleLines.push(
-      `Style: Input,${io?.fontName ?? fontName},${chipSize},${chipText},${chipText},${chipBox},${chipBox},0,0,0,0,100,100,0,0,3,${chipPad},0,${alignment},${chipMargin},${chipMargin},${chipMarginV},1`,
+      `Style: Input,${io?.fontName ?? fontName},${chipSize},${chipText},${chipText},${chipBox},${chipBox},0,0,0,0,100,100,0,0,3,${chipPad},0,${alignment},${marginL},${marginR},${chipMarginV},1`,
     )
     for (const segment of input.segments) {
       const lines = segment.lines.map((l) => {
@@ -2847,7 +3071,13 @@ export function formatAss(
       // Layer 1: above the captions, so a chip is never hidden by a cue that grew into it.
       // A row is one line with separators; a stack is one line per chip. Either way it is
       // ONE dialogue, so libass lays it out exactly as written.
-      const body = layout === 'row' ? lines.join(ROW_SEPARATOR) : lines.join('\\N')
+      //
+      // The padding is applied AFTER `escapeAssText`, so `\h` stays a hard space: the escaper
+      // deliberately breaks a CALLER's backslash before an h with a zero-width space, and
+      // running our own padding through it would turn the plate into six literal `\h`s.
+      // Per LINE in a stack, not per dialogue — each stacked chip gets its own box.
+      const pad = (s: string) => `${leadPad}${s}${trailPad}`
+      const body = layout === 'row' ? pad(lines.join(ROW_SEPARATOR)) : lines.map(pad).join('\\N')
       eventLines.push(`Dialogue: 1,${assTime(segment.startMs)},${assTime(segment.endMs)},Input,,0,0,0,,${body}`)
     }
   }

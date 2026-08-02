@@ -107,7 +107,19 @@ const NOISY_LOG_EVENTS = new Set([
 ])
 
 export type RelayServer = {
-  close(): void
+  /**
+   * Shut the relay down. Everything synchronous (closing sockets, unbinding the listener,
+   * clearing timers) happens before the first await, so a caller that ignores the promise
+   * still gets the port released immediately — but the promise is the only honest signal
+   * that shutdown has actually FINISHED, and callers that care must await it.
+   *
+   * It returns a promise because close() genuinely has async work to finish: closing the
+   * shared headless browser. It used to be fire-and-forget, which meant close() could still
+   * be starting work after its caller believed shutdown was done. In a Vitest worker that
+   * outlived the test run and crashed the pool — see the comment at the closeSharedHeadlessBrowser
+   * call in close() below.
+   */
+  close(): Promise<void>
   on<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]): void
   off<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]): void
 }
@@ -2212,30 +2224,62 @@ export async function startPlayWriterCDPRelayServer({
               if (!alreadyConnected) {
                 sendToPlaywright({
                   message: {
-                    // Iframe targets must be routed to the parent page sessionId so Playwright attaches them under the right page.
-                    // - iframeOwnerSessionId: derived parent session via parentFrameId -> page sessionId (frameId tracking).
-                    // - incomingSessionId: extension event sessionId for the parent tab.
-                    // The frameId mapping is racy: Target.attachedToTarget can arrive before Page.frameAttached/Page.frameNavigated populate frameIds.
-                    // When iframeOwnerSessionId is missing we must fall back to incomingSessionId, otherwise Playwright receives the attach on the root
-                    // session, detaches it, and the iframe stays paused (waitingForDebugger) which can hang navigations.
+                    // An iframe (OOPIF) target's attach must reach Playwright on the session that OWNS
+                    // the frame containing it, or Playwright drops it — see the crBrowser/crPage split
+                    // below. Two candidates:
+                    //   - incomingSessionId: the session the EXTENSION delivered this event on. The
+                    //     extension sends `source.sessionId || tab.sessionId` (background.ts
+                    //     onDebuggerEvent), i.e. the child session when Chrome delivered the event on a
+                    //     child session and the tab's page session otherwise. That is, by construction,
+                    //     the session Chrome itself used.
+                    //   - iframeOwnerSessionId: re-derived from targetInfo.parentFrameId against the
+                    //     `frameIds` sets that Page.frameAttached / Page.frameNavigated build up.
                     //
-                    // The CONSEQUENCE half of that is VERIFIED against the pinned playwright-core 1.59.10 source,
-                    // not inferred. Two different handlers read Target.attachedToTarget:
-                    //   - crBrowser.ts `_onAttachedToTarget` (the ROOT/browser session). `type: 'iframe'` matches
-                    //     none of its branches — browser, devtools 'other', page, service_worker — so it reaches
-                    //     the final `session.detach().catch(() => {})` at crBrowser.ts:209. The attach is dropped.
-                    //   - crPage.ts `_onAttachedToTarget` (the PAGE session). Its `type === 'iframe'` branch at
-                    //     crPage.ts:691 builds a FrameSession and calls `_initialize`, which is what sends
-                    //     `Runtime.runIfWaitingForDebugger` (crPage.ts:534) and unpauses the iframe.
-                    // So delivering the attach on the root session really does mean detached-and-still-paused,
-                    // and the fallback is what keeps it on the page session.
+                    // MEASURED, both halves, against a real Chrome driving the packed extension over
+                    // this relay (cross-site frames forced with --host-resolver-rules over three OOPIF
+                    // shapes: an iframe already loaded when the tab is attached, one created later on an
+                    // already-attached tab, and a nested a→b→c OOPIF chain). Six iframe attaches,
+                    // `incomingSessionId` vs `iframeOwnerSessionId`:
                     //
-                    // The RACE half — that the extension can emit Target.attachedToTarget before
-                    // Page.frameAttached/Page.frameNavigated have populated `frameIds` — is NOT MEASURED and has
-                    // no test. It needs the packed extension driving a real Chrome, which this repo's test
-                    // environment cannot do. Treat it as an assumption about extension event ordering. What would
-                    // settle it: log the arrival order of these three events for an OOPIF across many loads and
-                    // check whether `getPageTargetForFrameId` ever misses.
+                    //   child=A56D…  incoming=<none>       derived=<none>       MISS
+                    //   child=F526…  incoming=pw-tab-…-2   derived=<none>       MISS
+                    //   child=B176…  incoming=pw-tab-…-3   derived=pw-tab-…-3   same
+                    //   child=6114…  incoming=pw-tab-…-3   derived=pw-tab-…-3   same
+                    //   child=6C62…  incoming=pw-tab-…-4   derived=pw-tab-…-4   same
+                    //   child=11F7…  incoming=6C62…        derived=<none>       MISS   (nested OOPIF)
+                    //
+                    // So: the `frameIds` mapping IS racy — it missed on 3 of 6 — but it never once
+                    // disagreed with incomingSessionId, and on every miss the fallback was correct.
+                    // The misses are structural, not luck:
+                    //   - F526…: the tab was attached to an already-loaded page. Page.enable does not
+                    //     replay frameNavigated, so the page target's `frameIds` was still EMPTY.
+                    //   - 11F7…: the parent frame is an OOPIF, and the page target had already had that
+                    //     frameId removed by the Page.frameDetached that accompanies the local→remote
+                    //     swap (which necessarily precedes the nested frame existing at all).
+                    // getPageTargetForFrameId only ever looks at type==='page' targets, so for a nested
+                    // OOPIF it can only miss or answer with the wrong (top page) session; it never adds
+                    // information incomingSessionId did not already carry. It is kept because it is
+                    // harmless and pins the intent, NOT because anything observed needed it.
+                    //
+                    // The CONSEQUENCE of getting this wrong is VERIFIED against the pinned
+                    // playwright-core 1.59.10 source AND observed on the wire. Two handlers read
+                    // Target.attachedToTarget:
+                    //   - crBrowser.ts `_onAttachedToTarget` (the ROOT/browser session). `type: 'iframe'`
+                    //     matches none of its branches — browser, devtools 'other', page, service_worker
+                    //     — so it reaches `session.detach().catch(() => {})` at crBrowser.ts:209.
+                    //   - crPage.ts `_onAttachedToTarget` (the PAGE session). Its `type === 'iframe'`
+                    //     branch at crPage.ts:691 builds a FrameSession and calls `_initialize`.
+                    // The A56D… row above is that failure, live: the extension had no session to name
+                    // (it emitted the attach mid-attachTab, before the tab's sessionId existed), the
+                    // relay forwarded it with no sessionId, and Playwright answered with
+                    // Runtime.runIfWaitingForDebugger + Target.detachFromTarget three lines later. Note
+                    // what did NOT happen: `waitingForDebugger` was false and CRSession.detach resumes
+                    // the target before detaching, so the iframe was never left paused — the older
+                    // version of this comment asserted that and it is not what Chrome/Playwright do.
+                    // background.ts now moves that Target.setAutoAttach after the tab's attach echo so
+                    // the A56D… row cannot recur; the fallback below still carries the F526…/11F7… rows.
+                    // relay-oopif-attach.test.ts pins the A56D… row (it reproduces that shape without a
+                    // race and fails on every run with the background.ts change reverted, 5/5).
                     sessionId: iframeOwnerSessionId ?? incomingSessionId,
                     method: 'Target.attachedToTarget',
                     params: targetParams,
@@ -2461,14 +2505,21 @@ export async function startPlayWriterCDPRelayServer({
   // Session counter for suggesting next session number
   let nextSessionNumber = 1
 
-  // Lazy-load ExecutorManager to avoid circular imports and only when needed
+  // Lazy-load ./executor.js to avoid circular imports and only when needed.
+  //
+  // The whole module namespace is retained, not just ExecutorManager: close() needs
+  // PlaywrightExecutor.closeSharedHeadlessBrowser(), and it must be able to reach it
+  // WITHOUT starting an import of its own. `executorModule === null` is therefore the
+  // exact, checkable answer to "did this relay ever touch the executor subsystem?".
+  let executorModule: typeof import('./executor.js') | null = null
   let executorManager: import('./executor.js').ExecutorManager | null = null
 
   const getExecutorManager = async () => {
     if (!executorManager) {
-      const { ExecutorManager } = await import('./executor.js')
+      const module = await import('./executor.js')
+      executorModule = module
       // Pass config instead of URL so executor can generate unique client IDs for each connection
-      executorManager = new ExecutorManager({
+      executorManager = new module.ExecutorManager({
         cdpConfig: { host: '127.0.0.1', port, token },
         logger: logger || { log: console.error, error: console.error },
       })
@@ -3115,7 +3166,11 @@ export async function startPlayWriterCDPRelayServer({
   logger?.log('CDP endpoint:', cdpEndpoint)
 
   return {
-    close() {
+    async close() {
+      // Everything in this block is synchronous on purpose: an `async` function body runs
+      // up to its first `await` synchronously, so a caller that ignores the returned promise
+      // still gets sockets closed, timers cleared and the port unbound before close() returns.
+      // Keep the single await LAST.
       const { extensions, playwrightClients } = store.getState()
 
       for (const client of playwrightClients.values()) {
@@ -3130,11 +3185,6 @@ export async function startPlayWriterCDPRelayServer({
         ext.ws?.close(1000, 'Server stopped')
       }
 
-      // Close shared headless browser if any headless sessions were created (fire-and-forget)
-      void import('./executor.js').then(({ PlaywrightExecutor }) => {
-        return PlaywrightExecutor.closeSharedHeadlessBrowser()
-      })
-
       // Reset store state
       store.setState({
         extensions: new Map(),
@@ -3145,6 +3195,34 @@ export async function startPlayWriterCDPRelayServer({
       persistCloudSessions() // Remove the file on graceful shutdown
       server.close()
       emitter.removeAllListeners()
+
+      // Close the shared headless browser if this relay ever created a headless session.
+      //
+      // Two deliberate properties, both of which this used to get wrong as
+      // `void import('./executor.js').then(...)`:
+      //
+      // 1. It does NOT start an import. A shared headless browser can only exist if
+      //    ./executor.js is loaded AND a headless session was launched through it, and the
+      //    only route to that in this file is /cli/session/new { headless: true }, which goes
+      //    through getExecutorManager() — the one place that sets executorModule. So when
+      //    executorModule is null there is provably nothing to close, and importing the module
+      //    would only pull in executor.js -> playwright-import.js -> playwright-core purely to
+      //    call a static that would find nothing.
+      //
+      //    MEASURED, and the reason this is written this way: under Vitest the import was not
+      //    free, it was fatal. Vitest's module runner fetches every module's transformed source
+      //    from the parent process over the fork's IPC channel, so the import kept issuing
+      //    `fetch` RPCs after the last test had finished. Instrumenting birpc showed the exact
+      //    shape: `fetch /src/executor.ts` answered, pool sends `stop`, worker exits, and the
+      //    pool then writes the reply to `fetch /src/playwright-import.ts` into a dead pipe —
+      //    `write EPIPE` out of an EventEmitter with no 'error' listener, so `vitest run` exits
+      //    non-zero with all tests green. That was 7 failures in 40 runs of relay-state.test.ts.
+      //
+      // 2. It is AWAITED, not fire-and-forget. browser.close() is real work, and a close()
+      //    that returns while still doing it is lying to its caller.
+      if (executorModule) {
+        await executorModule.PlaywrightExecutor.closeSharedHeadlessBrowser()
+      }
     },
     on<K extends keyof RelayServerEvents>(event: K, listener: RelayServerEvents[K]) {
       emitter.on(event, listener as (...args: unknown[]) => void)

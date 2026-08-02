@@ -48,6 +48,62 @@ const MIN_ARIA_LABELS = {
   hackerNews: { minLabels: 50, minSnapshotLines: 235 },
 } as const
 
+/**
+ * How many times a measurement is retaken when the page moved out from under it.
+ *
+ * Two tests below compare something CDP reported — a screenshot clip, a
+ * `Page.getLayoutMetrics` reply — against what the page reports about itself. Those are two
+ * reads at two moments, and the viewport between them is not this test's to hold still:
+ * three clients drive this suite's Chrome at once (the Playwright that launched it, the
+ * extension's `chrome.debugger`, and the `connectOverCDP` client each test opens), and
+ * Chrome's device-metrics emulation is state they share. Under full-suite load the settling
+ * runs late enough to land in the middle of a test, and it did: one run had the screenshot
+ * test capture a 720-tall clip and then read 581 off the page, while the layout-metrics test
+ * in the same run read 581 where its inline snapshot said 720. The same two numbers, in
+ * opposite directions, which is what a moving viewport looks like and what a real change in
+ * behaviour does not.
+ *
+ * Retaking the sample is the fix, and it is not tolerance: every assertion downstream is an
+ * exact equality against page-reported values, with no literal and no margin. What the retry
+ * buys is only that both sides of that equality describe the same page state. A viewport
+ * still moving after every attempt is not a settling race, so that is a failure and it
+ * carries every reading it saw.
+ *
+ * This matters more than an ordinary flake because `pnpm test` is `vitest run -u`: the
+ * layout-metrics expectation used to be a `toMatchInlineSnapshot`, so one unlucky run
+ * silently REWROTE it to the wrong number and went green.
+ */
+const COHERENT_SAMPLE_ATTEMPTS = 5
+
+async function coherentSample<P, M>({
+  label,
+  readPage,
+  measure,
+}: {
+  /** What is being measured. Only used in the exhaustion message. */
+  label: string
+  /** The page's own account of itself. Taken before AND after `measure`. */
+  readPage: () => Promise<P>
+  /** The measurement that has to describe the same page state as `readPage`. */
+  measure: () => Promise<M>
+}): Promise<{ pageState: P; measured: M }> {
+  const rejected: string[] = []
+  for (let attempt = 1; attempt <= COHERENT_SAMPLE_ATTEMPTS; attempt++) {
+    const before = await readPage()
+    const measured = await measure()
+    const after = await readPage()
+    if (JSON.stringify(before) === JSON.stringify(after)) {
+      return { pageState: before, measured }
+    }
+    rejected.push(`attempt ${attempt}: before=${JSON.stringify(before)} after=${JSON.stringify(after)}`)
+  }
+  throw new Error(
+    `${label}: the page changed underneath all ${COHERENT_SAMPLE_ATTEMPTS} attempts, so nothing measured ` +
+      `describes a single page state. This is not the settling race the retry exists for — something is ` +
+      `resizing the viewport continuously.\n${rejected.join('\n')}`,
+  )
+}
+
 describe('Snapshot & Screenshot Tests', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
   let cleanup: (() => Promise<void>) | null = null
@@ -110,20 +166,6 @@ describe('Snapshot & Screenshot Tests', () => {
     // `if (viewportSize)` guard around the dimension checks meant they never ran at all.
     console.log('Viewport size (emulated, null over CDP):', cdpPage!.viewportSize())
 
-    const viewportScreenshot = await cdpPage!.screenshot()
-    expect(viewportScreenshot).toBeDefined()
-
-    const viewportDimensions = imageSize(viewportScreenshot)
-    console.log('Viewport screenshot dimensions:', viewportDimensions)
-
-    const fullPageScreenshot = await cdpPage!.screenshot({ fullPage: true })
-    expect(fullPageScreenshot).toBeDefined()
-
-    const fullPageDimensions = imageSize(fullPageScreenshot)
-    console.log('Full page screenshot dimensions:', fullPageDimensions)
-
-    testCtx!.relayServer.off('cdp:command', commandHandler)
-
     // The two clips Playwright asked for are not free numbers — each is a documented function of
     // state the page itself can report, so the page is asked and the answer is compared:
     //
@@ -140,38 +182,71 @@ describe('Snapshot & Screenshot Tests', () => {
     // formula's `document.documentElement.clientHeight` term alone makes the full-page height at
     // least the viewport height, so a machine with a different window size records a different
     // number and the snapshot fails for a reason that has nothing to do with the relay.
-    const pageMetrics = await cdpPage!.evaluate(() => ({
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-      scroll: { x: window.visualViewport?.pageLeft ?? window.scrollX, y: window.visualViewport?.pageTop ?? window.scrollY },
-      devicePixelRatio: window.devicePixelRatio,
-      fullPage: {
-        width: Math.max(
-          document.body.scrollWidth,
-          document.documentElement.scrollWidth,
-          document.body.offsetWidth,
-          document.documentElement.offsetWidth,
-          document.body.clientWidth,
-          document.documentElement.clientWidth,
-        ),
-        height: Math.max(
-          document.body.scrollHeight,
-          document.documentElement.scrollHeight,
-          document.body.offsetHeight,
-          document.documentElement.offsetHeight,
-          document.body.clientHeight,
-          document.documentElement.clientHeight,
-        ),
+    const readPageMetrics = async () =>
+      await cdpPage!.evaluate(() => ({
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        scroll: {
+          x: window.visualViewport?.pageLeft ?? window.scrollX,
+          y: window.visualViewport?.pageTop ?? window.scrollY,
+        },
+        devicePixelRatio: window.devicePixelRatio,
+        fullPage: {
+          width: Math.max(
+            document.body.scrollWidth,
+            document.documentElement.scrollWidth,
+            document.body.offsetWidth,
+            document.documentElement.offsetWidth,
+            document.body.clientWidth,
+            document.documentElement.clientWidth,
+          ),
+          height: Math.max(
+            document.body.scrollHeight,
+            document.documentElement.scrollHeight,
+            document.body.offsetHeight,
+            document.documentElement.offsetHeight,
+            document.body.clientHeight,
+            document.documentElement.clientHeight,
+          ),
+        },
+      }))
+
+    // Both captures and the reading they are compared against have to describe ONE viewport —
+    // see COHERENT_SAMPLE_ATTEMPTS. Reading the page after the captures instead, as this test
+    // did, is exactly how a 720-tall clip came to be compared against a 581-tall page.
+    const { pageState: pageMetrics, measured } = await coherentSample({
+      label: 'screenshot clips against the page-reported viewport',
+      readPage: readPageMetrics,
+      measure: async () => {
+        // Each attempt is judged on its OWN commands. Keeping the previous attempt's entries
+        // would assert a clip captured under the viewport that just moved.
+        capturedCommands.length = 0
+        const viewport = await cdpPage!.screenshot()
+        const fullPage = await cdpPage!.screenshot({ fullPage: true })
+        return { viewport, fullPage, commands: [...capturedCommands] }
       },
-    }))
+    })
+
+    testCtx!.relayServer.off('cdp:command', commandHandler)
+
+    const viewportScreenshot = measured.viewport
+    expect(viewportScreenshot).toBeDefined()
+    const viewportDimensions = imageSize(viewportScreenshot)
+    console.log('Viewport screenshot dimensions:', viewportDimensions)
+
+    const fullPageScreenshot = measured.fullPage
+    expect(fullPageScreenshot).toBeDefined()
+    const fullPageDimensions = imageSize(fullPageScreenshot)
+    console.log('Full page screenshot dimensions:', fullPageDimensions)
+
     console.log('Page-reported metrics:', pageMetrics)
 
     const fullPageFitsViewport =
       pageMetrics.fullPage.width <= pageMetrics.viewport.width &&
       pageMetrics.fullPage.height <= pageMetrics.viewport.height
 
-    expect(capturedCommands.length).toBe(2)
+    expect(measured.commands.length).toBe(2)
     expect(
-      capturedCommands.map((c) => ({
+      measured.commands.map((c) => ({
         method: c.method,
         params: c.params,
       })),
@@ -644,60 +719,74 @@ describe('Snapshot & Screenshot Tests', () => {
 
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
 
-    const layoutMetrics = await cdpSession.send('Page.getLayoutMetrics')
+    // What `Page.getLayoutMetrics` reports through the relay has to be the page's OWN viewport,
+    // in the page's own numbers. That is the whole claim, and it is the one the relay can break.
+    //
+    // This used to be a `toMatchInlineSnapshot` pinning 1280x720 in five places. 1280x720 is not
+    // a property of the relay at all — it is whatever size this suite's Chrome gave the tab, and
+    // a full-suite run read 581 instead. Worse than failing: `pnpm test` is `vitest run -u`, so
+    // that run would have REWRITTEN the expectation to 581 and gone green, shipping the wrong
+    // number as the recorded truth. Nothing about the literal was ever the subject.
+    const readPageViewport = async () =>
+      await cdpPage!.evaluate(() => {
+        const vv = window.visualViewport
+        if (!vv) {
+          throw new Error('window.visualViewport is unavailable, so CDP has nothing to be checked against')
+        }
+        return {
+          layout: {
+            pageX: window.scrollX,
+            pageY: window.scrollY,
+            clientWidth: document.documentElement.clientWidth,
+            clientHeight: document.documentElement.clientHeight,
+          },
+          visual: {
+            offsetX: vv.offsetLeft,
+            offsetY: vv.offsetTop,
+            pageX: vv.pageLeft,
+            pageY: vv.pageTop,
+            clientWidth: vv.width,
+            clientHeight: vv.height,
+            scale: vv.scale,
+          },
+          devicePixelRatio: window.devicePixelRatio,
+        }
+      })
 
-    const normalized = {
-      cssLayoutViewport: layoutMetrics.cssLayoutViewport,
-      cssVisualViewport: layoutMetrics.cssVisualViewport,
-      layoutViewport: layoutMetrics.layoutViewport,
-      visualViewport: layoutMetrics.visualViewport,
-      devicePixelRatio:
-        layoutMetrics.cssVisualViewport.clientWidth > 0
-          ? layoutMetrics.visualViewport.clientWidth / layoutMetrics.cssVisualViewport.clientWidth
-          : 1,
-    }
+    const { pageState: pageViewport, measured: layoutMetrics } = await coherentSample({
+      label: 'Page.getLayoutMetrics against the page-reported viewport',
+      readPage: readPageViewport,
+      measure: async () => await cdpSession.send('Page.getLayoutMetrics'),
+    })
+    console.log('Page-reported viewport:', pageViewport)
+    console.log('cssLayoutViewport:', layoutMetrics.cssLayoutViewport)
+    console.log('cssVisualViewport:', layoutMetrics.cssVisualViewport)
 
-    expect(normalized).toMatchInlineSnapshot(`
-          {
-            "cssLayoutViewport": {
-              "clientHeight": 720,
-              "clientWidth": 1280,
-              "pageX": 0,
-              "pageY": 0,
-            },
-            "cssVisualViewport": {
-              "clientHeight": 720,
-              "clientWidth": 1280,
-              "offsetX": 0,
-              "offsetY": 0,
-              "pageX": 0,
-              "pageY": 0,
-              "scale": 1,
-              "zoom": 1,
-            },
-            "devicePixelRatio": 1,
-            "layoutViewport": {
-              "clientHeight": 720,
-              "clientWidth": 1280,
-              "pageX": 0,
-              "pageY": 0,
-            },
-            "visualViewport": {
-              "clientHeight": 720,
-              "clientWidth": 1280,
-              "offsetX": 0,
-              "offsetY": 0,
-              "pageX": 0,
-              "pageY": 0,
-              "scale": 1,
-              "zoom": 1,
-            },
-          }
-        `)
+    // The layout viewport in CSS pixels is `document.documentElement.clientWidth/Height` at the
+    // document scroll offset — both exclude scrollbars, so they are the same measurement.
+    expect(layoutMetrics.cssLayoutViewport).toEqual(pageViewport.layout)
 
-    const windowDpr = await cdpPage!.evaluate(() => (globalThis as any).devicePixelRatio)
-    console.log('window.devicePixelRatio:', windowDpr)
-    expect(windowDpr).toBe(1)
+    // The visual viewport in CSS pixels is `window.visualViewport`, field for field. `zoom` is
+    // the only member with no page-visible counterpart: it is the browser's own zoom level, and
+    // nothing in this suite changes it.
+    const { zoom, ...cssVisualViewport } = layoutMetrics.cssVisualViewport
+    expect(cssVisualViewport).toEqual(pageViewport.visual)
+    expect(zoom).toBe(1)
+
+    // `layoutViewport`/`visualViewport` are the protocol's pre-CSS-pixel fields, documented as
+    // "in device pixels". Current Chromium reports them IDENTICAL to the css* ones even at
+    // deviceScaleFactor 2 (measured directly), which is why the `devicePixelRatio` this test used
+    // to derive as visualViewport.clientWidth / cssVisualViewport.clientWidth was 1 by
+    // construction and said nothing whatsoever about the device pixel ratio. Assert the equality
+    // that makes it a tautology rather than recording the tautology as if it were evidence.
+    expect(layoutMetrics.layoutViewport).toEqual(layoutMetrics.cssLayoutViewport)
+    expect(layoutMetrics.visualViewport).toEqual(layoutMetrics.cssVisualViewport)
+
+    // The real device pixel ratio is the page's, and it is 1 because this suite launches Chrome
+    // with Playwright's default deviceScaleFactor. It is asserted here rather than derived
+    // because the screenshot test above multiplies clips by it to predict PNG sizes.
+    console.log('window.devicePixelRatio:', pageViewport.devicePixelRatio)
+    expect(pageViewport.devicePixelRatio).toBe(1)
 
     await cdpSession.detach()
     await browser.close()

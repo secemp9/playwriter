@@ -654,43 +654,21 @@ describe('Extension Connection Tests', () => {
     // works on browserContext.pages()[0] and must not close it, so it has to hand the tabs back
     // explicitly. It used to only navigate to about:blank — which was harmless while the test
     // aborted at step 3 and never enabled anything, and became load-bearing the moment it ran
-    // to the end. See the note in the next test for what the leftover tab does to it.
+    // to the end.
+    //
+    // This cleanup also used to be the only thing keeping the next test green, by accident: the
+    // multi-tab teardown it removes is what triggered the stale-tab-group-event bug. That is now
+    // fixed (extension/src/background.ts + playwriter/src/tab-group-events.ts) and the ordering
+    // has its own test — 'should survive disconnectEverything with several tabs connected' below
+    // — which builds the multi-tab teardown itself instead of inheriting it from a neighbour.
+    // Keeping the clean handover is right on its own merits: a test whose result depends on what
+    // the previous test happened to leave behind cannot be run alone.
     await serviceWorker.evaluate(async () => {
       await globalThis.disconnectEverything()
     })
     await page.goto('about:blank')
   })
 
-  // KNOWN, UNFIXED, AND REACHABLE BY USERS — read this before "simplifying" the cleanup at the
-  // end of the previous test.
-  //
-  // This test disconnects everything and immediately re-enables the extension on its tab. When
-  // more than one tab is connected at the moment disconnectEverything() runs, the re-enabled tab
-  // can be torn straight back down. Relay log of the failure, in order:
-  //
-  //   Disconnecting tab <blank> / <disconnect-test> / <auto-reconnect>   (disconnectEverything)
-  //   Cleared empty workspace group: wt:… <groupId>
-  //   syncTabGroups deferred: attach setup in flight for [<auto-reconnect>]   (x3)
-  //   Tab attached successfully: <auto-reconnect> … state connected
-  //   Tab manually removed from playwriter group: <auto-reconnect>
-  //   Disconnecting tab <auto-reconnect>
-  //   Auto-creating initial tab for Playwright client → about:blank
-  //
-  // The groupId event queued by deleting the empty workspace group is processed after the tab
-  // has finished re-attaching. background.ts:2587-2594 only skips the disconnect while the tab
-  // is still 'connecting'; by then it is 'connected', and syncTabGroups — which would have put
-  // it back in a group — deferred itself because the attach was in flight. So the handler sees
-  // a genuinely ungrouped, genuinely connected tab and reads it as a human drag-out. The client
-  // loses its tab and is handed an auto-created about:blank instead.
-  //
-  // Not fixed here: the honest fix is in the extension's tab-group queue (the group-removal
-  // branch needs to ignore events generated before the tab's current attach, which the
-  // 'connecting' check only approximates), and that is a different change from the six this
-  // file's task covered. Acting on the tab's live groupId instead of the event's snapshot was
-  // tried and does NOT fix it — at that instant the tab really is ungrouped.
-  //
-  // What keeps this test green is that its predecessor now hands over with nothing connected,
-  // so only one tab is in flight here. Restore that cleanup if you see this test fail.
   it('should auto-reconnect MCP after extension WebSocket reconnects', async () => {
     const serviceWorker = await getExtensionServiceWorker(testCtx!.browserContext)
 
@@ -776,6 +754,132 @@ describe('Extension Connection Tests', () => {
     // Clean up
     await page.goto('about:blank')
   })
+
+  // Regression guard for the stale-tab-group-event bug: an agent's tab silently disconnected
+  // while it was genuinely connected, with the client transparently handed a fresh about:blank
+  // by the relay's auto-create (cdp-relay.ts maybeAutoCreateInitialTab) and no error anywhere.
+  //
+  // THE ORDERING THIS BUILDS. Several tabs are connected when disconnectEverything() runs, and
+  // one of them is re-enabled straight afterwards. That leaves group events the extension caused
+  // itself sitting in its serialized tab-group queue while the tabs they describe change state
+  // underneath them. Two interpretations then go wrong, both measured in the relay log (quoted
+  // in playwriter/src/tab-group-events.ts):
+  //   - syncTabGroups' own chrome.tabs.ungroup() read back as "the human dragged this tab out"
+  //     → disconnectTab on a tab that had just finished re-attaching;
+  //   - syncTabGroups' own chrome.tabs.group() read back as "the human dragged this tab in"
+  //     → connectTab on a tab that had just been deliberately disconnected, re-attaching it as
+  //     FREESTYLE (workspaceKey null), so the workspace that owned it can never see it again.
+  // The fix records every group change the extension makes and absorbs the matching event.
+  //
+  // WHY THE ASSERTIONS ARE WHAT THEY ARE. The state check would pass for a tab that came back
+  // freestyle, and the workspaceKey check would pass for a tab nobody ever disconnected, so both
+  // are needed; the MCP check is the user-visible half — the page the client actually has.
+  //
+  // WHY IT LOOPS. Which of the two misreadings fires depends on where Chrome delivers the event
+  // relative to an in-flight attach, so one pass is not evidence. Measured before the fix: the
+  // survivor was lost at every settle delay from 500ms up (5 of 7 iterations overall, 4 of 4 at
+  // 500/600/800/1000ms); after the fix, 7 of 7 iterations clean across two runs, with 51
+  // self-inflicted group events absorbed and none misread. The rule itself is pinned
+  // deterministically by src/tab-group-events.test.ts, which needs no browser at all.
+  it('should survive disconnectEverything with several tabs connected', async () => {
+    const browserContext = getBrowserContext()
+    const serviceWorker = await getExtensionServiceWorker(browserContext)
+
+    const enable = async () => {
+      return await serviceWorker.evaluate(
+        async ([k, l]) => {
+          return await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
+    }
+
+    const survivorUrl = 'https://example.com/teardown-survivor'
+    const outcomes: Array<{ settleMs: number; state: string; workspaceKey: string | null; seenByMcp: boolean }> = []
+
+    // Settle windows that were measured to lose the tab before the fix. Kept as a list rather
+    // than one value because the two misreadings surface at different points in that window.
+    for (const settleMs of [500, 800]) {
+      const decoyA = await browserContext.newPage()
+      await decoyA.goto('https://example.com/teardown-decoy-a')
+      await decoyA.bringToFront()
+      await enable()
+
+      const decoyB = await browserContext.newPage()
+      await decoyB.goto('https://example.com/teardown-decoy-b')
+      await decoyB.bringToFront()
+      await enable()
+
+      const survivor = await browserContext.newPage()
+      await survivor.goto(survivorUrl)
+      await survivor.bringToFront()
+      expect((await enable()).isConnected).toBe(true)
+
+      // Three tabs go down at once. This is the precondition — with a single connected tab the
+      // queue never holds a group event long enough for the tab under it to change state.
+      await serviceWorker.evaluate(async () => {
+        await globalThis.disconnectEverything()
+      })
+      await new Promise((r) => setTimeout(r, settleMs))
+
+      await survivor.bringToFront()
+      await enable()
+
+      // Let every queued group event drain. The tab is torn back down within a few hundred ms
+      // when the bug is present, so a short wait here is what makes the failure observable
+      // rather than a coin flip on when we happen to look.
+      await new Promise((r) => setTimeout(r, 1500))
+
+      const tracked = await serviceWorker.evaluate(async (url) => {
+        const state = globalThis.getExtensionState()
+        const chrome = globalThis.chrome
+        const tabs = await chrome.tabs.query({})
+        const tab = tabs.find((t: any) => t.url === url)
+        const info = tab?.id === undefined ? undefined : state.tabs.get(tab.id)
+        return { state: info?.state ?? 'ABSENT', workspaceKey: info?.workspaceKey ?? null }
+      }, survivorUrl)
+
+      const mcpResult = await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`
+            for (let i = 0; i < 20; i++) {
+              if (context.pages().some((p) => p.url() === ${JSON.stringify(survivorUrl)})) break;
+              await new Promise((r) => { setTimeout(r, 100) });
+            }
+            return { urls: context.pages().map((p) => p.url()) };
+          `,
+        },
+      })
+      const mcpOutput = (mcpResult as any).content[0].text
+
+      outcomes.push({
+        settleMs,
+        state: tracked.state,
+        workspaceKey: tracked.workspaceKey,
+        seenByMcp: mcpOutput.includes(survivorUrl),
+      })
+
+      await decoyA.close()
+      await decoyB.close()
+      await survivor.close()
+      await new Promise((r) => setTimeout(r, 200))
+    }
+
+    // Reported together so a failure names every window that lost the tab, not just the first.
+    expect(outcomes).toEqual(
+      outcomes.map(({ settleMs }) => ({
+        settleMs,
+        state: 'connected',
+        workspaceKey: TEST_WORKSPACE.key,
+        seenByMcp: true,
+      })),
+    )
+
+    await serviceWorker.evaluate(async () => {
+      await globalThis.disconnectEverything()
+    })
+  }, 300000)
 
   it('should keep an active browser connected when another Chromium context starts', async () => {
     const browserContext = getBrowserContext()

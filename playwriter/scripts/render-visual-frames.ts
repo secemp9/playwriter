@@ -34,12 +34,21 @@
  * glyph runs side by side on shared rows; under the band there is nothing beside the caption
  * to be side by side with.
  *
- * FOR THE CHIPS IT IS STILL A PERSON. The chip strip has no band — a full-width bar behind a
- * corner HUD would be a worse artifact than the defect it prevents — so its box padding
- * (2px at a 10px face) is all that separates a chip from whatever page glyph is next to it,
- * and 3px of opaque plate is MEASURED below not to be enough. So question 6 in the checklist
- * is live, and it is about the chips. This script exists to make that repeatable rather than
- * heroic.
+ * FOR THE CHIPS IT IS NOW MOSTLY AUTOMATED TOO, BY A WEAKER RULE. They cannot have the
+ * caption's band — a full-width bar behind a corner HUD would be a worse artifact than the
+ * defect it prevents — so `chipMergeShieldFindings` asserts three things instead: the plate is
+ * OPAQUE (nothing under it survives, which is what a 0.65 box lost), it runs to the frame
+ * EDGE it is anchored to (nothing beside it on that side exists), and it clears the ink by a
+ * MEASURED distance inboard. Two of those are proofs. The third is a number, and it holds for
+ * page text up to about 2.1 times the chip face — above that it is not a proof, though the
+ * same measurement found that a 2:1 size step is itself a word boundary, so the band of real
+ * risk is narrow rather than open-ended.
+ *
+ * WHAT THAT LEAVES FOR A PERSON. Question 6 in the checklist is still live for the chips, but
+ * it is now asking about the residual — page text much LARGER than the chip face sitting just
+ * inboard of the strip — rather than about the whole class. Question 7 has grown a second
+ * half: the chip plate is wider than it used to be and reaches a frame edge, and whether that
+ * still reads as a subordinate corner HUD is not something a pixel check can answer.
  *
  * THE PER-FRAME CHECKLIST
  * -----------------------
@@ -51,18 +60,24 @@
  *   4. Do either of them cover page content that matters — the field being typed into,
  *      the button being pressed, a heading?
  *   5. Is any text clipped at a frame edge, or drawn partly outside it?
- *   6. **The merge question, which is now ONLY about the chips.** Read the frame the way a
- *      viewer does. Does any CHIP label run into a page word so the pair reads as a third
- *      word that is in neither? The `checkout-top-left` and `portrait` scenes are built for
- *      this — their page words (`Checkout`, `Filter`, `Scrollbar`) are prefix-neighbours of
- *      the chip vocabulary (`Click`, `Fill`, `Scroll`). The ground truth for both layers is
+ *   6. **The merge question, which is now only about the chips' RESIDUAL.** Read the frame the
+ *      way a viewer does. Does any CHIP label run into a page word so the pair reads as a
+ *      third word that is in neither? The `checkout-top-left` and `portrait` scenes are built
+ *      for this — their page words (`Checkout`, `Filter`, `Scrollbar`) are prefix-neighbours
+ *      of the chip vocabulary (`Click`, `Fill`, `Scroll`). The ground truth for both layers is
  *      printed next to each path below, so a manufactured word is identifiable rather than
- *      arguable. The CAPTION cannot merge any more and you do not have to check it: it sits
- *      on a full-frame-width opaque band, so there is no page pixel on its rows at all, and
- *      `mergeShieldFindings` asserts that on every scene at every height.
- *   7. **Is the band too heavy?** It is the one thing here that covers page content on
- *      purpose. It should read as a subtitle plate, sized to the cue that is up — one line
- *      of narration should not black out three lines of page.
+ *      arguable. Two thirds of the question are now settled by construction: nothing under the
+ *      plate survives and nothing exists beside it on its anchored side, both asserted. What
+ *      is left is page text sitting INBOARD of the strip and much larger than the chip face,
+ *      which is where the measured clearance stops being a proof. The CAPTION cannot merge at
+ *      all and you do not have to check it: it sits on a full-frame-width opaque band, so
+ *      there is no page pixel on its rows, and `mergeShieldFindings` asserts that everywhere.
+ *   7. **Are the plates too heavy?** They are the two things here that cover page content on
+ *      purpose. The caption band should read as a subtitle plate sized to the cue that is up —
+ *      one line of narration should not black out three lines of page. The chip plate should
+ *      still read as a subordinate corner HUD: it is now wider than its letters and runs to
+ *      the frame edge it is anchored to, and if that has turned it into a bar rather than a
+ *      badge, that is a defect this checklist is the only thing that can catch.
  *
  * Anything you find is a defect in the RENDERER, not in the scene. Fix it in
  * `cdp-screencast.ts`, re-run this, and look again.
@@ -85,12 +100,28 @@
  *   by rendering it and cropping the seam, after it had been written down as the remedy on
  *   the strength of reasoning alone. Under `boxed` the padding is `outlineWidth`, 1px at
  *   this face, so the plate stopped ~3px past the `e` and the page's `s` was still there: it
- *   still read `charges`. THREE PIXELS OF OPAQUE PLATE IS NOT A WORD BOUNDARY — that is the
- *   measurement that rules out every "just add a bit of padding" remedy, including for the
- *   chips, and it is why the fix is a band that spans the frame rather than one that hugs
- *   the text. `boxed: true` WITH `outlineWidth: 6` also stopped it, by covering whatever
- *   page glyph happened to be next to the line end — luck, not construction, and a ratio far
- *   outside the counter-survival band.
+ *   still read `charges`. THREE PIXELS OF OPAQUE PLATE IS NOT A WORD BOUNDARY, and that is
+ *   why the CAPTION's fix is a band that spans the frame rather than one that hugs the text.
+ *   `boxed: true` WITH `outlineWidth: 6` also stopped it, by covering whatever page glyph
+ *   happened to be next to the line end — luck, not construction, and a ratio far outside the
+ *   counter-survival band.
+ *
+ *   THAT LINE USED TO END "…rules out every 'just add a bit of padding' remedy, including for
+ *   the chips", AND THAT PART WAS WRONG. It reads a measurement of one padding value as a
+ *   verdict on the whole idea. Sweeping the padding instead of asserting about it — the same
+ *   pairs, the same faces, clear separations of 0 to 20px, read at 1x and 6x — puts the
+ *   fusion threshold at about 8px at 12px page text and 9-10px at 15-17px, which is roughly
+ *   twice the page's own inter-word gap. 3px failed because it is NARROWER THAN A SPACE (a
+ *   space is 4 clear pixels at 12px), not because padding cannot work. The chip plate now
+ *   carries 18px at the smallest supported face, and that IS a padding remedy — a measured
+ *   one. See `chipStripMetrics`.
+ *
+ *   At 480x320, every frame, BEFORE the chip plate was made opaque. The strip sat on the same
+ *   `…and keeps going past the fold` row, and at 0.65 opacity the page's `going past the`
+ *   showed straight THROUGH `Fill •••••• · Click · Ctrl+A`: two texts superimposed, both
+ *   illegible, with the page's `keep` running into the chip's `F` at zero separation. Found
+ *   by cropping the same seam at 8x. The clearance sweep above is about text BESIDE a chip;
+ *   this was text UNDER one, and no amount of clearance addresses it.
  *
  *   The same scene at 1280x720 did NOT merge — the page's line ends at x=493 and the caption
  *   spans 366..915, so the caption's right half was over blank page. The defect was invisible

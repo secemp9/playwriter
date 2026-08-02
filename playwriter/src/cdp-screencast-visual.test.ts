@@ -23,17 +23,24 @@
  * pass — see `compareGoldenFrame`.
  *
  * THE "Clickkout" CLASS — overlay text landing beside page text so the composite reads as a
- * word that is in NEITHER layer — is covered here FOR THE CAPTION AND NOT FOR THE CHIPS.
- * It became coverable when `captionOptions.backdrop` turned it from a question about words
- * into a question about scanlines: `mergeShieldFindings` asserts that every row carrying
- * caption ink is opaque overlay from one edge of the frame to the other, which is precisely
- * the condition under which no page glyph can sit beside a caption glyph. The break test
- * below turns the band off on `dense-12px` at 480x320 and watches it go red on the frame
- * that really shipped.
+ * word that is in NEITHER layer — is covered here for BOTH layers, by two different rules.
  *
- * The chip strip has no band and is NOT held to that, so a chip can still merge with page
- * text and nothing here will say so. That remainder is a LOOKING step, and it has its own
- * harness:
+ * For the CAPTION it became coverable when `captionOptions.backdrop` turned it from a
+ * question about words into a question about scanlines: `mergeShieldFindings` asserts that
+ * every row carrying caption ink is opaque overlay from one edge of the frame to the other,
+ * which is precisely the condition under which no page glyph can sit beside a caption glyph.
+ * The break test below turns the band off on `dense-12px` at 480x320 and watches it go red on
+ * the frame that really shipped.
+ *
+ * The CHIPS cannot use that rule — a full-width bar behind a corner HUD would be a worse
+ * artifact than the defect — so `chipMergeShieldFindings` asserts a weaker three-part one:
+ * the plate is opaque, it runs to the frame edge it is anchored to, and it clears the ink by
+ * a MEASURED distance inboard. Two proofs and a number; `chipStripMetrics` says how the
+ * number was measured and where it stops being a proof. Its break test reverts the strip to
+ * the geometry that shipped — margins on both sides, 2px of padding, a 0.65 box — and watches
+ * both halves go red.
+ *
+ * Neither shield replaces looking, and looking has its own harness:
  *
  *     pnpm exec vite-node scripts/render-visual-frames.ts
  *
@@ -52,6 +59,7 @@ import {
   buildEncodeArgs,
   buildInputChips,
   captionBlockHeightPx,
+  chipStripMetrics,
   defaultOutlineWidth,
   encodeFrames,
   formatAss,
@@ -62,6 +70,7 @@ import {
   type StampedInput,
 } from './cdp-screencast.js'
 import {
+  chipMergeShieldFindings,
   compareGoldenFrame,
   contrastFindings,
   counterFindings,
@@ -150,12 +159,39 @@ interface Variants {
   captionOnly: DecodedVideo
   /** The full-width opaque band behind the caption, alone. */
   backdropOnly: DecodedVideo
+  /** The chip strip AS DRAWN: the opaque merge plate with its letters on it. */
   chipsOnly: DecodedVideo
+  /** The chip GLYPHS alone, with the plate made transparent — see `transparentChipBox`. */
+  chipInkOnly: DecodedVideo
   dumpDir: string
 }
 
 /** The three dialogue layers `formatAss` emits, keyed by the Layer field it writes. */
 type AssLayer = 'backdrop' | 'caption' | 'chips'
+
+/**
+ * The same ASS with the chip plate made invisible, so the strip's GLYPHS can be measured
+ * apart from the plate they sit on.
+ *
+ * The caption gets that split for free: its band is a separate dialogue on its own layer, so
+ * `keep()` can simply drop it. A chip's plate is the BorderStyle-3 box of the same dialogue
+ * that draws its letters, and there is no layer to filter on.
+ *
+ * Splitting it by COLOUR instead was tried and is wrong in a way worth recording, because the
+ * failure looked exactly like a real defect: the box's own antialiased boundary is neither the
+ * box colour nor the text colour, so "the footprint minus the box colour" classified the
+ * plate's outermost column as INK — and the invariant then correctly reported that there was
+ * no plate outboard of that "ink". A one-pixel classification error read as a merge.
+ *
+ * Changing only the ALPHA of OutlineColour and BackColour cannot do that. Every field libass
+ * lays out from — Fontsize, BorderStyle, Outline, Alignment, the margins — is untouched, so
+ * the glyphs land in exactly the same pixels; the box is simply not painted. Style fields
+ * after `Style: Input,` are Fontname(0), Fontsize(1), PrimaryColour(2), SecondaryColour(3),
+ * OutlineColour(4), BackColour(5), so four are skipped to reach the pair being cleared.
+ */
+function transparentChipBox(assText: string): string {
+  return assText.replace(/^(Style: Input,(?:[^,]*,){4})[^,]*,[^,]*(,.*)$/m, '$1&HFF000000,&HFF000000$2')
+}
 
 /**
  * Encode the scene, and encode the overlay's GEOMETRY separately over a flat plate.
@@ -235,6 +271,7 @@ async function encodeVariants(
     captionOnly: await encodeAssText(`${name}/flat-caption`, flat, keep('caption')),
     backdropOnly: await encodeAssText(`${name}/flat-backdrop`, flat, keep('backdrop')),
     chipsOnly: await encodeAssText(`${name}/flat-chips`, flat, keep('chips')),
+    chipInkOnly: await encodeAssText(`${name}/flat-chip-ink`, flat, transparentChipBox(keep('chips'))),
     dumpDir,
   }
 }
@@ -341,6 +378,9 @@ describe('scenes: the invariants hold on eight pages at two frame heights', () =
         const captionMasks = masksForEveryFrame(v.captionOnly, v.flatPlate)
         const backdropMasks = masksForEveryFrame(v.backdropOnly, v.flatPlate)
         const chipMasks = masksForEveryFrame(v.chipsOnly, v.flatPlate)
+        // The chip GLYPHS, without the plate they sit on — the chip half of the same split
+        // `keep()` already gives the caption for free.
+        const chipInk = masksForEveryFrame(v.chipInkOnly, v.flatPlate)
         // The caption AS DRAWN: its glyphs plus the band they sit on. The chips have to
         // clear the band, not merely the letters, and the band is what occludes the page.
         const captionLayerMasks = captionMasks.map((m, i) => maskUnion(m, backdropMasks[i]))
@@ -356,10 +396,13 @@ describe('scenes: the invariants hold on eight pages at two frame heights', () =
         // 1. The two layers never share a pixel, in ANY frame — band included.
         findings.push(...(await disjointFindings(captionLayerMasks, chipMasks, v.composite, v.dumpDir)))
 
-        // 2. Nothing is clipped at a frame edge. Asked of the GLYPHS: the band reaches both
-        //    side edges deliberately, which is the entire point of it (see invariant 8).
+        // 2. Nothing is clipped at a frame edge. Asked of the GLYPHS for BOTH layers, and for
+        //    the same reason in both cases: the caption's band reaches the two side edges
+        //    deliberately and the chip's plate reaches its anchored edge deliberately, which
+        //    is the entire point of each (invariants 8 and 9). Asking it of a footprint that
+        //    is SUPPOSED to touch the edge would be asserting against the fix.
         findings.push(...(await edgeClipFindings(captionMasks, v.composite, v.dumpDir, 'caption')))
-        findings.push(...(await edgeClipFindings(chipMasks, v.composite, v.dumpDir, 'chip strip')))
+        findings.push(...(await edgeClipFindings(chipInk, v.composite, v.dumpDir, 'chip strip')))
 
         // 3. A chip row is one line.
         const chipFace = Math.max(10, Math.round((size.height * 2.4) / 100))
@@ -395,6 +438,24 @@ describe('scenes: the invariants hold on eight pages at two frame heights', () =
         //    is the "Clickkout" class, and it is here rather than in the looking harness only
         //    because captionOptions.backdrop made it a geometric property.
         findings.push(...(await mergeShieldFindings(captionMasks, captionLayerMasks, v.composite, v.dumpDir)))
+
+        // 9. The chip merge shield, which is the same class under a weaker rule because the
+        //    chips cannot have a full-width band. The plate is opaque, it reaches the frame
+        //    edge it is anchored to, and it clears the ink by the measured merge distance
+        //    inboard. The required distance comes from the shipped metrics rather than from a
+        //    number retyped here, so the assertion cannot drift away from what is drawn — and
+        //    it is still a real check, because what it is verifying is that libass actually
+        //    delivered the geometry the hard spaces asked for.
+        const chip = chipStripMetrics(size)
+        expect(chip.clearPx, `${id}: the plate must claim at least the measured merge distance`).toBeGreaterThanOrEqual(
+          chip.requiredClearPx,
+        )
+        findings.push(
+          ...(await chipMergeShieldFindings(chipInk, chipMasks, v.composite, v.dumpDir, {
+            requiredClearPx: chip.requiredClearPx,
+            boxColor: [0, 0, 0],
+          })),
+        )
 
         expect(describeFindings(findings), `${id}\n${describeFindings(findings)}`).toBe('')
       }, 180000)
@@ -702,6 +763,83 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
       await mergeShieldFindings(ink, ink.map((m, i) => maskUnion(m, band[i])), fixed.composite, fixed.dumpDir),
     ).toEqual([])
   }, 180000)
+
+  it('chip merge shield: the strip geometry that shipped goes red on both halves', async () => {
+    const scene = VISUAL_SCENES.find((s) => s.name === 'dense-12px')!
+    const jpegs = await captureSceneFrames(browser, scene, size.width, size.height, 6)
+    const chip = chipStripMetrics(size)
+    const spec = { requiredClearPx: chip.requiredClearPx, boxColor: [0, 0, 0] as [number, number, number] }
+
+    /* --- half one: the clearance, broken back to the geometry that really shipped --- */
+
+    // Built by PATCHING the shipped ASS rather than by inventing a broken one, so "broken"
+    // means exactly two things and nothing else: the anchored margin goes back from 0 to
+    // chipMargin, which pulls the plate off the frame edge, and the hard-space runs are
+    // stripped, which drops the inboard clearance back to the 2px of box padding that was
+    // measured insufficient.
+    const frames = jpegs.map((data, i) => ({ data, offsetMs: i * SCENE_FRAME_INTERVAL_MS }))
+    const durationMs = jpegs.length * SCENE_FRAME_INTERVAL_MS
+    const frameOffsetsMs = frames.map((f) => f.offsetMs)
+    const chips = buildInputChips({ events: chipEvents(), frameOffsetsMs, durationMs, video: size })
+    const shipped = formatAss([], size, undefined, { segments: chips.segments })
+    // Style fields after `Style: Input,` are Fontname(0) .. MarginL(18), MarginR(19),
+    // MarginV(20), Encoding(21) — so 18 are skipped to reach the pair being reverted.
+    const brokenAss = shipped.text
+      .replace(/^(Style: Input,(?:[^,]*,){18})\d+,\d+(,.*)$/m, `$1${chip.margin},${chip.margin}$2`)
+      .replace(/^Dialogue: 1,.*$/gm, (line) => line.replace(/\\h/g, ''))
+    expect(brokenAss, 'the Input margins must actually have been reverted').not.toBe(shipped.text)
+    expect(brokenAss, 'the hard-space padding must actually have been stripped').not.toMatch(/^Dialogue: 1,.*\\h/m)
+
+    const flat = await flatFrames(size, jpegs.length)
+    const stripDialogue = (t: string) => t.split('\n').filter((l) => !l.startsWith('Dialogue: ')).join('\n')
+    const brokenComposite = await encodeAssText('break-chipmerge', jpegs, brokenAss)
+    const brokenChipsFlat = await encodeAssText('break-chipmerge-chips', flat, brokenAss)
+    const brokenInkFlat = await encodeAssText('break-chipmerge-ink', flat, transparentChipBox(brokenAss))
+    const brokenFlatPlate = await encodeAssText('break-chipmerge-plate', flat, stripDialogue(brokenAss))
+    const brokenChipMasks = masksForEveryFrame(brokenChipsFlat, brokenFlatPlate)
+    const brokenInk = masksForEveryFrame(brokenInkFlat, brokenFlatPlate)
+    const brokenDir = path.join(tmpRoot, 'break-chipmerge')
+    const brokenFindings = await chipMergeShieldFindings(brokenInk, brokenChipMasks, brokenComposite, brokenDir, spec)
+    // MEASURED when this test was written: "worst on row 302, inboard/left, with only 2px of
+    // clear plate", which is the padding the shipped strip really had, against a 3px figure
+    // already known to fail.
+    expect(brokenFindings.length, '2px of box padding must be reported as too little clearance').toBeGreaterThan(0)
+    expect(brokenFindings[0].message).toMatch(/of clear plate/)
+    expect(brokenFindings[0].pngPath).toBeTruthy()
+
+    /* --- half two: the opacity, broken back to the 0.65 box that really shipped --- */
+
+    // dense-12px is white to all four edges, so a translucent box has page under every pixel
+    // of it. On `solid-dark` the same box would pass, correctly: nothing shows through a
+    // black box on a black page.
+    const seeThrough = await encodeVariants('break-chipopacity', jpegs, [], chipEvents(), size, undefined, {
+      boxOpacity: 0.65,
+    })
+    const stMasks = masksForEveryFrame(seeThrough.chipsOnly, seeThrough.flatPlate)
+    const stFindings = await chipMergeShieldFindings(
+      masksForEveryFrame(seeThrough.chipInkOnly, seeThrough.flatPlate),
+      stMasks,
+      seeThrough.composite,
+      seeThrough.dumpDir,
+      spec,
+    )
+    // MEASURED: 124 plate pixels at a worst channel delta of 103, against a 32 tolerance.
+    expect(stFindings.some((f) => /showing THROUGH/.test(f.message)), 'a 0.65 box over a white page must be reported').toBe(true)
+
+    /* --- RESTORED: the shipped strip, same page, same chips, same frame size --- */
+
+    const fixedStrip = await encodeVariants('break-chipmerge-fixed', jpegs, [], chipEvents(), size)
+    const fixedMasks = masksForEveryFrame(fixedStrip.chipsOnly, fixedStrip.flatPlate)
+    expect(
+      await chipMergeShieldFindings(
+        masksForEveryFrame(fixedStrip.chipInkOnly, fixedStrip.flatPlate),
+        fixedMasks,
+        fixedStrip.composite,
+        fixedStrip.dumpDir,
+        spec,
+      ),
+    ).toEqual([])
+  }, 300000)
 
   it('golden: a frame rendered with different options fails against the committed reference', async () => {
     if (goldenUpdateRequested()) return

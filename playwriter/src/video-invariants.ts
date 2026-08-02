@@ -47,10 +47,17 @@
  * instant the band stops spanning the frame, which is the only way the property can be
  * lost.
  *
- * IT COVERS THE CAPTION AND NOT THE CHIPS. The chip strip has no band — a full-width bar
- * behind a corner HUD would be a worse artifact than the defect — so a chip CAN still land
- * beside page text and nothing in this file will say so. That remainder is a LOOKING step,
- * and it is a real step rather than an aspiration:
+ * THE CHIPS ARE COVERED TOO NOW, BY A DIFFERENT AND WEAKER RULE. They cannot use the
+ * caption's, because a full-width bar behind a corner HUD would be a worse artifact than the
+ * defect it prevents. `chipMergeShieldFindings` asserts instead that the plate is opaque
+ * (nothing under it survives), that it runs to the frame edge it is anchored to (nothing
+ * beside it on that side exists), and that it extends a MEASURED clear distance inboard.
+ * The first two are proofs; the third is a number, and the number has a page-face ceiling
+ * above which it stops being one — stated at `chipStripMetrics` and not glossed over,
+ * because on a row carrying chip ink either the whole row is overlay or some page pixel is
+ * on it, and there is no third option short of the bar.
+ *
+ * SO LOOKING IS STILL A STEP, and it is a real step rather than an aspiration:
  *
  *     pnpm exec vite-node scripts/render-visual-frames.ts
  *
@@ -173,8 +180,9 @@ export async function disjointFindings(
  * alone, so the flat render gives the layout exactly, with no page content to be mistaken
  * for overlay. `ink` is the caption's glyph layer; `layer` is that plus the band.
  *
- * What it does NOT cover, said out loud because a green check is read as a guarantee: the
- * CHIP strip, which has no band and is not held to this. See the file header.
+ * The CHIP strip is held to a different rule, for a reason rather than out of laziness: it
+ * cannot span the frame, so "no page pixel on the row" is not available to it. See
+ * `chipMergeShieldFindings`.
  */
 export async function mergeShieldFindings(
   ink: Uint8Array[],
@@ -231,6 +239,215 @@ export async function mergeShieldFindings(
     }]
   }
   return []
+}
+
+/**
+ * How far inside its own boundary — and away from the ink — the plate is read for opacity.
+ *
+ * 3, because two was measured not to be enough. At 2 the check fired on frames rendered with
+ * a FULLY OPAQUE box: 4 pixels of the plate's antialiased left edge on the portrait frame at
+ * a delta of 125, and a handful of x264 ringing pixels beside glyph stems at 34-41. Neither
+ * is the page surviving; both are the renderer and the codec drawing the boundary they are
+ * supposed to draw.
+ */
+const PLATE_INTERIOR_INSET = 3
+
+/** What `chipMergeShieldFindings` is measuring against. */
+export interface ChipShieldSpec {
+  /** Opaque plate required inboard of the ink, in px. From `chipStripMetrics`. */
+  requiredClearPx: number
+  /** The chip box colour. Every plate pixel in the composite must BE this. */
+  boxColor: [number, number, number]
+  /**
+   * Per-channel slack when comparing a plate pixel to the box colour.
+   *
+   * 32, the same figure `OVERLAY_MASK_THRESHOLD` is set from and for the same reason: two
+   * x264 encodes of the same content differ by up to 24 on a real capture and by 0 on a flat
+   * one. The failure it has to catch is far larger — MEASURED, a 0.65-opacity black box over
+   * the white `dense-12px` page reads a worst delta of 103.
+   */
+  colorTolerance?: number
+}
+
+/**
+ * The same class for the CHIPS, which need a different formulation and get a weaker one.
+ *
+ * The caption's rule — every scanline carrying its ink is overlay from edge to edge — is
+ * available to the caption only because its band spans the frame. A full-width bar behind a
+ * corner HUD would be a worse artifact than the defect it prevents, so the chips cannot have
+ * it, and there is no way to dress that up: **on a row carrying chip ink, either the whole row
+ * is overlay or some page pixel is on it at some distance, and whether that distance reads as
+ * a word break is perceptual.** There is no third option. So what is asserted here is three
+ * properties, two of which are proofs and one of which is a measured number:
+ *
+ *   1. **UNDER the plate.** Every plate pixel in the COMPOSITE is the box colour, so no page
+ *      pixel inside the plate survived. This is what a translucent box loses: at 0.65 the
+ *      page shows through at a third of its contrast and composites with the chip's own
+ *      letters, which is a merge at zero separation. Checked on the composite and not on the
+ *      flat differential, because the flat plate has no page in it to show through.
+ *
+ *   2. **OUTBOARD of the ink.** The plate is allowed to run to a frame edge, and where it
+ *      does, that side needs no clearance at all: there is no page pixel beyond the edge.
+ *      The check spends its clearance budget walking outward and simply stops when it reaches
+ *      x = 0 or x = width - 1, which is exactly how the caption's band terminates too.
+ *
+ *   3. **INBOARD of the ink.** `requiredClearPx` pixels of plate between the chip's ink and
+ *      the first page pixel, on EVERY row the ink occupies. `chipStripMetrics` in
+ *      `cdp-screencast.ts` carries the measurement that sets the number and the page face
+ *      above which it stops being a proof.
+ *
+ * Per ROW rather than per bounding box, and that distinction matters: a box-level check is
+ * satisfied by clearance beside the widest row, and the row that merges is whichever one the
+ * page's baseline happens to cross.
+ *
+ * `ink` must be the glyph pixels and `layer` the whole footprint (glyphs plus plate); both
+ * come from the flat-plate differential so the geometry is exact.
+ */
+export async function chipMergeShieldFindings(
+  ink: Uint8Array[],
+  layer: Uint8Array[],
+  composite: DecodedVideo,
+  dumpDir: string,
+  { requiredClearPx, boxColor, colorTolerance = 32 }: ChipShieldSpec,
+): Promise<Finding[]> {
+  const { width, height } = composite
+  const n = Math.min(ink.length, layer.length, composite.frameCount)
+  const findings: Finding[] = []
+
+  for (let f = 0; f < n && findings.length === 0; f++) {
+    const box = maskBBox(layer[f], width, height)
+    if (!box) continue
+    const exposed = new Uint8Array(width * height)
+    let exposedCount = 0
+    // The WORST row, not the first one found. A check that reported the first would name a
+    // row with 10px of clearance while a row with 2px went unmentioned, and 2px is the case.
+    let worstRow = -1
+    let worstSide = ''
+    let worstGap = requiredClearPx
+
+    for (let y = box.y0; y <= box.y1; y++) {
+      let xL = -1
+      let xR = -1
+      for (let x = box.x0; x <= box.x1; x++) {
+        if (!ink[f][y * width + x]) continue
+        if (xL < 0) xL = x
+        xR = x
+      }
+      if (xL < 0) continue
+      // Walk outward from the ink. A pixel that is plate is fine; running off the frame is
+      // fine and is the stronger of the two outcomes; anything else is page beside a glyph.
+      for (const [dir, from] of [[-1, xL], [1, xR]] as const) {
+        for (let k = 1; k <= requiredClearPx; k++) {
+          const x = from + dir * k
+          if (x < 0 || x >= width) break
+          if (layer[f][y * width + x]) continue
+          exposed[y * width + x] = 1
+          exposedCount++
+          if (k - 1 < worstGap) {
+            worstGap = k - 1
+            worstRow = y
+            worstSide = dir < 0 ? 'inboard/left' : 'inboard/right'
+          }
+        }
+      }
+    }
+
+    if (exposedCount === 0) continue
+    const eb = maskBBox(exposed, width, height)!
+    findings.push({
+      invariant: 'the chip plate clears the chip ink by the measured merge distance',
+      frame: f,
+      message:
+        `${exposedCount} pixel(s) of the page sit within ${requiredClearPx}px of chip ink with no plate between ` +
+        `them — worst on row ${worstRow}, ${worstSide}, with only ${worstGap}px of clear plate; the exposure spans ` +
+        `x ${eb.x0}..${eb.x1}, y ${eb.y0}..${eb.y1} (red). A page glyph that close to a chip glyph on the same rows ` +
+        'reads as one word with it: MEASURED, two runs fuse below about twice the page\'s own inter-word gap, and ' +
+        '3px is the `charge` + `s` = `charges` case. The clearance comes from the hard-space padding and the zero ' +
+        'anchored margin in formatAss — check that the Input style still has 0 on its anchored side and that the ' +
+        'Dialogue: 1 lines still carry their \\h runs.',
+      pngPath: await writeMaskOverlayPng(
+        composite,
+        f,
+        [
+          { mask: layer[f], color: [255, 220, 0] },
+          { mask: exposed, color: [255, 0, 0] },
+        ],
+        path.join(dumpDir, `chip-merge-shield-frame-${f}.png`),
+      ),
+    })
+  }
+
+  /**
+   * The plate is opaque: nothing of the page survives inside it.
+   *
+   * Read on the INTERIOR of the plate, `PLATE_INTERIOR_INSET` px in from its own boundary and
+   * away from the ink, and both exclusions are for antialiasing rather than for convenience.
+   * The plate's outermost pixels are a blend of the box colour and the page — MEASURED at a
+   * delta of 125 on the portrait frame with the box fully opaque — and a glyph's edge blends
+   * towards the text colour, with x264 ringing carrying that a couple of pixels further. Both
+   * are the renderer drawing exactly what it should; neither is the page surviving.
+   *
+   * That leaves a real region to test rather than a token one, because the merge plate is now
+   * mostly padding: at the smallest supported face the hard-space runs alone are 16px wide
+   * against a 2px box padding, so the interior is the great majority of the plate. And
+   * opacity is a property of the whole box, not of one pixel of it — a translucent plate is
+   * translucent everywhere — so a subset that large cannot miss it.
+   */
+  for (let f = 0; f < n && findings.length < 2; f++) {
+    const box = maskBBox(layer[f], width, height)
+    if (!box) continue
+    const seeThrough = new Uint8Array(width * height)
+    let count = 0
+    let worst = 0
+    const clearOf = (mask: Uint8Array, x: number, y: number, r: number, want: 0 | 1): boolean => {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const ny = y + dy
+          const nx = x + dx
+          if (ny < 0 || ny >= height || nx < 0 || nx >= width) return false
+          if ((mask[ny * width + nx] ? 1 : 0) !== want) return false
+        }
+      }
+      return true
+    }
+    for (let y = box.y0; y <= box.y1; y++) {
+      for (let x = box.x0; x <= box.x1; x++) {
+        const p = y * width + x
+        if (!layer[f][p]) continue
+        // Inside the plate's boundary, and clear of the ink.
+        if (!clearOf(layer[f], x, y, PLATE_INTERIOR_INSET, 1)) continue
+        if (!clearOf(ink[f], x, y, PLATE_INTERIOR_INSET, 0)) continue
+        const [r, g, b] = composite.pixel(f, x, y)
+        const d = Math.max(Math.abs(r - boxColor[0]), Math.abs(g - boxColor[1]), Math.abs(b - boxColor[2]))
+        if (d <= colorTolerance) continue
+        if (d > worst) worst = d
+        seeThrough[p] = 1
+        count++
+      }
+    }
+    if (count === 0) continue
+    const sb = maskBBox(seeThrough, width, height)!
+    findings.push({
+      invariant: 'the chip plate is opaque',
+      frame: f,
+      message:
+        `${count} pixel(s) inside the chip plate are not the box colour in the composite — worst channel delta ` +
+        `${worst}/255 against a tolerance of ${colorTolerance}, spanning x ${sb.x0}..${sb.x1}, y ${sb.y0}..${sb.y1} ` +
+        '(red). The page is showing THROUGH the plate, so a page glyph is compositing with the chip\'s own letters ' +
+        'at zero separation — the original `Clickkout` was a chip over a word, not beside one. Raise ' +
+        'inputOverlayOptions.boxOpacity back to 1; MEASURED, at 0.65 a black box over the white dense-12px page ' +
+        'reads a worst delta of 103 rather than 0.',
+      pngPath: await writeMaskOverlayPng(
+        composite,
+        f,
+        [{ mask: seeThrough, color: [255, 0, 0] }],
+        path.join(dumpDir, `chip-opacity-frame-${f}.png`),
+      ),
+    })
+    break
+  }
+
+  return findings
 }
 
 /**

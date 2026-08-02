@@ -20,7 +20,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import dedent from 'string-dedent'
-import { Lexer, type Token, type Tokens } from 'marked'
+// The `## CLI Usage` strip lives in src/ so the build and the guards in
+// executor-sandbox.test.ts run the same code. It THROWS rather than degrading: a renamed
+// heading ships the whole CLI section into every agent's context, and a runaway section
+// boundary empties the prompt — both are silent if the strip is allowed to return a
+// plausible-looking string. See src/strip-cli-sections.ts.
+import { stripCliSectionsFromSkill } from '../src/strip-cli-sections.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const playwriterDir = path.join(__dirname, '..')
@@ -438,50 +443,6 @@ function buildPerformanceProfiling() {
   `
 
   writeToDestinations('performance-profiling.md', content)
-}
-
-/**
- * Removes CLI-related sections from skill.md to create prompt.md for the MCP.
- *
- * Sections removed:
- * - "## CLI Usage" section and all its subsections
- */
-function stripCliSectionsFromSkill(skillContent: string): string {
-  // Parse markdown tokens
-  const tokens = Lexer.lex(skillContent)
-
-  // Filter out CLI Usage section and its subsections
-  const filteredTokens: Token[] = []
-  let skipUntilLevel: number | null = null
-
-  for (const token of tokens) {
-    if (token.type === 'heading') {
-      const heading = token as Tokens.Heading
-      // Check if we should start skipping (CLI Usage section)
-      if (heading.depth === 2 && heading.text === 'CLI Usage') {
-        skipUntilLevel = 2
-        continue
-      }
-      // Check if we should stop skipping (next h2 section)
-      if (skipUntilLevel !== null && heading.depth <= skipUntilLevel) {
-        skipUntilLevel = null
-      }
-    }
-
-    if (skipUntilLevel === null) {
-      filteredTokens.push(token)
-    }
-  }
-
-  // Reconstruct markdown from tokens
-  return (
-    filteredTokens
-      .map((token) => {
-        return token.raw
-      })
-      .join('')
-      .trim() + '\n'
-  )
 }
 
 function buildPromptFromSkill() {

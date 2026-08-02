@@ -209,7 +209,7 @@ describe('Cross-workspace isolation (Todo 24 — decisive)', () => {
 
   afterAll(async () => {
     ext?.close()
-    server?.close()
+    await server?.close()
     await sleep(100)
   })
 

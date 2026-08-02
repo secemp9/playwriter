@@ -653,7 +653,10 @@ function httpGet({ port, path, host }: { port: number; path: string; host: strin
 }
 
 describe('Host header validation (DNS rebinding protection)', () => {
-  let server: { close(): void } | null = null
+  // Structural, so the type-only surface this file needs does not drag cdp-relay.js into the
+  // module graph at load time (see the beforeAll comment below). close() is awaited in afterAll:
+  // it must be, or the relay's shutdown work outlives the test run.
+  let server: { close(): Promise<void> } | null = null
   // Resolved in beforeAll rather than at module scope, and by the same lazy import cdp-relay
   // already uses: everything above this describe is a pure state-transition unit test, and
   // keeping the relay/test-utils graph out of the module's load path is what keeps it that way.
@@ -669,7 +672,7 @@ describe('Host header validation (DNS rebinding protection)', () => {
   })
 
   afterAll(async () => {
-    server?.close()
+    await server?.close()
     server = null
   })
 

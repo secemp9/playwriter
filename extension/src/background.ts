@@ -25,6 +25,7 @@ import {
   FREESTYLE_GROUP_KEY,
 } from './workspace-groups'
 import { initPlaywriterToolbar } from './toolbar/toolbar'
+import { SelfGroupChangeLedger, UNGROUPED_TAB_GROUP_ID } from 'playwriter/src/tab-group-events'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
 import { handleGhostBrowserCommand, type GhostBrowserCommandParams } from 'playwriter/src/ghost-browser'
@@ -1080,9 +1081,18 @@ async function getGroupOrUndefined(groupId: number): Promise<chrome.tabGroups.Ta
  *   2. It NEVER calls store.setState — it only reads store.getState(). So the programmatic
  *      grouping/ungrouping it performs cannot trigger the store.subscribe that (re)schedules
  *      it. There is no path from this function back into itself except the queue.
- *   3. 'connecting' tabs are grouped only while the relay is connected; the onUpdated handler
- *      ignores group-removal events for 'connecting' tabs. Together these stop a tab that is
- *      mid-attach from being ungrouped-then-disconnected.
+ *   3. EVERY chrome.tabs.group()/ungroup() call below is recorded in `selfGroupChanges`
+ *      immediately BEFORE it is made, and the onUpdated listener absorbs the matching event
+ *      instead of acting on it. This is what stops the extension reading its own writes back
+ *      as a human dragging a tab in or out of the group.
+ *
+ * Fact 3 used to read "the onUpdated handler ignores group-removal events for 'connecting'
+ * tabs". That is a timing approximation of fact 3 as now stated, and it was measured to fail
+ * in both directions: an ungroup performed while a tab was untracked, handled after the tab had
+ * finished re-attaching, tore the live tab down; and a group performed while a tab was
+ * connected, handled after disconnectEverything had untracked it, re-attached it as a freestyle
+ * tab its owning workspace could no longer see. playwriter/src/tab-group-events.ts carries the
+ * relay-log evidence for both.
  */
 // Tabs whose attachTab setup sequence is currently in flight. chrome.tabs.group() /
 // ungroup() targeting a tab mid-debugger-attach deterministically kills this service
@@ -1093,6 +1103,27 @@ async function getGroupOrUndefined(groupId: number): Promise<chrome.tabGroups.Ta
 // is in flight; the state change that completes (or fails) an attach re-triggers
 // syncTabGroups via the store subscription, so a deferred pass is re-run, never dropped.
 const attachSetupInProgress = new Set<number>()
+
+// Every tab-group change THIS extension makes is recorded here before it is made, and the
+// chrome.tabs.onUpdated listener at the bottom of this file absorbs the matching event instead
+// of acting on it. Without this the extension reads its own chrome.tabs.group()/ungroup() calls
+// back as user intent: an ungroup becomes "the human dragged this tab out" → disconnectTab, and
+// a group becomes "the human dragged this tab in" → connectTab as freestyle. Both were measured;
+// tab-group-events.ts carries the log evidence and why the alternatives do not work.
+const selfGroupChanges = new SelfGroupChangeLedger({
+  onUndelivered: ({ tabId, expected, ageMs }) => {
+    logger.warn(
+      `Tab-group change we made was never reported by Chrome: tab=${tabId} expected=${expected} ` +
+        `age=${ageMs}ms. A human drag of this tab may be ignored once.`,
+    )
+  },
+  onUnexpected: ({ tabId, expected, actual }) => {
+    logger.warn(
+      `Tab-group event for tab ${tabId} reported group ${actual} where we recorded ${expected}. ` +
+        `Absorbing it anyway; Chrome's group-event order is not what tab-group-events.ts assumes.`,
+    )
+  },
+})
 
 async function syncTabGroups(): Promise<void> {
   try {
@@ -1141,6 +1172,7 @@ async function syncTabGroups(): Promise<void> {
         const tabsInGroup = await chrome.tabs.query({ groupId })
         const idsToUngroup = tabsInGroup.map((t) => t.id).filter((id): id is number => id !== undefined)
         if (idsToUngroup.length > 0) {
+          selfGroupChanges.note(idsToUngroup, UNGROUPED_TAB_GROUP_ID)
           await chrome.tabs.ungroup(idsToUngroup)
         }
       }
@@ -1197,6 +1229,9 @@ async function syncTabGroups(): Promise<void> {
         if (!isFreestyle) {
           takenColors.add(color)
         }
+        // 'new-group': Chrome only reveals the id in the promise result, which resolves AFTER
+        // it has already dispatched the tabs.onUpdated events for these tabs.
+        selfGroupChanges.note(bucket.tabIds, 'new-group')
         const newGroupId = await chrome.tabs.group({ tabIds: bucket.tabIds })
         await setGroupId(key, newGroupId)
         await chrome.tabGroups.update(newGroupId, { title, color })
@@ -1216,6 +1251,7 @@ async function syncTabGroups(): Promise<void> {
 
         if (toRemove.length > 0) {
           try {
+            selfGroupChanges.note(toRemove, UNGROUPED_TAB_GROUP_ID)
             await chrome.tabs.ungroup(toRemove)
             logger.debug('Removed tabs from group:', key, toRemove)
           } catch (e: any) {
@@ -1223,6 +1259,7 @@ async function syncTabGroups(): Promise<void> {
           }
         }
         if (toAdd.length > 0) {
+          selfGroupChanges.note(toAdd, groupId)
           await chrome.tabs.group({ tabIds: toAdd, groupId })
           logger.debug('Added tabs to group:', key, toAdd)
         }
@@ -1720,14 +1757,11 @@ async function attachTab(
 
     await setupCommand('Page.enable')
 
-    // Reapply cached auto-attach for new tabs so OOPIF targets are reported immediately.
-    if (autoAttachParams) {
-      try {
-        await setupCommand('Target.setAutoAttach', autoAttachParams)
-      } catch (error) {
-        logger.debug('Failed to apply auto-attach for tab:', tabId, error)
-      }
-    }
+    // The cached root Target.setAutoAttach re-apply used to be the next line. It is now the
+    // last thing this function does, AFTER the Target.attachedToTarget echo — running it here
+    // makes Chrome report this tab's already-loaded OOPIFs while `tab.sessionId` is still
+    // undefined, so they reach the relay unroutable. The measurement is at that block; this
+    // signpost exists only because that is where a reader looks for it.
 
     const contextMenuScript = js`
       document.addEventListener('contextmenu', (e) => {
@@ -1810,6 +1844,63 @@ async function attachTab(
             waitingForDebugger: false,
           },
         },
+      })
+    }
+
+    // Re-apply the cached root Target.setAutoAttach so this tab's OOPIF child targets are
+    // reported. This MUST come after the store commit and after the Target.attachedToTarget
+    // echo above, and it used to come before Page.enable. MEASURED consequence of the old
+    // position, on a real Chrome with this extension packed, attaching a tab whose cross-site
+    // iframe was already loaded (relay wire log, playwriter/src/relay-oopif-attach.test.ts
+    // reproduces this exact shape):
+    //
+    //   66 from-extension Target.attachedToTarget  <no sessionId>  type=iframe  child=A56D…
+    //   67 to-playwright  Target.attachedToTarget  <no sessionId>  type=iframe  child=A56D…
+    //   68 from-playwright Runtime.runIfWaitingForDebugger sessionId=A56D…
+    //   71 from-playwright Target.detachFromTarget          params.sessionId=A56D…
+    //   73 from-extension Target.detachedFromTarget         sessionId=A56D…
+    //   76 from-extension Target.attachedToTarget  <no sessionId>  type=page   child=pw-tab-…-2
+    //
+    // Chrome delivers an OOPIF's Target.attachedToTarget on the TAB's root debugger session,
+    // so onDebuggerEvent forwards it with `source.sessionId || tab.sessionId`. Run from the
+    // old position, that is `undefined || undefined`: the store still holds the 'connecting'
+    // TabInfo, whose sessionId is only assigned by the setState above. The relay then had
+    // nothing to route on and sent the attach with no sessionId at all — i.e. on Playwright's
+    // ROOT session, where crBrowser._onAttachedToTarget has no branch for `type: 'iframe'` and
+    // reaches `session.detach()` (crBrowser.ts:209). Lines 68-73 are exactly that detach. It
+    // self-healed only by accident, when the page's own FrameSession sent its per-page
+    // Target.setAutoAttach (crPage.ts:500) and Chrome re-attached the now-detached OOPIF under
+    // a fresh session (line 113 of the same log). It also leaked: a message with no sessionId
+    // resolves to no owning target in the relay, which classifies it as browser-level and
+    // broadcasts it to EVERY client of this extension, across workspaces.
+    //
+    // From here, `tab.sessionId` is committed and the relay has already processed this tab's
+    // page target (the WebSocket is ordered), so every child attach this triggers carries the
+    // page session and is routed and workspace-scoped correctly.
+    //
+    // NOT AWAITED, and that is load-bearing rather than laziness. The ordering this fix needs
+    // is already paid for: sendMessage above wrote the echo to the socket synchronously, and
+    // Chrome cannot deliver a child attach before it has even received this command, so the
+    // echo is strictly earlier on the same ordered socket whether or not we wait for the
+    // response. Awaiting, on the other hand, would silently break tab grouping: the setState
+    // that just marked this tab 'connected' schedules syncTabGroups as a MICROTASK, and
+    // syncTabGroups returns early while `attachSetupInProgress` still holds this tabId. Today
+    // nothing awaits between that setState and the `finally` that clears the tabId, so the
+    // deferred pass never actually defers. An await here would introduce the first microtask
+    // checkpoint inside that window, the pass would bail, and — since this attach produces no
+    // further store change — nothing would re-trigger it, leaving the tab out of its
+    // workspace group.
+    //
+    // skipAttachedEvent (createInitialTab) is excluded because that path sends no echo: the
+    // relay only learns the tab from attachTab's RETURN value, so an auto-attach here would
+    // again produce child attaches it cannot route. Nothing is lost — the relay announces the
+    // created target to the requesting client in its Target.setAutoAttach replay, and
+    // Playwright answers every page attach with a per-page Target.setAutoAttach on that page's
+    // session (observed for every page target in the log above), which enables OOPIF attach
+    // for it.
+    if (autoAttachParams && !skipAttachedEvent) {
+      void setupCommand('Target.setAutoAttach', autoAttachParams).catch((error) => {
+        logger.debug('Failed to apply auto-attach for tab:', tabId, error)
       })
     }
 
@@ -2230,6 +2321,9 @@ async function updateIcons(): Promise<void> {
 
 async function onTabRemoved(tabId: number): Promise<void> {
   popupSourceTabMap.delete(tabId)
+  // A closed tab can emit no further group events, so any change we recorded for it would sit
+  // in the ledger forever — and a recycled tab id would inherit it.
+  selfGroupChanges.forget(tabId)
   const { tabs } = store.getState()
   if (!tabs.has(tabId)) return
   logger.debug(`Connected tab ${tabId} was closed, disconnecting`)
@@ -2555,6 +2649,21 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // Narrowed to `number` here; captured so the (deferred) async callback below keeps the
     // narrowing — TypeScript drops the outer narrowing across the closure boundary.
     const changedGroupId = changeInfo.groupId
+    // FIRST, before anything is queued: was this OUR OWN chrome.tabs.group()/ungroup()? Every
+    // mutation syncTabGroups performs is recorded in selfGroupChanges immediately before the
+    // call, and Chrome dispatches the resulting event while that call is still pending — so the
+    // record is always in place by the time we get here. Absorbing it here rather than in the
+    // queued handler below is deliberate: the queue reorders this event relative to the attach
+    // and disconnect work that changes store.tabs, which is precisely what made the handler
+    // misread our own writes as user intent (a stale ungroup read as a drag-out that tore down a
+    // live agent tab; a stale group read as a drag-in that resurrected a deliberately
+    // disconnected tab as freestyle). Both were measured — see playwriter/src/tab-group-events.ts
+    // for the relay-log evidence and for why acting on the tab's live groupId, or on a
+    // per-attach generation number, does NOT separate these cases.
+    if (selfGroupChanges.consume(tabId, changedGroupId)) {
+      logger.debug('Ignoring tab-group change we made ourselves:', tabId, changedGroupId)
+      return
+    }
     // Queue tab group operations to serialize with syncTabGroups and disconnectEverything
     tabGroupQueue = tabGroupQueue
       .then(async () => {
@@ -2565,12 +2674,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         // ours. This supersedes the old chrome.tabGroups.query({title}) lookup, which only ever
         // recognised the freestyle group and so misclassified worktree-group events.
         //
-        // This reverse lookup is what closes the residual worktree-thrash edge Todo 22
-        // documented: when syncTabGroups first groups an already-'connected' worktree tab, it
-        // awaits setGroupId(key, newGroupId) BEFORE returning, and this handler is chained AFTER
-        // syncTabGroups on the single serialized tabGroupQueue, so the map already contains that
-        // group id by the time this runs. The event therefore lands in the benign added-branch
-        // (tab already tracked → no-op) instead of falling through to disconnectTab.
+        // Everything below therefore describes a group change made by SOMEONE ELSE — a human
+        // dragging the tab, or another extension. Our own group/ungroup calls never reach here;
+        // the selfGroupChanges check above absorbed them. The reverse lookup still matters for
+        // classifying a foreign change: it says whether the tab landed in one of our groups or
+        // left them, by identity rather than by title.
         const groupIds = await getGroupIds()
         const isPlaywriterGroup = Object.values(groupIds).includes(changedGroupId)
         const { tabs } = store.getState()
@@ -2587,6 +2695,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         } else if (tabs.has(tabId)) {
           const tabInfo = tabs.get(tabId)
           if (tabInfo?.state === 'connecting') {
+            // A human drag that lands while the tab is mid-attach: the attach is already in
+            // flight and tearing it down here would race it. This guard used to be the ONLY
+            // thing standing between a self-inflicted ungroup and disconnectTab, which is what
+            // made it fail — it approximates "we caused this event" by timing, and the timing
+            // stopped holding the moment the attach finished first. That job now belongs to
+            // selfGroupChanges above; all this guard covers is a genuine drag racing an attach.
             logger.debug('Tab removed from group while connecting, ignoring:', tabId)
             return
           }

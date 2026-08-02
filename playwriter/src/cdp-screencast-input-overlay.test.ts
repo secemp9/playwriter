@@ -26,6 +26,7 @@ import {
   buildEncodeArgs,
   buildInputChips,
   captionBackdropRect,
+  chipStripMetrics,
   defaultOutlineWidth,
   encodeFrames,
   formatAss,
@@ -711,7 +712,7 @@ describe('formatAss: captions and chips share one subtitle file', () => {
     expect(built.inputNote).toMatch(/clamped to \d+px above the bottom edge/)
   })
 
-  it('renders a stack as one line per chip when asked', () => {
+  it('renders a stack as one line per chip when asked, each on its own merge plate', () => {
     const three = buildInputChips({
       events: [inputStamp('A', 0), inputStamp('B', 100), inputStamp('C', 200)],
       frameOffsetsMs: [0, 1000, 2000],
@@ -720,7 +721,13 @@ describe('formatAss: captions and chips share one subtitle file', () => {
     })
     const ass = formatAss([], video, {}, { segments: three.segments, options: { layout: 'stack' } }).text
     const widest = ass.split('\n').filter((l) => l.startsWith('Dialogue: 1')).map((l) => l.split(',,').pop()!)
-    expect(widest.some((d) => d === 'A\\NB\\NC')).toBe(true)
+    // Each stacked chip draws its OWN BorderStyle-3 box, so each line needs its own hard-space
+    // padding — one run for the whole dialogue would leave the middle chips' plates hugging
+    // their letters. Written out from `chipStripMetrics` rather than as a literal, so it stays
+    // an assertion about the shipped geometry rather than about a string somebody once saw.
+    const m = chipStripMetrics(video)
+    const pad = (s: string) => '\\h'.repeat(m.inboardSpaces) + s + '\\h'.repeat(m.outboardSpaces)
+    expect(widest.some((d) => d === [pad('A'), pad('B'), pad('C')].join('\\N'))).toBe(true)
   })
 
   it('rejects an unknown layout rather than silently picking one', () => {

@@ -65,6 +65,7 @@ const PRODUCTION_RELAY_PORT = 19988
 const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'relay-workspace.test.ts': 19771,
   'relay-two-targets.test.ts': 19772,
+  'relay-oopif-attach.test.ts': 19773,
   'trace-integration.test.ts': 19985,
   'aria-snapshot.test.ts': 19986,
   'relay-core.test.ts': 19987,
@@ -257,7 +258,7 @@ export async function cleanupTestContext(
     await ctx.browserContext.close()
   }
   if (ctx?.relayServer) {
-    ctx.relayServer.close()
+    await ctx.relayServer.close()
   }
 
   if (ctx?.userDataDir) {
