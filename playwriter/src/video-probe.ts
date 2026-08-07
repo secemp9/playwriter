@@ -515,6 +515,35 @@ export function brightPixelsPerFrame(
   region: { x0?: number; x1?: number; y0?: number; y1?: number } = {},
   threshold = 200,
 ): number[] {
+  return lumaPixelsPerFrame(video, region, (g) => g > threshold)
+}
+
+/**
+ * The same count, the other way up: pixels DARKER than `threshold`.
+ *
+ * Exists because the caption inverted. It used to be white text over an arbitrary page and
+ * was counted as "bright"; it is now black text on a light strip, so on the strip the ink is
+ * the dark minority and the background is the bright majority. Counting bright pixels there
+ * measures the strip's area, which is constant, and is blind to whether any caption was
+ * drawn in it at all.
+ *
+ * Sound only where the region is known to be uniformly light apart from the ink — i.e. the
+ * caption strip, whose colour this file chooses. It is not a general "find the ink" rule any
+ * more than its sibling is; for that, use the clean-plate differential.
+ */
+export function darkPixelsPerFrame(
+  video: DecodedVideo,
+  region: { x0?: number; x1?: number; y0?: number; y1?: number } = {},
+  threshold = 128,
+): number[] {
+  return lumaPixelsPerFrame(video, region, (g) => g < threshold)
+}
+
+function lumaPixelsPerFrame(
+  video: DecodedVideo,
+  region: { x0?: number; x1?: number; y0?: number; y1?: number },
+  keep: (luma: number) => boolean,
+): number[] {
   const x0 = Math.floor(video.width * (region.x0 ?? 0))
   const x1 = Math.floor(video.width * (region.x1 ?? 1))
   const y0 = Math.floor(video.height * (region.y0 ?? 0))
@@ -526,7 +555,7 @@ export function brightPixelsPerFrame(
       for (let x = x0; x < x1; x++) {
         const o = f * video.frameBytes + (y * video.width + x) * 3
         const g = 0.299 * video.rgb[o] + 0.587 * video.rgb[o + 1] + 0.114 * video.rgb[o + 2]
-        if (g > threshold) n++
+        if (keep(g)) n++
       }
     }
     out.push(n)

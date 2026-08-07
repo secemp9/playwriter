@@ -146,77 +146,105 @@ export interface CaptionOptions {
   maxCaptions?: number
   /** libass font family (default 'DejaVu Sans' — present anywhere ffmpeg+fontconfig is). */
   fontName?: string
-  /** Font size as a percentage of video height (default 5), floored at 16px. */
+  /**
+   * Font size as a percentage of the PAGE height (default 5), floored at 16px.
+   *
+   * The page, not the encoded frame. The frame is taller than the page by the caption
+   * strip, and the strip's height is derived from this face — so reading the percentage
+   * off the frame would make the face feed its own input and the two would chase each
+   * other. Against the page it is also the number a caller means: "how big is the
+   * narration next to the thing being narrated".
+   */
   fontSizePct?: number
-  /** `#RRGGBB`. Outline defaults to black because it has to survive a white page. */
+  /**
+   * `#RRGGBB` for the caption text. **Default black**, because the caption no longer sits
+   * on the page — it sits on the light strip below it, and there is nothing behind it to
+   * hide from.
+   */
   textColor?: string
+  /**
+   * `#RRGGBB` for the glyph outline. Defaults to `stripColor`, i.e. to no visible outline.
+   *
+   * IT IS NO LONGER LOAD-BEARING, AND SAYING SO IS THE POINT. A black outline used to be
+   * what made white text legible over an arbitrary page; with the strip the background is
+   * known and controlled, so an outline the colour of its own background draws nothing.
+   * The mechanism is kept rather than deleted because it is still the thing that keeps a
+   * caller-CHOSEN outline from closing the glyph counters — see `defaultOutlineWidth` for
+   * the measured ratio, which is unchanged and still enforced.
+   */
   outlineColor?: string
   /** Outline thickness in px; default scales with the font. */
   outlineWidth?: number
   /** Drop-shadow offset in px (default 1). */
   shadow?: number
   /**
-   * A per-line opaque box behind the text instead of an outline. **Not the merge fix** —
-   * see `backdrop`, which is on by default and does that job properly.
+   * A per-line opaque box behind the text, painted from `outlineColor`, instead of an
+   * outline. **Under `boxed`, `outlineWidth` stops being an outline and becomes the box's
+   * PADDING** — ASS BorderStyle 3 paints the box from OutlineColour and reads Outline as
+   * its inset.
    *
-   * **Under `boxed`, `outlineWidth` stops being an outline and becomes the box's PADDING**
-   * (ASS BorderStyle 3 paints the box from OutlineColour and reads Outline as its inset).
-   * That was once thought to be enough to stop overlay text merging with page text, and it
-   * is not. Both halves are MEASURED on `dense-12px` at 480x320, where the caption's first
-   * line ends in `charge` and the page row it crosses resumes with the surviving `s` of
-   * `keeps`:
+   * A pure look option, and at the defaults a no-op: `outlineColor` defaults to the strip
+   * colour, so the box is drawn in the colour it is drawn on. It does something only for a
+   * caller who also sets a contrasting `outlineColor`, and then it is a tight plate hugging
+   * each line inside the strip.
    *
-   *   - `boxed: true` alone: the default padding is `defaultOutlineWidth(16)` = 1px, so
-   *     the box stops ~3px past the `e` and leaves the page's `s` uncovered. The frame
-   *     still reads `charges` — a word in NEITHER layer. Three pixels of black between two
-   *     glyphs is not a word boundary to the eye.
-   *   - `boxed: true` with `outlineWidth: 6`: the box now extends past the seam and covers
-   *     the adjacent page glyph outright, so the frame reads `charge  going past the`. The
-   *     merge is gone there — but by occluding whatever glyph happened to be next to the
-   *     line end, which is luck, not construction: a page word two pixels further out
-   *     merges just the same. It also puts the outline/fontSize ratio at 1/2.7, far outside
-   *     the (1/32, 1/16] band `defaultOutlineWidth` documents.
-   *
-   * So `boxed` is kept for the look — a tight box hugging each line — and NOT as a
-   * guarantee. It composes with `backdrop`; against the backdrop's own colour the box is
-   * invisible, which is why leaving both on is harmless.
+   * IT USED TO BE OFFERED AS THE MERGE FIX AND IT WAS NEVER ONE. MEASURED on `dense-12px`
+   * at 480x320, back when the caption was drawn over the page: with the default 1px padding
+   * the box stopped ~3px past the line's final `e` and the page's surviving `s` was still
+   * beside it, so the frame still read `charges` — a word in neither layer. Three pixels of
+   * plate is not a word boundary to the eye; a space at 12px page text is four. That whole
+   * class is now closed by construction rather than by padding — the caption is not on the
+   * page at all — so this option carries no guarantee and never did.
    */
   boxed?: boolean
   /**
-   * A full-frame-width opaque band behind the caption, drawn only while a cue is up.
-   * **On by default, and the reason a caption can no longer merge with page text.**
+   * `#RRGGBB` of the strip the caption is drawn on (default `#E8E8E8`).
    *
-   * THE DEFECT IT CLOSES. Overlay text landing beside page text so the composite reads as
-   * a word that is in NEITHER layer — the "Clickkout" class. It is strictly worse than
-   * occlusion: occlusion destroys information and shows up as absence, merging FABRICATES
-   * information. Measured on `dense-12px` at 480x320 with the outlined default: the
-   * caption's first line ended in `charge`, the page row it crossed resumed with the `s`
-   * of `keeps`, there was zero gap between them at 10x, and the frame read `two charges
-   * going past the fold`. Both layers were individually perfect, so every mask-based
-   * check was green.
+   * THE STRIP IS APPENDED TO THE FRAME, NOT DRAWN OVER IT. The encoder pads the page
+   * render with `stripHeight` extra rows along the bottom and the caption is drawn only
+   * there, so the page area of every frame is exactly the pixels the page showed. That is
+   * the whole design, and it replaces a full-frame-width opaque band that was composited
+   * over the page.
    *
-   * WHY IT CANNOT HAPPEN UNDER THIS. The band spans x = 0..width and, vertically, the
-   * caption's whole drawn extent plus `captionBackdropPaddingPx` above and below (see
-   * `captionBackdropRect` for the arithmetic and the measurements it rests on). So EVERY
-   * scanline that carries caption ink is opaque band from the left edge of the frame to
-   * the right edge of it. A merged token needs two glyph runs side by side on shared rows;
-   * on the caption's rows there is no page pixel left to be beside. That is a geometric
-   * property of the layout, not an observation about the pages that were tried — and it is
-   * asserted on pixels by `mergeShieldFindings` in `video-invariants.ts`.
+   * WHY THE BAND WAS WRONG. It closed a real defect — overlay text landing beside page text
+   * so the composite reads as a word in NEITHER layer, the "Clickkout" class, measured on
+   * this exact scene as `charge` + a surviving page `s` = `charges`. But it closed it by
+   * blacking out every scanline the caption occupied, edge to edge, for as long as the cue
+   * was up. On `dense-12px` at 480x320 that is two full rows of page content destroyed, at
+   * the bottom of the frame, which is exactly where status text, totals, toasts and error
+   * messages live. A video made to show a bug was covering the part of the page most likely
+   * to be carrying it. Occlusion is not a cheaper failure than merging; it is the same
+   * failure — evidence that is not in the file — arriving as absence rather than as
+   * fabrication.
    *
-   * WHAT IT COSTS. The page is hidden inside the band, and only there, and only while a
-   * cue is on screen. The band is the caption's own block plus a quarter of the face top
-   * and bottom, so it is a few pixels taller than the ink the outlined form already drew
-   * across; it does not grow with the frame the way a fixed letterbox would. It also makes
-   * caption contrast unconditional — white on the band's own colour, whatever the page is.
+   * WHY APPENDING IS STRICTLY BETTER RATHER THAN A TRADE. The merge guarantee survives and
+   * gets simpler: caption ink and page pixels are in disjoint REGIONS, so no page glyph can
+   * share a scanline with a caption glyph, whatever the page says. `mergeShieldFindings` in
+   * `video-invariants.ts` asserts exactly that — no caption ink inside the page region —
+   * which is a stronger statement than the old per-scanline rule and easier to prove.
+   * Against that, the only cost is canvas: the file is `stripHeight` rows taller. The old
+   * size objection ("a letterbox grows with the frame") does not survive contact with the
+   * arithmetic — the strip is sized to the caption block, which is precisely what the band
+   * was sized to, so it is the SAME number of rows, moved off the page instead of onto it.
    *
-   * TURNING IT OFF REINSTATES THE MERGE. `backdrop: false` is a real choice for a
-   * recording where no page pixel may be covered, and it is exactly as unsafe as the
-   * paragraph above says. Nothing else in this file can catch what it lets back in.
+   * THE COLOUR WAS CHOSEN BY RENDERING AND LOOKING, against both a light page (`dense-12px`,
+   * white to all four edges) and a dark one (`solid-dark`, #111). Candidates were pure white,
+   * #F2F2F2 and #E8E8E8 with black text, and #151515 with white text. Pure white on a white
+   * page reads as one more paragraph of the document — narration indistinguishable from
+   * evidence, which is its own defect. A dark strip disappears into a dark page and simply
+   * relocates the black slab on a light one. #E8E8E8 is one clear tone step below any white
+   * page and the softest of the light options against a dark one.
    */
-  backdrop?: boolean
-  /** Distance from the bottom edge as a percentage of video height (default 6). */
-  marginBottomPct?: number
+  stripColor?: string
+  /**
+   * `#RRGGBB` of the hairline rule between the page and the strip (default `#707070`).
+   *
+   * `stripRuleHeightPx` rows at the very top of the strip. It exists because the tone step
+   * alone is not enough in both directions: against a white page a light strip needs a hard
+   * boundary to read as chrome rather than as content, and against a dark page it stops the
+   * transition being a raw black-meets-light edge. Verified by rendering both.
+   */
+  stripRuleColor?: string
 }
 
 /**
@@ -296,13 +324,35 @@ const CAPTION_DEFAULTS = {
   maxCaptions: 500,
   fontName: 'DejaVu Sans',
   fontSizePct: 5,
-  textColor: '#FFFFFF',
-  outlineColor: '#000000',
+  textColor: '#000000',
   shadow: 1,
   boxed: false,
-  backdrop: true,
-  marginBottomPct: 6,
+  stripColor: '#E8E8E8',
+  stripRuleColor: '#707070',
 } as const
+
+/**
+ * The caption's resolved palette, in one place because `formatAss` and
+ * `validateVisualOptions` must agree about what `outlineColor` defaults to.
+ *
+ * `outlineColor` follows `stripColor` rather than a constant: the outline's only remaining
+ * job is not to be seen, and a fixed black default would put a black halo around black text
+ * on a light strip.
+ */
+export function resolveCaptionColors(options?: CaptionOptions): {
+  text: string
+  outline: string
+  strip: string
+  rule: string
+} {
+  const strip = options?.stripColor ?? CAPTION_DEFAULTS.stripColor
+  return {
+    text: options?.textColor ?? CAPTION_DEFAULTS.textColor,
+    outline: options?.outlineColor ?? strip,
+    strip,
+    rule: options?.stripRuleColor ?? CAPTION_DEFAULTS.stripRuleColor,
+  }
+}
 
 /** Pre-wrap ceiling. Bounds memory before the wrapper has a chance to truncate. */
 const MAX_RAW_CAPTION_CHARS = 2000
@@ -455,13 +505,16 @@ export interface InputOverlayOptions {
    * the word `Checkout`, not beside it.
    *
    * At 1 the covered region is a proof rather than an attenuation: no page pixel inside the
-   * plate survives at all, whatever the page is. Lowering it reinstates the defect in
-   * exactly the way `captionOptions.backdrop: false` does for the caption, and the visual
-   * suite's chip merge shield goes red when it is lowered on a page that is not already the
-   * box colour.
+   * plate survives at all, whatever the page is. Lowering it reinstates the defect, and the
+   * visual suite's chip merge shield goes red when it is lowered on a page that is not
+   * already the box colour.
+   *
+   * The CAPTION no longer has an equivalent knob, because it no longer has anything behind
+   * it: it is drawn in a strip appended below the page rather than composited over it. The
+   * chips cannot follow it there — see `chipStripMetrics`.
    */
   boxOpacity?: number
-  /** Distance from the two anchored edges, as a percentage of video height (default 3). */
+  /** Distance from the two anchored edges, as a percentage of the PAGE height (default 3). */
   marginPct?: number
   /**
    * How long one chip stays up (default 1600ms). A keystroke is instantaneous; one frame
@@ -648,14 +701,39 @@ const CHIP_INBOARD_CLEAR_SPACES = 6
  * The chip strip's resolved geometry, in one place because two functions need it and they
  * must not disagree: `buildInputChips` budgets a row against it and `formatAss` draws it.
  *
+ * THE CHIPS STAY ON THE PAGE, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT. The caption
+ * moved OFF the page into an appended strip (see `captionOptions.stripColor`), and the
+ * obvious next move is to put the chips there too, where they would obstruct nothing and
+ * their merge question would vanish the same way the caption's did. It is not done, for
+ * three reasons:
+ *
+ *   - **It would not be the thing that was asked for.** This is a NohBoard-style keystroke
+ *     HUD, and a keystroke HUD is by definition ON the recording. Every one of them on
+ *     YouTube is. A row of key names in a caption bar is a subtitle about keys, which is a
+ *     different and worse artifact.
+ *   - **The chip's position is information.** A chip sits in the picture at the moment the
+ *     input landed, so the viewer's eye travels between the key and the thing it changed
+ *     without leaving the page. Moved into the strip it becomes a second line of narration
+ *     competing with the first, at which point it may as well be a caption.
+ *   - **It costs almost nothing where it is.** The plate is one line tall in the emptiest
+ *     corner of an ordinary page, against a caption band that was three lines across the
+ *     full width at the bottom. The two are not the same size of imposition and did not
+ *     deserve the same remedy.
+ *
+ * So the chips keep the geometry below, unchanged, and `chipMergeShieldFindings` still has
+ * to pass on it. What DID change is the vertical offset: the frame is now taller than the
+ * page by the strip, and a bottom-anchored strip measures its `MarginV` from the frame's
+ * bottom edge, so `formatAss` adds the strip height to keep the chips in the same place on
+ * the PAGE. The caption-lift reserve that used to sit in that number is gone — there is no
+ * longer a caption on the page to be lifted clear of.
+ *
  * WHY THE CHIP CANNOT MERGE, AND WHERE THAT STOPS BEING A PROOF.
  *
  * A composite reads as a word that is in neither layer only when two glyph runs sit side by
- * side on the rows they share. `captionOptions.backdrop` kills that for the caption by
- * spanning the whole frame width, so on a caption row there is no page pixel to be beside.
- * The chips cannot have that: a full-frame-width bar behind a corner HUD is a worse artifact
- * than the defect it prevents. So the strip is given the strongest thing that is not a bar,
- * and it is three separate properties:
+ * side on the rows they share. The caption is now immune by construction, because it shares
+ * no row with the page at all. The chips cannot have that without leaving the page, so the
+ * strip is given the strongest thing available to something drawn ON the picture, and it is
+ * three separate properties:
  *
  *   1. **UNDER the plate: absolute.** The box is opaque (`boxOpacity` defaults to 1). No page
  *      pixel inside the plate survives, so a chip cannot composite with the page glyph it is
@@ -665,8 +743,7 @@ const CHIP_INBOARD_CLEAR_SPACES = 6
  *   2. **OUTBOARD of the ink: absolute.** The strip's anchored horizontal margin is ZERO and
  *      the ink is held off the edge by hard spaces instead, so the plate runs continuously
  *      from the chip's ink to the frame edge it is anchored to. On a chip-ink scanline there
- *      is no page pixel on that side AT ALL — the same argument the caption band makes, made
- *      by reaching one edge instead of two. It also costs less than clearance would: the
+ *      is no page pixel on that side AT ALL. It also costs less than clearance would: the
  *      plate grows by the old margin, which is smaller than `CHIP_MIN_CLEAR_RATIO` faces.
  *
  *   3. **INBOARD of the ink: measured, not absolute.** `CHIP_INBOARD_CLEAR_SPACES` hard
@@ -674,10 +751,11 @@ const CHIP_INBOARD_CLEAR_SPACES = 6
  *      `CHIP_MIN_CLEAR_RATIO` for what that distance was measured against and for the page
  *      face above which it stops being a proof.
  *
- * AND (3) CANNOT BE MADE ABSOLUTE WITHOUT THE BAR. On a row carrying chip ink, either the
- * whole row is overlay — which is the full-width bar — or some page pixel is on it, at some
- * distance, and whether that distance reads as a word break is a perceptual question. There
- * is no third option, so this is a limit of the geometry and not of the effort spent on it.
+ * AND (3) CANNOT BE MADE ABSOLUTE WHILE THE CHIPS ARE ON THE PAGE. On a row carrying chip
+ * ink, either the whole row is overlay — a full-width bar, which is the artifact this
+ * refuses — or some page pixel is on it, at some distance, and whether that distance reads
+ * as a word break is a perceptual question. There is no third option short of leaving the
+ * page, which is the trade weighed at the top of this comment and declined.
  * What can be done is what is done here: make two of the three sides proofs, put a measured
  * number on the third, and CHECK all three on pixels — `chipMergeShieldFindings` in
  * `video-invariants.ts` asserts every one of them on every scene at every frame size.
@@ -768,71 +846,157 @@ export function captionBlockHeightPx(lines: number, fontSize: number, outline: n
 }
 
 /**
- * How far the backdrop band extends past the caption's drawn extent, top and bottom.
+ * Blank strip left above and below the caption's drawn extent.
  *
- * A quarter of the face, which is the ordinary vertical padding of an opaque-box caption
- * and reads as a band rather than as a smear. It is NOT load-bearing for the merge
- * guarantee — that comes entirely from the band spanning the full frame width — so this is
- * a look decision and can be moved without weakening anything. It is load-bearing for one
- * smaller thing: the band must contain the caption's outline and shadow, or a page glyph
- * could sit against the very edge of a glyph's border, and any padding at all does that.
+ * A quarter of the face, which is the ordinary vertical padding of a subtitle plate. It is
+ * a look decision and can be moved without weakening anything — the merge guarantee comes
+ * from the strip being outside the page region, not from its padding.
  *
- * Floored at 2px so a tiny face still gets a visible band edge.
+ * Floored at 2px so a tiny face still gets a visible edge.
  */
-export function captionBackdropPaddingPx(fontSize: number): number {
+export function captionStripPaddingPx(fontSize: number): number {
   return Math.max(2, Math.round(fontSize / 4))
 }
 
 /**
- * The band drawn behind a cue, in frame pixels: `x0..x1` inclusive of the whole width.
+ * Rows of `stripRuleColor` at the very top of the strip, separating it from the page.
  *
- * EVERY NUMBER HERE IS MEASURED, and the measurements are the reason this is a proof
- * rather than a hope:
- *
- *   - **`MarginV` measures to the INK box, and the border overhangs below it.** Verified
- *     over 8 style combinations: the gap left under the drawn block is
- *     `marginV - outline - shadow`. So the caption's ink bottom is at `height - marginV`
- *     and its drawn bottom is `outline + shadow` lower.
- *   - **The line pitch is exactly `fontSize`** and the border is added once around the
- *     block, not once per line — see `captionBlockHeightPx`, whose formula is a measured
- *     UPPER bound on the true inked height (slack 1px at fontSize 10, 2px at 16, 3px at
- *     24, 8px at 54).
- *   - **`lines` is an over-estimate**, because `renderedCaptionLines` deliberately
- *     over-states the advance width. Over-estimating pushes the band's top HIGHER than the
- *     ink needs, which is the safe direction: the band still contains every ink row, it
- *     merely covers a little more page on a frame narrow enough that our character wrap and
- *     libass's pixel wrap disagree (measured: one extra 42px line at 390x844).
- *
- * Putting those together, with `pad = captionBackdropPaddingPx(fontSize)`:
- *
- *     y1 = height - marginV + outline + shadow + pad     (drawn bottom, plus padding)
- *     y0 = y1 - captionBlockHeightPx(...) - 2 * pad      (drawn top, minus padding)
- *
- * and `x0..x1` is `0..width` — the whole frame, with no inset whatsoever. That is the part
- * the guarantee rests on. A band inset even a little leaves a sliver of page on the
- * caption's own scanlines, and a page glyph in that sliver can sit beside a caption glyph
- * exactly as `charges` did; there is no inset small enough to be safe and none large enough
- * to be provable, because "how many pixels of gap stop two glyphs reading as one word" is a
- * perceptual threshold and 3px is already measured to fail. Full width has no threshold in
- * it: on a row that carries caption ink there is no page pixel at all.
- *
- * Clamped to the frame at both ends. Clamping `y1` only discards band below the bottom
- * edge, where there is no page to protect; `y0` can only clamp for a caption taller than
- * its own frame, which `validateVisualOptions` refuses before this is ever reached.
+ * Two rather than one because a single row is swallowed by chroma subsampling in yuv420p —
+ * the rule is a horizontal edge one pixel tall, which is exactly what 4:2:0 halves
+ * vertically. Verified by rendering.
  */
-export function captionBackdropRect(
-  video: { width: number; height: number },
+export const STRIP_RULE_HEIGHT_PX = 2
+
+/**
+ * Everything about the caption strip and the frame it turns the page into.
+ *
+ * `pageHeight` rows of page, then `height` rows of strip; nothing is ever drawn above
+ * `pageHeight`, which is the whole guarantee.
+ */
+export interface CaptionStripMetrics {
+  /** The page area as ENCODED, after the even-dimension rounding. Rows `0 .. pageHeight-1`. */
+  pageWidth: number
+  pageHeight: number
+  /** Rows the strip occupies: `pageHeight .. pageHeight + height - 1`. Always even. 0 with no cue. */
+  height: number
+  /** The rule, occupying the first `ruleHeight` rows of the strip. 0 when there is no strip. */
+  ruleHeight: number
+  /** The encoded frame. Both even, because yuv420p requires it. */
+  videoWidth: number
+  videoHeight: number
+  /** Caption face, floored at 16px. Derived from `pageHeight`, never from `videoHeight`. */
+  fontSize: number
+  outline: number
+  shadow: number
+  /** Blank strip above and below the drawn caption block. */
+  pad: number
+  /** The ASS `MarginV` that lands the drawn block exactly `pad` above the frame bottom. */
+  marginV: number
+  /** Rendered line count the strip was sized for — the tallest cue in the clip. */
+  lines: number
+  stripColor: string
+  ruleColor: string
+  textColor: string
+  outlineColor: string
+}
+
+/**
+ * Size the strip from the caption, and the frame from the strip.
+ *
+ * FIXED FOR THE WHOLE CLIP, sized to the TALLEST cue in it, and both halves of that are
+ * deliberate.
+ *
+ * Fixed, because a video stream has one frame size: a strip that grew and shrank per cue
+ * would have to be a constant frame with a variable-height coloured band inside it, and
+ * then the boundary between page and narration would move under the viewer mid-clip. A
+ * moving boundary is its own evidence problem — it reads as the page shifting — and it
+ * would put the rule in a different place every few seconds. The page origin stays at
+ * (0, 0) for every frame of every clip, which is what makes "the page area is exactly what
+ * the page showed" a statement anyone can check with a crop.
+ *
+ * Sized to the tallest cue rather than to `maxLines`, because the cost of over-sizing is
+ * paid in dead canvas on every frame, and a clip whose cues are all one line has no reason
+ * to carry three lines of empty strip. This is the same rule the chip reserve used and for
+ * the same reason. Note that over-sizing is now the SAFE direction in a way it never was
+ * for the band: extra strip covers nothing.
+ *
+ * THE ARITHMETIC, and every number in it is measured elsewhere in this file:
+ *
+ *   - `MarginV` measures to the INK box and the border overhangs below it by
+ *     `outline + shadow` (verified over 8 style combinations), so `marginV = pad + outline
+ *     + shadow` lands the DRAWN bottom exactly `pad` above the frame's bottom edge;
+ *   - the line pitch is exactly `fontSize` and the border is added once around the block,
+ *     so the drawn block is `captionBlockHeightPx(lines, ...)` tall — a measured upper
+ *     bound, slack 1px at fontSize 10 and 3px at 24;
+ *   - `lines` comes from `renderedCaptionLines`, which deliberately over-estimates. An
+ *     over-estimate now costs a few rows of empty strip instead of a few rows of buried
+ *     page, which is why the over-estimate is comfortable rather than merely safe.
+ *
+ * so `height = ruleHeight + captionBlockHeightPx(...) + 2 * pad`, rounded UP to even. The
+ * page dimensions are rounded DOWN to even to match `scale=trunc(iw/2)*2:trunc(ih/2)*2`,
+ * which the encoder applies before the pad — PlayRes has to describe the frame libass is
+ * actually drawing on, and on an odd-sized capture that is the rounded one. Both halves
+ * even means the sum is even, which is what yuv420p requires.
+ *
+ * `lines <= 0` means no cue is burned, and then there is no strip at all: the encode is
+ * byte-for-byte the one this recorder produced before captions existed.
+ */
+export function captionStripMetrics(
+  page: { width: number; height: number },
   lines: number,
-  fontSize: number,
-  outline: number,
-  shadow: number,
-  marginV: number,
-): { x0: number; y0: number; x1: number; y1: number } {
-  const pad = captionBackdropPaddingPx(fontSize)
-  const bottom = video.height - marginV + outline + shadow + pad
-  const top = bottom - captionBlockHeightPx(lines, fontSize, outline, shadow) - 2 * pad
-  const clamp = (v: number) => Math.max(0, Math.min(video.height, Math.round(v)))
-  return { x0: 0, x1: Math.max(1, Math.round(video.width)), y0: clamp(top), y1: clamp(bottom) }
+  options?: CaptionOptions,
+): CaptionStripMetrics {
+  const even = (v: number) => Math.max(2, Math.floor(Math.round(v) / 2) * 2)
+  const pageWidth = even(page.width)
+  const pageHeight = even(page.height)
+  const fontSize = Math.max(16, Math.round((pageHeight * (options?.fontSizePct ?? CAPTION_DEFAULTS.fontSizePct)) / 100))
+  const outline = options?.outlineWidth ?? defaultOutlineWidth(fontSize)
+  const shadow = options?.shadow ?? CAPTION_DEFAULTS.shadow
+  const pad = captionStripPaddingPx(fontSize)
+  const colors = resolveCaptionColors(options)
+
+  if (!(lines > 0)) {
+    return {
+      pageWidth,
+      pageHeight,
+      height: 0,
+      ruleHeight: 0,
+      videoWidth: pageWidth,
+      videoHeight: pageHeight,
+      fontSize,
+      outline,
+      shadow,
+      pad,
+      marginV: pad + outline + shadow,
+      lines: 0,
+      ...colors2fields(colors),
+    }
+  }
+
+  const block = captionBlockHeightPx(lines, fontSize, outline, shadow)
+  const raw = STRIP_RULE_HEIGHT_PX + block + 2 * pad
+  // Up, never down: rounding down would eat a row of the caption's own border. The odd
+  // extra row lands above the block, where it is blank strip.
+  const height = raw + (raw % 2)
+  return {
+    pageWidth,
+    pageHeight,
+    height,
+    ruleHeight: STRIP_RULE_HEIGHT_PX,
+    videoWidth: pageWidth,
+    videoHeight: pageHeight + height,
+    fontSize,
+    outline,
+    shadow,
+    pad,
+    marginV: pad + outline + shadow,
+    lines: Math.max(1, Math.round(lines)),
+    ...colors2fields(colors),
+  }
+}
+
+function colors2fields(c: { text: string; outline: string; strip: string; rule: string }) {
+  return { stripColor: c.strip, ruleColor: c.rule, textColor: c.text, outlineColor: c.outline }
 }
 
 /**
@@ -1110,6 +1274,16 @@ export interface CdpScreencastResult {
   captionRender?: CaptionRender[]
   /** Sidecar subtitle files written next to the mp4. */
   captionFiles?: string[]
+  /**
+   * Rows of caption strip appended BELOW the page, when captions were burned in.
+   *
+   * The encoded video is this much taller than the page it recorded: rows
+   * `0 .. height-1-captionStripHeightPx` are exactly the pixels the page showed, and the
+   * rest is narration. Reported because it is the number a caller needs to crop the page
+   * back out, or to check that claim for themselves. Absent when nothing was burned, in
+   * which case the frame is the page.
+   */
+  captionStripHeightPx?: number
   /** Set when any cue was moved, shortened, truncated or dropped. */
   captionNote?: string
   /**
@@ -1707,6 +1881,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         note: notes.length ? notes.join(' ') : undefined,
         videoStartOffsetMs: built.videoStartOffsetMs,
         videoDurationMs: built.videoDurationMs,
+        ...(encoded.strip ? { captionStripHeightPx: encoded.strip.height } : {}),
         ...(stamped.length
           ? {
               captions: built.cues,
@@ -2702,6 +2877,19 @@ function assColor(hex: string, alpha = 0): string {
   return `&H${alpha.toString(16).padStart(2, '0').toUpperCase()}${b}${g}${r}`
 }
 
+/**
+ * `#RRGGBB` -> `0xRRGGBB`, the form an ffmpeg filter option takes.
+ *
+ * Validated rather than string-replaced, because this value goes into a filtergraph: an
+ * unvalidated caller string could carry a `:` or a `,` and silently become extra filter
+ * options. Re-emitted from the parsed bytes, so nothing of the input survives into the
+ * command line except six hex digits.
+ */
+function ffmpegColor(hex: string): string {
+  const [r, g, b] = parseHexColor(hex)
+  return '0x' + [r, g, b].map((v) => v.toString(16).padStart(2, '0').toUpperCase()).join('')
+}
+
 /** `#RRGGBB` -> `[r, g, b]`, for comparing two colours the caller supplied. */
 function parseHexColor(hex: string): [number, number, number] {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
@@ -2759,14 +2947,13 @@ export function validateVisualOptions(
     throw new Error(`The video size must be positive and finite, got ${video.width}x${video.height}.`)
   }
 
-  assertFiniteInRange(options?.fontSizePct, 'captionOptions.fontSizePct', 0.1, 100, 'percent of the video height')
-  assertFiniteInRange(options?.marginBottomPct, 'captionOptions.marginBottomPct', 0, 100, 'percent of the video height')
+  assertFiniteInRange(options?.fontSizePct, 'captionOptions.fontSizePct', 0.1, 100, 'percent of the page height')
   assertFiniteInRange(options?.outlineWidth, 'captionOptions.outlineWidth', 0, 100, 'pixels')
   assertFiniteInRange(options?.shadow, 'captionOptions.shadow', 0, 100, 'pixels')
   assertFiniteInRange(options?.maxLines, 'captionOptions.maxLines', 1, 100, 'lines')
   assertFiniteInRange(options?.maxCharsPerLine, 'captionOptions.maxCharsPerLine', 1, 1000, 'characters')
-  assertFiniteInRange(inputOptions?.fontSizePct, 'inputOverlayOptions.fontSizePct', 0.1, 100, 'percent of the video height')
-  assertFiniteInRange(inputOptions?.marginPct, 'inputOverlayOptions.marginPct', 0, 100, 'percent of the video height')
+  assertFiniteInRange(inputOptions?.fontSizePct, 'inputOverlayOptions.fontSizePct', 0.1, 100, 'percent of the page height')
+  assertFiniteInRange(inputOptions?.marginPct, 'inputOverlayOptions.marginPct', 0, 100, 'percent of the page height')
   assertFiniteInRange(inputOptions?.boxOpacity, 'inputOverlayOptions.boxOpacity', 0, 1, '(0 = invisible, 1 = opaque)')
 
   for (const [name, value] of [
@@ -2790,14 +2977,25 @@ export function validateVisualOptions(
     }
   }
 
-  const textColor = options?.textColor ?? CAPTION_DEFAULTS.textColor
-  const outlineColor = options?.outlineColor ?? CAPTION_DEFAULTS.outlineColor
-  const boxed = options?.boxed ?? CAPTION_DEFAULTS.boxed
-  if (colorsCollide(textColor, outlineColor)) {
+  const colors = resolveCaptionColors(options)
+  // The thing the caption is actually READ against is the strip, so that is the pair worth
+  // refusing. It used to be text-vs-outline, which was right when the outline was the only
+  // thing between white text and an arbitrary page; on a strip an outline the colour of its
+  // own background is the DEFAULT, and refusing that pair would refuse the defaults.
+  if (colorsCollide(colors.text, colors.strip)) {
     throw new Error(
-      `captionOptions.textColor ${JSON.stringify(textColor)} and outlineColor ${JSON.stringify(outlineColor)} are the ` +
-        `same colour, so the caption would be ${boxed ? 'a solid block with no readable text in it' : 'invisible — its outline is the only thing separating it from the page'}. ` +
-        'The default pair is white text on a black outline, which survives both a white document and a dark screenshot.',
+      `captionOptions.textColor ${JSON.stringify(colors.text)} and stripColor ${JSON.stringify(colors.strip)} are the ` +
+        'same colour, so the caption would be invisible: it is drawn in a strip appended below the page, and the strip ' +
+        'is the only thing behind it. The default pair is black text on a light strip.',
+    )
+  }
+  // A caller who asks for a visible outline must still get one that is not the text colour,
+  // or the glyphs fill in to a solid block. Only checked when it would be visible at all.
+  if (!colorsCollide(colors.outline, colors.strip) && colorsCollide(colors.text, colors.outline)) {
+    throw new Error(
+      `captionOptions.textColor ${JSON.stringify(colors.text)} and outlineColor ${JSON.stringify(colors.outline)} are ` +
+        `the same colour, so the caption would be ${options?.boxed ?? CAPTION_DEFAULTS.boxed ? 'a solid block with no readable text in it' : 'a smudge with no separation between fill and border'}. ` +
+        'Leave outlineColor unset to have it follow stripColor, which draws no visible outline at all.',
     )
   }
 
@@ -2816,62 +3014,67 @@ export function validateVisualOptions(
     }
   }
 
-  // The caption has to fit in the frame it is drawn on. maxLines and marginBottomPct are
-  // independently reasonable numbers that are jointly impossible: 3 lines of a 22% face
-  // 20% up from the bottom is 86% of the frame, and libass simply draws it off the top.
-  const fontSize = Math.max(16, Math.round((video.height * (options?.fontSizePct ?? CAPTION_DEFAULTS.fontSizePct)) / 100))
-  const outline = options?.outlineWidth ?? defaultOutlineWidth(fontSize)
-  const shadow = options?.shadow ?? CAPTION_DEFAULTS.shadow
+  /**
+   * The narration must not be bigger than the evidence.
+   *
+   * The old form of this check was "the caption has to fit inside the frame it is drawn
+   * on", which the strip makes impossible to fail — the frame grows to hold the caption,
+   * so a 22% face simply produces a very tall video. That is not a crash but it is still
+   * not what anyone meant: at `fontSizePct: 30` with three lines the strip is taller than
+   * the page and the clip is mostly subtitle. Refused at parity, where the page is still
+   * at least half the frame.
+   */
   const maxLines = options?.maxLines ?? CAPTION_DEFAULTS.maxLines
-  const marginV = Math.max(4, Math.round((video.height * (options?.marginBottomPct ?? CAPTION_DEFAULTS.marginBottomPct)) / 100))
-  const tallest = captionBlockHeightPx(maxLines, fontSize, outline, shadow) + marginV
-  if (tallest > video.height) {
+  const worst = captionStripMetrics(video, maxLines, options)
+  if (worst.height > worst.pageHeight) {
     throw new Error(
-      `A ${maxLines}-line caption at ${fontSize}px sitting ${marginV}px above the bottom edge needs ${tallest}px of a ` +
-        `${video.height}px frame, so the top of the caption would be drawn off the top of the video. Lower ` +
-        'captionOptions.fontSizePct, lower marginBottomPct, or lower maxLines.',
+      `A ${maxLines}-line caption at ${worst.fontSize}px needs a ${worst.height}px strip appended below a ` +
+        `${worst.pageHeight}px page, so more than half the video would be subtitle rather than page. The caption is ` +
+        'drawn in a strip below the page, not over it, so this is not clipping — it is a clip whose narration ' +
+        'dominates the thing it narrates. Lower captionOptions.fontSizePct or maxLines.',
     )
   }
 }
 
 /**
- * Build an ASS script sized to the video.
+ * Build an ASS script sized to the LETTERBOXED frame, from the PAGE size.
  *
- * ASS rather than handing the SRT to `subtitles=` with `force_style`: PlayResX/Y let
- * the style be expressed relative to the actual frame, and it keeps a second layer of
+ * `video` is the page — the size of the captured frames — and everything the caller has is
+ * expressed in it. The frame the ASS describes is taller: `captionStripMetrics` appends a
+ * caption strip below the page and returns the sum, and `PlayResX/Y` is written from THAT,
+ * because PlayRes has to describe the surface libass is drawing on or every margin and face
+ * in the style means something else. The returned `strip` is how `encodeFrames` knows how
+ * many rows to pad, so the two cannot disagree about where the page ends.
+ *
+ * ASS rather than handing the SRT to `subtitles=` with `force_style`: PlayResX/Y let the
+ * style be expressed relative to the actual frame, and it keeps a second layer of
  * filtergraph escaping (force_style is itself a `:`-separated value) out of the picture.
  *
- * The default look exists to survive an arbitrary page: white text with a black outline
- * and a shadow is legible over both a white document and a dark screenshot, which a
- * plain fill is not.
+ * TWO STYLES, TWO LAYERS, ONE FILE:
  *
- * THREE STYLES, THREE LAYERS, ONE FILE:
+ *     Layer 0  Default — the caption glyphs, inside the strip and never above it.
+ *     Layer 1  Input   — the key/button chips, on the page, offset by the strip height.
  *
- *     Layer -1  Backdrop — the full-width opaque band behind the caption (see `backdrop`).
- *     Layer  0  Default  — the caption glyphs.
- *     Layer  1  Input    — the key/button chips, lifted clear of the band above.
- *
- * A negative layer is legal ASS and libass sorts it below 0; verified by rendering, not
- * assumed. It is used rather than renumbering the other two so that `Dialogue: 0,` still
- * means "caption" and `Dialogue: 1,` still means "chip" everywhere those prefixes are read.
+ * There used to be a third, `Layer -1 Backdrop`, drawing a full-frame-width opaque band
+ * behind each cue ON the page. It is gone: the strip does its job without covering anything.
  *
  * AFTER CHANGING ANY OF THE LAYOUT OR STYLING BELOW, LOOK AT THE RESULT.
  * `video-invariants.ts` automates what can be stated as a property of known pixel masks —
  * disjointness, edge clipping, per-glyph contrast, counter survival, single-row chips, chip
  * subordination, subject occlusion, golden-frame drift, and the two merge shields.
  *
- *   CAPTION. Every scanline carrying caption ink is fully covered by the caption layer, from
- *   one edge of the frame to the other, which is exactly the condition under which page text
- *   cannot end up beside caption text. That used to be impossible to state — the "Clickkout"
- *   class fabricates a word out of two individually perfect layers — and it became statable
- *   only because `backdrop` made the geometry absolute instead of incidental.
+ *   CAPTION. No caption ink falls inside the page region at all. That is the whole merge
+ *   argument now, and it is a statement about two disjoint REGIONS rather than about
+ *   scanlines: a merged token needs two glyph runs side by side on rows they share, and the
+ *   caption shares no row with the page. It replaces "every scanline carrying caption ink is
+ *   opaque overlay from edge to edge", which was true but bought with the page underneath.
  *
- *   CHIPS. A different formulation, because a full-width bar behind a corner HUD would be a
- *   worse artifact than the defect it prevents, so the chips cannot copy the caption's
- *   answer. Instead the plate is opaque (nothing under it survives), it runs to the frame
- *   edge it is anchored to (nothing beside it on that side exists), and it extends a MEASURED
- *   clear distance inboard. Two of those three are proofs; the third is a number, and
- *   `chipStripMetrics` says how the number was measured and where it stops being a proof.
+ *   CHIPS. A different formulation, because the chips deliberately stay ON the page — see
+ *   `chipStripMetrics` for why that trade is taken rather than assumed. The plate is opaque
+ *   (nothing under it survives), it runs to the frame edge it is anchored to (nothing beside
+ *   it on that side exists), and it extends a MEASURED clear distance inboard. Two of those
+ *   three are proofs; the third is a number, and `chipStripMetrics` says how it was measured
+ *   and where it stops being a proof.
  *
  * Neither shield is a substitute for looking, and the harness for that is:
  *
@@ -2884,6 +3087,7 @@ export function validateVisualOptions(
  */
 export function formatAss(
   cues: ResolvedCue[],
+  /** The PAGE size — the captured frame. The encoded frame is this plus `strip.height`. */
   video: { width: number; height: number },
   options?: CaptionOptions,
   /**
@@ -2892,25 +3096,40 @@ export function formatAss(
    * frame again for a handful of chips.
    */
   input?: { segments: InputSegment[]; options?: InputOverlayOptions },
-): { text: string; adjustments: Map<number, string[]>; inputAdjustments: Map<number, string[]>; inputNote?: string } {
+): {
+  text: string
+  /** The letterbox geometry this file was written for. `encodeFrames` pads to match. */
+  strip: CaptionStripMetrics
+  adjustments: Map<number, string[]>
+  inputAdjustments: Map<number, string[]>
+  inputNote?: string
+} {
   validateVisualOptions(video, options, input?.options)
   const fontName = options?.fontName ?? CAPTION_DEFAULTS.fontName
-  const fontSize = Math.max(16, Math.round((video.height * (options?.fontSizePct ?? CAPTION_DEFAULTS.fontSizePct)) / 100))
-  // Measured against libass; see `defaultOutlineWidth` for the counter-survival table and
-  // why the old `Math.max(2, …)` floor put every frame 320px or shorter in the smudge band.
-  const outline = options?.outlineWidth ?? defaultOutlineWidth(fontSize)
-  const shadow = options?.shadow ?? CAPTION_DEFAULTS.shadow
-  const marginV = Math.max(4, Math.round((video.height * (options?.marginBottomPct ?? CAPTION_DEFAULTS.marginBottomPct)) / 100))
-  const marginH = Math.max(8, Math.round(video.width * 0.05))
-  const primary = assColor(options?.textColor ?? CAPTION_DEFAULTS.textColor)
-  const outlineCol = assColor(options?.outlineColor ?? CAPTION_DEFAULTS.outlineColor)
+  const burnedCues = cues.filter((c) => !c.dropped)
+
+  // The face has to be known before the line count can be, and the line count before the
+  // strip height — so the face is resolved once against the PAGE and reused. Reading it off
+  // the letterboxed frame would make the strip feed its own input.
+  const probe = captionStripMetrics(video, 0, options)
+  const marginH = Math.max(8, Math.round(probe.pageWidth * 0.05))
+  const usableWidth = probe.pageWidth - 2 * marginH
+  /**
+   * ONE strip for the whole clip, sized to the tallest cue in it.
+   *
+   * `renderedCaptionLines` rather than the source line count, because our wrapper wraps at
+   * characters and libass wraps at pixels, and on a narrow frame a 42-character line becomes
+   * three — see that function. Over-estimating now costs blank strip instead of buried page.
+   */
+  const lines = burnedCues.length > 0
+    ? Math.max(...burnedCues.map((c) => renderedCaptionLines(c.text, usableWidth, probe.fontSize)))
+    : 0
+  const strip = captionStripMetrics(video, lines, options)
+  const { fontSize, outline, shadow } = strip
+  const primary = assColor(strip.textColor)
+  const outlineCol = assColor(strip.outlineColor)
   // BorderStyle 3 paints an opaque box using OutlineColour; 1 is outline + shadow.
   const borderStyle = options?.boxed ?? CAPTION_DEFAULTS.boxed ? 3 : 1
-
-  const burnedCues = cues.filter((c) => !c.dropped)
-  const usableWidth = video.width - 2 * marginH
-  const backdrop = options?.backdrop ?? CAPTION_DEFAULTS.backdrop
-  const backdropPad = backdrop ? captionBackdropPaddingPx(fontSize) : 0
 
   const adjustments = new Map<number, string[]>()
   const events = burnedCues
@@ -2923,39 +3142,13 @@ export function formatAss(
 
   const inputAdjustments = new Map<number, string[]>()
   let inputNote: string | undefined
+  // Alignment 2 is bottom-centre and MarginV measures up from the frame's bottom edge, which
+  // is now the strip's bottom edge. `strip.marginV` is what lands the drawn block exactly
+  // `strip.pad` above it, so the caption is centred in a strip that was sized around it.
   const styleLines = [
-    `Style: Default,${fontName},${fontSize},${primary},${primary},${outlineCol},${outlineCol},0,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,${marginH},${marginH},${marginV},1`,
+    `Style: Default,${fontName},${fontSize},${primary},${primary},${outlineCol},${outlineCol},0,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,${marginH},${marginH},${strip.marginV},1`,
   ]
   const eventLines = events ? [events] : []
-
-  /**
-   * The band, one rectangle per cue, sized to THAT cue's rendered line count.
-   *
-   * Per cue rather than one band for the whole clip, because a one-line cue has no business
-   * covering the three lines the longest cue needed — the page is hidden for exactly as many
-   * rows as the narration currently occupies, and no more.
-   *
-   * Drawn as an ASS `\p1` path rather than by an ffmpeg `drawbox`: it keeps the whole layout
-   * in one file at one PlayRes, so the band and the glyphs cannot drift apart, and it needs
-   * no second filter. `\an7\pos(0,0)` puts the drawing origin at the frame's top-left so the
-   * path coordinates are absolute frame pixels. The style carries Outline 0 and Shadow 0 so
-   * the rectangle gets no border of its own, and its PrimaryColour — which is what fills a
-   * drawing — is the caption's outline colour at full opacity, the one colour the text is
-   * already guaranteed to contrast with (`validateVisualOptions` refuses the collision).
-   */
-  if (backdrop && burnedCues.length > 0) {
-    styleLines.unshift(
-      `Style: Backdrop,${fontName},${fontSize},${outlineCol},${outlineCol},${outlineCol},${outlineCol},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1`,
-    )
-    for (const c of burnedCues) {
-      const lines = renderedCaptionLines(c.text, usableWidth, fontSize)
-      const r = captionBackdropRect(video, lines, fontSize, outline, shadow, marginV)
-      eventLines.push(
-        `Dialogue: -1,${assTime(c.startMs)},${assTime(c.endMs)},Backdrop,,0,0,0,,` +
-          `{\\an7\\pos(0,0)\\p1}m ${r.x0} ${r.y0} l ${r.x1} ${r.y0} ${r.x1} ${r.y1} ${r.x0} ${r.y1}{\\p0}`,
-      )
-    }
-  }
 
   if (input && input.segments.length > 0) {
     const io = input.options
@@ -2989,45 +3182,28 @@ export function formatAss(
     }
 
     /**
-     * Lift a bottom-anchored strip clear of the caption block.
+     * Hold a bottom-anchored strip on the PAGE, now that the frame is taller than the page.
      *
-     * The caption's vertical extent is not a guess: its font size, its bottom margin and
-     * the number of lines it actually wrapped to are all known right here. Reserving the
-     * measured height and adding a gap is what makes "the chips never cover the narration"
-     * a property of the file rather than a hope about libass's collision-avoidance — which
-     * would not help anyway, since the two styles are on different layers.
+     * THE CAPTION-LIFT RESERVE THAT USED TO BE HERE IS GONE, and this is what replaced it.
+     * It reserved the caption block's measured height plus a gap so the chips could not be
+     * drawn on top of the narration — an arithmetic that had to track the caption's font
+     * size, its bottom margin, its backdrop padding and the number of lines libass would
+     * really wrap it to, and that had a clamp for when the answer pushed the chips off the
+     * top of the frame. All of it existed because both layers were competing for the bottom
+     * of the same page. They are not any more: the caption is below the page entirely, so
+     * the chips only have to clear the strip, and the strip's height is a constant known
+     * exactly.
      *
-     * Only the OBSERVED maximum line count is reserved, not `maxLines`: a clip whose cues
-     * are all one line should not have its chips pushed three lines up for nothing.
+     * `MarginV` on a bottom alignment measures up from the frame's bottom edge, which is now
+     * the strip's bottom. Adding `strip.height` puts the chip ink `chipMargin` above the
+     * PAGE's bottom edge — the same place it sat before the strip existed, and the same
+     * place it sits in a clip with no captions at all, where `strip.height` is 0.
      *
-     * The line count is what libass will DRAW, not what our own wrapper produced. Those
-     * are different numbers whenever the frame is narrow enough that a 42-character source
-     * line does not fit across it — see `renderedCaptionLines`. Counting source lines was
-     * correct on every landscape frame and wrong by 3x on a 390x844 one.
-     *
-     * `backdropPad` is in the reserve because the band is what the chips now have to clear:
-     * it rises `pad` above the caption's own drawn top. Adding exactly `pad` leaves the
-     * clearance where it was before the band existed — `outline + shadow + gap - chipPad`,
-     * which is 7px at 480x320 and 12px at 1280x720 — rather than eating the gap.
+     * Nothing to clamp and nothing to report: the sum cannot exceed the frame, because
+     * `validateVisualOptions` already refuses a strip taller than its own page.
      */
-    let chipMarginV = chipMargin
     const bottomAnchored = position === 'bottom-left' || position === 'bottom-right'
-    if (bottomAnchored && burnedCues.length > 0) {
-      const captionLines = Math.max(...burnedCues.map((c) => renderedCaptionLines(c.text, usableWidth, fontSize)))
-      const captionBlockPx = captionBlockHeightPx(captionLines, fontSize, outline, shadow)
-      const gap = Math.max(4, Math.round(chipSize * 0.7))
-      const wanted = marginV + captionBlockPx + backdropPad + gap
-      // A pathological caption (huge font, many lines) must not push the chips off the
-      // top of the frame; better to sit high than to vanish.
-      const ceiling = Math.round(video.height * 0.55)
-      chipMarginV = Math.min(wanted, ceiling)
-      if (wanted > ceiling) {
-        inputNote =
-          `The caption block is ${captionBlockPx}px tall, so the chips were clamped to ${ceiling}px above the bottom ` +
-          `edge instead of the ${wanted}px that would clear it — they may sit closer to the captions than intended. ` +
-          `Reduce captionOptions.fontSizePct/maxLines, or move the overlay with inputOverlayOptions.position.`
-      }
-    }
+    const chipMarginV = bottomAnchored ? chipMargin + strip.height : chipMargin
 
     /**
      * The merge plate, expressed as margins and hard spaces rather than as a rectangle.
@@ -3068,7 +3244,9 @@ export function formatAss(
         }
         return escaped.text
       })
-      // Layer 1: above the captions, so a chip is never hidden by a cue that grew into it.
+      // Layer 1, above the captions. The two can no longer reach each other — they are in
+      // disjoint regions of the frame — so the ordering is now only a convention, kept so
+      // that `Dialogue: 1,` still means "chip" everywhere that prefix is read.
       // A row is one line with separators; a stack is one line per chip. Either way it is
       // ONE dialogue, so libass lays it out exactly as written.
       //
@@ -3085,8 +3263,12 @@ export function formatAss(
   const text = [
     '[Script Info]',
     'ScriptType: v4.00+',
-    `PlayResX: ${Math.max(1, Math.round(video.width))}`,
-    `PlayResY: ${Math.max(1, Math.round(video.height))}`,
+    // The LETTERBOXED frame, not the page. `ScaledBorderAndShadow: yes` scales the whole
+    // style by the frame/PlayRes ratio, so a PlayRes describing only the page would render
+    // every margin and face against the wrong height — the exact silent mis-scaling that
+    // `resolveFrameSize` exists to prevent, arriving from the other direction.
+    `PlayResX: ${strip.videoWidth}`,
+    `PlayResY: ${strip.videoHeight}`,
     // 0 keeps libass wrapping anything our own wrapper mis-measured, rather than
     // letting a wide line run off the frame.
     'WrapStyle: 0',
@@ -3102,7 +3284,7 @@ export function formatAss(
     '',
   ].join('\n')
 
-  return { text, adjustments, inputAdjustments, ...(inputNote ? { inputNote } : {}) }
+  return { text, strip, adjustments, inputAdjustments, ...(inputNote ? { inputNote } : {}) }
 }
 
 /** ASS wants `H:MM:SS.cc` — centiseconds, one digit of hours, no padding on hours. */
@@ -3137,9 +3319,11 @@ export function escapeFilterPath(p: string): string {
 /**
  * Read a JPEG's pixel dimensions from its SOF marker.
  *
- * Needed so the ASS PlayRes matches the frame and the style can be expressed as a
- * fraction of it. Done by hand rather than with `image-size` because that is a
- * devDependency and this file runs in the published package.
+ * This measures the PAGE — a captured frame is the page and nothing else. The ASS PlayRes
+ * is NOT this: `formatAss` appends the caption strip and writes PlayRes from the sum, so
+ * the page size measured here is the input to that calculation rather than its answer.
+ * Done by hand rather than with `image-size` because that is a devDependency and this file
+ * runs in the published package.
  *
  * `null` means "this is not a JPEG we can measure". **Never default around it** — see
  * `resolveFrameSize`, which is the only thing that should call this on a captured frame.
@@ -3191,7 +3375,13 @@ export interface ResolvedFrameSize {
 }
 
 /**
- * The size every style in the ASS file is expressed as a fraction of.
+ * The PAGE size — the size of the captured frames, and the base every style in the ASS
+ * file is expressed as a fraction of.
+ *
+ * Not the size of the encoded video, which is taller by `captionStripMetrics(...).height`.
+ * The distinction matters in exactly one direction: everything a caller can choose
+ * (`fontSizePct`, `marginPct`) is a fraction of THIS, so that the strip, whose height is
+ * derived from those fractions, cannot feed back into them.
  *
  * THROWS rather than defaulting. The previous `?? { width: 1280, height: 720 }` was a
  * silent catastrophe: on a 480x320 frame it declared PlayRes 1280x720, and since
@@ -3342,7 +3532,12 @@ export async function encodeFrames({
   files: string[]
   extraAdjustments: Map<number, string[]>
   inputAdjustments: Map<number, string[]>
-  /** Set when the layout itself had to compromise, e.g. a caption block too tall to clear. */
+  /**
+   * The caption strip appended below the page, when there was one. Absent when nothing was
+   * burned, in which case the encoded frame is exactly the page.
+   */
+  strip?: CaptionStripMetrics
+  /** Set when the layout itself had to compromise. */
   inputNote?: string
 }> {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-screencast-'))
@@ -3418,12 +3613,14 @@ export async function encodeFrames({
     }
 
     let burnAssPath: string | undefined
+    let strip: CaptionStripMetrics | undefined
     let extraAdjustments = new Map<number, string[]>()
     let inputAdjustments = new Map<number, string[]>()
     if (needsBurn) {
-      // PlayRes has to match the frame or every size in the style means something else.
-      // `scale` only rounds odd dimensions down by a pixel, so the jpeg size is right.
-      // No fallback: a wrong PlayRes silently rescales every margin and font in the file.
+      // The PAGE size. `formatAss` derives the letterboxed PlayRes from it and hands back
+      // the strip, which is what `buildEncodeArgs` pads with — so the ASS and the filter
+      // chain cannot disagree about where the page ends and the caption begins.
+      // No fallback: a wrong page size silently rescales every margin and font in the file.
       const measured = videoSize ?? resolveFrameSize(frames)
       const size = { width: measured.width, height: measured.height }
       const ass = formatAss(
@@ -3435,6 +3632,7 @@ export async function encodeFrames({
       extraAdjustments = ass.adjustments
       inputAdjustments = ass.inputAdjustments
       inputNote = ass.inputNote
+      strip = ass.strip
       burnAssPath = path.join(workDir, 'captions.ass')
       fs.writeFileSync(burnAssPath, ass.text, 'utf8')
     }
@@ -3445,7 +3643,7 @@ export async function encodeFrames({
       fs.writeFileSync(softSrtPath, formatSrt(emitted), 'utf8')
     }
 
-    await runFfmpeg(buildEncodeArgs({ listFile, outputPath, fps, burnAssPath, softSrtPath }))
+    await runFfmpeg(buildEncodeArgs({ listFile, outputPath, fps, burnAssPath, softSrtPath, strip }))
 
     const files: string[] = []
     if (render.includes('sidecar')) {
@@ -3458,7 +3656,14 @@ export async function encodeFrames({
       }
     }
 
-    return { render, files, extraAdjustments, inputAdjustments, ...(inputNote ? { inputNote } : {}) }
+    return {
+      render,
+      files,
+      extraAdjustments,
+      inputAdjustments,
+      ...(strip && strip.height > 0 ? { strip } : {}),
+      ...(inputNote ? { inputNote } : {}),
+    }
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true })
   }
@@ -3493,9 +3698,31 @@ function normalizeRender(render: CaptionOptions['render']): CaptionRender[] {
  * The ffmpeg command line, in one place so a test can prove the uncaptioned form is
  * byte-for-byte what it always was.
  *
- * `-vf` may only appear once, so burn-in is chained onto the existing scale rather
- * than added as a second filter argument — after it, so libass draws at output
- * resolution and the ASS PlayRes lines up with what the viewer sees.
+ * `-vf` may only appear once, so everything is one chain, and the ORDER of the three stages
+ * is the whole of the letterbox mechanism:
+ *
+ *     scale  →  pad (rule, then strip)  →  subtitles
+ *
+ *   - `scale` first, because `trunc(iw/2)*2` is what makes the PAGE dimensions even, and
+ *     `captionStripMetrics` computes its geometry against those rounded numbers. Padding
+ *     first and scaling after would round the SUM and could shave a row off the strip.
+ *   - `pad` next. It places the input at `0:0` and fills the new rows below it, so the page
+ *     keeps the origin it had and every page pixel keeps its coordinates. This is the line
+ *     that makes the page area of the output identical to the page area of the input — pad
+ *     copies, it does not resample.
+ *   - `subtitles` last, so libass draws at the final resolution and the ASS PlayRes — which
+ *     `formatAss` wrote from `strip.videoWidth/videoHeight` — lines up with what the viewer
+ *     sees. Drawing before the pad would put the caption on the page and then push it up.
+ *
+ * TWO PADS, NOT ONE, because the rule is a different colour from the strip: the first adds
+ * `ruleHeight` rows of `ruleColor`, the second adds the rest in `stripColor`. `iw`/`ih` are
+ * re-evaluated per filter, so the second sees the height the first produced.
+ *
+ * EVEN DIMENSIONS, WHICH `-pix_fmt yuv420p` REQUIRES. `scale` makes the page even and
+ * `captionStripMetrics` rounds the strip UP to even, so the sum is even by construction and
+ * no second `trunc` is needed after the pad. Getting this wrong is not subtle — x264 refuses
+ * an odd dimension outright — but it is worth stating, because the guarantee now comes from
+ * arithmetic in another file rather than from the filter that used to carry it.
  */
 export function buildEncodeArgs({
   listFile,
@@ -3503,16 +3730,23 @@ export function buildEncodeArgs({
   fps,
   burnAssPath,
   softSrtPath,
+  strip,
 }: {
   listFile: string
   outputPath: string
   fps: number
   burnAssPath?: string
   softSrtPath?: string
+  /** The caption strip to append below the page. Omitted or zero-height means no letterbox. */
+  strip?: Pick<CaptionStripMetrics, 'height' | 'ruleHeight' | 'stripColor' | 'ruleColor'>
 }): string[] {
-  const filter = burnAssPath
-    ? `scale=trunc(iw/2)*2:trunc(ih/2)*2,subtitles=${escapeFilterPath(burnAssPath)}`
-    : 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+  const stages = ['scale=trunc(iw/2)*2:trunc(ih/2)*2']
+  if (strip && strip.height > 0) {
+    if (strip.ruleHeight > 0) stages.push(`pad=iw:ih+${strip.ruleHeight}:0:0:${ffmpegColor(strip.ruleColor)}`)
+    stages.push(`pad=iw:ih+${strip.height - strip.ruleHeight}:0:0:${ffmpegColor(strip.stripColor)}`)
+  }
+  if (burnAssPath) stages.push(`subtitles=${escapeFilterPath(burnAssPath)}`)
+  const filter = stages.join(',')
 
   return [
     '-y',
@@ -3526,7 +3760,8 @@ export function buildEncodeArgs({
     '-c:v', 'libx264',
     '-preset', 'veryfast',
     '-pix_fmt', 'yuv420p',
-    // yuv420p needs even dimensions; screencast output is often odd.
+    // yuv420p needs even dimensions; screencast output is often odd, and the strip is
+    // rounded up to even so the padded sum stays even too.
     '-vf', filter,
     '-movflags', '+faststart',
     path.resolve(outputPath),

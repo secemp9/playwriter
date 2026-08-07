@@ -27,12 +27,18 @@
  * different garbage each time, while being plainly legible to a person. An oracle that
  * cannot see is not an oracle, and it dragged an external binary into CI for the privilege.
  *
- * FOR THE CAPTION IT IS NOW AUTOMATED, and not by learning to read. `captionOptions.backdrop`
- * puts a full-frame-width opaque band behind every cue, which turns "does this read as a
- * third word" into "is any page pixel left on a row that carries caption ink" — a question
- * about scanlines that `mergeShieldFindings` answers on pixels. A merged token needs two
- * glyph runs side by side on shared rows; under the band there is nothing beside the caption
- * to be side by side with.
+ * FOR THE CAPTION IT IS NOW AUTOMATED, and not by learning to read. The caption is drawn in
+ * a strip APPENDED BELOW the page, so "does this read as a third word" becomes "is any
+ * caption ink inside the page region" — a question about two disjoint areas that
+ * `mergeShieldFindings` answers on pixels. A merged token needs two glyph runs side by side
+ * on shared rows; the caption shares no row with the page at all.
+ *
+ * THAT REPLACED A FULL-FRAME-WIDTH OPAQUE BAND, and the replacement is the reason to re-read
+ * these frames rather than trust the old ones. The band also closed the merge, by blacking
+ * out every scanline the caption occupied — on `dense-12px` at 480x320, two entire rows of
+ * page content, at the bottom of the frame, which is where status text, totals and errors
+ * live. The strip costs the same number of rows and takes them from the canvas instead of
+ * from the page. Question 7 below is now only about the CHIPS.
  *
  * FOR THE CHIPS IT IS NOW MOSTLY AUTOMATED TOO, BY A WEAKER RULE. They cannot have the
  * caption's band — a full-width bar behind a corner HUD would be a worse artifact than the
@@ -70,14 +76,19 @@
  *      plate survives and nothing exists beside it on its anchored side, both asserted. What
  *      is left is page text sitting INBOARD of the strip and much larger than the chip face,
  *      which is where the measured clearance stops being a proof. The CAPTION cannot merge at
- *      all and you do not have to check it: it sits on a full-frame-width opaque band, so
- *      there is no page pixel on its rows, and `mergeShieldFindings` asserts that everywhere.
- *   7. **Are the plates too heavy?** They are the two things here that cover page content on
- *      purpose. The caption band should read as a subtitle plate sized to the cue that is up —
- *      one line of narration should not black out three lines of page. The chip plate should
- *      still read as a subordinate corner HUD: it is now wider than its letters and runs to
- *      the frame edge it is anchored to, and if that has turned it into a bar rather than a
- *      badge, that is a defect this checklist is the only thing that can catch.
+ *      all and you do not have to check it: it is not on the page, and `mergeShieldFindings`
+ *      asserts that everywhere.
+ *   7. **Is the chip plate too heavy?** It is now the ONLY thing here that covers page content
+ *      on purpose. It should read as a subordinate corner HUD: it is wider than its letters
+ *      and runs to the frame edge it is anchored to, and if that has turned it into a bar
+ *      rather than a badge, that is a defect this checklist is the only thing that can catch.
+ *   8. **Is the strip proportionate, and is it obviously NOT the page?** The strip is the
+ *      whole cost of the change: the file is that many rows taller. Judge it against the
+ *      frame — a strip that dominates a short clip is a real complaint even though it hides
+ *      nothing. And check the boundary in both directions: against a white page the rule and
+ *      the tone step have to stop the strip reading as one more paragraph of the document;
+ *      against a dark page they have to stop it reading as a raw slab. Those two are what the
+ *      colours were chosen by looking at, and they are the two a change to them would break.
  *
  * Anything you find is a defect in the RENDERER, not in the scene. Fix it in
  * `cdp-screencast.ts`, re-run this, and look again.
@@ -85,12 +96,18 @@
  * WHAT DOING THIS FOUND, so that "I saw nothing" is calibrated against a sweep that did see
  * something. All of it is on `dense-12px`, which is why that scene exists:
  *
- *   At 480x320, every frame, BEFORE `captionOptions.backdrop`. The caption's first line
+ *   At 480x320, every frame, BEFORE the caption left the page. The caption's first line
  *   ended in `charge`; the page row it was drawn across is `…and keeps going past the fold`,
  *   whose `keep` was under the caption and whose `s` was not. The composite read **`two
  *   charges going past the fold`** — `charges` is in neither layer. Confirmed by cropping
  *   the seam at 8x: no gap at all between the caption's `e` and the page's `s`. The caption
  *   itself was fully legible, so no contrast, counter or geometry check could see it.
+ *
+ *   At 480x320, every frame, AFTER the band and BEFORE the strip. The band that closed the
+ *   merge sat on `row 9` and `row 10` of the same page and blacked both out end to end. That
+ *   is what looking found the second time: the fix for a fabrication defect had introduced an
+ *   occlusion defect in the same pixels, and every automated check was green for it because
+ *   burying the page was what the band was FOR.
  *
  *   It was NOT fixable by moving anything: a bottom-centred caption over a page that is text
  *   to all four edges has nowhere to go, and the outline that guarantees legibility cannot
@@ -308,6 +325,8 @@ async function main() {
   console.log(`\n${written.length} frame(s) written to ${OUT_DIR}:`)
   for (const p of written) console.log(p)
   console.log('\nNow OPEN EVERY ONE and run the checklist in the header of this file.')
+  console.log('The frames are TALLER than the page: the rows below the rule are the caption')
+  console.log('strip, and everything above it must be exactly what the page showed.')
 }
 
 main().catch((err) => {

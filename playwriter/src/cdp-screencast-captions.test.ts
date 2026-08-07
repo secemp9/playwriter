@@ -19,10 +19,11 @@ import http from 'node:http'
 import {
   buildCues,
   buildEncodeArgs,
-  captionBackdropPaddingPx,
-  captionBackdropRect,
   captionBlockHeightPx,
+  captionStripMetrics,
+  captionStripPaddingPx,
   defaultOutlineWidth,
+  STRIP_RULE_HEIGHT_PX,
   encodeFrames,
   escapeAssText,
   escapeFilterPath,
@@ -44,7 +45,7 @@ import {
 } from './cdp-screencast.js'
 import type { CdpScreencastHandle } from './cdp-screencast.js'
 import type { recording as recordingDecl } from './debugger-examples-types.js'
-import { brightPixelsPerFrame, openVideo } from './video-probe.js'
+import { darkPixelsPerFrame, openVideo } from './video-probe.js'
 import { PlaywrightCDPSessionAdapter } from './cdp-session.js'
 import { getChromium } from './playwright-import.js'
 import type { Browser, BrowserContext } from '@xmorse/playwright-core'
@@ -76,23 +77,36 @@ async function solidJpeg(color: string, size = '320x240'): Promise<Buffer> {
 }
 
 /**
- * Count bright pixels in the bottom third of every decoded frame.
+ * Count caption ink per decoded frame, inside the caption STRIP.
  *
- * Now one line over `video-probe`'s `brightPixelsPerFrame`. This file and the input-overlay
- * suite each carried their own copy of this loop and the two had drifted — that one took a
- * region, this one hardcoded the bottom third — so a change to either proved nothing about
- * the other.
+ * IT USED TO COUNT BRIGHT PIXELS IN THE BOTTOM THIRD, and both halves of that had to change
+ * when the caption moved off the page. The caption is now black on a light strip appended
+ * BELOW the page, so:
  *
- * A `> 200` threshold on a gray conversion is "bright", not "ink": it is hue-dependent and
- * on a light page it matches the whole frame. Every plate in this file is solid black,
- * which is the only reason it answers the question being asked. Anything new should use the
- * clean-plate differential in `video-invariants.ts`, which does not care about the page.
+ *   - the region is the strip, derived from the encoded height against the page height this
+ *     caller knows it recorded. Anything computed as a fraction of the frame would drift
+ *     every time the strip's height changed;
+ *   - the ink is DARK, not bright. Counting bright pixels in the strip would measure the
+ *     strip's own constant area and be blind to whether a caption was drawn in it.
  *
- * The width and height are no longer parameters: they come from ffprobe, so a caller who
- * believes the wrong size gets an error rather than a sheared image.
+ * `pageHeight` is passed rather than inferred, which makes this self-checking: when nothing
+ * is burned there is no strip, the encoded height equals the page height, and the answer is
+ * all zeros — which is exactly the claim the `soft` and `sidecar` tests want to make. A
+ * frame SHORTER than the page would mean the encode did something nobody asked for, so it
+ * throws rather than returning a plausible number.
  */
-async function inkPerFrame(videoPath: string): Promise<number[]> {
-  return brightPixelsPerFrame(await openVideo(videoPath), { y0: 0.66 })
+async function inkPerFrame(videoPath: string, pageHeight: number): Promise<number[]> {
+  const v = await openVideo(videoPath)
+  const stripTop = Math.floor(pageHeight / 2) * 2 // `scale=trunc(ih/2)*2` runs before the pad
+  if (v.height < stripTop) {
+    throw new Error(`${videoPath} decoded to ${v.height} rows, which is shorter than the ${stripTop}-row page it recorded.`)
+  }
+  if (v.height === stripTop) return Array.from({ length: v.frameCount }, () => 0)
+  // Below the RULE, not merely below the page. The rule is `#707070` — luma 112, under the
+  // dark threshold — and it is drawn on every frame whether or not a cue is up, so leaving
+  // it in the region would put a constant few hundred "ink" pixels on frames that carry no
+  // caption at all and quietly defeat every "nothing before the cue" assertion below.
+  return darkPixelsPerFrame(v, { y0: (stripTop + STRIP_RULE_HEIGHT_PX) / v.height })
 }
 
 async function subtitleStreams(videoPath: string): Promise<Array<{ codec_name?: string }>> {
@@ -639,43 +653,88 @@ describe('the caption block, measured against libass rather than guessed', () =>
     expect(renderedCaptionLines('a\nb\nc', 1152, 36)).toBe(3)
   })
 
-  it('puts the backdrop band across the WHOLE frame, and around the whole drawn block', () => {
-    // 480x320 at the defaults: face 16, outline 1, shadow 1, marginV 19, pad 4.
-    const video = { width: 480, height: 320 }
-    expect(captionBackdropPaddingPx(16)).toBe(4)
-    const two = captionBackdropRect(video, 2, 16, 1, 1, 19)
-    // Full width, with no inset at all. This is the merge guarantee: on a row carrying
-    // caption ink there is no page pixel left for a page glyph to occupy.
-    expect([two.x0, two.x1]).toEqual([0, 480])
-    // MEASURED on this machine's libass: the drawn extent of that exact 2-line caption is
-    // rows 270..302. The band has to contain it with padding to spare on both sides.
-    expect(two.y0).toBeLessThan(270)
-    expect(two.y1).toBeGreaterThan(302)
-    expect(two.y1 - two.y0).toBe(captionBlockHeightPx(2, 16, 1, 1) + 2 * 4)
-    // A one-line cue gets a shorter band: the page is hidden for the rows the narration
-    // occupies now, not for the rows the longest cue in the clip would need.
-    const one = captionBackdropRect(video, 1, 16, 1, 1, 19)
-    expect(one.y1).toBe(two.y1)
-    expect(one.y0).toBe(two.y0 + 16)
+  it('appends the strip BELOW the page and leaves the page untouched', () => {
+    // 480x320 at the defaults: face 16, outline 1, shadow 1, pad 4, rule 2.
+    const page = { width: 480, height: 320 }
+    expect(captionStripPaddingPx(16)).toBe(4)
+    const two = captionStripMetrics(page, 2)
+    expect(two.fontSize).toBe(16)
+    expect(two.outline).toBe(1)
+    expect(two.pad).toBe(4)
+
+    // The page is the page. This is the whole point: nothing is drawn above `pageHeight`,
+    // so the page area of the frame is exactly the pixels the page showed.
+    expect(two.pageHeight).toBe(320)
+    expect(two.pageWidth).toBe(480)
+    // The frame is taller by exactly the strip, and the strip is the rule plus the drawn
+    // block plus a pad above and below — rounded UP to even, because yuv420p refuses an odd
+    // height and rounding DOWN would eat a row of the caption's own border. Here the raw sum
+    // is 2 + 35 + 8 = 45, so the strip is 46 and the spare row is blank strip above the block.
+    expect(2 + captionBlockHeightPx(2, 16, 1, 1) + 2 * 4).toBe(45)
+    expect(two.height).toBe(46)
+    expect(two.videoHeight).toBe(320 + two.height)
+    expect(two.videoWidth).toBe(480)
+    // `MarginV` measures to the INK box and the border overhangs by outline + shadow, so
+    // this is what lands the DRAWN bottom exactly `pad` above the frame's bottom edge.
+    expect(two.marginV).toBe(4 + 1 + 1)
+
+    // Sized to the tallest cue, so a one-line clip carries a shorter strip — one line of
+    // narration should not letterbox the video for three.
+    const one = captionStripMetrics(page, 1)
+    expect(two.height - one.height).toBe(16)
+    expect(one.marginV).toBe(two.marginV)
+
+    // No cue, no strip at all: the frame is the page and the encode is the one this
+    // recorder produced before captions existed.
+    const none = captionStripMetrics(page, 0)
+    expect(none.height).toBe(0)
+    expect(none.videoHeight).toBe(320)
   })
 
-  it('keeps the band inside the frame however the caption is styled', () => {
-    for (const height of [180, 320, 720, 844, 1440]) {
+  it('keeps every dimension even, because yuv420p refuses an odd one', () => {
+    for (const [w, h] of [[480, 320], [1280, 720], [390, 844], [641, 361], [321, 241]]) {
       for (const lines of [1, 2, 3]) {
-        const video = { width: 640, height }
-        const fontSize = Math.max(16, Math.round((height * 5) / 100))
-        const marginV = Math.max(4, Math.round((height * 6) / 100))
-        const r = captionBackdropRect(video, lines, fontSize, defaultOutlineWidth(fontSize), 1, marginV)
-        expect(r.y0, `${height}px, ${lines} lines`).toBeGreaterThanOrEqual(0)
-        expect(r.y1, `${height}px, ${lines} lines`).toBeLessThanOrEqual(height)
-        expect(r.y1).toBeGreaterThan(r.y0)
-        // The caption's ink bottom sits at height - marginV; the band must reach past it,
-        // because MarginV measures to the INK box and the border overhangs below.
-        expect(r.y1).toBeGreaterThan(height - marginV)
-        // …and past its ink top, which is `lines * fontSize` above that.
-        expect(r.y0).toBeLessThan(height - marginV - lines * fontSize)
+        const m = captionStripMetrics({ width: w, height: h }, lines)
+        const where = `${w}x${h}, ${lines} lines`
+        expect(m.height % 2, where).toBe(0)
+        expect(m.videoWidth % 2, where).toBe(0)
+        expect(m.videoHeight % 2, where).toBe(0)
+        // The page rounds DOWN, matching `scale=trunc(iw/2)*2` which the encoder applies
+        // before the pad — so PlayRes describes the surface libass really draws on.
+        expect(m.pageWidth, where).toBe(Math.floor(w / 2) * 2)
+        expect(m.pageHeight, where).toBe(Math.floor(h / 2) * 2)
       }
     }
+  })
+
+  it('leaves room for the whole drawn block however the caption is styled', () => {
+    for (const height of [180, 320, 720, 844, 1440]) {
+      for (const lines of [1, 2, 3]) {
+        const m = captionStripMetrics({ width: 640, height }, lines)
+        const where = `${height}px, ${lines} lines`
+        // Rule, then pad, then the drawn block, then pad — with the even-rounding slack
+        // landing above the block, never below it.
+        expect(m.height, where).toBeGreaterThanOrEqual(
+          m.ruleHeight + captionBlockHeightPx(lines, m.fontSize, m.outline, m.shadow) + 2 * m.pad,
+        )
+        // The block's drawn top stays below the rule, so the caption never touches the page.
+        const drawnTop = m.height - m.pad - captionBlockHeightPx(lines, m.fontSize, m.outline, m.shadow)
+        expect(drawnTop, where).toBeGreaterThanOrEqual(m.ruleHeight)
+        expect(m.outline, where).toBe(defaultOutlineWidth(m.fontSize))
+      }
+    }
+  })
+
+  it('takes the face from the PAGE, so the strip cannot feed its own input', () => {
+    // 5% of 320 is 16. If the face were read off the letterboxed frame it would come out of
+    // 320 + strip, the strip would grow, and the two would chase each other every time this
+    // was recomputed. Measured against the page it is a fixed point by construction.
+    const a = captionStripMetrics({ width: 480, height: 320 }, 2)
+    expect(a.fontSize).toBe(16)
+    const b = captionStripMetrics({ width: 480, height: a.videoHeight }, 2)
+    expect(b.fontSize).toBeGreaterThan(a.fontSize)
+    // …and re-measuring the page gives the same answer, however many times it is asked.
+    expect(captionStripMetrics({ width: 480, height: 320 }, 2)).toEqual(a)
   })
 
   it('holds the outline ratio inside the band where counters survive', () => {
@@ -701,14 +760,28 @@ describe('validateVisualOptions: the gap in an otherwise strict file', () => {
     expect(() => validateVisualOptions(video, { fontSizePct: 4, textColor: '#FFFF00', outlineColor: '#101010' })).not.toThrow()
   })
 
-  it('refuses a caption whose text and outline are the same colour', () => {
+  it('refuses caption text the colour of the strip it is drawn on', () => {
     // Encodes perfectly, renders an invisible caption, and reports wrote: true.
-    expect(() => validateVisualOptions(video, { textColor: '#FFFFFF', outlineColor: '#FFFFFF' })).toThrow(
-      /are the same colour, so the caption would be invisible/,
+    expect(() => validateVisualOptions(video, { textColor: '#E8E8E8' })).toThrow(
+      /textColor .* and stripColor .* are the same colour, so the caption would be invisible/,
     )
-    expect(() => validateVisualOptions(video, { textColor: '#FFFFFF', outlineColor: '#FEFEFE' })).toThrow(/same colour/)
-    // Far enough apart to be a deliberate low-contrast choice, which is not refused here.
-    expect(() => validateVisualOptions(video, { textColor: '#FFFFFF', outlineColor: '#CCCCCC' })).not.toThrow()
+    expect(() => validateVisualOptions(video, { textColor: '#FFFFFF', stripColor: '#FEFEFE' })).toThrow(/same colour/)
+    // Far enough apart to be a deliberate low-contrast choice, which is not refused here —
+    // the per-glyph contrast invariant in the visual suite is what judges legibility.
+    expect(() => validateVisualOptions(video, { textColor: '#FFFFFF', stripColor: '#CCCCCC' })).not.toThrow()
+    // The DEFAULT pairing must survive its own check: outlineColor follows stripColor, so a
+    // rule that refused text == outline would refuse black text with an invisible outline.
+    expect(() => validateVisualOptions(video)).not.toThrow()
+  })
+
+  it('still refuses a VISIBLE outline the colour of the text, which fills the glyphs in', () => {
+    expect(() => validateVisualOptions(video, { textColor: '#000000', outlineColor: '#000000' })).toThrow(
+      /outlineColor .* are the same colour/,
+    )
+    expect(() => validateVisualOptions(video, { textColor: '#000000', outlineColor: '#0A0A0A' })).toThrow(/same colour/)
+    // …but an outline that IS the strip colour is the default and draws nothing at all, so
+    // it is not a collision however close it sits to nothing.
+    expect(() => validateVisualOptions(video, { textColor: '#000000', outlineColor: '#E8E8E8' })).not.toThrow()
   })
 
   it('refuses a chip whose text and box are the same colour, unless the box is transparent', () => {
@@ -736,15 +809,21 @@ describe('validateVisualOptions: the gap in an otherwise strict file', () => {
     expect(() => validateVisualOptions(video, { fontName: 'A,B' })).toThrow(/silently substitutes/)
   })
 
-  it('refuses a caption that cannot fit in the frame it is drawn on', () => {
-    // maxLines and marginBottomPct are each reasonable and jointly impossible.
-    expect(() => validateVisualOptions({ width: 640, height: 200 }, { fontSizePct: 30, maxLines: 3, marginBottomPct: 20 })).toThrow(
-      /would be drawn off the top of the video/,
+  it('refuses a strip that would dominate the page it is appended to', () => {
+    // Nothing here can be CLIPPED any more — the frame grows to hold the caption — so what
+    // is refused is a clip that is mostly subtitle. 3 lines of a 30% face on a 200px page is
+    // a strip taller than the page.
+    expect(() => validateVisualOptions({ width: 640, height: 200 }, { fontSizePct: 30, maxLines: 3 })).toThrow(
+      /more than half the video would be subtitle rather than page/,
     )
+    // …and the defaults are nowhere near it, at any frame size.
+    for (const height of [180, 320, 720, 844, 1440]) {
+      expect(() => validateVisualOptions({ width: 640, height })).not.toThrow()
+    }
   })
 
   it('is enforced by formatAss, not merely exported', () => {
-    expect(() => formatAss([], video, { textColor: '#FFFFFF', outlineColor: '#FFFFFF' })).toThrow(/same colour/)
+    expect(() => formatAss([], video, { textColor: '#E8E8E8' })).toThrow(/same colour/)
   })
 })
 
@@ -883,7 +962,7 @@ describe('real encodes', () => {
     expect(built.cues[0].startMs).toBe(1000)
     expect(built.cues[0].endMs).toBe(2000)
 
-    const ink = await inkPerFrame(outputPath)
+    const ink = await inkPerFrame(outputPath, H)
     const lit = ink.map((v) => v > 0)
     const firstLit = lit.indexOf(true)
     const lastLit = lit.lastIndexOf(true)
@@ -902,7 +981,7 @@ describe('real encodes', () => {
   it('burn: leaves NO soft subtitle stream in the mp4', async () => {
     const { outputPath } = await encodeWith('burn-only.mp4', [stamp('burned', 500)])
     expect(await subtitleStreams(outputPath)).toEqual([])
-    expect((await inkPerFrame(outputPath)).some((v) => v > 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).some((v) => v > 0)).toBe(true)
   })
 
   it('soft: muxes a mov_text track and burns nothing into the pixels', async () => {
@@ -910,7 +989,7 @@ describe('real encodes', () => {
       captionOptions: { render: 'soft' },
     })
     expect((await subtitleStreams(outputPath)).map((s) => s.codec_name)).toEqual(['mov_text'])
-    expect((await inkPerFrame(outputPath)).every((v) => v === 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).every((v) => v === 0)).toBe(true)
   })
 
   it('sidecar: writes an .srt whose timings match the cues, and leaves the mp4 alone', async () => {
@@ -922,7 +1001,7 @@ describe('real encodes', () => {
       { firstOffsetMs: 500, durationMs: 4500, captionOptions: { render: 'sidecar' } },
     )
     expect(await subtitleStreams(outputPath)).toEqual([])
-    expect((await inkPerFrame(outputPath)).every((v) => v === 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).every((v) => v === 0)).toBe(true)
 
     expect(encoded.files).toEqual([path.join(tmpRoot, 'sidecar.srt')])
     const parsed = parseSrt(fs.readFileSync(encoded.files[0], 'utf8'))
@@ -940,7 +1019,7 @@ describe('real encodes', () => {
     expect(encoded.render).toEqual(['burn', 'sidecar'])
     expect(encoded.files.map((f) => path.extname(f))).toEqual(['.srt', '.vtt'])
     expect(fs.readFileSync(encoded.files[1], 'utf8').startsWith('WEBVTT')).toBe(true)
-    expect((await inkPerFrame(outputPath)).some((v) => v > 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).some((v) => v > 0)).toBe(true)
     expect(await subtitleStreams(outputPath)).toEqual([])
   })
 
@@ -960,7 +1039,7 @@ describe('real encodes', () => {
     })
     expect(fs.statSync(outputPath).size).toBeGreaterThan(0)
     expect(encoded.files[0]).toBe(path.join(dir, "clip: v1, o'brien [final].srt"))
-    expect((await inkPerFrame(outputPath)).some((v) => v > 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).some((v) => v > 0)).toBe(true)
   })
 
   it('burns from a hostile TEMP path, where the filtergraph actually has to escape', async () => {
@@ -971,7 +1050,7 @@ describe('real encodes', () => {
     process.env.TMPDIR = hostileTmp
     try {
       const { outputPath } = await encodeWith('hostile-tmp.mp4', [stamp('escaped', 500)])
-      expect((await inkPerFrame(outputPath)).some((v) => v > 0)).toBe(true)
+      expect((await inkPerFrame(outputPath, H)).some((v) => v > 0)).toBe(true)
     } finally {
       if (originalTmp === undefined) delete process.env.TMPDIR
       else process.env.TMPDIR = originalTmp
@@ -993,7 +1072,7 @@ describe('real encodes', () => {
 
     expect(fs.statSync(outputPath).size).toBeGreaterThan(0)
     expect((await subtitleStreams(outputPath)).map((s) => s.codec_name)).toEqual(['mov_text'])
-    expect((await inkPerFrame(outputPath)).some((v) => v > 0)).toBe(true)
+    expect((await inkPerFrame(outputPath, H)).some((v) => v > 0)).toBe(true)
 
     const srt = fs.readFileSync(encoded.files[0], 'utf8')
     expect(() => parseSrt(srt)).not.toThrow()
@@ -1009,16 +1088,16 @@ describe('real encodes', () => {
     const escaped = await encodeWith('brace-escaped.mp4', [stamp('A{XXXXXXXX}B', 500)], { captionOptions: style })
     const plain = await encodeWith('brace-absent.mp4', [stamp('AB', 500)], { captionOptions: style })
     const ink = (v: number[]) => Math.max(...v)
-    expect(ink(await inkPerFrame(escaped.outputPath))).toBeGreaterThan(
-      ink(await inkPerFrame(plain.outputPath)) * 1.5,
+    expect(ink(await inkPerFrame(escaped.outputPath, H))).toBeGreaterThan(
+      ink(await inkPerFrame(plain.outputPath, H)) * 1.5,
     )
   })
 
   it('styling options actually change the pixels', async () => {
     const small = await encodeWith('small.mp4', [stamp('SIZE', 500)], { captionOptions: { fontSizePct: 4 } })
     const large = await encodeWith('large.mp4', [stamp('SIZE', 500)], { captionOptions: { fontSizePct: 12 } })
-    expect(Math.max(...(await inkPerFrame(large.outputPath)))).toBeGreaterThan(
-      Math.max(...(await inkPerFrame(small.outputPath))) * 2,
+    expect(Math.max(...(await inkPerFrame(large.outputPath, H)))).toBeGreaterThan(
+      Math.max(...(await inkPerFrame(small.outputPath, H))) * 2,
     )
   })
 })
@@ -1097,7 +1176,7 @@ describe('recording.caption end to end', () => {
 
     // The burned text is really in the pixels: the first caption's window is lit and
     // the run-up to it is not.
-    const ink = await inkPerFrame(outputPath)
+    const ink = await inkPerFrame(outputPath, 300)
     const startFrame = Math.round(result.captions![0].startMs / 100)
     expect(ink.slice(Math.max(0, startFrame - 3), startFrame).every((v) => v === 0)).toBe(true)
     expect(ink.slice(startFrame + 1, startFrame + 4).some((v) => v > 0)).toBe(true)

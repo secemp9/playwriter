@@ -25,7 +25,7 @@ import {
   buildCues,
   buildEncodeArgs,
   buildInputChips,
-  captionBackdropRect,
+  captionStripMetrics,
   chipStripMetrics,
   defaultOutlineWidth,
   encodeFrames,
@@ -629,38 +629,37 @@ describe('formatAss: captions and chips share one subtitle file', () => {
 
   it('adds styles and layers, not a second filter', () => {
     const ass = formatAss(cues, video, {}, { segments: chips.segments }).text
-    expect(ass.match(/^Style: /gm)).toHaveLength(3)
-    expect(ass).toContain('Style: Backdrop,')
+    expect(ass.match(/^Style: /gm)).toHaveLength(2)
     expect(ass).toContain('Style: Default,')
     expect(ass).toContain('Style: Input,')
-    // The band under the captions on layer -1, captions on 0, chips on 1: a cue that grows
-    // cannot hide a chip, and the band can never cover the words it exists to carry.
-    expect(ass).toMatch(/^Dialogue: -1,.*,Backdrop,/m)
+    // Captions on layer 0, chips on 1. There is no longer a layer -1: the band that used to
+    // sit under the captions is gone, replaced by a strip the ENCODER pads on.
+    expect(ass).not.toMatch(/^Dialogue: -1,/m)
+    expect(ass).not.toContain('Style: Backdrop,')
     expect(ass).toMatch(/^Dialogue: 0,.*,Default,/m)
     expect(ass).toMatch(/^Dialogue: 1,.*,Input,/m)
   })
 
-  it('draws the band across the WHOLE frame width, which is the whole merge guarantee', () => {
-    const ass = formatAss(cues, video, {}, { segments: chips.segments }).text
-    const drawing = /^Dialogue: -1,[^,]*,[^,]*,Backdrop,,0,0,0,,(.*)$/m.exec(ass)![1]
-    // `\an7\pos(0,0)` makes the path coordinates absolute frame pixels; the rectangle then
-    // runs x = 0 .. video.width. An inset of even a pixel leaves page on the caption's own
-    // scanlines, and 3px of gap is MEASURED not to stop two glyphs reading as one word.
-    const m = /\{\\an7\\pos\(0,0\)\\p1\}m (\d+) (\d+) l (\d+) \2 \3 (\d+) \1 \4\{\\p0\}/.exec(drawing)
-    expect(m, `unparseable backdrop drawing: ${drawing}`).not.toBeNull()
-    expect(Number(m![1])).toBe(0)
-    expect(Number(m![3])).toBe(video.width)
-    // And it is inside the frame vertically, below the top edge and no lower than the bottom.
-    expect(Number(m![2])).toBeGreaterThan(0)
-    expect(Number(m![4])).toBeLessThanOrEqual(video.height)
+  it('declares PlayRes as the LETTERBOXED frame, not as the page', () => {
+    const built = formatAss(cues, video, {}, { segments: chips.segments })
+    const strip = captionStripMetrics(video, 1)
+    expect(built.strip.height).toBe(strip.height)
+    expect(built.strip.height).toBeGreaterThan(0)
+    // PlayRes has to describe the surface libass draws on. Declaring the PAGE height would
+    // make `ScaledBorderAndShadow: yes` rescale every margin and face by frame/PlayRes.
+    expect(built.text).toContain(`PlayResX: ${video.width}`)
+    expect(built.text).toContain(`PlayResY: ${video.height + strip.height}`)
+    // The caption's MarginV is measured against the FRAME's bottom, which is the strip's
+    // bottom: this is the number that keeps the block inside the strip.
+    const marginV = Number(/^Style: Default,(.*)$/m.exec(built.text)![1].split(',')[20])
+    expect(marginV).toBe(strip.marginV)
+    expect(marginV).toBeLessThan(strip.height)
   })
 
-  it('omits the band, and its style, when the caller turns it off', () => {
-    const off = formatAss(cues, video, { backdrop: false }, { segments: chips.segments }).text
-    expect(off).not.toContain('Style: Backdrop,')
-    expect(off).not.toMatch(/^Dialogue: -1,/m)
-    // And when there is no cue to sit behind, there is nothing to draw either.
-    expect(formatAss([], video, {}, { segments: chips.segments }).text).not.toContain('Style: Backdrop,')
+  it('appends no strip at all when nothing is burned, so the frame is the page', () => {
+    const none = formatAss([], video, {}, { segments: chips.segments })
+    expect(none.strip.height).toBe(0)
+    expect(none.text).toContain(`PlayResY: ${video.height}`)
   })
 
   it('defaults to the bottom-right corner, in a row', () => {
@@ -674,42 +673,60 @@ describe('formatAss: captions and chips share one subtitle file', () => {
     expect(dialogue).not.toContain('\\N')
   })
 
-  it('lifts a bottom-anchored strip clear of the caption block, and only then', () => {
+  /**
+   * The caption-lift reserve is gone and this is what replaced it.
+   *
+   * It used to add the caption block's measured height plus a gap to the chip MarginV, so
+   * the chips could not be drawn on top of the narration; it needed the caption's font size,
+   * its bottom margin, its backdrop padding and the line count libass would really wrap to,
+   * and it needed a clamp for when the sum pushed the chips off the top. All of that existed
+   * because both layers competed for the bottom of the same page. They no longer do — so the
+   * offset is exactly `strip.height`, which is a constant known exactly.
+   */
+  it('offsets a bottom-anchored strip by the caption strip, so the chips stay on the PAGE', () => {
     const marginVOf = (assText: string) => Number(/^Style: Input,(.*)$/m.exec(assText)![1].split(',')[20])
+    const chipMargin = chipStripMetrics(video).margin
     const noCaption = marginVOf(formatAss([], video, {}, { segments: chips.segments }).text)
     const oneLine = marginVOf(formatAss(cues, video, {}, { segments: chips.segments }).text)
-    const threeLine = marginVOf(
-      formatAss(
-        [{ index: 1, text: 'a\nb\nc', startMs: 0, endMs: 1000, atMs: 0 }],
-        video,
-        {},
-        { segments: chips.segments },
-      ).text,
-    )
-    // No caption, no reserve: the strip hugs the corner.
-    expect(noCaption).toBeLessThan(oneLine)
-    // And the reserve tracks the caption's ACTUAL line count, not its maximum.
+    const threeLineCue = [{ index: 1, text: 'a\nb\nc', startMs: 0, endMs: 1000, atMs: 0 }]
+    const threeLine = marginVOf(formatAss(threeLineCue, video, {}, { segments: chips.segments }).text)
+
+    // No caption, no strip, no offset: the chips hug the frame's own bottom edge.
+    expect(noCaption).toBe(chipMargin)
+    // With one, the offset is the strip height and nothing else — so the chip ink sits
+    // `chipMargin` above the PAGE's bottom edge, exactly where it sat with no caption at all.
+    expect(oneLine).toBe(chipMargin + captionStripMetrics(video, 1).height)
+    expect(threeLine).toBe(chipMargin + captionStripMetrics(video, 3).height)
+    // …and a taller strip moves them further, because the frame grew underneath them.
     expect(oneLine).toBeLessThan(threeLine)
+    // Nothing is clamped and nothing is reported: the sum cannot exceed the frame.
+    expect(formatAss(threeLineCue, video, {}, { segments: chips.segments }).inputNote).toBeUndefined()
   })
 
-  it('does not lift a TOP-anchored strip: there is nothing there to clear', () => {
+  it('does not offset a TOP-anchored strip: the strip is at the bottom', () => {
     const marginVOf = (assText: string) => Number(/^Style: Input,(.*)$/m.exec(assText)![1].split(',')[20])
     const top = marginVOf(formatAss(cues, video, {}, { segments: chips.segments, options: { position: 'top-right' } }).text)
     const bottom = marginVOf(formatAss(cues, video, {}, { segments: chips.segments, options: { position: 'bottom-right' } }).text)
+    expect(top).toBe(chipStripMetrics(video).margin)
     expect(top).toBeLessThan(bottom)
   })
 
-  it('clamps rather than pushing the chips off the top, and says so', () => {
-    const huge: CaptionOptions = { fontSizePct: 22, marginBottomPct: 20 }
-    const built = formatAss(
-      [{ index: 1, text: 'a\nb\nc', startMs: 0, endMs: 1000, atMs: 0 }],
-      video,
-      huge,
-      { segments: chips.segments },
+  it('refuses a caption whose strip would be taller than the page it is appended to', () => {
+    // The clamp that used to live here is gone with the reserve. What replaced it is a
+    // refusal further upstream: there is nothing to push the chips off the top of, but a
+    // clip that is mostly subtitle is still not what anyone meant.
+    //
+    // MEASURED on this 480x320 frame, sweeping fontSizePct against the 3-line `maxLines`
+    // default: 25% gives a 294px strip under a 320px page and is allowed, 28% gives 330px
+    // and is refused. The boundary is parity, so both sides of it are pinned here rather
+    // than one — a limit only ever tested from the failing side can be off by any margin.
+    const threeLines = [{ index: 1, text: 'a\nb\nc', startMs: 0, endMs: 1000, atMs: 0 }]
+    expect(() => formatAss(threeLines, video, { fontSizePct: 25 }, { segments: chips.segments })).not.toThrow()
+    expect(captionStripMetrics(video, 3, { fontSizePct: 25 }).height).toBe(294)
+    expect(() => formatAss(threeLines, video, { fontSizePct: 28 }, { segments: chips.segments })).toThrow(
+      /more than half the video would be subtitle rather than page/,
     )
-    const marginV = Number(/^Style: Input,(.*)$/m.exec(built.text)![1].split(',')[20])
-    expect(marginV).toBe(Math.round(video.height * 0.55))
-    expect(built.inputNote).toMatch(/clamped to \d+px above the bottom edge/)
+    expect(captionStripMetrics(video, 3, { fontSizePct: 28 }).height).toBe(330)
   })
 
   it('renders a stack as one line per chip when asked, each on its own merge plate', () => {
@@ -900,11 +917,10 @@ describe('the overlay is really in the pixels', () => {
         undefined,
         chips.segments.length ? { segments: chips.segments, options: opts.options } : undefined,
       )
-      const variant = async (label: string, which: 'none' | 'backdrop' | 'caption' | 'chips') => {
+      const variant = async (label: string, which: 'none' | 'caption' | 'chips') => {
         const text = ass.text
           .split('\n')
           .filter((l) => {
-            if (l.startsWith('Dialogue: -1,')) return which === 'backdrop'
             if (l.startsWith('Dialogue: 0,')) return which === 'caption'
             if (l.startsWith('Dialogue: 1,')) return which === 'chips'
             return true
@@ -924,25 +940,25 @@ describe('the overlay is really in the pixels', () => {
         const assPath = path.join(dir, 'a.ass')
         fs.writeFileSync(assPath, text, 'utf8')
         const out = path.join(dir, 'v.mp4')
-        const r = await run('ffmpeg', ['-v', 'error', ...buildEncodeArgs({ listFile, outputPath: out, fps: 10, burnAssPath: assPath })])
+        // The SAME strip for every variant, so all three clips are the same shape and the
+        // differential is the layer and nothing else.
+        const r = await run('ffmpeg', [
+          '-v', 'error',
+          ...buildEncodeArgs({ listFile, outputPath: out, fps: 10, burnAssPath: assPath, strip: ass.strip }),
+        ])
         if (r.code !== 0) throw new Error(r.stderr)
         return openVideo(out)
       }
       const plate = await variant('plate', 'none')
-      const backdropOnly = await variant('backdrop', 'backdrop')
       const captionOnly = await variant('caption', 'caption')
       const chipsOnly = await variant('chips', 'chips')
-      // `caption` is the GLYPHS, `backdrop` the full-width band they sit on. Kept apart
-      // because the two answer different questions: how big the lettering is, and how much
-      // of the frame the caption layer as a whole occupies.
       const at = (frameIndex: number) => ({
         caption: overlayMask(captionOnly, plate, frameIndex),
-        backdrop: overlayMask(backdropOnly, plate, frameIndex),
         chips: overlayMask(chipsOnly, plate, frameIndex),
         width: plate.width,
         height: plate.height,
       })
-      return { at }
+      return { at, strip: ass.strip }
     }
 
     return { outputPath, chips, cues, layers }
@@ -994,7 +1010,7 @@ describe('the overlay is really in the pixels', () => {
     // The two layers must not share a single PIXEL — asked in two dimensions, of the two
     // masks, rather than inferred from which column each row happened to start in.
     const layers = await built.layers()
-    const { caption, backdrop, chips, width, height } = layers.at(15)
+    const { caption, chips, width, height } = layers.at(15)
     expect(maskBBox(caption, width, height)).not.toBeNull()
     expect(maskBBox(chips, width, height)).not.toBeNull()
     let shared = 0
@@ -1003,41 +1019,58 @@ describe('the overlay is really in the pixels', () => {
     // And the strip is strictly above the caption, which is the layout that was intended.
     expect(maskBBox(chips, width, height)!.y1).toBeLessThan(maskBBox(caption, width, height)!.y0)
 
-    // The BAND is what the chips really have to clear — it rises above the letters — and it
-    // cannot be measured here: every plate in this describe block is solid black and so is
-    // the band, so the differential is empty by construction rather than by absence. (The
-    // visual suite measures it for real, over a mid-grey flat plate.) So the geometry is
-    // asserted from the same function that drew it, against the mask that CAN be seen.
-    expect(maskBBox(backdrop, width, height), 'a black band on a black page leaves no differential').toBeNull()
-    const fontSize = Math.max(16, Math.round((H * 5) / 100))
-    const band = captionBackdropRect(
-      { width: W, height: H },
-      renderedCaptionLines(long.text, W - 2 * Math.max(8, Math.round(W * 0.05)), fontSize),
-      fontSize,
-      defaultOutlineWidth(fontSize),
-      1,
-      Math.max(4, Math.round((H * 6) / 100)),
+    /**
+     * THE STRONGER STATEMENT, which is what replaced the band arithmetic that used to be
+     * here: the two are in disjoint REGIONS of the frame. The caption is entirely inside the
+     * strip and the chips are entirely on the page, so they cannot reach each other whatever
+     * the caption says or how it wraps.
+     *
+     * A three-line cue is the worst case the default styling can produce — `maxLines` is 3 —
+     * so this is not a sample, it is the bound.
+     */
+    const strip = layers.strip
+    expect(strip.lines, 'a three-line cue must produce a three-line strip').toBe(
+      renderedCaptionLines(long.text, W - 2 * Math.max(8, Math.round(W * 0.05)), strip.fontSize),
     )
-    expect([band.x0, band.x1], 'the band runs edge to edge; that is the whole merge guarantee').toEqual([0, W])
-    expect(maskBBox(chips, width, height)!.y1, 'the chip strip must clear the band, not just the letters').toBeLessThan(band.y0)
-    // …and it clears it by a visible margin rather than by a pixel.
-    expect(band.y0 - maskBBox(chips, width, height)!.y1).toBeGreaterThanOrEqual(4)
+    expect(height).toBe(strip.videoHeight)
+    expect(maskBBox(caption, width, height)!.y0, 'no caption ink above the strip').toBeGreaterThanOrEqual(strip.pageHeight)
+    expect(maskBBox(chips, width, height)!.y1, 'no chip ink below the page').toBeLessThan(strip.pageHeight)
 
     const png = await extractFrame(built.outputPath, 1.5, path.join(tmpRoot, 'no-overlap.png'))
     expect(fs.statSync(png).size).toBeGreaterThan(0)
   })
 
-  it('hugs the bottom edge when there is no caption to clear', async () => {
+  it('sits in the SAME place on the page whether or not there is a caption', async () => {
+    /**
+     * This used to assert the opposite — that a caption pushed the chips UP — because the
+     * caption was drawn on the page and the chips had to be reserved clear of it. There is
+     * nothing to clear now, so the correct property is that the caption changes nothing
+     * about where the chips land on the page. The frame is taller, the chip MarginV is
+     * larger by exactly that much, and the two cancel.
+     *
+     * It is a real check and not a tautology: getting the offset wrong in either direction
+     * moves the chips, and moving them is the whole failure this replaces.
+     */
     const withCaption = await encodeWith('lift-yes.mp4', [inputStamp('Click', 1000)], {
       captions: [captionStamp('narration', 1000)],
     })
     const without = await encodeWith('lift-no.mp4', [inputStamp('Click', 1000)])
-    const lowestChip = async (b: Awaited<ReturnType<typeof encodeWith>>) => {
+    const chipBox = async (b: Awaited<ReturnType<typeof encodeWith>>) => {
       const l = (await b.layers()).at(15)
-      return maskBBox(l.chips, l.width, l.height)!.y1
+      return { box: maskBBox(l.chips, l.width, l.height)!, height: l.height, strip: (await b.layers()).strip }
     }
-    // Without a caption the strip sits lower — the reserve is paid only when it is owed.
-    expect(await lowestChip(without)).toBeGreaterThan(await lowestChip(withCaption))
+    const a = await chipBox(withCaption)
+    const b = await chipBox(without)
+
+    // The captioned clip really is letterboxed and the other really is not.
+    expect(a.strip.height).toBeGreaterThan(0)
+    expect(b.strip.height).toBe(0)
+    expect(a.height).toBe(b.height + a.strip.height)
+
+    // …and the chips are in the same rows of the PAGE in both.
+    expect(a.box.y0).toBe(b.box.y0)
+    expect(a.box.y1).toBe(b.box.y1)
+    expect(a.box.y1, 'the chips are on the page, not in the strip').toBeLessThan(a.strip.pageHeight)
   })
 
   it('is visually subordinate: the chip carries far less ink than the caption', async () => {

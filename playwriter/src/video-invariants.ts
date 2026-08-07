@@ -40,22 +40,33 @@
  *
  * What changed is that reading the composite is no longer the only way in. A merged token
  * needs two glyph runs SIDE BY SIDE ON SHARED SCANLINES; that is the whole mechanism, and
- * it is a statement about geometry, not about words. `captionOptions.backdrop` puts a
- * full-frame-width opaque band behind every cue, so on the caption's rows there is no page
- * pixel left to be beside — and `mergeShieldFindings` below asserts precisely that, on
- * pixels, from the same clean-plate differential everything else here uses. It goes red the
- * instant the band stops spanning the frame, which is the only way the property can be
- * lost.
+ * it is a statement about geometry, not about words. The caption is drawn in a strip
+ * APPENDED BELOW the page rather than composited over it, so caption ink and page pixels
+ * occupy disjoint regions and share no scanline at all — and `mergeShieldFindings` below
+ * asserts precisely that, on pixels, from the same clean-plate differential everything else
+ * here uses.
  *
- * THE CHIPS ARE COVERED TOO NOW, BY A DIFFERENT AND WEAKER RULE. They cannot use the
- * caption's, because a full-width bar behind a corner HUD would be a worse artifact than the
- * defect it prevents. `chipMergeShieldFindings` asserts instead that the plate is opaque
- * (nothing under it survives), that it runs to the frame edge it is anchored to (nothing
- * beside it on that side exists), and that it extends a MEASURED clear distance inboard.
- * The first two are proofs; the third is a number, and the number has a page-face ceiling
- * above which it stops being one — stated at `chipStripMetrics` and not glossed over,
- * because on a row carrying chip ink either the whole row is overlay or some page pixel is
- * on it, and there is no third option short of the bar.
+ * THAT RULE REPLACED A WEAKER ONE, and the difference is worth recording because the weaker
+ * one was also true. It was "every scanline carrying caption ink is opaque overlay from one
+ * edge of the frame to the other", made true by painting a full-frame-width band behind each
+ * cue. It closed the merge — and it closed it by destroying the page underneath: two full
+ * rows of `dense-12px` blacked out at the bottom of the frame, which is where status text,
+ * totals and error messages live. A video made to show a bug was covering the part of the
+ * page most likely to be carrying it. Occlusion is not a cheaper failure than merging; it is
+ * the same failure arriving as absence rather than as fabrication. Appending the strip keeps
+ * the guarantee, drops the cost to canvas, and makes the invariant a single comparison per
+ * ink pixel instead of a per-row mask sweep.
+ *
+ * THE CHIPS ARE COVERED TOO, BY A DIFFERENT AND WEAKER RULE. They cannot use the caption's,
+ * because they deliberately stay ON the page — a keystroke HUD that is not on the picture is
+ * not a keystroke HUD, and the argument is set out in full at `chipStripMetrics`.
+ * `chipMergeShieldFindings` asserts instead that the plate is opaque (nothing under it
+ * survives), that it runs to the frame edge it is anchored to (nothing beside it on that
+ * side exists), and that it extends a MEASURED clear distance inboard. The first two are
+ * proofs; the third is a number, and the number has a page-face ceiling above which it stops
+ * being one — stated at `chipStripMetrics` and not glossed over, because on a row carrying
+ * chip ink either the whole row is overlay or some page pixel is on it, and there is no
+ * third option short of leaving the page.
  *
  * SO LOOKING IS STILL A STEP, and it is a real step rather than an aspiration:
  *
@@ -149,9 +160,10 @@ export async function disjointFindings(
       frame: f,
       message:
         `${shared.length} pixel(s) carry BOTH the caption and a chip, inside ` +
-        `x ${box!.x0}..${box!.x1}, y ${box!.y0}..${box!.y1}. The chip strip is lifted clear of the caption by ` +
-        'reserving the caption block height in formatAss; a collision means that reserve is short — most often ' +
-        'because the caption wrapped to more RENDERED lines than its source text has (see renderedCaptionLines).',
+        `x ${box!.x0}..${box!.x1}, y ${box!.y0}..${box!.y1}. These two live in different regions of the frame now — ` +
+        'the caption in the appended strip, the chips on the page — so a collision means the chip strip was not ' +
+        'offset by the strip height: check that formatAss still adds strip.height to a bottom-anchored Input ' +
+        'MarginV, which is measured from the FRAME bottom and therefore from the bottom of the strip.',
       pngPath: png,
     })
     break
@@ -160,81 +172,85 @@ export async function disjointFindings(
 }
 
 /**
- * No page pixel shares a scanline with caption ink — the merge class, as geometry.
+ * No caption ink falls inside the page region — the merge class, as geometry.
  *
- * THIS IS THE ONE THE "Clickkout" CLASS WAS SUPPOSED TO BE UNCHECKABLE. It is checkable
+ * THIS IS THE ONE THE "Clickkout" CLASS WAS SUPPOSED TO MAKE UNCHECKABLE. It is checkable
  * because the mechanism is not linguistic. A composite reads as a word that is in neither
  * layer only when two glyph runs sit SIDE BY SIDE on the rows they share: `charge` ending
  * at x=362 and the page's `s` beginning at x=363 on the same baseline is `charges`. Two
- * glyphs on different rows are two words however close they are, and two glyphs on the same
- * rows with the whole frame width of opaque band between them are not adjacent at all.
+ * glyphs on different rows are two words however close they are.
  *
- * So the property is: **every scanline that carries caption ink is covered by the caption
- * layer across the entire width of the frame.** Under it, a page pixel horizontally
- * adjacent to a caption glyph does not exist — not "is unlikely", does not exist — and no
- * merge can be manufactured no matter what the page says. `captionOptions.backdrop` is what
- * makes it true; this is what makes it CHECKED.
+ * So the property is: **no caption ink exists at any y < pageHeight.** The caption is drawn
+ * in a strip appended below the page, so the two occupy disjoint REGIONS; a caption glyph
+ * and a page glyph therefore share no scanline, and a page pixel horizontally adjacent to a
+ * caption glyph does not exist — not "is unlikely", does not exist.
  *
- * Both masks come from the flat-plate differential, not from the real scene, for the same
- * reason the geometric invariants do: libass positions everything from the ASS and PlayRes
+ * IT REPLACES A WEAKER RULE AND IS EASIER TO PROVE. The previous formulation was "every
+ * scanline that carries caption ink is covered by the caption layer across the entire width
+ * of the frame", which was true, and was bought by painting an opaque full-width band over
+ * the page — destroying two rows of page content on `dense-12px` for as long as a cue was
+ * up. That rule needed a per-row sweep of a mask union and a band whose rectangle had to be
+ * verified to start at x=0 and end at x=width. This one needs a single comparison per ink
+ * pixel and no band at all. It is also strictly stronger: the old rule permitted page pixels
+ * on a caption row as long as something opaque of ours covered them, so it was satisfied by
+ * occlusion; this one permits no page pixel on a caption row because there are no page rows
+ * among them.
+ *
+ * `ink` comes from the flat-plate differential, not from the real scene, for the same reason
+ * the other geometric invariants do: libass positions everything from the ASS and PlayRes
  * alone, so the flat render gives the layout exactly, with no page content to be mistaken
- * for overlay. `ink` is the caption's glyph layer; `layer` is that plus the band.
+ * for overlay.
  *
  * The CHIP strip is held to a different rule, for a reason rather than out of laziness: it
- * cannot span the frame, so "no page pixel on the row" is not available to it. See
- * `chipMergeShieldFindings`.
+ * stays ON the page deliberately (see `chipStripMetrics`), so "not in the page region" is
+ * not available to it. See `chipMergeShieldFindings`.
  */
 export async function mergeShieldFindings(
   ink: Uint8Array[],
-  layer: Uint8Array[],
   composite: DecodedVideo,
   dumpDir: string,
+  /** Rows `0 .. pageHeight-1` are the page. Everything below is the caption strip. */
+  pageHeight: number,
 ): Promise<Finding[]> {
   const { width, height } = composite
-  const n = Math.min(ink.length, layer.length)
-  for (let f = 0; f < n; f++) {
-    const exposed = new Uint8Array(width * height)
-    let exposedCount = 0
-    let firstRow = -1
-    for (let y = 0; y < height; y++) {
-      let inked = false
-      for (let x = 0; x < width; x++) {
-        if (ink[f][y * width + x]) {
-          inked = true
-          break
-        }
-      }
-      if (!inked) continue
+  if (!(pageHeight >= 0) || pageHeight > height) {
+    throw new Error(
+      `mergeShieldFindings needs a page region inside the frame; got pageHeight ${pageHeight} for a ` +
+        `${width}x${height} composite. Pass the strip height from formatAss/encodeFrames rather than a guess — ` +
+        'a wrong boundary makes this invariant pass by looking at the wrong rows.',
+    )
+  }
+  for (let f = 0; f < ink.length; f++) {
+    const trespass = new Uint8Array(width * height)
+    let count = 0
+    for (let y = 0; y < pageHeight; y++) {
       for (let x = 0; x < width; x++) {
         const p = y * width + x
-        if (layer[f][p]) continue
-        exposed[p] = 1
-        exposedCount++
-        if (firstRow < 0) firstRow = y
+        if (!ink[f][p]) continue
+        trespass[p] = 1
+        count++
       }
     }
-    if (exposedCount === 0) continue
-    const box = maskBBox(exposed, width, height)!
+    if (count === 0) continue
+    const box = maskBBox(trespass, width, height)!
     const png = await writeMaskOverlayPng(
       composite,
       f,
-      [
-        { mask: layer[f], color: [0, 96, 255] },
-        { mask: exposed, color: [255, 0, 0] },
-      ],
+      [{ mask: trespass, color: [255, 0, 0] }],
       path.join(dumpDir, `merge-shield-frame-${f}.png`),
     )
     return [{
-      invariant: 'no page pixel shares a scanline with caption ink',
+      invariant: 'no caption ink falls inside the page region',
       frame: f,
       message:
-        `${exposedCount} pixel(s) of the page are still visible on rows that carry caption ink — first at row ` +
-        `${firstRow}, across x ${box.x0}..${box.x1}, y ${box.y0}..${box.y1} (red). A page glyph there sits on the ` +
-        'same baseline as a caption glyph with nothing between them, which is how `charge` plus a surviving `s` ' +
-        'became `charges`: a word in NEITHER layer, with both layers individually perfect. The fix is not to move ' +
-        'the caption — on a page that is text to all four edges there is nowhere to move it — it is for ' +
-        'captionOptions.backdrop to span the FULL frame width behind every cue. Check that it is on, and that ' +
-        'captionBackdropRect still returns x0 = 0 and x1 = the frame width.',
+        `${count} pixel(s) of caption ink are drawn inside the page region (rows 0..${pageHeight - 1} of a ` +
+        `${width}x${height} frame), spanning x ${box.x0}..${box.x1}, y ${box.y0}..${box.y1} (red). Caption ink on a ` +
+        'page row can sit beside a page glyph on the same baseline with nothing between them, which is how `charge` ' +
+        'plus a surviving `s` became `charges`: a word in NEITHER layer, with both layers individually perfect. It ' +
+        'also covers page content, which is the other half of why the caption was moved off the page. The caption ' +
+        'belongs entirely in the strip appended below the page — check that the ASS PlayResY is the LETTERBOXED ' +
+        'height (page + strip.height) and that the Default style\'s MarginV is strip.marginV, so the block lands ' +
+        'inside the strip rather than being measured against the page.',
       pngPath: png,
     }]
   }
@@ -272,13 +288,15 @@ export interface ChipShieldSpec {
 /**
  * The same class for the CHIPS, which need a different formulation and get a weaker one.
  *
- * The caption's rule — every scanline carrying its ink is overlay from edge to edge — is
- * available to the caption only because its band spans the frame. A full-width bar behind a
- * corner HUD would be a worse artifact than the defect it prevents, so the chips cannot have
- * it, and there is no way to dress that up: **on a row carrying chip ink, either the whole row
- * is overlay or some page pixel is on it at some distance, and whether that distance reads as
- * a word break is perceptual.** There is no third option. So what is asserted here is three
- * properties, two of which are proofs and one of which is a measured number:
+ * The caption's rule — no ink inside the page region — is available to the caption only
+ * because it left the page for an appended strip. The chips deliberately do not: a NohBoard
+ * HUD that is not on the picture is not a NohBoard HUD, and a chip's position in the frame
+ * is itself information about where the input landed (the full argument is at
+ * `chipStripMetrics`). So there is no way to dress this up: **on a row carrying chip ink,
+ * either the whole row is overlay or some page pixel is on it at some distance, and whether
+ * that distance reads as a word break is perceptual.** There is no third option that keeps
+ * the chips on the page. So what is asserted here is three properties, two of which are
+ * proofs and one of which is a measured number:
  *
  *   1. **UNDER the plate.** Every plate pixel in the COMPOSITE is the box colour, so no page
  *      pixel inside the plate survived. This is what a translucent box loses: at 0.65 the
@@ -289,7 +307,7 @@ export interface ChipShieldSpec {
  *   2. **OUTBOARD of the ink.** The plate is allowed to run to a frame edge, and where it
  *      does, that side needs no clearance at all: there is no page pixel beyond the edge.
  *      The check spends its clearance budget walking outward and simply stops when it reaches
- *      x = 0 or x = width - 1, which is exactly how the caption's band terminates too.
+ *      x = 0 or x = width - 1.
  *
  *   3. **INBOARD of the ink.** `requiredClearPx` pixels of plate between the chip's ink and
  *      the first page pixel, on EVERY row the ink occupies. `chipStripMetrics` in

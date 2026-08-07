@@ -25,19 +25,19 @@
  * THE "Clickkout" CLASS — overlay text landing beside page text so the composite reads as a
  * word that is in NEITHER layer — is covered here for BOTH layers, by two different rules.
  *
- * For the CAPTION it became coverable when `captionOptions.backdrop` turned it from a
- * question about words into a question about scanlines: `mergeShieldFindings` asserts that
- * every row carrying caption ink is opaque overlay from one edge of the frame to the other,
- * which is precisely the condition under which no page glyph can sit beside a caption glyph.
- * The break test below turns the band off on `dense-12px` at 480x320 and watches it go red on
- * the frame that really shipped.
+ * For the CAPTION it is now a question about REGIONS: the caption is drawn in a strip
+ * appended below the page, so `mergeShieldFindings` asserts simply that no caption ink falls
+ * inside the page region. No shared scanline, no adjacency, no merge, whatever the page says.
+ * The break test below patches the shipped ASS so the caption is measured against the page
+ * instead of the strip — which is exactly the geometry that shipped — and watches it go red
+ * on `dense-12px` at 480x320.
  *
- * The CHIPS cannot use that rule — a full-width bar behind a corner HUD would be a worse
- * artifact than the defect — so `chipMergeShieldFindings` asserts a weaker three-part one:
- * the plate is opaque, it runs to the frame edge it is anchored to, and it clears the ink by
- * a MEASURED distance inboard. Two proofs and a number; `chipStripMetrics` says how the
- * number was measured and where it stops being a proof. Its break test reverts the strip to
- * the geometry that shipped — margins on both sides, 2px of padding, a 0.65 box — and watches
+ * The CHIPS cannot use that rule, because they deliberately stay on the page — see
+ * `chipStripMetrics` — so `chipMergeShieldFindings` asserts a weaker three-part one: the
+ * plate is opaque, it runs to the frame edge it is anchored to, and it clears the ink by a
+ * MEASURED distance inboard. Two proofs and a number; `chipStripMetrics` says how the number
+ * was measured and where it stops being a proof. Its break test reverts the strip to the
+ * geometry that shipped — margins on both sides, 2px of padding, a 0.65 box — and watches
  * both halves go red.
  *
  * Neither shield replaces looking, and looking has its own harness:
@@ -58,13 +58,15 @@ import {
   buildCues,
   buildEncodeArgs,
   buildInputChips,
-  captionBlockHeightPx,
+  captionStripMetrics,
   chipStripMetrics,
   defaultOutlineWidth,
   encodeFrames,
   formatAss,
   renderedCaptionLines,
+  resolveCaptionColors,
   type CaptionOptions,
+  type CaptionStripMetrics,
   type InputOverlayOptions,
   type StampedCaption,
   type StampedInput,
@@ -96,7 +98,7 @@ import {
   sizesForScene,
   type Scene,
 } from './video-scenes.js'
-import { colorMask, maskUnion, openVideo, overlayMask, type DecodedVideo } from './video-probe.js'
+import { OVERLAY_MASK_THRESHOLD, colorMask, maskBBox, maskUnion, openVideo, overlayMask, type DecodedVideo } from './video-probe.js'
 import { getChromium } from './playwright-import.js'
 import type { Browser } from '@xmorse/playwright-core'
 
@@ -155,19 +157,23 @@ interface Variants {
   composite: DecodedVideo
   /** The same ASS over a flat plate — exact geometry, see `encodeVariants`. */
   flatPlate: DecodedVideo
-  /** The caption GLYPHS alone, without their band, so glyph geometry stays measurable. */
+  /** The caption GLYPHS alone. */
   captionOnly: DecodedVideo
-  /** The full-width opaque band behind the caption, alone. */
-  backdropOnly: DecodedVideo
   /** The chip strip AS DRAWN: the opaque merge plate with its letters on it. */
   chipsOnly: DecodedVideo
   /** The chip GLYPHS alone, with the plate made transparent — see `transparentChipBox`. */
   chipInkOnly: DecodedVideo
+  /**
+   * The letterbox this scene was encoded with. Every variant shares it, so all six clips
+   * are the same shape and the differential is the overlay and nothing else. `pageHeight`
+   * is the boundary `mergeShieldFindings` is asked about.
+   */
+  strip: CaptionStripMetrics
   dumpDir: string
 }
 
-/** The three dialogue layers `formatAss` emits, keyed by the Layer field it writes. */
-type AssLayer = 'backdrop' | 'caption' | 'chips'
+/** The two dialogue layers `formatAss` emits, keyed by the Layer field it writes. */
+type AssLayer = 'caption' | 'chips'
 
 /**
  * The same ASS with the chip plate made invisible, so the strip's GLYPHS can be measured
@@ -239,9 +245,9 @@ async function encodeVariants(
   const dumpDir = path.join(tmpRoot, name)
   fs.mkdirSync(dumpDir, { recursive: true })
 
-  // ONE ass file. Every variant is this file with some dialogue lines removed. The three
-  // layers are told apart by the Layer field: -1 backdrop, 0 caption, 1 chips. A line that
-  // is not a dialogue at all — the styles, the headers — belongs to every variant.
+  // ONE ass file. Every variant is this file with some dialogue lines removed. The two
+  // layers are told apart by the Layer field: 0 caption, 1 chips. A line that is not a
+  // dialogue at all — the styles, the headers — belongs to every variant.
   const ass = formatAss(
     built.cues,
     size,
@@ -252,7 +258,6 @@ async function encodeVariants(
     ass.text
       .split('\n')
       .filter((line) => {
-        if (line.startsWith('Dialogue: -1,')) return layers.includes('backdrop')
         if (line.startsWith('Dialogue: 0,')) return layers.includes('caption')
         if (line.startsWith('Dialogue: 1,')) return layers.includes('chips')
         return true
@@ -260,18 +265,19 @@ async function encodeVariants(
       .join('\n')
 
   const flat = await flatFrames(size, jpegs.length)
+  // The SAME letterbox for every variant, taken from the one `formatAss` call above. If the
+  // plate were padded differently from the composite they would not be the same shape and
+  // `overlayMask` would refuse to difference them — which is the loud failure. The quiet one
+  // it also prevents: a strip sized from a subset of the cues would move the caption.
+  const enc = (label: string, src: Buffer[], text: string) => encodeAssText(label, src, text, ass.strip)
   return {
-    plate: await encodeAssText(`${name}/plate`, jpegs, keep()),
-    composite: await encodeAssText(`${name}/composite`, jpegs, keep('backdrop', 'caption', 'chips')),
-    flatPlate: await encodeAssText(`${name}/flat-plate`, flat, keep()),
-    // The glyphs WITHOUT their band. libass positions a dialogue from the ASS alone, so the
-    // glyphs land in exactly the same pixels either way; leaving the band out keeps this
-    // mask the caption's ink rather than a rectangle, which is what the edge-clip, contrast
-    // and subordination questions are actually about.
-    captionOnly: await encodeAssText(`${name}/flat-caption`, flat, keep('caption')),
-    backdropOnly: await encodeAssText(`${name}/flat-backdrop`, flat, keep('backdrop')),
-    chipsOnly: await encodeAssText(`${name}/flat-chips`, flat, keep('chips')),
-    chipInkOnly: await encodeAssText(`${name}/flat-chip-ink`, flat, transparentChipBox(keep('chips'))),
+    plate: await enc(`${name}/plate`, jpegs, keep()),
+    composite: await enc(`${name}/composite`, jpegs, keep('caption', 'chips')),
+    flatPlate: await enc(`${name}/flat-plate`, flat, keep()),
+    captionOnly: await enc(`${name}/flat-caption`, flat, keep('caption')),
+    chipsOnly: await enc(`${name}/flat-chips`, flat, keep('chips')),
+    chipInkOnly: await enc(`${name}/flat-chip-ink`, flat, transparentChipBox(keep('chips'))),
+    strip: ass.strip,
     dumpDir,
   }
 }
@@ -279,16 +285,38 @@ async function encodeVariants(
 /**
  * The flat plate the geometry is measured against, as JPEG frames.
  *
- * Mid-grey, because it is the only background on which BOTH a white fill and a black
- * outline leave a mark — and the differential has to see the overlay's whole footprint,
- * not just the half of it that happens to contrast with the page.
+ * IT USED TO BE MID-GREY AND THAT WAS A LATENT BUG IN THE INSTRUMENT. Mid-grey was chosen
+ * because both a white fill and a black outline leave a mark on it, which is true and is
+ * still required. What it missed is that the chip is white lettering on a black plate, so
+ * EVERY antialiased pixel along a chip glyph's edge is a grey — and one of those greys is
+ * the plate colour. Such a pixel differs from the flat plate by nothing and drops out of the
+ * differential, leaving a one-pixel hole in the middle of an opaque plate, which the chip
+ * merge shield correctly reports as "page visible beside chip ink".
+ *
+ * MEASURED, on `solid-white-large` — a page with no ink anywhere near the chips — at
+ * x=1194, y=683: the chip render reads [96,96,96] against a flat plate of [128,128,128], a
+ * delta of exactly 32 against a threshold of 32. Its neighbours read 115, 123, 128 and 40.
+ * A single antialias pixel, reported as a merge on four separate scenes at 1280x720.
+ *
+ * THE FIX IS TO GET THE INSTRUMENT OFF THE LINE IT IS MEASURING. Every blend of white and
+ * black is a neutral grey, so any grey plate can be hit by one; a saturated colour cannot
+ * be, because it is not on that line at all. For a plate `c` the closest grey is at the
+ * midpoint of its extreme channels, so the guaranteed separation is
+ * `(max(c) - min(c)) / 2` — here `(192 - 48) / 2 = 72`, comfortably above the 32 threshold
+ * and above the 36 of real codec bleed measured elsewhere in this suite.
+ *
+ * It still satisfies the original requirement, and by a wide margin: 207 from white and 192
+ * from black, so both the fill and the outline leave a mark.
  */
+const FLAT_PLATE_COLOR = '0x3070C0'
 const flatCache = new Map<string, Buffer[]>()
 async function flatFrames(size: { width: number; height: number }, count: number): Promise<Buffer[]> {
   const key = `${size.width}x${size.height}`
   if (!flatCache.has(key)) {
     const f = path.join(tmpRoot, `flat-${key}.jpg`)
-    const r = await run('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=gray:s=${key}`, '-frames:v', '1', '-q:v', '2', f])
+    const r = await run('ffmpeg', [
+      '-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=${FLAT_PLATE_COLOR}:s=${key}`, '-frames:v', '1', '-q:v', '2', f,
+    ])
     if (r.code !== 0) throw new Error(r.stderr)
     flatCache.set(key, [fs.readFileSync(f)])
   }
@@ -303,7 +331,18 @@ async function flatFrames(size: { width: number; height: number }, count: number
  * `buildEncodeArgs` so that "broken" means one style field changed and nothing else. This
  * is how a regression that has already been FIXED can still be shown to be caught.
  */
-async function encodeAssText(name: string, jpegs: Buffer[], assText: string): Promise<DecodedVideo> {
+async function encodeAssText(
+  name: string,
+  jpegs: Buffer[],
+  assText: string,
+  /**
+   * The letterbox to pad with. It must be the SAME for every variant of one scene, or the
+   * clips come out different shapes and the differential is meaningless — so it is threaded
+   * explicitly rather than recomputed, and it comes from the single `formatAss` call whose
+   * output these variants are filtered copies of.
+   */
+  strip?: CaptionStripMetrics,
+): Promise<DecodedVideo> {
   const dir = path.join(tmpRoot, name)
   fs.mkdirSync(dir, { recursive: true })
   const lines: string[] = []
@@ -318,7 +357,10 @@ async function encodeAssText(name: string, jpegs: Buffer[], assText: string): Pr
   const assPath = path.join(dir, 'patched.ass')
   fs.writeFileSync(assPath, assText, 'utf8')
   const out = path.join(dir, 'patched.mp4')
-  const r = await run('ffmpeg', ['-v', 'error', ...buildEncodeArgs({ listFile, outputPath: out, fps: SCENE_FPS, burnAssPath: assPath })])
+  const r = await run('ffmpeg', [
+    '-v', 'error',
+    ...buildEncodeArgs({ listFile, outputPath: out, fps: SCENE_FPS, burnAssPath: assPath, strip }),
+  ])
   if (r.code !== 0) throw new Error(r.stderr)
   return openVideo(out)
 }
@@ -345,16 +387,26 @@ function busiestFrame(masks: Uint8Array[]): number {
   return best
 }
 
-/** The caption style `formatAss` will resolve for a frame of this height, at the defaults. */
-function styleOf(height: number, options?: CaptionOptions) {
-  const fontSize = Math.max(16, Math.round((height * (options?.fontSizePct ?? 5)) / 100))
+/**
+ * The caption style `formatAss` will resolve for a PAGE of this height, at the defaults.
+ *
+ * The page, not the encoded frame — `captionStripMetrics` derives the face from the page so
+ * the strip cannot feed its own input, and this has to ask the same question the same way.
+ *
+ * The colours come from `resolveCaptionColors` rather than from literals here, because
+ * `outlineColor` now DEFAULTS to `stripColor`: a hardcoded '#000000' would hand
+ * `counterFindings` a black outline the renderer never draws, and it would measure the
+ * counters of a style nobody ships.
+ */
+function styleOf(pageHeight: number, options?: CaptionOptions) {
+  const m = captionStripMetrics({ width: 640, height: pageHeight }, 0, options)
   return {
     fontName: options?.fontName ?? 'DejaVu Sans',
-    fontSize,
-    outline: options?.outlineWidth ?? defaultOutlineWidth(fontSize),
-    shadow: options?.shadow ?? 1,
-    textColor: options?.textColor ?? '#FFFFFF',
-    outlineColor: options?.outlineColor ?? '#000000',
+    fontSize: m.fontSize,
+    outline: m.outline,
+    shadow: m.shadow,
+    textColor: m.textColor,
+    outlineColor: m.outlineColor,
   }
 }
 
@@ -376,31 +428,33 @@ describe('scenes: the invariants hold on eight pages at two frame heights', () =
         )
 
         const captionMasks = masksForEveryFrame(v.captionOnly, v.flatPlate)
-        const backdropMasks = masksForEveryFrame(v.backdropOnly, v.flatPlate)
         const chipMasks = masksForEveryFrame(v.chipsOnly, v.flatPlate)
         // The chip GLYPHS, without the plate they sit on — the chip half of the same split
         // `keep()` already gives the caption for free.
         const chipInk = masksForEveryFrame(v.chipInkOnly, v.flatPlate)
-        // The caption AS DRAWN: its glyphs plus the band they sit on. The chips have to
-        // clear the band, not merely the letters, and the band is what occludes the page.
-        const captionLayerMasks = captionMasks.map((m, i) => maskUnion(m, backdropMasks[i]))
-        // Frame choice stays on the INK, so the busiest frame is still the one with the most
-        // caption and chips on it rather than any frame the constant-area band happens to be
-        // up for.
-        const bothMasks = captionMasks.map((m, i) => maskUnion(m, chipMasks[i]))
-        const overlayMasks = captionLayerMasks.map((m, i) => maskUnion(m, chipMasks[i]))
-        const frame = busiestFrame(bothMasks)
+        const overlayMasks = captionMasks.map((m, i) => maskUnion(m, chipMasks[i]))
+        const frame = busiestFrame(overlayMasks)
+
+        // The letterbox is real and the page is the top of it. Asserted before anything else
+        // reads a mask, because every invariant below is stated against this boundary and a
+        // frame that was not actually padded would make all of them vacuous.
+        expect(v.strip.height, `${id}: a captioned clip must have a strip`).toBeGreaterThan(0)
+        expect(v.composite.height, `${id}: the frame is the page plus the strip`).toBe(v.strip.videoHeight)
+        expect(v.strip.pageHeight, `${id}: the page area is the captured frame`).toBe(size.height)
+        expect(v.composite.height % 2, `${id}: yuv420p needs an even height`).toBe(0)
+        expect(v.composite.width % 2, `${id}: yuv420p needs an even width`).toBe(0)
 
         const findings: Finding[] = []
 
-        // 1. The two layers never share a pixel, in ANY frame — band included.
-        findings.push(...(await disjointFindings(captionLayerMasks, chipMasks, v.composite, v.dumpDir)))
+        // 1. The two layers never share a pixel, in ANY frame.
+        findings.push(...(await disjointFindings(captionMasks, chipMasks, v.composite, v.dumpDir)))
 
-        // 2. Nothing is clipped at a frame edge. Asked of the GLYPHS for BOTH layers, and for
-        //    the same reason in both cases: the caption's band reaches the two side edges
-        //    deliberately and the chip's plate reaches its anchored edge deliberately, which
-        //    is the entire point of each (invariants 8 and 9). Asking it of a footprint that
-        //    is SUPPOSED to touch the edge would be asserting against the fix.
+        // 2. Nothing is clipped at a frame edge. Asked of the caption's glyphs, and of the
+        //    chip's GLYPHS rather than its footprint: the chip plate reaches its anchored
+        //    edge deliberately, which is the entire point of invariant 9, so asking this of
+        //    the footprint would be asserting against the fix. The caption has no such
+        //    exemption any more — the band that used to reach both side edges is gone, so
+        //    its ink and its footprint are the same thing.
         findings.push(...(await edgeClipFindings(captionMasks, v.composite, v.dumpDir, 'caption')))
         findings.push(...(await edgeClipFindings(chipInk, v.composite, v.dumpDir, 'chip strip')))
 
@@ -409,38 +463,139 @@ describe('scenes: the invariants hold on eight pages at two frame heights', () =
         findings.push(...(await singleRowFindings(chipMasks, v.composite, v.dumpDir, chipFace + 2 * Math.max(2, Math.round(chipFace / 6)))))
 
         // 4. Glyph ink has local contrast against what is immediately behind it.
-        //    The FILL, not the whole footprint: the footprint includes the black outline,
-        //    and averaging fill and outline together on a dark page produces a mean that
-        //    matches the page and reports every legible caption as invisible.
-        const captionFill = colorMask(v.composite, frame, captionMasks[frame], '#FFFFFF')
+        //    The FILL, not the whole footprint: the footprint includes the outline, and
+        //    averaging fill and outline together produces a mean that matches neither.
+        //    Read at the RESOLVED text colour, which is now black on a light strip.
+        const captionFill = colorMask(v.composite, frame, captionMasks[frame], resolveCaptionColors().text)
         findings.push(...(await contrastFindings(v.composite, frame, captionFill, v.dumpDir, 'caption')))
 
         // 5. Counters survive: the smudge class, measured topologically on the resolved style.
         findings.push(...(await counterFindings(styleOf(size.height), v.dumpDir)))
 
-        // 6. The chips stay subordinate to the caption.
-        //    MEASURED rather than assumed: the intended face ratio is 2.4%/5% = 0.48, but
-        //    at H=320 BOTH floors bind (chip 10px against caption 16px = 0.63) and the
-        //    chip's opaque box adds twice its padding on top, so the rendered strip is
-        //    0.82 of the caption block there against 0.64 at H=720. 0.9 is above the
-        //    worst case the defaults can produce and far below the 2.3 that a chip face
-        //    larger than the caption face produces.
-        findings.push(...subordinateFindings(captionMasks[frame], chipMasks[frame], v.composite, frame, 0.9))
+        /**
+         * 6. The chips stay subordinate to the caption — LETTERING against LETTERING.
+         *
+         * It used to compare the chip's whole footprint, plate included, against the
+         * caption's. That worked only while the caption's footprint was inflated by a black
+         * outline drawn over the page; with the strip the outline is the strip's own colour
+         * and draws nothing, so the caption's footprint IS its ink and the comparison became
+         * a chip's opaque plate against a caption's bare glyphs. MEASURED at 480x320 with a
+         * one-word cue, that reads 1.00 for the shipped renderer — the plate padding alone
+         * putting it at the limit, while the chip's letters are visibly smaller.
+         *
+         * Comparing the chip's INK instead measures what the invariant's own message claims:
+         * the chip face is 2.4% of the page height against the caption's 5%. The plate's
+         * padding is chrome that exists for the merge guarantee, not lettering.
+         *
+         * The band is MEASURED and wider than the one it replaces. Chip ink over caption ink:
+         *
+         *     one-word cue @480x320   0.64      dense-12px @480x320    0.23
+         *     solid-dark  @480x320    0.23      solid-dark @1280x720   0.18
+         *     portrait    @390x844    0.08      a 9% chip face         1.79
+         *
+         * 0.9 sits 1.4x above the worst the defaults produce and 2x below the break — against
+         * the old pairing, where the worst default was already 1.00 and the break 2.79.
+         */
+        findings.push(...subordinateFindings(captionMasks[frame], chipInk[frame], v.composite, frame, 0.9))
 
-        // 7. The overlay does not cover what the action changed — and the band is part of
-        //    the overlay, so a band that solved the merge by burying the subject fails here.
+        // 7. The overlay does not cover what the action changed. The caption cannot fail this
+        //    any more — it is not on the page — so what this now guards is the chips, which
+        //    still are. That is a genuine narrowing and not a loss: the case it used to catch
+        //    for the caption was the band burying the subject, and there is no band.
         if (scene.actionFrames?.length) {
           findings.push(...(await occlusionFindings(v.plate, v.composite, overlayMasks, scene.actionFrames, v.dumpDir)))
         }
 
-        // 8. The merge shield: no page pixel is left on a row that carries caption ink, so
-        //    no page glyph can sit beside a caption glyph and fabricate a third word. This
-        //    is the "Clickkout" class, and it is here rather than in the looking harness only
-        //    because captionOptions.backdrop made it a geometric property.
-        findings.push(...(await mergeShieldFindings(captionMasks, captionLayerMasks, v.composite, v.dumpDir)))
+        // 8. The merge shield: no caption ink anywhere in the page region, so no page glyph
+        //    can share a scanline with a caption glyph and fabricate a third word. This is
+        //    the "Clickkout" class, and the strip is what turns it from a question about
+        //    words into a question about two disjoint regions.
+        findings.push(...(await mergeShieldFindings(captionMasks, v.composite, v.dumpDir, v.strip.pageHeight)))
+
+        /**
+         * 8b. The other half of the same change, and the one the merge shield does NOT say.
+         *
+         * The merge shield reads the FLAT differential, so it proves where libass put the
+         * caption. It cannot see the page at all. This reads the REAL composite against the
+         * REAL plate, on every frame, and asserts that inside the page region nothing changed
+         * except under the chips — which is the actual claim being made about this renderer:
+         * the page area of every frame is the pixels the page showed.
+         *
+         * Bounded by the chip bounding box rather than by the chip mask, because x264 rings a
+         * couple of pixels around a hard-edged plate and that ringing is the codec, not the
+         * page being altered. A whole-page change — a dim, a rescale, a one-pixel shift from
+         * padding in the wrong order — lands far outside that box and cannot hide in it.
+         *
+         * IT IS TWO BOUNDS, BOTH MEASURED, BECAUSE ONE CANNOT DO THE JOB. The composite and
+         * the plate are two separate LOSSY encodes of the same page, so they differ slightly
+         * even where nothing was drawn: adding a subtitle changes x264's rate allocation and
+         * the residual lands on the page's own high-contrast edges. That noise is irreducible
+         * — there is no way to ask "is the page byte-identical" through two h264 encodes — so
+         * the question has to be asked as "is anything here louder than the codec".
+         *
+         * Swept over the whole page region of every frame of all 15 scene/size combinations:
+         *
+         *     checkout-top-left @480x320   worst delta 58   worst frame 0.2998% over 32
+         *     checkout-top-left @1280x720  worst delta 58   worst frame 0.1369% over 32
+         *     dense-12px @480x320          worst delta 36   worst frame 0.0013% over 32
+         *     edge-hugging @480x320        worst delta 35   worst frame 0.0013% over 32
+         *     every other combination      worst delta 1-15 worst frame 0.0000% over 32
+         *
+         * `checkout-top-left` is the outlier because it is the only scene with a large
+         * saturated block — a dark-blue header carrying white text — and those edges are
+         * where x264 puts its residual. Nothing anywhere in the matrix reaches 64.
+         *
+         *   - the MAX bound catches anything DRAWN on the page. A caption glyph is black on
+         *     whatever the page is; on this matrix that is a delta of 200-255, four times the
+         *     bound. This is the bound that goes red if the strip is ever composited instead
+         *     of appended.
+         *   - the FRACTION bound catches anything done to the page AS A WHOLE — a dim, a
+         *     rescale, a one-pixel shift from padding in the wrong order — which need not
+         *     move any single pixel far but must move a great many. 1% is triple the worst
+         *     observed 0.2998%, and a whole-page operation moves tens of percent.
+         */
+        const PAGE_MAX_DELTA = 64
+        const PAGE_MAX_DIFFERING_FRACTION = 0.01
+        for (let f = 0; f < v.composite.frameCount; f++) {
+          const chipBox = maskBBox(chipMasks[Math.min(f, chipMasks.length - 1)], v.composite.width, v.composite.height)
+          let loud = 0
+          let noisy = 0
+          let considered = 0
+          let worst = 0
+          let worstAt = ''
+          for (let y = 0; y < v.strip.pageHeight; y++) {
+            for (let x = 0; x < v.composite.width; x++) {
+              if (chipBox && x >= chipBox.x0 - 2 && x <= chipBox.x1 + 2 && y >= chipBox.y0 - 2 && y <= chipBox.y1 + 2) continue
+              considered++
+              const o = f * v.composite.frameBytes + (y * v.composite.width + x) * 3
+              const d = Math.max(
+                Math.abs(v.composite.rgb[o] - v.plate.rgb[o]),
+                Math.abs(v.composite.rgb[o + 1] - v.plate.rgb[o + 1]),
+                Math.abs(v.composite.rgb[o + 2] - v.plate.rgb[o + 2]),
+              )
+              if (d > worst) {
+                worst = d
+                worstAt = `(${x}, ${y})`
+              }
+              if (d > OVERLAY_MASK_THRESHOLD) noisy++
+              if (d > PAGE_MAX_DELTA) loud++
+            }
+          }
+          const where = `${id}: frame ${f}, worst delta ${worst} at ${worstAt}`
+          expect(
+            loud,
+            `${where} — ${loud} page pixel(s) outside the chip plate differ by more than ${PAGE_MAX_DELTA}/255. ` +
+              'Something is being DRAWN on the page; the caption belongs in the strip appended below it.',
+          ).toBe(0)
+          expect(
+            noisy / considered,
+            `${where} — ${((noisy / considered) * 100).toFixed(4)}% of page pixels differ at all. Codec residual is ` +
+              'measured under 0.3%; this much means the page as a whole was altered.',
+          ).toBeLessThan(PAGE_MAX_DIFFERING_FRACTION)
+        }
 
         // 9. The chip merge shield, which is the same class under a weaker rule because the
-        //    chips cannot have a full-width band. The plate is opaque, it reaches the frame
+        //    chips deliberately stay on the page. The plate is opaque, it reaches the frame
         //    edge it is anchored to, and it clears the ink by the measured merge distance
         //    inboard. The required distance comes from the shipped metrics rather than from a
         //    number retyped here, so the assertion cannot drift away from what is drawn — and
@@ -534,43 +689,63 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
     }
   }, 180000)
 
-  it('contrast: a near-white outline on a white page is caught per glyph', async () => {
+  it('contrast: text with hue but no lightness separation from its strip is caught per glyph', async () => {
     const jpegs = await captureSceneFrames(browser, VISUAL_SCENES[0], size.width, size.height, 4) // solid white
     /**
      * The FILL, not the whole footprint — which is what `contrastFindings` documents and
-     * what the scene loop above has always passed it. This test used to pass the raw
-     * footprint and got away with it only because the page behind it was white: the
-     * footprint of a 16px face with a 1px outline is mostly OUTLINE, so its mean luma is
-     * ~51-65 against a white surround of 255, and the contrast came out ~190.
+     * what the scene loop above has always passed it. Passing the raw footprint used to
+     * work by accident when the page behind the caption was white and the outline black;
+     * it stopped working the moment the caption got a controlled background, because the
+     * footprint's mean is a blend of fill and outline and matches neither.
      *
-     * `captionOptions.backdrop` ended that, and rightly. The caption now sits on a black
-     * band, so the surround is ~9-16 and the footprint's own mean is still 51-65: MEASURED
-     * contrast 35-55, and one component under the 40 floor — for a caption that is white on
-     * black and about as legible as text can be. That is precisely the failure mode the
-     * invariant's own comment warns about ("averaging fill and outline together on a dark
-     * page produces a mean that matches the page and reports every legible caption as
-     * invisible"), arriving here because the band makes every page a dark page.
+     * WHAT THIS BREAKS IS NOW A DIFFERENT THING, and it has to be, because the defect the
+     * old version staged cannot happen any more. It used to be "a near-white outline on a
+     * white page", i.e. the outline failing at its job of separating white text from an
+     * arbitrary page. There is no arbitrary page behind the caption now — there is the
+     * strip — so the way to make a caption unreadable is to put it a shade off ITS OWN
+     * STRIP. That is the live failure mode, and it is the one a caller can actually reach
+     * by setting `textColor` without thinking about `stripColor`.
      *
-     * So this measures the fill. The broken half below still goes red, and for a sharper
-     * reason than before: the band is painted from `outlineColor`, so a near-white outline
-     * now means a near-white BAND behind near-white text.
+     * THE BROKEN COLOUR IS A TINT, NOT A GREY, and that is forced by the instrument rather
+     * than chosen for flavour. Three constants have to be threaded at once:
+     *
+     *     > 24   `MIN_COLOR_SEPARATION`, or `validateVisualOptions` throws and nothing renders
+     *     > 32   `OVERLAY_MASK_THRESHOLD`, or the clean-plate differential cannot SEE the
+     *            caption, the glyph mask comes back empty, and the check passes VACUOUSLY
+     *            with zero glyphs to judge
+     *     < 40   `MIN_GLYPH_CONTRAST`, which is a LUMA distance — or the caption is legible
+     *            and there is nothing to catch
+     *
+     * The first two are per-channel distances and the third is a luma distance, so no grey
+     * can satisfy all three with any margin: for a grey the two distances are the same
+     * number, leaving a window of 32 to 40. `#C8C8C8` at 32 rendered an empty mask; `#C4C4C4`
+     * at 36 rendered strokes so thin after antialiasing that no component reached the 12px
+     * floor `contrastFindings` applies. Both passed by measuring nothing.
+     *
+     * `#E8B4E8` on the `#E8E8E8` default strip separates the two: 52 per channel, so the
+     * mask sees solid glyph cores, but luma 201 against the strip's 232 — a difference of 31,
+     * under the floor. It is also the realistic version of this mistake, and the reason the
+     * floor is expressed in luma at all: a pastel tint that differs plenty in HUE and barely
+     * at all in LIGHTNESS is the classic unreadable-text bug, and it is invisible to every
+     * check that compares colours channel by channel.
      */
-    const fillOf = (v: Variants, frame: number) =>
-      colorMask(v.composite, frame, overlayMask(v.captionOnly, v.flatPlate, frame), '#FFFFFF')
+    const fillOf = (v: Variants, frame: number, hex: string) =>
+      colorMask(v.composite, frame, overlayMask(v.captionOnly, v.flatPlate, frame), hex)
 
-    // BROKEN: white text with a barely-darker outline, on a white page. It encodes cleanly
-    // and the caption is on screen; there is simply nothing to see.
+    // BROKEN: a tint that differs from the strip in hue but not in lightness. Encodes
+    // cleanly, caption is on screen, and there is simply nothing to read.
     const broken = await encodeVariants('break-contrast', jpegs, [captionStamp(CAPTION_TEXT, 0)], [], size, {
-      textColor: '#FFFFFF',
-      outlineColor: '#DCDCDC',
+      textColor: '#E8B4E8',
     })
-    const brokenFindings = await contrastFindings(broken.composite, 2, fillOf(broken, 2), broken.dumpDir, 'caption')
-    expect(brokenFindings.length, 'a near-white outline on a white page must fail contrast').toBeGreaterThan(0)
+    const brokenFindings = await contrastFindings(broken.composite, 2, fillOf(broken, 2, '#E8B4E8'), broken.dumpDir, 'caption')
+    expect(brokenFindings.length, 'text with no luma separation from its own strip must fail contrast').toBeGreaterThan(0)
     expect(brokenFindings[0].pngPath).toBeTruthy()
 
-    // RESTORED: the default black outline, on the same white page.
+    // RESTORED: the default black on the default strip, same page.
     const fixed = await encodeVariants('break-contrast-fixed', jpegs, [captionStamp(CAPTION_TEXT, 0)], [], size)
-    expect(await contrastFindings(fixed.composite, 2, fillOf(fixed, 2), fixed.dumpDir, 'caption')).toEqual([])
+    expect(
+      await contrastFindings(fixed.composite, 2, fillOf(fixed, 2, resolveCaptionColors().text), fixed.dumpDir, 'caption'),
+    ).toEqual([])
   }, 180000)
 
   it('single row: a label of Ws beats CHIP_CHAR_WIDTH_RATIO and libass wraps the strip', async () => {
@@ -600,17 +775,21 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
 
   it('subordinate: a chip face larger than the caption face is caught', async () => {
     const jpegs = await captureSceneFrames(browser, VISUAL_SCENES[1], size.width, size.height, 4)
+    // Chip INK against caption ink, matching the scene loop — see invariant 6 there for the
+    // measurements that set the 0.9 limit and for why the chip's plate is not the subject.
     const broken = await encodeVariants('break-subordinate', jpegs, [captionStamp('caption', 0)], [inputStamp('chip', 0)], size, undefined, {
       fontSizePct: 9,
     })
     const capM = overlayMask(broken.captionOnly, broken.flatPlate, 2)
-    const chipM = overlayMask(broken.chipsOnly, broken.flatPlate, 2)
+    const chipM = overlayMask(broken.chipInkOnly, broken.flatPlate, 2)
     const brokenFindings = subordinateFindings(capM, chipM, broken.composite, 2, 0.9)
+    // MEASURED: a 9% chip face reads 1.79 of the caption's ink height against a 0.9 limit.
     expect(brokenFindings.length, 'a 9% chip face against a 5% caption face must be reported').toBeGreaterThan(0)
 
     const fixed = await encodeVariants('break-subordinate-fixed', jpegs, [captionStamp('caption', 0)], [inputStamp('chip', 0)], size)
     const fCap = overlayMask(fixed.captionOnly, fixed.flatPlate, 2)
-    const fChip = overlayMask(fixed.chipsOnly, fixed.flatPlate, 2)
+    const fChip = overlayMask(fixed.chipInkOnly, fixed.flatPlate, 2)
+    // MEASURED: the shipped defaults read 0.64 on this same one-word cue.
     expect(subordinateFindings(fCap, fChip, fixed.composite, 2, 0.9)).toEqual([])
   }, 180000)
 
@@ -657,18 +836,24 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
     expect(await occlusionFindings(fixed.plate, fixed.composite, fixedMasks, [3], fixed.dumpDir)).toEqual([])
   }, 180000)
 
-  it('disjointness: the pre-fix source-line reserve collides on a portrait frame', async () => {
+  it('disjointness: a chip MarginV that forgets the strip lands in the narration', async () => {
+    /**
+     * The portrait frame, because that is where the caption block is tallest: our wrapper
+     * wraps at 42 CHARACTERS and libass wraps at PIXELS, so at 390x844 a full source line
+     * becomes three rendered ones and the strip is three lines deep. A chip that ignores the
+     * strip therefore lands squarely in it rather than grazing it.
+     */
     const size390 = { width: 390, height: 844 }
     const scene = VISUAL_SCENES.find((s) => s.name === 'portrait')!
     const jpegs = await captureSceneFrames(browser, scene, size390.width, size390.height, 6)
     const co: CaptionOptions = {}
     const cues = [captionStamp(CAPTION_TEXT, 0, co)]
-    const fontSize = Math.max(16, Math.round((size390.height * 5) / 100))
+    const probe = captionStripMetrics(size390, 0, co)
     const marginH = Math.max(8, Math.round(size390.width * 0.05))
 
     // The arithmetic first, so the render is confirming something already known.
     const sourceLines = cues[0].text.split('\n').length
-    const drawnLines = renderedCaptionLines(cues[0].text, size390.width - 2 * marginH, fontSize)
+    const drawnLines = renderedCaptionLines(cues[0].text, size390.width - 2 * marginH, probe.fontSize)
     expect(drawnLines).toBeGreaterThan(sourceLines * 2)
 
     const frames = jpegs.map((data, i) => ({ data, offsetMs: i * SCENE_FRAME_INTERVAL_MS }))
@@ -677,91 +862,105 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
     const built = buildCues({ captions: cues, frameOffsetsMs, durationMs, options: co })
     const chips = buildInputChips({ events: [inputStamp('Click', 0)], frameOffsetsMs, durationMs, video: size390 })
     const shipped = formatAss(built.cues, size390, co, { segments: chips.segments })
+    expect(shipped.strip.height).toBeGreaterThan(0)
 
-    // BROKEN: the Input style's MarginV reverted to what counting SOURCE lines produced.
-    const outline = defaultOutlineWidth(fontSize)
-    const chipSize = Math.max(10, Math.round((size390.height * 2.4) / 100))
-    const marginV = Math.max(4, Math.round((size390.height * 6) / 100))
-    const oldReserve = marginV + captionBlockHeightPx(sourceLines, fontSize, outline, 1) + Math.max(4, Math.round(chipSize * 0.7))
+    /**
+     * BROKEN: the Input style's MarginV reverted to the bare chip margin.
+     *
+     * That is the exact mistake this change can introduce and nothing else would catch:
+     * `MarginV` on a bottom alignment measures from the FRAME's bottom edge, and the frame
+     * now ends below the strip rather than below the page. Omit `+ strip.height` and the
+     * chips are drawn `chipMargin` above the bottom of the STRIP — i.e. on top of the
+     * narration — while every other number in the file stays correct.
+     */
+    const chipMargin = chipStripMetrics(size390).margin
     // Style fields after `Style: Input,` are Fontname(0) .. MarginL(18), MarginR(19),
     // MarginV(20), Encoding(21) — so 20 fields are skipped before the one being reverted.
-    const brokenAss = shipped.text.replace(/^(Style: Input,(?:[^,]*,){20})(\d+)(,\d+)$/m, `$1${oldReserve}$3`)
+    const brokenAss = shipped.text.replace(/^(Style: Input,(?:[^,]*,){20})(\d+)(,\d+)$/m, `$1${chipMargin}$3`)
     expect(brokenAss, 'the Input MarginV must actually have been replaced').not.toBe(shipped.text)
 
-    const brokenComposite = await encodeAssText('break-disjoint', jpegs, brokenAss)
-    const captionOnlyAss = formatAss(built.cues, size390, co)
-    // Both the glyphs AND their band come out of the chips-only render: leaving the band in
-    // would put it in both masks, and the collision this test claims to demonstrate would be
-    // the band overlapping itself rather than a chip landing on the narration.
-    const chipsOnlyBrokenAss = brokenAss
-      .split('\n')
-      .filter((l) => !l.startsWith('Dialogue: 0,') && !l.startsWith('Dialogue: -1,'))
-      .join('\n')
-    const brokenChipsOnly = await encodeAssText('break-disjoint-chips', jpegs, chipsOnlyBrokenAss)
-    const captionOnly = await encodeAssText('break-disjoint-caption', jpegs, captionOnlyAss.text)
+    const strip = shipped.strip
+    const brokenComposite = await encodeAssText('break-disjoint', jpegs, brokenAss, strip)
+    const captionOnlyAss = brokenAss.split('\n').filter((l) => !l.startsWith('Dialogue: 1,')).join('\n')
+    const chipsOnlyBrokenAss = brokenAss.split('\n').filter((l) => !l.startsWith('Dialogue: 0,')).join('\n')
+    const brokenChipsOnly = await encodeAssText('break-disjoint-chips', jpegs, chipsOnlyBrokenAss, strip)
+    const captionOnly = await encodeAssText('break-disjoint-caption', jpegs, captionOnlyAss, strip)
 
     const plateDir = path.join(tmpRoot, 'break-disjoint-plate')
     fs.mkdirSync(plateDir, { recursive: true })
-    await encodeFrames({
-      frames,
-      outputPath: path.join(plateDir, 'plate.mp4'),
-      fps: SCENE_FPS,
-      durationMs,
-      captions: [],
-      inputSegments: [],
-      videoSize: size390,
-    })
-    const plate = await openVideo(path.join(plateDir, 'plate.mp4'))
+    const plateAss = brokenAss.split('\n').filter((l) => !l.startsWith('Dialogue: ')).join('\n')
+    const plate = await encodeAssText('break-disjoint-plate-clip', jpegs, plateAss, strip)
+    void plateDir
 
     const capMasks = masksForEveryFrame(captionOnly, plate)
     const chipMasks = masksForEveryFrame(brokenChipsOnly, plate)
-    const brokenFindings = await disjointFindings(capMasks, chipMasks, brokenComposite, plateDir)
+    const brokenFindings = await disjointFindings(capMasks, chipMasks, brokenComposite, tmpRoot)
     expect(
       brokenFindings.length,
-      'reserving only the SOURCE line count on a 390x844 frame must put the chips through the caption',
+      'a chip MarginV measured from the frame bottom without the strip must land on the caption',
     ).toBeGreaterThan(0)
     expect(brokenFindings[0].message).toMatch(/carry BOTH the caption and a chip/)
 
-    // RESTORED: the shipped reserve, same page, same caption, same chip.
+    // RESTORED: the shipped offset, same page, same caption, same chip.
     const fixed = await encodeVariants('break-disjoint-fixed', jpegs, cues, [inputStamp('Click', 0)], size390, co)
     const fixedCap = masksForEveryFrame(fixed.captionOnly, fixed.flatPlate)
     const fixedChip = masksForEveryFrame(fixed.chipsOnly, fixed.flatPlate)
     expect(await disjointFindings(fixedCap, fixedChip, fixed.composite, fixed.dumpDir)).toEqual([])
   }, 300000)
 
-  it('merge shield: backdrop:false reinstates the exact defect on dense-12px, and it goes red', async () => {
+  it('merge shield: a caption drawn on the page instead of the strip goes red on dense-12px', async () => {
     const scene = VISUAL_SCENES.find((s) => s.name === 'dense-12px')!
     const jpegs = await captureSceneFrames(browser, scene, size.width, size.height, 6)
-
-    // BROKEN, and broken the way it SHIPPED rather than in some invented way: an outlined
-    // caption with no band, over a page that is 12px text to all four edges. Measured on
-    // this exact scene and size before the band existed — the caption's first line ended in
-    // `charge`, the page row it crossed resumed with the surviving `s` of `keeps`, there was
-    // no gap at all between them at 10x, and the frame read `two charges going past the
-    // fold`: a word in NEITHER layer, with both layers individually perfect.
-    const broken = await encodeVariants('break-merge', jpegs, [captionStamp(CAPTION_TEXT, 0)], [], size, {
-      backdrop: false,
+    const cues = buildCues({
+      captions: [captionStamp(CAPTION_TEXT, 0)],
+      frameOffsetsMs: jpegs.map((_, i) => i * SCENE_FRAME_INTERVAL_MS),
+      durationMs: jpegs.length * SCENE_FRAME_INTERVAL_MS,
     })
-    const brokenInk = masksForEveryFrame(broken.captionOnly, broken.flatPlate)
-    const brokenBand = masksForEveryFrame(broken.backdropOnly, broken.flatPlate)
-    expect(brokenBand.every((m) => m.every((v) => v === 0)), 'backdrop:false must draw no band at all').toBe(true)
-    const brokenFindings = await mergeShieldFindings(
-      brokenInk,
-      brokenInk.map((m, i) => maskUnion(m, brokenBand[i])),
-      broken.composite,
-      broken.dumpDir,
-    )
-    expect(brokenFindings.length, 'a caption with no band leaves the page on its own scanlines').toBeGreaterThan(0)
+    const shipped = formatAss(cues.cues, size)
+    const strip = shipped.strip
+
+    /**
+     * BROKEN, and broken the way it SHIPPED rather than in some invented way.
+     *
+     * The frame is still letterboxed — the pad filter is untouched — but the caption's
+     * `MarginV` is raised so the block is drawn where it used to be: over the page, a little
+     * above its bottom edge, exactly as it was when the recorder composited captions onto
+     * the picture. `marginBottomPct` defaulted to 6% of the frame, so that is the number
+     * reinstated here.
+     *
+     * MEASURED on this exact scene and size back when that was the shipped geometry: the
+     * caption's first line ended in `charge`, the page row it crossed resumed with the
+     * surviving `s` of `keeps`, there was no gap at all between them at 10x, and the frame
+     * read `two charges going past the fold` — a word in NEITHER layer, with both layers
+     * individually perfect and every mask-based check green.
+     *
+     * Style fields after `Style: Default,` are Fontname(0) .. MarginL(18), MarginR(19),
+     * MarginV(20), Encoding(21) — so 20 fields are skipped to reach the one being reverted.
+     */
+    const oldMarginV = Math.max(4, Math.round((strip.videoHeight * 6) / 100)) + strip.height
+    const brokenAss = shipped.text.replace(/^(Style: Default,(?:[^,]*,){20})(\d+)(,\d+)$/m, `$1${oldMarginV}$3`)
+    expect(brokenAss, 'the Default MarginV must actually have been replaced').not.toBe(shipped.text)
+
+    const flat = await flatFrames(size, jpegs.length)
+    const stripDialogue = (t: string) => t.split('\n').filter((l) => !l.startsWith('Dialogue: ')).join('\n')
+    const brokenComposite = await encodeAssText('break-merge', jpegs, brokenAss, strip)
+    const brokenFlatCaption = await encodeAssText('break-merge-flat', flat, brokenAss, strip)
+    const brokenFlatPlate = await encodeAssText('break-merge-flat-plate', flat, stripDialogue(brokenAss), strip)
+    const brokenInk = masksForEveryFrame(brokenFlatCaption, brokenFlatPlate)
+
+    const brokenFindings = await mergeShieldFindings(brokenInk, brokenComposite, tmpRoot, strip.pageHeight)
+    expect(brokenFindings.length, 'a caption drawn on the page must be reported').toBeGreaterThan(0)
+    expect(brokenFindings[0].invariant).toBe('no caption ink falls inside the page region')
     expect(brokenFindings[0].message).toMatch(/became `charges`/)
     expect(brokenFindings[0].pngPath).toBeTruthy()
 
-    // RESTORED: the shipped default, same page, same caption, same frame size.
+    // RESTORED: the shipped geometry, same page, same caption, same frame size, same strip.
     const fixed = await encodeVariants('break-merge-fixed', jpegs, [captionStamp(CAPTION_TEXT, 0)], [], size)
     const ink = masksForEveryFrame(fixed.captionOnly, fixed.flatPlate)
-    const band = masksForEveryFrame(fixed.backdropOnly, fixed.flatPlate)
-    expect(
-      await mergeShieldFindings(ink, ink.map((m, i) => maskUnion(m, band[i])), fixed.composite, fixed.dumpDir),
-    ).toEqual([])
+    expect(await mergeShieldFindings(ink, fixed.composite, fixed.dumpDir, fixed.strip.pageHeight)).toEqual([])
+    // …and the caption really is on screen, so the pass above is not the vacuous one a
+    // renderer that drew nothing at all would also earn.
+    expect(ink.some((m) => m.some((p) => p !== 0)), 'the restored caption must actually be drawn').toBe(true)
   }, 180000)
 
   it('chip merge shield: the strip geometry that shipped goes red on both halves', async () => {
@@ -845,9 +1044,13 @@ describe('a deliberately broken render: every invariant is shown to go red', () 
     if (goldenUpdateRequested()) return
     const size2 = { width: 480, height: 320 }
     const jpegs = await captureSceneFrames(browser, VISUAL_SCENES[1], size2.width, size2.height, 8)
-    // Same scene as the committed `solid-dark` golden, one option changed.
+    // Same scene as the committed `solid-dark` golden, one option changed — and one that
+    // changes PIXELS rather than DIMENSIONS. A different `fontSizePct` would resize the
+    // strip and `compareGoldenFrame` would report the size mismatch instead, which is a
+    // different message and a weaker demonstration: the per-pixel comparison would never
+    // have run.
     const broken = await encodeVariants('break-golden', jpegs, [captionStamp(CAPTION_TEXT, 400)], chipEvents(), size2, {
-      marginBottomPct: 12,
+      stripColor: '#C4C4C4',
     })
     const capM = masksForEveryFrame(broken.captionOnly, broken.flatPlate)
     const chipM = masksForEveryFrame(broken.chipsOnly, broken.flatPlate)
