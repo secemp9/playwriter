@@ -11,7 +11,7 @@ catalogued in "The nine bugs" below.
 The repo's `pnpm-workspace.yaml` globs are `./*` and
 `playwright/packages/playwright-core`. `./*` only matches **immediate** children
 of the repo root, so this deeply-nested package
-(`playwriter/playwriter/test/fixtures/buggy-app`) is **never** picked up by the
+(`playwriter/test/fixtures/buggy-app`) is **never** picked up by the
 workspace, and its dependencies are **not** installed by the root `pnpm install`.
 
 Install and build it **standalone with plain npm** — do not run pnpm here:
