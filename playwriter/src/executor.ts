@@ -553,6 +553,31 @@ function markedAsAct<T extends object>(api: T): T {
   })
 }
 
+/** Characters of a source line a code frame shows around the column it points at. */
+const CODE_FRAME_WIDTH = 120
+
+/**
+ * A code frame of `text` at `line` / `column` (1-based), with every line longer than
+ * {@link CODE_FRAME_WIDTH} cut to a window around the column (`…` marks the cut). A minified
+ * stylesheet is one line of hundreds of kilobytes: measured on Wikipedia, the uncut frame for one
+ * declaration was 390 000 characters.
+ */
+function clippedCodeFrame(text: string, line: number, column: number, message: string): string {
+  const lines = text.split('\n')
+  const first = Math.max(1, line - 2)
+  const last = Math.min(lines.length, line + 3)
+  const from = Math.max(0, column - 1 - Math.floor(CODE_FRAME_WIDTH / 3))
+  const clip = (source: string): string => {
+    if (source.length <= CODE_FRAME_WIDTH) return source
+    return `${from > 0 ? '…' : ''}${source.slice(from, from + CODE_FRAME_WIDTH)}${from + CODE_FRAME_WIDTH < source.length ? '…' : ''}`
+  }
+  // Lines before the window stay empty: the frame keeps the stylesheet's own line numbers.
+  const shown = Array.from({ length: last }, (_, index) => (index + 1 >= first ? clip(lines[index]) : ''))
+  const target = lines[line - 1] ?? ''
+  const shownColumn = target.length <= CODE_FRAME_WIDTH ? column : column - from + (from > 0 ? 1 : 0)
+  return codeFrameColumns(shown.join('\n'), { start: { line, column: shownColumn } }, { highlightCode: false, message })
+}
+
 /** Whether human mode refuses the protocol call `type.method` (wherever it goes): unknown, or with a refused effect. */
 function refusedInHumanMode(type: string, method: string, params: unknown): boolean {
   const effect = callEffect(type, method, params)
@@ -2169,7 +2194,10 @@ export class PlaywrightExecutor {
         }
 
         if (!search) {
-          return `${snapshotStr}\n\nuse refToLocator({ ref: 'e3' }) to get locators for ref strings.`
+          // A line's selector (after the role and name) is the element's Playwright locator.
+          return self.policy === 'human'
+            ? `${snapshotStr}\n\nThe selector on each line (like [id="q"] or role=button[name="Save"]) is a Playwright locator; human mode refuses locators, because they run Playwright's script in the page. Act with a ref from observe() or find().`
+            : snapshotStr
         }
 
         const lines = snapshotStr.split('\n')
@@ -2489,11 +2517,7 @@ export class PlaywrightExecutor {
         try {
           const { text } = await cdp.send('CSS.getStyleSheetText', { styleSheetId: rule.styleSheetId })
           if (typeof text !== 'string' || text.length === 0) return null
-          return codeFrameColumns(
-            text,
-            { start: { line: rule.source.line, column: rule.source.column + 1 } },
-            { highlightCode: false, message },
-          )
+          return clippedCodeFrame(text, rule.source.line, rule.source.column + 1, message)
         } catch {
           return null
         }

@@ -7,7 +7,11 @@
  *
  *   - The function runs in the page's own JavaScript world, in the frame of the element it reads, as
  *     `fn(el, arg)` — `el` is the element of `ref`, or the page's `document` without one — through
- *     `Runtime.callFunctionOn` without `userGesture`: measured, `navigator.userActivation` stays false.
+ *     `Runtime.evaluate` without `userGesture`: measured, `navigator.userActivation` stays false.
+ *     `Runtime.evaluate` because it is the only call V8 bounds in time itself (see below); it receives
+ *     the element of a ref as `$_`, the console helper Chrome sets to the result of a call made in the
+ *     console group, so a read with a ref runs with Chrome's console helpers defined, as a DevTools
+ *     console expression does ($, $$, keys…; they are gone when it returns).
  *   - Under V8's side-effect check (`throwOnSideEffect`, the check DevTools' eager evaluation uses):
  *     V8 aborts the call before anything with an effect runs — a DOM or style write, a storage write, an
  *     event, focus, scrolling, a request, a global write, a write into a page object, a timer, a
@@ -24,7 +28,10 @@
  *     properties, `Object.fromEntries`; each falls back to the native call (and V8's refusal) where
  *     it could differ. `console.*` is collected and printed with the call's output.
  *   - Synchronous only (V8 refuses promises under the check). Every loop iteration and function
- *     entry checks a time budget, so a loop that never ends stops instead of freezing the tab.
+ *     entry checks a time budget, so a loop that never ends stops instead of freezing the tab; code
+ *     the checks cannot reach — a function of the page it calls, a regular expression that
+ *     backtracks — is stopped by V8 itself a second later (`Runtime.evaluate`'s `timeout`, scoped to
+ *     that evaluation, so nothing else on the page is ever stopped).
  *   - V8 says nothing about where its check stopped a function. readPage finds it: the function is
  *     run again (under the check, so again changing nothing) with each call counted as a start and an
  *     end event, stopped at event n, and the last event reached is found by doubling then halving n.
@@ -41,6 +48,7 @@ import type { BrowserContext, Page } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import { withDeadline } from './isolated-world.js'
+import { pageWorldContextId } from './playwright-server.js'
 import { ModelFacingError } from './probe-types.js'
 import { renderLocatedNode, type PageProbes } from './page-probe.js'
 import type { FrameHandle } from './page-frames.js'
@@ -51,6 +59,17 @@ export const READ_BUDGET_MS = 5000
 /** Beyond the budget: the renderer itself did not answer (a native call that does not return). */
 const CDP_MARGIN_MS = 5000
 const CDP_TIMEOUT_MS = 5000
+/**
+ * V8 stops the evaluation this long after the budget, wherever it is: the budget checks only run in
+ * the function's own code, and a function of the page or a regular expression never reaches them.
+ */
+const STOP_AFTER_BUDGET_MS = 1000
+/** The object group whose last call result Chrome exposes to console expressions as `$_`. */
+const CONSOLE_GROUP = 'console'
+/** Thrown by the expression when `$_` is not the element this read handed over. */
+const CARRIER_MARK = '__playwriterReadCarrier__'
+/** Called on the element of a ref, in the console group: `$_` becomes `{ element, nonce }` in its page world. */
+const CARRIER_FN = 'function (nonce) { return { element: this, nonce: nonce } }'
 
 const HELPER = '__playwriterRead'
 const BUDGET_MARK = '__playwriterReadBudget__'
@@ -780,6 +799,28 @@ function wrapperFor(prepared: PreparedRead): { declaration: string; firstLine: n
   return { declaration: `${head}${prepared.instrumented}${tail}`, firstLine }
 }
 
+/** What the function receives besides its target: the model's `arg`, and the event a locate run stops at (0: none). */
+interface ReadPayload {
+  has: boolean
+  value: unknown
+  stopAt: number
+}
+
+/**
+ * The expression readPage evaluates: the wrapper applied to the page's `document`, or to the element
+ * handed over in `$_` when `nonce` is set (checked, so a `$_` the page defines itself is never read as
+ * the element). The wrapper starts on the expression's first line, so its line numbers stay its own.
+ */
+function expressionFor(prepared: PreparedRead, payload: ReadPayload, nonce: string | null): string {
+  const { declaration } = wrapperFor(prepared)
+  const data = JSON.stringify(payload)
+  if (nonce === null) return `(${declaration}).call(document, ${data})`
+  return (
+    `(function (carrier) { if (carrier === null || typeof carrier !== 'object' || carrier.nonce !== ${JSON.stringify(nonce)}) ` +
+    `throw new TypeError(${JSON.stringify(CARRIER_MARK)}); return (${declaration}).call(carrier.element, ${data}) })($_)`
+  )
+}
+
 /** Validate `arg` as JSON data, naming the first part that is not. */
 function checkArg(value: unknown, path: string, seen: Set<object>): void {
   if (value === null || value === undefined || typeof value === 'string' || typeof value === 'boolean') return
@@ -855,11 +896,37 @@ function isSideEffect(details: Protocol.Runtime.ExceptionDetails): boolean {
 const SIDE_EFFECT_HEAD = "Chrome's side-effect check stopped the function before anything on the page changed."
 const SIDE_EFFECT_TAIL = 'readPage only reads; act.* changes the page the way a person does.'
 
+/** Chrome's answer when V8 stopped the evaluation at its `timeout`. */
+const TERMINATED_RE = /Execution was terminated/
+/** Chrome's answer when the frame's page world is gone (it loaded another document). */
+const DEAD_CONTEXT_RE = /Cannot find context with specified id/
+
+const STOPPED_BY_TIME_LIMIT =
+  `the function was still running ${(READ_BUDGET_MS + STOP_AFTER_BUDGET_MS) / 1000}s after it started, inside code readPage cannot ` +
+  'stop from within — a function of the page it called, or a regular expression that backtracks — so Chrome stopped it there. ' +
+  'Nothing changed (it could only read), and the page went on running. Read less, or leave that call or pattern out.'
+
+/** The model-facing error when the evaluation itself failed (rather than the function throwing in it). */
+function runFailure(error: unknown, target: ReadTarget): unknown {
+  const message = error instanceof Error ? error.message : String(error)
+  if (TERMINATED_RE.test(message)) return readError(STOPPED_BY_TIME_LIMIT)
+  if (DEAD_CONTEXT_RE.test(message)) {
+    return readError(`${target.element ? `the frame of [${target.element.ref}]` : 'the page'} loaded another document while it was being read. Call observe() again.`)
+  }
+  return error
+}
+
 /** The model-facing error for an exception the function (or the check) raised in the page. */
 function failureOf(details: Protocol.Runtime.ExceptionDetails, prepared: PreparedRead, firstLine: number): ModelFacingError {
   const description = details.exception?.description ?? details.text
   const head = description.split('\n')[0]
   if (SIDE_EFFECT_RE.test(head)) return readError(`${SIDE_EFFECT_HEAD} ${unlocatedSideEffect(prepared, null)} ${SIDE_EFFECT_TAIL}`)
+  if (head.includes(CARRIER_MARK)) {
+    return readError(
+      "the element could not be handed to the function: this page defines its own $_, which hides Chrome's console helper " +
+        'readPage hands the element over with. Read without a ref, starting from the document (document.querySelector(…)).',
+    )
+  }
   if (head.includes(BUDGET_MARK)) {
     return readError(
       `the function was still running after ${READ_BUDGET_MS}ms and was stopped. The page cannot change while it runs (its own ` +
@@ -882,7 +949,7 @@ type LocateEvent = { kind: 'begin' | 'end'; site: number } | { kind: 'result' }
 /** What one locate run did: stopped where it was told to, was stopped by the check, or neither. */
 type LocateOutcome = { kind: 'stopped'; event: LocateEvent } | { kind: 'side-effect' } | { kind: 'other' }
 
-function locateOutcome(called: Protocol.Runtime.CallFunctionOnResponse): LocateOutcome {
+function locateOutcome(called: { exceptionDetails?: Protocol.Runtime.ExceptionDetails }): LocateOutcome {
   const details = called.exceptionDetails
   if (!details) return { kind: 'other' }
   const thrown: unknown = details.exception?.value
@@ -902,13 +969,19 @@ function locateOutcome(called: Protocol.Runtime.CallFunctionOnResponse): LocateO
  * n: doubled until a run is stopped by the check, then halved down. Every run only reads (the check
  * holds for each). `null` event: stopped before its first call. A string: why it was not found.
  */
-async function locateSideEffect(run: (stopAt: number) => Promise<Protocol.Runtime.CallFunctionOnResponse>): Promise<{ event: LocateEvent | null } | string> {
+async function locateSideEffect(run: (stopAt: number) => Promise<{ exceptionDetails?: Protocol.Runtime.ExceptionDetails }>): Promise<{ event: LocateEvent | null } | string> {
   const started = performance.now()
   const probe = async (stopAt: number): Promise<LocateOutcome | string> => {
     if (performance.now() - started > LOCATE_BUDGET_MS) {
       return `re-running it to find the spot took more than ${LOCATE_BUDGET_MS / 1000}s (it makes too many calls before it is stopped)`
     }
-    return locateOutcome(await run(stopAt))
+    try {
+      return locateOutcome(await run(stopAt))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (TERMINATED_RE.test(message)) return `a run to find it reached the ${(READ_BUDGET_MS + STOP_AFTER_BUDGET_MS) / 1000}s time limit`
+      throw error
+    }
   }
   const unstable = 'it did not stop the same way when it was run again (the page changed between the runs)'
   /** The largest event number known to be reached, and that event; the smallest known not to be. */
@@ -1016,8 +1089,18 @@ function codeFrameAt(details: Protocol.Runtime.ExceptionDetails, prepared: Prepa
   return codeFrameColumns(prepared.source, { start: { line: before.length, column: before[before.length - 1].length + 1 } }, { highlightCode: false })
 }
 
-/** The page's object to call the function on: the element of a ref (in its frame's session), or the page's document. */
-async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGroup: string): Promise<{ page: Page; cdp: ICDPSession; objectId: string; frame: FrameHandle }> {
+/** What a read runs against: the page's document, or the element of a ref in its frame's session and page world. */
+interface ReadTarget {
+  page: Page
+  cdp: ICDPSession
+  frame: FrameHandle
+  /** The page world of a same-process iframe, by id; undefined for the session's own top document (its default context). */
+  contextId: number | undefined
+  /** The element of a ref, resolved in its frame's page world; null to read the document. */
+  element: { ref: number; objectId: string } | null
+}
+
+async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGroup: string): Promise<ReadTarget> {
   if (options.ref !== undefined) {
     const element = await deps.probes.element(options.ref)
     const { frame } = element
@@ -1028,7 +1111,12 @@ async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGrou
       `resolving [${element.target.ref}] in the page`,
     )
     if (!resolved.object.objectId) throw readError(`[${element.target.ref}] is no longer in the page. Call observe() again.`)
-    return { page: element.page, cdp: frame.cdp, objectId: resolved.object.objectId, frame }
+    // The top document of a session is its default context; an iframe in the same process is reached by id.
+    const contextId =
+      frame.sessionRootId === frame.frameId
+        ? undefined
+        : await withDeadline(pageWorldContextId(frame.frame), CDP_TIMEOUT_MS, `finding the page world of the frame of [${element.target.ref}]`)
+    return { page: element.page, cdp: frame.cdp, frame, contextId, element: { ref: element.target.ref, objectId: resolved.object.objectId } }
   }
   const page = options.page ?? deps.currentPage()
   const probe = await deps.probes.get(page)
@@ -1039,13 +1127,82 @@ async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGrou
         'person would: act.dialog.accept() or act.dialog.dismiss().',
     )
   }
-  const evaluated = await withDeadline(
-    probe.cdp.send('Runtime.evaluate', { expression: 'document', objectGroup, throwOnSideEffect: true }),
-    CDP_TIMEOUT_MS,
-    "reaching the page's document",
-  )
-  if (!evaluated.result.objectId) throw readError("the page's document could not be reached.")
-  return { page, cdp: probe.cdp, objectId: evaluated.result.objectId, frame: probe.frames.main }
+  return { page, cdp: probe.cdp, frame: probe.frames.main, contextId: undefined, element: null }
+}
+
+/** The read in progress on each session: `$_` is one slot per page world, so reads on a session take turns. */
+const readsInProgress = new WeakMap<ICDPSession, Promise<void>>()
+
+async function inTurn<T>(cdp: ICDPSession, read: () => Promise<T>): Promise<T> {
+  const previous = readsInProgress.get(cdp) ?? Promise.resolve()
+  const done = Promise.withResolvers<void>()
+  const turn = previous.then(() => done.promise)
+  readsInProgress.set(cdp, turn)
+  await previous
+  try {
+    return await read()
+  } finally {
+    done.resolve()
+    if (readsInProgress.get(cdp) === turn) readsInProgress.delete(cdp)
+  }
+}
+
+/**
+ * Evaluate the read — and, when Chrome's check stops it, run it again to find where — with the element of
+ * a ref handed over in `$_`. Resolves with the evaluation that returned; throws the model-facing error.
+ */
+async function evaluateRead(fn: unknown, prepared: PreparedRead, options: ReadPageOptions, target: ReadTarget, objectGroup: string): Promise<Protocol.Runtime.EvaluateResponse> {
+  const { cdp, element } = target
+  const nonce = element === null ? null : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  if (element !== null) {
+    await withDeadline(
+      cdp.send('Runtime.callFunctionOn', {
+        objectId: element.objectId,
+        functionDeclaration: CARRIER_FN,
+        arguments: [{ value: nonce }],
+        objectGroup: CONSOLE_GROUP,
+        returnByValue: false,
+        throwOnSideEffect: true,
+      }),
+      CDP_TIMEOUT_MS,
+      `handing [${element.ref}] to the function`,
+    )
+  }
+  try {
+    const run = async (code: PreparedRead, stopAt: number): Promise<Protocol.Runtime.EvaluateResponse> =>
+      await withDeadline(
+        cdp.send('Runtime.evaluate', {
+          expression: expressionFor(code, { has: options.arg !== undefined, value: options.arg ?? null, stopAt }, nonce),
+          ...(target.contextId === undefined ? {} : { contextId: target.contextId }),
+          includeCommandLineAPI: element !== null,
+          throwOnSideEffect: true,
+          timeout: READ_BUDGET_MS + STOP_AFTER_BUDGET_MS,
+          returnByValue: false,
+          objectGroup,
+        }),
+        READ_BUDGET_MS + STOP_AFTER_BUDGET_MS + CDP_MARGIN_MS,
+        'running the readPage function',
+      )
+    let called: Protocol.Runtime.EvaluateResponse
+    try {
+      called = await run(prepared, 0)
+    } catch (error) {
+      throw runFailure(error, target)
+    }
+    if (called.exceptionDetails && isSideEffect(called.exceptionDetails)) {
+      // V8 reports no position for its check: run the function again, counting its calls, to find it.
+      const located = prepareRead(fn, { locate: true })
+      const found = await locateSideEffect((stopAt) => run(located, stopAt))
+      throw readError(`${SIDE_EFFECT_HEAD} ${typeof found === 'string' ? unlocatedSideEffect(prepared, found) : locatedSideEffect(located, found.event)}\n${SIDE_EFFECT_TAIL}`)
+    }
+    if (called.exceptionDetails) throw failureOf(called.exceptionDetails, prepared, wrapperFor(prepared).firstLine)
+    return called
+  } finally {
+    // Releasing the console group also clears `$_`.
+    if (element !== null) {
+      await withDeadline(cdp.send('Runtime.releaseObjectGroup', { objectGroup: CONSOLE_GROUP }), CDP_TIMEOUT_MS, 'releasing the element handed to the function').catch(() => {})
+    }
+  }
 }
 
 /** `readPage(fn, { ref, arg, page })` — see the module comment. */
@@ -1056,28 +1213,7 @@ export async function readPage(fn: unknown, rawOptions: unknown, deps: ReadPageD
   const target = await targetOf(options, deps, objectGroup)
   const { cdp } = target
   try {
-    const run = async (code: PreparedRead, stopAt: number): Promise<Protocol.Runtime.CallFunctionOnResponse> =>
-      await withDeadline(
-        cdp.send('Runtime.callFunctionOn', {
-          functionDeclaration: wrapperFor(code).declaration,
-          objectId: target.objectId,
-          arguments: [{ value: { has: options.arg !== undefined, value: options.arg ?? null, stopAt } }],
-          returnByValue: false,
-          throwOnSideEffect: true,
-          objectGroup,
-        }),
-        READ_BUDGET_MS + CDP_MARGIN_MS,
-        'running the readPage function',
-      )
-    const { firstLine } = wrapperFor(prepared)
-    const called = await run(prepared, 0)
-    if (called.exceptionDetails && isSideEffect(called.exceptionDetails)) {
-      // V8 reports no position for its check: run the function again, counting its calls, to find it.
-      const located = prepareRead(fn, { locate: true })
-      const found = await locateSideEffect((stopAt) => run(located, stopAt))
-      throw readError(`${SIDE_EFFECT_HEAD} ${typeof found === 'string' ? unlocatedSideEffect(prepared, found) : locatedSideEffect(located, found.event)}\n${SIDE_EFFECT_TAIL}`)
-    }
-    if (called.exceptionDetails) throw failureOf(called.exceptionDetails, prepared, firstLine)
+    const called = await inTurn(cdp, () => evaluateRead(fn, prepared, options, target, objectGroup))
     const resultId = called.result.objectId
     if (!resultId) throw readError('the page returned no result object.')
     const summarized = await withDeadline(
@@ -1085,7 +1221,7 @@ export async function readPage(fn: unknown, rawOptions: unknown, deps: ReadPageD
       CDP_TIMEOUT_MS,
       'reading the readPage result',
     )
-    if (summarized.exceptionDetails) throw failureOf(summarized.exceptionDetails, prepared, firstLine)
+    if (summarized.exceptionDetails) throw failureOf(summarized.exceptionDetails, prepared, wrapperFor(prepared).firstLine)
     const summary: unknown = summarized.result.value
     if (!isSummary(summary)) throw readError('the page returned a result readPage cannot read.')
     for (const [level, text] of summary.logs) deps.log(level, text)

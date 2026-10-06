@@ -2,14 +2,11 @@ import type { Page, Locator } from '@xmorse/playwright-core'
 import { formatHtmlForPrompt } from './htmlrewrite.js'
 import { createSmartDiff } from './diff-utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
-import { withDeadline } from './isolated-world.js'
+import { isNodeGoneError, withDeadline } from './isolated-world.js'
 import type { ResolvedElement } from './element-resolve.js'
 import { ModelFacingError } from './probe-types.js'
 
 const CDP_TIMEOUT_MS = 5000
-
-/** The element's innerHTML, read in playwriter's isolated world (null when the node is gone). */
-const INNER_HTML_FN = 'function (_args, element) { return element ? element.innerHTML : null }'
 
 /** Page -> (snapshot key -> last HTML). The diff baseline for `showDiffSinceLastCall`. */
 export type HtmlDiffStore = WeakMap<Page, Map<string, string>>
@@ -17,7 +14,8 @@ export type HtmlDiffStore = WeakMap<Page, Map<string, string>>
 export interface GetCleanHTMLOptions {
   /**
    * What to read: the whole page, a Locator (read with Playwright's script in the page, which it
-   * runs as a user gesture — debug mode only), or an element resolved from a ref.
+   * runs as a user gesture — debug mode only), or an element resolved from a ref. An element is read
+   * with its own tag and attributes (its outerHTML), so a field or an image is not empty.
    */
   locator: Locator | Page | ResolvedElement
   search?: string | RegExp
@@ -85,16 +83,20 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
     ;({ outerHTML: rawHtml } = await withDeadline(cdp.send('DOM.getOuterHTML', { nodeId: root.nodeId }), CDP_TIMEOUT_MS, "reading the page's HTML (DOM.getOuterHTML)"))
   } else if ('backendNodeId' in locator) {
     page = locator.frame.page()
-    const inner = await locator.world.callFunctionOnNodes<string | null>([locator.backendNodeId], INNER_HTML_FN, {
-      what: `reading the HTML of <${locator.node.localName}>`,
-    })
-    if (inner === null) {
+    // The element's own markup from the DOM agent of its frame's session: no script in any world.
+    try {
+      ;({ outerHTML: rawHtml } = await withDeadline(
+        locator.cdp.send('DOM.getOuterHTML', { backendNodeId: locator.backendNodeId }),
+        CDP_TIMEOUT_MS,
+        `reading the HTML of <${locator.node.localName}> (DOM.getOuterHTML)`,
+      ))
+    } catch (error) {
+      if (!isNodeGoneError(error)) throw error
       throw new ModelFacingError(`getCleanHTML: <${locator.node.localName}> was removed from the page before its HTML could be read. observe() again for current refs.`)
     }
-    rawHtml = inner
   } else {
     page = locator.page()
-    rawHtml = await locator.innerHTML()
+    rawHtml = await locator.evaluate((element) => element.outerHTML)
   }
 
   // Clean the HTML using formatHtmlForPrompt

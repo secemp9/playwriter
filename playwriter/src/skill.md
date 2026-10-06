@@ -863,7 +863,7 @@ await state.page.locator('role=link[name="SIGN IN"]').click()
 
 **Beware CSS text-transform**: snapshots show visual text (`heading "NODE.JS"`) but DOM may be `"Node.js"`. Use case-insensitive regex: `getByRole('heading', { name: /node\.js/i })`.
 
-If a screenshot shows ref labels like `e3`, resolve them using the last snapshot:
+Debug mode: if a screenshot shows snapshot ref labels like `e3`, resolve them to locators using the last snapshot (human mode refuses locators — act on the refs `observe()` prints):
 
 ```js
 const snap = await snapshot({ page: state.page })
@@ -1146,7 +1146,7 @@ console.log(await getLatestLogs({ page: state.page, sinceLastCall: true }))  // 
 
 Three readers below (`getCleanHTML`, `getPageMarkdown`, and `snapshot`) share the same two options: `search` (string/regex — returns the first 10 matching lines with 5 lines of context) and `showDiffSinceLastCall` (default `false`; `true` returns only what changed since the last call on the same page).
 
-**getCleanHTML** - get cleaned HTML of the page or of one element. `{ ref }` reads the element in playwriter's isolated world; `{ locator: <Locator> }` reads it with Playwright's script in the page, debug mode only (`{ locator: state.page }`, the whole page, works in both modes):
+**getCleanHTML** - get cleaned HTML of the page or of one element, the element's own tag and attributes included (a field or an image is not empty). `{ ref }` reads the element from Chrome's DOM agent, without running anything in the page; `{ locator: <Locator> }` reads it with Playwright's script in the page, debug mode only (`{ locator: state.page }`, the whole page, works in both modes):
 
 ```js
 await getCleanHTML({ locator, search?, showDiffSinceLastCall?, includeStyles?, maxAttrLen?, maxContentLen? })
@@ -1553,7 +1553,8 @@ await resizeImageForAgent({ input: '/absolute/path/to/shot.png' })
 - **Where:** in the page's own JavaScript world (`window.__NEXT_DATA__`, a store's state and the page's globals are visible), in the frame of the element of `ref` — `document` is that frame's document. Without a ref, `el` is the `document` of `page` (default: the current page).
 - **Read-only, enforced by Chrome:** it runs under V8's side-effect check (the one DevTools' eager evaluation uses) and without a user gesture. Anything that could change the page stops it before it happens — DOM, style and storage writes, focus, scrolling, events, requests, timers, promises, writes into the page's objects, a page function that caches, logs or reads `arguments`. Chrome does not say where it stopped; readPage finds out by running the function again under the same check, and the error shows the call in your code with why and what to read instead: ``It stopped in `window.siteConfig.get('title')` (line 3)`` … ``Object.keys(window.siteConfig) lists what window.siteConfig holds.`` Read the data the page's function would have read (`window.siteConfig.values.title`).
 - Some reads Chrome has not marked read-only are routed to exact equivalents for you: `closest`, `matches`, `getRootNode`, `getElementById`, `isSameNode`, `localStorage.getItem` / `key`, `rect.toJSON()`, `getPropertyValue` of standard properties, `location.toString()`, `Object.fromEntries`, `Object.assign`, `{ ...spread }`. Still refused: `getClientRects`, `elementFromPoint`, `checkVisibility`, `matchMedia`, `new URL` (use `a.pathname` / `a.search` / `location.*`), `getPropertyValue('--custom')`, object rest (`{ a, ...rest } = obj`), `arguments`.
-- **Synchronous.** No `async`/`await`. It may run 5 s: a loop waiting for the page to change never ends (the page cannot run while your function does) — read, `act.waitForIdle()`, read again.
+- **Synchronous, and bounded.** No `async`/`await`. It may run 5 s: a loop waiting for the page to change never ends (the page cannot run while your function does) — read, `act.waitForIdle()`, read again. A function of the page that never returns, or a regular expression that backtracks without end, is stopped by Chrome 6 s after the read started; the page goes on, untouched.
+- **With a ref, Chrome's console helpers exist while it runs** (`$`, `$$`, `$x`, `$_`, `keys`, `values`, `copy`, `inspect`, `dir`…, as in the DevTools console): that is how the element reaches your function. They are gone when it returns. Test for a library by its own name (`window.jQuery`), not by `$`.
 - **Data in, data out.** `fn` cannot see your code's variables: pass them as `{ arg }` (JSON data). It returns JSON data; an element, an array of elements or a NodeList comes back as `{ ref, text }` entries (the ref observe() uses, or what contains the element). `console.log` inside prints with the call's output.
 
 ```js

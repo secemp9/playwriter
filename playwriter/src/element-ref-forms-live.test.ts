@@ -17,8 +17,13 @@ const PAGE = `<!doctype html><html><head><title>Ref forms</title><style>
   #save { color: rgb(255, 0, 0); }
 </style></head><body>
   <h1>Settings</h1>
+  <label>Email <input id="email" type="email" placeholder="you@example.com"></label>
   <button id="save" class="primary" data-kind="submit">Save <b>now</b></button>
 </body></html>`
+
+/** A production stylesheet: one line of 120 000 characters, the rule that colours the button in the middle of it. */
+const MINIFIED_CSS = `${'.pad{margin:0}'.repeat(4000)}#deal{color:rgb(0,128,0)}${'.tail{padding:0}'.repeat(4000)}`
+const MINIFIED_PAGE = `<!doctype html><html><head><title>Minified</title><link rel="stylesheet" href="/min.css"></head><body><button id="deal">Deal</button></body></html>`
 
 let server: http.Server
 let baseUrl = ''
@@ -26,9 +31,10 @@ let cwd = ''
 const executors: PlaywrightExecutor[] = []
 
 beforeAll(async () => {
-  server = http.createServer((_req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(PAGE)
+  server = http.createServer((req, res) => {
+    const css = req.url === '/min.css'
+    res.writeHead(200, { 'Content-Type': css ? 'text/css' : 'text/html; charset=utf-8' })
+    res.end(css ? MINIFIED_CSS : req.url === '/min' ? MINIFIED_PAGE : PAGE)
   })
   const listening = Promise.withResolvers<void>()
   server.listen(0, '127.0.0.1', () => listening.resolve())
@@ -49,11 +55,11 @@ afterAll(async () => {
   fs.rmSync(cwd, { recursive: true, force: true })
 })
 
-/** A fresh executor whose blank tab loads the fixture (the first load of a blank tab is allowed in human mode too). */
-async function open(policy: 'human' | 'debug'): Promise<PlaywrightExecutor> {
+/** A fresh executor whose blank tab loads a fixture page (the first load of a blank tab is allowed in human mode too). */
+async function open(policy: 'human' | 'debug', at = ''): Promise<PlaywrightExecutor> {
   const executor = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: { log: () => {}, error: () => {} }, cwd, policy })
   executors.push(executor)
-  const loaded = await executor.execute(`await page.goto('${baseUrl}', { waitUntil: 'load' })`, 30000)
+  const loaded = await executor.execute(`await page.goto('${baseUrl}${at}', { waitUntil: 'load' })`, 30000)
   expect(loaded.isError, loaded.text).toBe(false)
   return executor
 }
@@ -112,23 +118,43 @@ describe('element readers: { ref } forms', () => {
     expect(enabled.text).toContain('act.click(12), act.hover(12)')
 
     const ref = await saveRef(human)
+    const look = (await human.execute('await observe()', 30000)).text
+    const email = /\[(\d+)\] textbox "Email"/.exec(look)?.[1]
+    if (!email) throw new Error(`no ref for the Email field in:\n${look}`)
     const read = await human.execute(
       `const style = await debugStyle({ ref: ${ref}, property: 'color' })\n` +
         `const html = await getCleanHTML({ ref: ${ref} })\n` +
+        `const field = await getCleanHTML({ ref: ${email} })\n` +
         `const styles = await getStylesForLocator({ ref: ${ref} })\n` +
         // A page-model handle's cascade is read by the node's id in the model's own session.
         "const handle = await pm.anchor('element#save')\n" +
         'const winners = await handle.styles()\n' +
-        'return JSON.stringify({ style: style.text.includes("rgb(255, 0, 0)"), html, rules: styles.rules.length, color: winners.color })',
+        'return JSON.stringify({ style: style.text.includes("rgb(255, 0, 0)"), html, field, rules: styles.rules.length, color: winners.color })',
       30000,
     )
     expect(read.isError, read.text).toBe(false)
     expect(read.text).toContain('"style":true')
     expect(read.text).toContain('now')
+    // An element is read with its own tag: a field has no content, and is not empty.
+    expect(read.text).toContain('"field":"<input')
+    expect(read.text).toContain('type=\\"email\\"')
     expect(read.text).toMatch(/"color":\{"value":"rgb\(255, 0, 0\)","selector":"#save"/)
 
     const activation = await human.execute('return await readPage(() => navigator.userActivation.hasBeenActive)', 30000)
     expect(activation.isError, activation.text).toBe(false)
     expect(activation.text).toContain('[return value] false')
+  })
+
+  it("points at the winning rule of a minified stylesheet with a frame of a few short lines, not the stylesheet's one long line", async () => {
+    const human = await open('human', 'min')
+    const look = (await human.execute('await observe()', 30000)).text
+    const deal = /\[(\d+)\] button "Deal"/.exec(look)?.[1]
+    if (!deal) throw new Error(`no ref for the Deal button in:\n${look}`)
+    const style = await human.execute(`return (await debugStyle({ ref: ${deal}, property: 'color' })).text`, 30000)
+    expect(style.isError, style.text).toBe(false)
+    const frame = style.text.slice(style.text.indexOf('> 1 |'))
+    expect(frame).toMatch(/> 1 \| …[^\n]*#deal\{color:rgb\(0,128,0\)\}[^\n]*…/)
+    expect(frame).toMatch(/\n\s+\|\s*\^/)
+    for (const line of frame.split('\n')) expect(line.length).toBeLessThan(200)
   })
 })

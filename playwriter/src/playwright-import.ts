@@ -8,6 +8,8 @@
  * optional patchright dep being installed.
  */
 
+import { installElementPreviewWithoutGesture } from './playwright-server.js'
+
 export type {
   Page,
   Frame,
@@ -48,6 +50,9 @@ export async function getChromium(): Promise<Chromium> {
     }
   } else {
     const mod = await import('@xmorse/playwright-core')
+    // Before any connection exists: the server previews the handles of the page's own
+    // console.log(element) as soon as it is attached (playwright-server.ts).
+    installElementPreviewWithoutGesture()
     _chromium = mod.chromium
   }
   return _chromium!

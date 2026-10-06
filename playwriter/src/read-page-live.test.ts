@@ -27,6 +27,10 @@ const PAGE = `<!doctype html><html><head><title>Read me</title>
   // App code Chrome's check refuses to run: a getter reading arguments (like MediaWiki's mw.config.get), a counting getter.
   window.siteConfig = { values: { title: 'Read me' }, get(key) { return arguments.length > 1 ? arguments[1] : this.values[key] } }
   window.counter = { seen: 0, get next() { return ++this.seen } }
+  // A function of the page that never returns, and a timer that shows the page still runs after a read was stopped.
+  window.spin = () => { for (;;) {} }
+  window.ticks = 0
+  setInterval(() => { window.ticks += 1 }, 50)
   window.__mutations = 0
   new MutationObserver((records) => { window.__mutations += records.length }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true })
   document.getElementById('host').attachShadow({ mode: 'open' }).innerHTML = '<span id="in" class="in-shadow">shadow text</span>'
@@ -84,7 +88,7 @@ function refOf(text: string, pattern: RegExp): number {
 async function pageState(executor: PlaywrightExecutor): Promise<string> {
   const read = await executor.execute(
     `const cdp = await getCDPSession({ page })
-     const { result } = await cdp.send('Runtime.evaluate', { expression: 'JSON.stringify({ mutations: window.__mutations, cart: localStorage.getItem("cart"), app: window.appState.cart.length, h1: !!document.querySelector("h1"), active: navigator.userActivation.hasBeenActive })', returnByValue: true })
+     const { result } = await cdp.send('Runtime.evaluate', { expression: 'JSON.stringify({ mutations: window.__mutations, cart: localStorage.getItem("cart"), app: window.appState.cart.length, h1: !!document.querySelector("h1"), active: navigator.userActivation.hasBeenActive, consoleHelpers: ["$_", "$0", "$", "keys"].filter((name) => Object.getOwnPropertyNames(window).includes(name)) })', returnByValue: true })
      return result.value`,
     30000,
   )
@@ -208,6 +212,22 @@ describe('readPage', () => {
     expect(after.text).toContain('complete')
   })
 
+  it('stops a function of the page that never returns, and a regular expression that backtracks; the page goes on', async () => {
+    // Real time on purpose: V8 stops the evaluation on the browser's clock, and the page's own timer runs on it.
+    for (const read of ['() => window.spin()', "() => /(a+)+$/.test('a'.repeat(40) + 'b')"]) {
+      const started = Date.now()
+      const stuck = await human.execute(`return await readPage(${read})`, 40000)
+      expect(stuck.isError, read).toBe(true)
+      expect(stuck.text, read).toContain('the function was still running 6s after it started, inside code readPage cannot stop from within')
+      expect(Date.now() - started, read).toBeLessThan(12000)
+    }
+    const ticks = async (): Promise<number> => Number(/\[return value\] (\d+)/.exec((await human.execute('return await readPage(() => window.ticks)', 30000)).text)?.[1])
+    const before = await ticks()
+    let after = before
+    for (let attempt = 0; attempt < 50 && after === before; attempt++) after = await ticks()
+    expect(after).toBeGreaterThan(before)
+  })
+
   it('left the page untouched: no mutation, no storage or app-state change, no user activation', async () => {
     const debug = await open('debug')
     const writes = [
@@ -223,7 +243,11 @@ describe('readPage', () => {
       expect(result.isError, write).toBe(true)
       expect(result.text, write).toContain("Chrome's side-effect check stopped the function before anything on the page changed")
     }
+    const look = (await debug.execute('await observe()', 30000)).text
+    const byRef = await debug.execute(`return await readPage((el) => el.textContent, { ref: ${refOf(look, /button "Buy"/)} })`, 30000)
+    expect(byRef.text).toContain('Buy')
     await debug.execute("return await readPage(() => [document.title, ...document.querySelectorAll('td')].length)", 30000)
-    expect(await pageState(debug)).toContain('{"mutations":0,"cart":"3 items","app":2,"h1":true,"active":false}')
+    // Chrome's console helpers, defined while a read with a ref runs, are gone from the page's window after it.
+    expect(await pageState(debug)).toContain('{"mutations":0,"cart":"3 items","app":2,"h1":true,"active":false,"consoleHelpers":[]}')
   })
 })

@@ -1,4 +1,5 @@
 import { createMCPClient } from './mcp-client.js'
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { chromium } from '@xmorse/playwright-core'
 import { getCDPSessionForPage } from './cdp-session.js'
@@ -1629,29 +1630,50 @@ describe('Relay Core Tests', () => {
       },
       [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
-    await new Promise((r) => setTimeout(r, 100))
+
+    /** Runs `code` through the MCP `execute` tool: the reply's text, and whether it is an error. */
+    const executeViaMcp = async (code: string): Promise<{ text: string; isError: boolean }> => {
+      const result = CallToolResultSchema.parse(await client.callTool({ name: 'execute', arguments: { code } }))
+      const text = result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n')
+      return { text, isError: result.isError === true }
+    }
+
+    // The toggle returns once the extension has attached page2, but the MCP's Playwright lists a
+    // page only after initializing it, which is another ~10 CDP round trips through relay and
+    // extension. Until then page2 is not in the MCP's context.pages(), so closing page1 would leave
+    // the MCP no page to switch to. Wait until the MCP itself sees page2.
+    const secondPageSeen = await executeViaMcp(js`
+      const url = 'https://example.com/second-page';
+      if (!context.pages().some((p) => p.url() === url)) await context.waitForEvent('page', { predicate: (p) => p.url() === url });
+    `)
+    expect(secondPageSeen.isError, secondPageSeen.text).toBe(false)
 
     // 6. Close the first page (which is the default `page` in MCP scope)
     await page1.close()
-    await new Promise((r) => setTimeout(r, 100))
+    // page1.close() returns once Chrome has closed the tab. The MCP hears of it later, by another
+    // route: the extension's chrome.tabs.onRemoved -> Target.detachedFromTarget over the relay ->
+    // the MCP's Playwright emits 'close' and the executor switches `page`. Under load that took
+    // longer than a fixed sleep, and the next execute still got page1 as `page`, whose title()
+    // then failed with "Target page, context or browser has been closed". Wait for the MCP's
+    // Playwright to see the close; page1 is no longer listed once it has.
+    const firstPageCloseSeen = await executeViaMcp(js`
+      const first = context.pages().find((p) => p.url() === 'https://example.com/first-page');
+      if (first) await first.waitForEvent('close');
+    `)
+    expect(firstPageCloseSeen.isError, firstPageCloseSeen.text).toBe(false)
 
     // 7. Execute code via MCP - should NOT fail with "page closed" error
     // Instead, it should automatically switch to the second page
-    const afterCloseResult = await client.callTool({
-      name: 'execute',
-      arguments: {
-        code: js`
+    const afterClose = await executeViaMcp(js`
                     const url = page.url();
                     console.log('Page URL after close:', url);
                     const title = await page.title();
                     return { url, title };
-                `,
-      },
-    })
+                `)
 
     // Should succeed and return the second page's info
-    expect((afterCloseResult as any).isError).toBeFalsy()
-    const output = (afterCloseResult as any).content[0].text
+    const output = afterClose.text
+    expect(afterClose.isError, output).toBe(false)
     expect(output).toContain('second-page')
     expect(output).not.toContain('page closed')
     expect(output).not.toContain('Target closed')
