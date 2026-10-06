@@ -8,10 +8,13 @@
  * no article, the visible page is rendered the same way. Every result starts with the
  * source it came from and the word counts of both (`source: article — …`).
  *
- * Both read only what is on screen. The content is a copy of the page's flat tree — open
- * shadow roots and slotted content included — built from the live nodes that pass
- * `checkVisibility()`, so a hidden tab panel, a `display:none` error template or a closed
- * `<details>` body never comes out as content.
+ * Both read only what is on screen. The content is a copy of the page's flat tree — open and
+ * closed shadow roots (nested ones too) and slotted content included — built from the live
+ * nodes that pass `checkVisibility()`, so a hidden tab panel, a `display:none` error template
+ * or a closed `<details>` body never comes out as content. Script cannot reach a closed shadow
+ * root, so CDP lists them (`DOM.describeNode` with `pierce`) and each is handed to its frame's
+ * isolated world as a node, which copies it in place of its host's light children like an open
+ * root. User-agent roots (the inside of an `<input>`, `<video>`…) are left out.
  *
  * Iframes are read where they sit. Every document — the page and each frame in it, same-process
  * or out-of-process, nested to any depth — is copied and rendered by its OWN frame's isolated
@@ -36,15 +39,20 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Page } from '@xmorse/playwright-core'
+import type { Protocol } from 'devtools-protocol'
 import { createSmartDiff } from './diff-utils.js'
+import { withDeadline } from './isolated-world.js'
 import type { FrameEntry, FrameHandle, PageFrames, UnreadableFrame } from './page-frames.js'
+import { ModelFacingError } from './probe-types.js'
 
-/** What a frame's isolated world is called with, besides the owner elements of the frame's child frames. */
+/** What a frame's isolated world is called with, besides its document and the nodes listed in `owners`. */
 interface ExtractArgs {
   /** Per call: the placeholder of slot n is `\uE000<nonce>:<n>\uE001`, which no page text holds. */
   nonce: string
   /** Also find the article with Readability: the top document only, which loads the bundle for it. */
   article: boolean
+  /** How many of the nodes after the document are owner elements of child frames; the rest are its closed shadow roots. */
+  owners: number
 }
 
 /** A rendered element of the document that shows another document, in flat-tree order. */
@@ -114,8 +122,8 @@ export interface GetPageMarkdownOptions extends PageMarkdownRequest {
 
 /**
  * Measured in headless Chromium on a 490 KB article (200 sections, 2000 paragraphs, 84k
- * words): ~400 ms for the first call (world creation + loading the bundle), ~300 ms after
- * (visible flat-tree copy, Readability, rendering both). The
+ * words): ~400 ms for the first call (world creation + loading the bundle), ~350 ms after
+ * (listing closed shadow roots ~55 ms, visible flat-tree copy, Readability, rendering both). The
  * cap is for a page whose main thread is busy or blocked by a native dialog, which
  * would otherwise hang the call forever.
  */
@@ -165,6 +173,10 @@ interface DomElement extends DomNode {
   /** False when the element has no box: display:none here or above, a content-visibility:hidden ancestor, display:contents. */
   checkVisibility(): boolean
 }
+/** A shadow root; one reached by reference (a closed root CDP handed over) still knows its host. */
+interface DomShadowRoot extends DomNode {
+  host: DomElement
+}
 interface DomSlot extends DomElement {
   assignedNodes(): DomNode[]
 }
@@ -209,12 +221,22 @@ interface WorldGlobal {
 }
 
 /**
- * Runs in a frame's isolated world as `fn(args, ...owners)` (serialised with `toString`, so it
- * must stay self-contained). `owners`: the elements that embed the frame's child frames, null
- * where one no longer exists. `globalThis.__readability` there is the world's own global, set
- * by the Readability bundle.
+ * Runs in a frame's isolated world (serialised with `toString`, so it must stay self-contained).
+ * `listed`: the document CDP listed the closed shadow roots in. `owners`: the elements that embed
+ * the frame's child frames, null where one no longer exists. `closedRoots`: the closed shadow
+ * roots of `listed`, nested ones included, null where one no longer exists.
+ * `globalThis.__readability` there is the world's own global, set by the Readability bundle.
+ *
+ * Null when `listed` is not the frame's document now: it navigated after the roots were listed,
+ * so they belong to another document and this one's closed roots are unknown.
  */
-function extractDocument(args: ExtractArgs, owners: Array<DomElement | null>): ExtractedDocument {
+function extractDocument(
+  args: ExtractArgs,
+  listed: DomDocument | null,
+  owners: Array<DomElement | null>,
+  closedRoots: Array<DomShadowRoot | null>,
+): ExtractedDocument | null {
+  if (listed !== document) return null
   const SKIP: Record<string, true> = {
     SCRIPT: true,
     STYLE: true,
@@ -428,6 +450,11 @@ function extractDocument(args: ExtractArgs, owners: Array<DomElement | null>): E
   owners.forEach((owner, index) => {
     if (owner) ownerIndex.set(owner, index)
   })
+  /** Host -> its closed shadow root, which `element.shadowRoot` does not show. */
+  const closedRootOf = new Map<DomElement, DomShadowRoot>()
+  for (const root of closedRoots) {
+    if (root) closedRootOf.set(root.host, root)
+  }
   const slots: FrameSlot[] = []
   /** A block holding the placeholder of the document `element` shows; the caller puts that document's markdown there. */
   const slotPlaceholder = (element: DomElement, tag: string, owner: number | null): DomElement => {
@@ -441,9 +468,10 @@ function extractDocument(args: ExtractArgs, owners: Array<DomElement | null>): E
     return placeholder
   }
 
-  /** The element's children in the flat tree: its open shadow root's, or a slot's assigned nodes. */
+  /** The element's children in the flat tree: its shadow root's (open or closed), or a slot's assigned nodes. */
   const flatChildren = (element: DomElement, tag: string): DomNode[] => {
-    if (element.shadowRoot) return Array.from(element.shadowRoot.childNodes)
+    const root = element.shadowRoot ?? closedRootOf.get(element)
+    if (root) return Array.from(root.childNodes)
     // A slot in a shadow tree shows the nodes assigned to it; with none, its own fallback children.
     // nodeType 11 is DOCUMENT_FRAGMENT_NODE: the slot's root is a shadow root.
     if (tag === 'SLOT' && element.getRootNode().nodeType === 11) {
@@ -637,44 +665,101 @@ interface DocumentRead {
   blocks: SlotBlock[]
 }
 
+/** A frame's document and the closed shadow roots in it, as backend node ids of the frame's session. */
+interface ClosedShadowRoots {
+  document: number
+  /** Every closed root of the document, nested ones (in open or closed roots) included, in document order. */
+  roots: number[]
+}
+
+/**
+ * The closed shadow roots of `handle`'s document, which no script can reach. Its world names the
+ * document (`document` is the frame's current one there), and `DOM.describeNode` with `pierce`
+ * lists the whole tree with every shadow root and its `shadowRootType`. Child frames' documents
+ * (`contentDocument`) are not walked: each frame is read, its closed roots too, on its own.
+ * User-agent roots (the inside of form controls and media) are not page content.
+ *
+ * Measured in headless Chromium on a 474 KB article (2000 paragraphs): ~75 ms for the describe,
+ * a 2 MB answer, against ~110-130 ms for a `DOMSnapshot.captureSnapshot` that would still need a
+ * describe per closed host.
+ */
+async function listClosedShadowRoots(handle: FrameHandle, where: string): Promise<ClosedShadowRoots> {
+  const [documentId] = await handle.world.nodesReturnedBy([], 'function () { return [document] }', {
+    timeoutMs: EXTRACT_TIMEOUT_MS,
+    what: `finding the document of ${where}`,
+  })
+  if (documentId === undefined || documentId === null) {
+    throw new Error(`The isolated world of ${where} returned no document node`)
+  }
+  const { node } = await withDeadline(
+    handle.cdp.send('DOM.describeNode', { backendNodeId: documentId, depth: -1, pierce: true }),
+    EXTRACT_TIMEOUT_MS,
+    `listing the closed shadow roots of ${where} (DOM.describeNode)`,
+  )
+  const roots: number[] = []
+  const collect = (parent: Protocol.DOM.Node): void => {
+    for (const root of parent.shadowRoots ?? []) {
+      if (root.shadowRootType === 'user-agent') continue
+      if (root.shadowRootType === 'closed') roots.push(root.backendNodeId)
+      collect(root)
+    }
+    for (const child of parent.children ?? []) collect(child)
+  }
+  collect(node)
+  return { document: documentId, roots }
+}
+
 /**
  * Read the document of `handle` in that frame's own isolated world, then every frame it shows,
  * each in its own world (same-process and out-of-process alike), concurrently.
  */
 async function readDocument(reading: FrameReading, handle: FrameHandle, article: boolean): Promise<DocumentRead> {
-  const placed = await Promise.all(
-    (reading.children.get(handle.frameId) ?? []).map(async (frame): Promise<PlacedFrame | null> => {
-      try {
-        return { frame, backendNodeId: (await reading.frames.owner(frame.frameId)).backendNodeId }
-      } catch (error) {
-        // Gone since the list (no element shows it now), or not readable anyway: an <iframe> still
-        // rendered without a frame gets its own not-read line.
-        if ('reason' in frame || frame.frame.isDetached()) return null
-        throw error
-      }
-    }),
-  )
-  const owners = placed.filter((owner): owner is PlacedFrame => owner !== null)
+  const where = handle.parentId === null ? 'the page' : `the iframe document ${handle.frame.url()}`
+  const subject = handle.parentId === null ? 'The page' : `The iframe ${handle.frame.url()}`
   // One call loads Readability (only if this copy of the world lacks it) and extracts, so a
   // navigation that recreates the world between two calls cannot split them.
   const declaration =
-    'function (args, ...owners) {\n' +
+    'function (args, listed, ...nodes) {\n' +
     (article ? `if (!globalThis.__readability) {\n${getReadabilityCode()}\n}\n` : '') +
-    `return (${extractDocument.toString()})(args, owners)\n}`
-  const args: ExtractArgs = { nonce: reading.nonce, article }
-  const extracted = await handle.world.callFunctionOnNodes<ExtractedDocument>(
-    owners.map((owner) => owner.backendNodeId),
-    declaration,
-    {
-      args,
-      timeoutMs: EXTRACT_TIMEOUT_MS,
-      what: article ? 'extracting the page content with Readability' : `reading the iframe document ${handle.frame.url()}`,
-    },
+    `return (${extractDocument.toString()})(args, listed, nodes.slice(0, args.owners), nodes.slice(args.owners))\n}`
+  // The closed roots are listed before the extraction runs; a document that navigates in between
+  // is listed again once.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const [placed, closed] = await Promise.all([
+      Promise.all(
+        (reading.children.get(handle.frameId) ?? []).map(async (frame): Promise<PlacedFrame | null> => {
+          try {
+            return { frame, backendNodeId: (await reading.frames.owner(frame.frameId)).backendNodeId }
+          } catch (error) {
+            // Gone since the list (no element shows it now), or not readable anyway: an <iframe> still
+            // rendered without a frame gets its own not-read line.
+            if ('reason' in frame || frame.frame.isDetached()) return null
+            throw error
+          }
+        }),
+      ),
+      listClosedShadowRoots(handle, where),
+    ])
+    const owners = placed.filter((owner): owner is PlacedFrame => owner !== null)
+    const args: ExtractArgs = { nonce: reading.nonce, article, owners: owners.length }
+    const extracted = await handle.world.callFunctionOnNodes<ExtractedDocument | null>(
+      [closed.document, ...owners.map((owner) => owner.backendNodeId), ...closed.roots],
+      declaration,
+      {
+        args,
+        timeoutMs: EXTRACT_TIMEOUT_MS,
+        what: article ? 'extracting the page content with Readability' : `reading ${where}`,
+      },
+    )
+    if (!extracted) continue
+    const blocks = await Promise.all(
+      extracted.slots.map((slot) => readSlot(reading, slot, slot.owner === null ? null : owners[slot.owner].frame)),
+    )
+    return { extracted, blocks }
+  }
+  throw new ModelFacingError(
+    `${subject} loaded a new document twice while it was being read. Call getPageMarkdown() again once it has finished loading.`,
   )
-  const blocks = await Promise.all(
-    extracted.slots.map((slot) => readSlot(reading, slot, slot.owner === null ? null : owners[slot.owner].frame)),
-  )
-  return { extracted, blocks }
 }
 
 /** The block for one slot: its frame's markdown between `[iframe "title"]` and `[end of iframe "title"]`, or why it was not read. */

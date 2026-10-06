@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Theme — colour fixture</title>
+<style>
+  body { font: 14px sans-serif; margin: 16px; }
+  label { display: block; margin: 12px 0; }
+  input[type=color] { width: 60px; height: 32px; }
+  .swatch-label { display: inline-block; padding: 8px 12px; border: 1px solid #999; }
+</style>
+</head>
+<body>
+<h1>Theme</h1>
+<!-- Drawn by its label only: the input is display:none, so the accessibility tree ignores it. -->
+<label class="swatch-label">Hidden accent <input type="color" id="hidden-accent" value="#000000" style="display:none"></label>
+<!-- Re-rendered on its first change: its layout goes away for a moment, which closes Chrome's chooser. -->
+<label>Brand colour <input type="color" id="brand" value="#000000"></label>
+<!-- Asks before the chooser opens. -->
+<label>Confirmed colour <input type="color" id="confirmed" value="#000000"></label>
+<!-- Asks on its first change, while the chooser is open. -->
+<label>Asked colour <input type="color" id="asked" value="#000000"></label>
+<!-- Nothing special: for a chooser a person opened with a click. -->
+<label>Plain colour <input type="color" id="plain" value="#000000"></label>
+<!-- Re-rendered once its colour is one of the brand palette's (#3366cc): that closes Chrome's
+     chooser right after the last key of that colour is typed, before anything else is pressed. -->
+<label>Palette colour <input type="color" id="palette" value="#000000"></label>
+<p id="log">Log:</p>
+<script>
+  // What the page heard, in order: keys that reached it, and its colour inputs' events.
+  const log = (text) => { document.getElementById('log').textContent += ' ' + text }
+  document.addEventListener('keydown', (event) => log('keydown:' + event.key))
+  for (const id of ['hidden-accent', 'brand', 'confirmed', 'asked', 'plain', 'palette']) {
+    const input = document.getElementById(id)
+    input.addEventListener('input', () => log('input:' + id + '=' + input.value))
+    input.addEventListener('change', () => log('change:' + id + '=' + input.value))
+  }
+  const brand = document.getElementById('brand')
+  let rendered = false
+  brand.addEventListener('input', () => {
+    if (rendered) return
+    rendered = true
+    brand.style.display = 'none'
+    brand.offsetWidth
+    brand.style.display = ''
+  })
+  document.getElementById('confirmed').addEventListener('click', () => log('confirm:' + confirm('Use a custom colour?')))
+  const asked = document.getElementById('asked')
+  let askedOnce = false
+  asked.addEventListener('input', () => {
+    if (askedOnce) return
+    askedOnce = true
+    log('confirm:' + confirm('Apply this colour?'))
+  })
+  const palette = document.getElementById('palette')
+  palette.addEventListener('input', () => {
+    if (palette.value !== '#3366cc') return
+    palette.style.display = 'none'
+    palette.offsetWidth
+    palette.style.display = ''
+  })
+</script>
+</body>
+</html>

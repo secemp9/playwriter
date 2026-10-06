@@ -24,6 +24,7 @@ import {
 } from './workspace-groups'
 import { createElementPicker, type PickPurpose } from './element-pick'
 import { copyTextViaOffscreen } from './offscreen-document'
+import { TabDownloads } from './tab-downloads'
 import { SelfGroupChangeLedger, UNGROUPED_TAB_GROUP_ID } from 'playwriter/src/tab-group-events'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
@@ -111,6 +112,13 @@ type ExtensionIdentity = {
   // in time and the worker-lifetime scope was used. Sent as `idSrc` on the relay URL so
   // the relay log shows which path fired — observability for wedged chrome.* APIs.
   idSource: 'storage' | 'fallback'
+  // The browser's own user agent (the service worker's navigator reports it). The relay answers
+  // Browser.getVersion with it: Playwright decides the platform from it ('Macintosh' means mac,
+  // which is what makes its keyboard send the editing commands macOS shortcuts need).
+  userAgent: string
+  // The Chromium product version Browser.getVersion reports after 'Chrome/'. Null only when the
+  // user agent has no Chrome/ token and the high-entropy version has not resolved.
+  browserVersion: string | null
 }
 
 function sleep(ms: number): Promise<void> {
@@ -166,24 +174,40 @@ function browserNameSync(): string {
 }
 
 let cachedBrowserName: string | null = null
+// The full Chromium version from the high-entropy brand list, once resolved. Chrome's reduced user
+// agent reports only the major version (Chrome/140.0.0.0), so this is the precise one.
+let cachedChromiumVersion: string | null = null
 let browserNameRefineStarted = false
 
 // Fire-and-forget refinement via the async high-entropy UA API (distinguishes e.g.
-// Chrome Canary). Never awaited on the connect path.
+// Chrome Canary, and gives the full Chromium version). Never awaited on the connect path.
 function refineBrowserNameInBackground(): void {
-  if (cachedBrowserName || browserNameRefineStarted) return
+  if ((cachedBrowserName && cachedChromiumVersion) || browserNameRefineStarted) return
   browserNameRefineStarted = true
   const navigatorWithUaData = navigator as NavigatorWithUaData
   Promise.resolve(navigatorWithUaData.userAgentData?.getHighEntropyValues?.(['fullVersionList']))
     .then((highEntropyValues) => {
-      const name = browserNameFromBrands(highEntropyValues?.fullVersionList || [])
+      const fullVersionList = highEntropyValues?.fullVersionList || []
+      const name = browserNameFromBrands(fullVersionList)
       if (name) {
         cachedBrowserName = name
+      }
+      const chromium = fullVersionList.find((brand) => brand.brand === 'Chromium')
+      if (chromium?.version) {
+        cachedChromiumVersion = chromium.version
       }
     })
     .catch(() => {
       browserNameRefineStarted = false
     })
+}
+
+// Synchronous: the Chromium version from the user agent's Chrome/ token, or the precise one the
+// background refinement cached.
+function browserVersionSync(): string | null {
+  if (cachedChromiumVersion) return cachedChromiumVersion
+  const token = /\bChrome\/(\d+(?:\.\d+)*)/.exec(navigator.userAgent)
+  return token ? token[1] : null
 }
 
 const tabSessionScope = (() => {
@@ -272,6 +296,8 @@ async function getExtensionIdentity(): Promise<ExtensionIdentity> {
     id: cachedProfile?.id || '',
     installId,
     idSource,
+    userAgent: navigator.userAgent,
+    browserVersion: browserVersionSync(),
   }
 }
 
@@ -476,6 +502,10 @@ class ConnectionManager {
       relayUrl.searchParams.set('installId', identity.installId)
     }
     relayUrl.searchParams.set('idSrc', identity.idSource)
+    relayUrl.searchParams.set('userAgent', identity.userAgent)
+    if (identity.browserVersion) {
+      relayUrl.searchParams.set('browserVersion', identity.browserVersion)
+    }
     if (typeof __PLAYWRITER_VERSION__ !== 'undefined') {
       relayUrl.searchParams.set('v', __PLAYWRITER_VERSION__)
     }
@@ -1493,6 +1523,12 @@ const DROPPED_CDP_EVENTS = new Set([
   'Network.resourceChangedPriority',
 ])
 
+/** Where Chrome saved the attached tabs' downloads, reported to the relay (tab-downloads.ts). */
+const tabDownloads = new TabDownloads((message) => sendMessage(message))
+if (typeof chrome.downloads !== 'undefined') {
+  chrome.downloads.onChanged.addListener(() => tabDownloads.onChromeDownloadChanged())
+}
+
 function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string, params: any): void {
   if (DROPPED_CDP_EVENTS.has(method)) {
     return
@@ -1558,27 +1594,40 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
         return { tabs: newTabs }
       })
       emitChildDetachesForTab(mainTab.tabId)
+      tabDownloads.forgetTab(mainTab.tabId)
     } else {
       logger.debug('Child target detached:', params.sessionId)
       childSessions.delete(params.sessionId)
     }
   }
 
-  sendMessage({
-    method: 'forwardCDPEvent',
-    params: {
-      sessionId: source.sessionId || tab.sessionId,
-      method,
-      params,
-      // Echo the owning workspace key for every event this tab forwards (Todo 20, Job A).
-      // The relay only consumes it on Target.attachedToTarget, where it stamps the target's
-      // ownership — including child/OOPIF targets, which belong to their parent tab's
-      // workspace (`tab` here is the parent, resolved from source.tabId). Without this, an
-      // owned tab's cross-origin iframe target would be stamped freestyle and its live
-      // events would reach nobody. null = freestyle.
-      workspaceKey: tab.workspaceKey,
-    },
-  })
+  const forwarded = {
+    sessionId: source.sessionId || tab.sessionId,
+    method,
+    params,
+    // Echo the owning workspace key for every event this tab forwards (Todo 20, Job A).
+    // The relay only consumes it on Target.attachedToTarget, where it stamps the target's
+    // ownership — including child/OOPIF targets, which belong to their parent tab's
+    // workspace (`tab` here is the parent, resolved from source.tabId). Without this, an
+    // owned tab's cross-origin iframe target would be stamped freestyle and its live
+    // events would reach nobody. null = freestyle.
+    workspaceKey: tab.workspaceKey,
+  }
+
+  if (method === 'Page.downloadWillBegin' && source.tabId !== undefined && forwarded.sessionId) {
+    tabDownloads.began({ tabId: source.tabId, sessionId: forwarded.sessionId, guid: params.guid, url: params.url, suggestedFilename: params.suggestedFilename })
+  } else if (method === 'Page.downloadProgress' && params?.state === 'canceled') {
+    tabDownloads.canceled(params.guid)
+  } else if (method === 'Page.downloadProgress' && params?.state === 'completed') {
+    // Held until chrome.downloads says where the file is (bounded): the relay puts it where each
+    // client's Playwright reads it before forwarding the completion.
+    void tabDownloads.fileOf(params.guid, params.receivedBytes).then((downloadFile) => {
+      sendMessage({ method: 'forwardCDPEvent', params: { ...forwarded, downloadFile } })
+    })
+    return
+  }
+
+  sendMessage({ method: 'forwardCDPEvent', params: forwarded })
 }
 
 function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.debugger.DetachReason}`): void {
@@ -1604,6 +1653,7 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
       },
     })
     emitChildDetachesForTab(detachedTabId)
+    tabDownloads.forgetTab(detachedTabId)
   }
 
   if (reason === chrome.debugger.DetachReason.CANCELED_BY_USER) {
@@ -1954,6 +2004,7 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   })
 
   emitChildDetachesForTab(tabId)
+  tabDownloads.forgetTab(tabId)
 
   if (shouldDetachDebugger) {
     chrome.debugger.detach({ tabId }).catch((err) => {

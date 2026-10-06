@@ -268,11 +268,20 @@ describe('renderObservation', () => {
       backendNodeId: 157,
       role: 'scroll area',
       name: 'main.inbox',
+      vertical: true,
+      horizontal: false,
       scrollTop: 0,
+      scrolledFromTop: 0,
       scrollHeight: 3000,
       clientHeight: 600,
       screensAbove: 0,
       screensBelow: 4,
+      scrollLeft: 0,
+      scrolledFromLeft: 0,
+      scrollWidth: 900,
+      clientWidth: 900,
+      screensLeft: 0,
+      screensRight: 0,
       visibility: 'in-view',
     }
     const obs = observation({
@@ -293,6 +302,76 @@ describe('renderObservation', () => {
       '[2] link "Mail 40" — inside [57] scroll area "main.inbox", scrolled out of sight (act.scrollTo(ref), or act.scroll(dir, { ref: 57 }))',
     )
     expect(renderObservation(obs, { scope: 57 })).toContain('SCOPE only inside [57] scroll area "main.inbox"')
+  })
+
+  it('gives an amount under a tenth of a screen in pixels, never as "0 screens" of an area that scrolls', () => {
+    const editor: ObservedScroller = {
+      ref: 61,
+      key: 'F:161' as NodeKey,
+      backendNodeId: 161,
+      role: 'scroll area',
+      name: 'div.cm-scroller',
+      vertical: false,
+      horizontal: true,
+      scrollTop: 0,
+      scrolledFromTop: 0,
+      scrollHeight: 200,
+      clientHeight: 200,
+      screensAbove: 0,
+      screensBelow: 0,
+      scrollLeft: 0,
+      scrolledFromLeft: 0,
+      scrollWidth: 614,
+      clientWidth: 600,
+      screensLeft: 0,
+      screensRight: 0,
+      visibility: 'in-view',
+    }
+    const list: ObservedScroller = { ...editor, ref: 62, key: 'F:162' as NodeKey, backendNodeId: 162, name: 'ul.feed', vertical: true, horizontal: false, scrollTop: 590, scrolledFromTop: 590, scrollHeight: 1200, clientHeight: 600, screensAbove: 1, screensBelow: 0, scrollWidth: 600 }
+    const rendered = renderObservation(observation({ scrollers: [editor, list] }))
+    expect(rendered).toContain('SCROLL [61] scroll area "div.cm-scroller" — left edge, 14px to the right')
+    expect(rendered).toContain('SCROLL [62] scroll area "ul.feed" — 1 screens above, 10px below')
+  })
+
+  it('points INSIDE towards where the hidden items are, on the axes the area scrolls', () => {
+    const base: ObservedScroller = {
+      ref: 57,
+      key: 'F:157' as NodeKey,
+      backendNodeId: 157,
+      role: 'scroll area',
+      name: 'main.feed',
+      vertical: true,
+      horizontal: false,
+      scrollTop: 2390,
+      scrolledFromTop: 2390,
+      scrollHeight: 3000,
+      clientHeight: 600,
+      screensAbove: 4,
+      screensBelow: 0,
+      scrollLeft: 0,
+      scrolledFromLeft: 0,
+      scrollWidth: 900,
+      clientWidth: 900,
+      screensLeft: 0,
+      screensRight: 0,
+      visibility: 'in-view',
+      box: { x: 0, y: 100, width: 900, height: 600 },
+    }
+    // 10px above its bottom, its out-of-sight control above: scrolling down reveals 10px of nothing.
+    const nearBottom = observation({
+      scroll: { y: 0, maxY: 0, screensAbove: 0, screensBelow: 0 },
+      scrollers: [base],
+      elements: [el(1, 'link', 'Older post', { scroller: 57, visibility: 'clipped', box: { x: 10, y: 40, width: 100, height: 20 } })],
+    })
+    expect(renderObservation(nearBottom)).toContain(`out of sight — act.scroll('up', { ref: 57 })`)
+    // Scrolls both ways, at its bottom, hiding a control to its right.
+    const wide: ObservedScroller = { ...base, horizontal: true, scrollTop: 2400, scrolledFromTop: 2400, scrollWidth: 2700, screensRight: 2 }
+    const sideways = observation({
+      scroll: { y: 0, maxY: 0, screensAbove: 0, screensBelow: 0 },
+      scrollers: [wide],
+      elements: [el(2, 'button', 'Next column', { scroller: 57, visibility: 'clipped', box: { x: 1500, y: 300, width: 100, height: 20 } })],
+    })
+    expect(renderObservation(sideways)).toContain(`out of sight — act.scroll('right', { ref: 57 })`)
   })
 })
 
@@ -422,16 +501,95 @@ describe('diffObservations / renderObservationDiff', () => {
       backendNodeId: 157,
       role: 'list',
       name: 'Inbox',
+      vertical: true,
+      horizontal: false,
       scrollTop: 0,
+      scrolledFromTop: 0,
       scrollHeight: 3000,
       clientHeight: 600,
       screensAbove: 0,
       screensBelow: 4,
+      scrollLeft: 0,
+      scrolledFromLeft: 0,
+      scrollWidth: 800,
+      clientWidth: 800,
+      screensLeft: 0,
+      screensRight: 0,
       visibility: 'in-view',
     }
     const before = observation({ scrollers: [area] })
-    const after = observation({ scrollers: [{ ...area, scrollTop: 840, screensAbove: 1.4, screensBelow: 2.6 }] })
+    const after = observation({ scrollers: [{ ...area, scrollTop: 840, scrolledFromTop: 840, screensAbove: 1.4, screensBelow: 2.6 }] })
     expect(renderObservationDiff(diffObservations(before, after))).toBe('SCROLL [57] list "Inbox" 0 → 840px (now 1.4 screens above, 2.6 below)')
+    // A list that does not scroll sideways says nothing sideways, whatever its sideways numbers do:
+    // right-to-left content behind overflow-x: hidden that got wider, or that the page scrolled.
+    const wider = observation({
+      scrollers: [{ ...area, scrollTop: 840, scrolledFromTop: 840, screensAbove: 1.4, screensBelow: 2.6, scrolledFromLeft: 200, scrollWidth: 1000 }],
+    })
+    expect(renderObservationDiff(diffObservations(before, wider))).toBe('SCROLL [57] list "Inbox" 0 → 840px (now 1.4 screens above, 2.6 below)')
+    expect(renderObservationDiff(diffObservations(before, observation({ scrollers: [{ ...area, scrollLeft: -200, scrolledFromLeft: 200 }] })))).toBe('')
+  })
+
+  it('reports a carousel that moved sideways', () => {
+    const area: ObservedScroller = {
+      ref: 58,
+      key: 'F:158' as NodeKey,
+      backendNodeId: 158,
+      role: 'region',
+      name: 'Featured products',
+      vertical: false,
+      horizontal: true,
+      scrollTop: 0,
+      scrolledFromTop: 0,
+      scrollHeight: 140,
+      clientHeight: 140,
+      screensAbove: 0,
+      screensBelow: 0,
+      scrollLeft: 0,
+      scrolledFromLeft: 0,
+      scrollWidth: 2400,
+      clientWidth: 600,
+      screensLeft: 0,
+      screensRight: 3,
+      visibility: 'in-view',
+    }
+    const before = observation({ scrollers: [area] })
+    const after = observation({ scrollers: [{ ...area, scrollLeft: 540, scrolledFromLeft: 540, screensLeft: 0.9, screensRight: 2.1 }] })
+    expect(renderObservationDiff(diffObservations(before, after))).toBe(
+      'SCROLL [58] region "Featured products" sideways 0 → 540px (now 0.9 screens to the left, 2.1 to the right)',
+    )
+  })
+
+  it('does not report a right-to-left carousel as scrolled when only content was added on its left', () => {
+    // Chrome's scrollLeft stays 0 at its right edge; the distance from its left edge grows by the new cards.
+    const area: ObservedScroller = {
+      ref: 59,
+      key: 'F:159' as NodeKey,
+      backendNodeId: 159,
+      role: 'region',
+      name: 'New arrivals',
+      vertical: false,
+      horizontal: true,
+      scrollTop: 0,
+      scrolledFromTop: 0,
+      scrollHeight: 140,
+      clientHeight: 140,
+      screensAbove: 0,
+      screensBelow: 0,
+      scrollLeft: 0,
+      scrolledFromLeft: 1000,
+      scrollWidth: 1600,
+      clientWidth: 600,
+      screensLeft: 1.7,
+      screensRight: 0,
+      visibility: 'in-view',
+    }
+    const before = observation({ scrollers: [area] })
+    const after = observation({ scrollers: [{ ...area, scrolledFromLeft: 1800, scrollWidth: 2400, screensLeft: 3 }] })
+    expect(renderObservationDiff(diffObservations(before, after))).toBe('')
+    const moved = observation({ scrollers: [{ ...area, scrollLeft: -480, scrolledFromLeft: 520, screensLeft: 0.9, screensRight: 0.8 }] })
+    expect(renderObservationDiff(diffObservations(before, moved))).toBe(
+      'SCROLL [59] region "New arrivals" sideways 0 → -480px (now 0.9 screens to the left, 0.8 to the right)',
+    )
   })
 
   it('says new document instead of an element diff after a navigation', () => {
@@ -471,6 +629,24 @@ describe('findInObservation', () => {
         `  text: (${at - 60} chars before) "…${LONG_REPLY.slice(at - 60)}" — in view · live region log "Conversation"`,
       ].join('\n'),
     )
+  })
+
+  it("matches a repeated control's context by the page's words in it, not by the words observe() frames them with", () => {
+    const obs = observation({
+      elements: [
+        el(1, 'link', 'Edit', { context: 'under heading "Shipping address"' }),
+        el(2, 'link', 'Edit', { context: 'in listitem "Headphones"' }),
+        el(3, 'button', 'Remove', { context: 'after "Quantity"' }),
+        el(4, 'button', 'Remove', { context: '2nd of 3' }),
+      ],
+    })
+    // "head" is in "under heading" on [1] but only in the page's own words on [2].
+    expect(findInObservation(obs, 'head')).toBe('1 match for "head":\n  [2] link "Edit" (in listitem "Headphones") — in view')
+    expect(findInObservation(obs, 'shipping')).toContain('[1] link "Edit" (under heading "Shipping address")')
+    expect(findInObservation(obs, 'after')).toMatch(/^No match for "after"/)
+    expect(findInObservation(obs, 'listitem')).toMatch(/^No match for "listitem"/)
+    expect(findInObservation(obs, '2nd')).toMatch(/^No match for "2nd"/)
+    expect(findInObservation(obs, 'remove quantity')).toBe('1 match for "remove quantity":\n  [3] button "Remove" (after "Quantity") — in view')
   })
 
   it('says plainly when nothing matches, and caps long result lists', () => {

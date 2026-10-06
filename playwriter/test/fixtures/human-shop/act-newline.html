@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Composer</title>
+<style>
+  body { font: 14px sans-serif; margin: 40px; }
+  textarea, [contenteditable] { display: block; width: 360px; height: 72px; margin-bottom: 20px; border: 1px solid #888; padding: 4px; }
+  /* Three 30px lines filling the box: a click in its middle lands on the second line. */
+  .lines { height: 90px; line-height: 30px; padding: 0 4px; overflow: hidden; }
+  .lines p, .lines div { margin: 0; }
+</style>
+</head>
+<body>
+  <!-- A chat composer, like Slack's or ChatGPT's: Enter sends the message, Shift+Enter starts a new line. -->
+  <textarea id="composer" aria-label="Message"></textarea>
+  <!-- A plain text area: Enter starts a new line. -->
+  <textarea id="notes" aria-label="Notes"></textarea>
+  <!-- A document editor that keeps each line in a <p>, like most rich text editors: Enter starts a new paragraph. -->
+  <div id="doc" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Document"><p><br></p></div>
+  <!-- A rich composer (contenteditable) that sends on Enter too. -->
+  <div id="rich" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Rich message"></div>
+  <!-- Fields that already hold three lines. -->
+  <textarea id="draft" class="lines" aria-label="Draft">one
+two
+three</textarea>
+  <div id="memo" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Memo"><div>one</div><div>two</div><div>three</div></div>
+  <div id="letter" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Letter"><p>Dear Ann,</p><p>See you.</p><p>Bob</p></div>
+  <!-- A field whose app takes every Ctrl/⌘ chord for its own shortcuts. -->
+  <textarea id="shortcuts" class="lines" aria-label="Snippet">one
+two
+three</textarea>
+  <!-- Like ProseMirror/TipTap: the editor's own Mod-A selects from before its first block to after its last one. -->
+  <div id="pm" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Prose"><p>Dear Ann,</p><p>Bob</p></div>
+  <!-- Content that ends in an atomic block: Chrome's own Ctrl+A and Ctrl+End end after it, at the editor. -->
+  <div id="rule" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Ruled"><p>Hello</p><hr></div>
+  <!-- Indented markup: white space around the text that the screen does not show. -->
+  <div id="indented" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Indented">
+    Hello world
+  </div>
+  <div id="card" class="lines" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Card"><p>
+    Dear Ann,
+  </p><p>Hello <b>there</b> </p></div>
+  <h2>Sent</h2>
+  <ul id="sent"></ul>
+  <script>
+    const send = (text) => {
+      const item = document.createElement('li')
+      item.textContent = text
+      document.getElementById('sent').append(item)
+    }
+    document.getElementById('composer').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey) return
+      event.preventDefault()
+      send(event.target.value)
+      event.target.value = ''
+    })
+    document.getElementById('rich').addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.shiftKey) return
+      event.preventDefault()
+      send(event.target.innerText)
+      event.target.replaceChildren()
+    })
+    document.getElementById('doc').addEventListener('focus', () => document.execCommand('defaultParagraphSeparator', false, 'p'))
+    document.getElementById('shortcuts').addEventListener('keydown', (event) => {
+      if (event.ctrlKey || event.metaKey) event.preventDefault()
+    })
+    const pm = document.getElementById('pm')
+    pm.addEventListener('keydown', (event) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key !== 'a') return
+      event.preventDefault()
+      getSelection().setBaseAndExtent(pm, 0, pm, pm.childNodes.length)
+    })
+  </script>
+</body>
+</html>

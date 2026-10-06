@@ -58,6 +58,12 @@ export type ExtensionEventMessage = {
        * freestyle (its pre-Todo-20 behaviour); Todo 33 owns the loud version-skew warning.
        */
       workspaceKey?: string | null
+      /**
+       * On a tab's `Page.downloadProgress` with `state: 'completed'` only: where Chrome saved the file,
+       * from chrome.downloads (download-match.ts), or why the extension could not tell. The relay puts
+       * the file where each owning client's Playwright reads it before forwarding the completion.
+       */
+      downloadFile?: DownloadFileReport
     }
   }
 }[keyof ProtocolMapping.Events]
@@ -98,6 +104,24 @@ export type RecordingCancelledMessage = {
   }
 }
 
+/** Where a finished download's file is, as the extension found it through chrome.downloads. */
+export type DownloadFileReport = { filePath: string } | { problem: string }
+
+/**
+ * A tab's download whose state the CDP events do not show: Chrome holds all its bytes and waits for the
+ * user to choose where to save it ("Ask where to save each file"), or no longer does.
+ */
+export type ExtensionDownloadStateMessage = {
+  id?: undefined
+  method: 'downloadState'
+  params: {
+    /** The tab session the download's `Page.downloadWillBegin` came on. */
+    sessionId: string
+    guid: string
+    asking: boolean
+  }
+}
+
 export type ExtensionMessage =
   | ExtensionResponseMessage
   | ExtensionEventMessage
@@ -105,6 +129,7 @@ export type ExtensionMessage =
   | ExtensionPongMessage
   | RecordingDataMessage
   | RecordingCancelledMessage
+  | ExtensionDownloadStateMessage
 
 // Recording command messages (MCP -> Extension via relay)
 export type StartRecordingParams = {

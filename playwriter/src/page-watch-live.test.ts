@@ -190,6 +190,23 @@ const PAGES: Record<string, string> = {
 <div style="position: relative; width: 60px; height: 60px"><div class="spinner" aria-label="Covered spinner"></div><div style="position: absolute; inset: 0; background: #fff"></div></div>
 <div class="spinner" aria-label="Far below" style="margin-top: 3000px"></div>`,
   ),
+  // Scrolled 1000px down by the page itself: the spinner is drawn at viewport y≈210, where the
+  // document holds the tall paragraph above it.
+  '/scrolled-spinner': html(
+    'scrolled spinner',
+    `<p style="height: 1200px; margin: 0">Intro</p><div class="spinner" aria-label="Loading comments"></div><div style="height: 2000px"></div>
+<script>scrollTo(0, 1000)</script>`,
+  ),
+  // The same with the spinner inside a cross-site iframe (its own renderer process): the iframe is
+  // drawn at viewport y≈110, where the document holds the paragraph.
+  '/scrolled-frame': html(
+    'scrolled frame',
+    `<p style="height: 1100px; margin: 0">Intro</p>
+<iframe src="http://localhost:__PORT__/spinner-frame" style="display: block; width: 300px; height: 150px; border: 0"></iframe>
+<div style="height: 2000px"></div>
+<script>scrollTo(0, 1000)</script>`,
+  ),
+  '/spinner-frame': html('comments', '<div class="spinner" aria-label="Loading comments"></div>'),
   '/advance': html(
     'advance',
     `<div role="progressbar" aria-label="Upload" aria-valuenow="10" aria-valuemin="0" aria-valuemax="100" style="width: 200px; height: 8px; background: #8bd"></div>
@@ -339,7 +356,7 @@ beforeAll(async () => {
       return
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(page.replace('__CLOSED_PORT__', String(closedPort)))
+    res.end(page.replace('__CLOSED_PORT__', String(closedPort)).replace('__PORT__', new URL(baseUrl).port))
   })
   sockets = new WebSocketServer({ server, path: '/ws' })
   sockets.on('connection', (socket) => socket.on('message', (data) => socket.send(`echo ${String(data)}`)))
@@ -559,6 +576,24 @@ describe('busy signals', () => {
     const idle = await watch.waitForIdle({ timeoutMs: 1200, quietMs: 200, networkQuietMs: 200 })
     expect(idle.reason).toBe('timeout')
     expect(idle.busy.some((s) => s.kind === 'aria-busy' && s.strength === 'strong')).toBe(true)
+    await page.close()
+  })
+
+  // Chrome's hit test takes document coordinates: a scrolled page must not move where it looks.
+  it('a spinner on screen in a scrolled page is on top', async () => {
+    const { page, watch } = await openWatched('/scrolled-spinner')
+    expect((await watch.busySignals()).filter((s) => s.kind === 'spinner')).toEqual([
+      { strength: 'strong', kind: 'spinner', label: 'div.spinner "Loading comments" (animation spin) repeating endlessly' },
+    ])
+    await page.close()
+  })
+
+  it('a spinner in a cross-site iframe on screen in a scrolled page is on top', async () => {
+    const { page, watch } = await openWatched('/scrolled-frame')
+    // The iframe's own renderer process starts its document after the page's.
+    await expect
+      .poll(async () => (await watch.busySignals()).filter((s) => s.kind === 'spinner').map((s) => `${s.strength} ${s.label}`))
+      .toEqual([expect.stringMatching(/^strong div\.spinner "Loading comments" \(animation spin\) repeating endlessly in iframe http:\/\/localhost:\d+\/spinner-frame$/)])
     await page.close()
   })
 

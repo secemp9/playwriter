@@ -3,6 +3,7 @@ import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.j
 import { withDeadline } from './isolated-world.js'
 import { ModelFacingError } from './probe-types.js'
 import { openingOwnCdpSession } from './playwright-client-hooks.js'
+import { restoreIsChromiumOption } from './playwright-server.js'
 
 /** Borrowing a session is one Playwright protocol round trip; if it does not come back, say so rather than hang. */
 const BORROW_TIMEOUT_MS = 10_000
@@ -163,6 +164,7 @@ export function getCDPSessionForPage({ page }: { page: Page }): Promise<Playwrig
 }
 
 async function borrowForPage(page: Page): Promise<PlaywrightCDPSessionAdapter> {
+  restoreIsChromiumOption(page.context())
   const session = await withDeadline(
     openingOwnCdpSession.run(true, () => page.context().getExistingCDPSession(page)),
     BORROW_TIMEOUT_MS,
@@ -236,6 +238,7 @@ const frameAdaptersByPage = new WeakMap<Page, Set<PlaywrightCDPSessionAdapter>>(
 
 async function borrowForFrame(frame: Frame): Promise<PlaywrightCDPSessionAdapter | null> {
   const page = frame.page()
+  restoreIsChromiumOption(page.context())
   let playwrightSession: PlaywrightCDPSession
   try {
     playwrightSession = await withDeadline(

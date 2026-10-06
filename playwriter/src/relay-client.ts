@@ -246,7 +246,9 @@ export function getExtensionStaleError(extensionPlaywriterVersion: string | null
     return (
       `Your Playwriter browser extension is stale: it was built with playwriter ${extensionPlaywriterVersion} ` +
       `but the relay is running ${VERSION}. A stale extension no longer reports workspace ownership, so every ` +
-      `page it opens is invisible to this session (you would see "no pages anywhere"). ` +
+      `page it opens is invisible to this session (you would see "no pages anywhere"). An extension built before ` +
+      `it reported the browser's user agent also leaves browser.version() wrong and makes Playwright treat a Mac as ` +
+      `Linux, so macOS keyboard shortcuts (Meta+A, Meta+ArrowLeft, Alt+Backspace…) do nothing in text fields. ` +
       `Reload the unpacked extension at chrome://extensions (or rebuild it with \`cd extension && pnpm build\`), then retry.`
     )
   }

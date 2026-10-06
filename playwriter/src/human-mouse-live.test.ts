@@ -54,6 +54,11 @@ const FIXTURE_HTML = `<!doctype html>
     document.getElementById('readout').textContent = 'hazard hovered x' + window.__hazardHovers
   })
   document.getElementById('target').addEventListener('click', function () { window.__targetClicks++ })
+  // ?navigateOnHazard: the page leaves for its plain address as soon as the pointer crosses the
+  // band, which happens strictly inside a move from origin to target.
+  if (new URLSearchParams(location.search).has('navigateOnHazard')) {
+    document.getElementById('hazard').addEventListener('mouseover', function () { location.replace(location.pathname) }, { once: true })
+  }
   document.addEventListener('mousemove', function (e) {
     if (window.__moveTrail.length < 4000) window.__moveTrail.push([e.clientX, e.clientY, Math.round(performance.now())])
   }, true)
@@ -230,18 +235,21 @@ describe('the behavioural claim: a real path fires hover events a teleport does 
   }, 60000)
 
   it('reports crossings lost to a navigation during the move instead of an empty trail', async () => {
-    const moving = humanMouse.moveTo({
+    // The page navigates itself when the pointer crosses #hazard, so the navigation lands inside the
+    // move whatever the machine's load: after the target was measured, before the pointer arrives.
+    // (A reload on a timer raced the move: under load it landed before the target was measured, or
+    // after the move had ended.)
+    await page.goto(`${baseUrl}/?navigateOnHazard`)
+    const result = await humanMouse.moveTo({
       page,
       from: ORIGIN,
       locator: page.locator('#target'),
       seed: 4242,
       reportCrossings: true,
     })
-    // Real timer: the reload has to land inside the move's real wall-clock window.
-    await page.waitForTimeout(60)
-    await page.reload()
-    const result = await moving
+    await page.waitForLoadState('load')
 
+    expect(page.url()).toBe(`${baseUrl}/`)
     expect(result.crossed).toBeUndefined()
     expect(result.warnings.join('\n')).toContain('navigated during the move')
   }, 60000)

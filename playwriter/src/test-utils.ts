@@ -67,6 +67,7 @@ const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'relay-two-targets.test.ts': 19772,
   'relay-oopif-attach.test.ts': 19773,
   'iframes-relay.test.ts': 19774,
+  'extension-downloads.test.ts': 19775,
   'trace-integration.test.ts': 19985,
   'aria-snapshot.test.ts': 19986,
   'relay-core.test.ts': 19987,

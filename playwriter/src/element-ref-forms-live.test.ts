@@ -105,16 +105,23 @@ describe('element readers: { ref } forms', () => {
 
   it('in human mode: refuses the locator form before it runs, reads by ref, and leaves the page unactivated', async () => {
     const human = await open('human')
-    const refused = await human.execute("return await debugStyle({ locator: page.locator('#save'), property: 'color' })", 30000)
+    // Written out, the policy reads it before the code runs: nothing of the call runs.
+    const refused = await human.execute("state.ran = true\nreturn await debugStyle({ locator: page.locator('#save'), property: 'color' })", 30000)
     expect(refused.isError).toBe(true)
-    expect(refused.text).toContain(
+    expect(refused.text).toContain("debugStyle({ locator }) on line 2 → debugStyle({ ref: 12 }). Given a Playwright locator, selector or element handle")
+    expect(refused.text).toContain('Nothing from this call was run.')
+    expect((await human.execute('return String(state.ran)', 30000)).text).toContain('undefined')
+    // Built in a variable, it is refused when the reader is called, before any Playwright call of it.
+    const dynamic = await human.execute("const options = { locator: page.locator('#save'), property: 'color' }\nreturn await debugStyle(options)", 30000)
+    expect(dynamic.isError).toBe(true)
+    expect(dynamic.text).toContain(
       "Refused (human mode): debugStyle({ locator }) resolves the locator with Playwright's script in the page, which Playwright " +
         'runs as a user gesture (the page then counts as clicked: navigator.userActivation). Pass a ref from observe() or find(): ' +
-        'debugStyle({ ref: 12 }). Nothing from this call was run.',
+        'debugStyle({ ref: 12 }). It was not run.',
     )
     const enabled = await human.execute('return await humanMouse.enable()', 30000)
     expect(enabled.isError).toBe(true)
-    expect(enabled.text).toContain('Refused (human mode): humanMouse.enable()')
+    expect(enabled.text).toContain('humanMouse.enable() on line 1 routes locator.click/dblclick/hover through human motion')
     expect(enabled.text).toContain('act.click(12), act.hover(12)')
 
     const ref = await saveRef(human)

@@ -526,12 +526,42 @@ describe('act on native form controls', () => {
     expect(await valueOf('volume')).toMatch(/75/)
   })
 
-  it('refuses a colour input: its picker is browser UI', async () => {
+  const colourEvents = async (): Promise<string> =>
+    (await executor.execute("return await readPage(() => document.getElementById('colour-events').textContent)", 30000)).text
+
+  it('refuses a colour that is not #rrggbb, before touching the input', async () => {
     const colour = refOf(look, /Theme colour/)
-    const result = await executor.execute(`await act.fill(${colour}, '#ff0000')`, 30000)
+    expect(look).toContain(`(takes #rrggbb: act.fill(${colour}, "#rrggbb"))`)
+    const result = await executor.execute(`await act.fill(${colour}, 'red')`, 30000)
     expect(result.isError).toBe(true)
-    expect(result.text).toMatch(/Ask the user to pick the colour/)
+    expect(result.text).toMatch(/give the colour as #rrggbb, six hex digits/)
     expect(await valueOf('colour')).toMatch(/#336699/)
+    expect(await colourEvents()).not.toMatch(/colour=/)
+  })
+
+  it("sets a colour input through Chrome's colour chooser with the keys a person uses, firing input and change", async () => {
+    const colour = refOf(look, /Theme colour/)
+    const result = await executor.execute(`await act.fill(${colour}, '#3366CC')`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/Shift\+Tab into the hex field, typed #3366cc, Enter; value read back: "#3366cc"/)
+    expect(await valueOf('colour')).toMatch(/#3366cc/)
+    // The page heard it the way it hears a person: input events while the hex was typed, change when the chooser closed.
+    const events = await colourEvents()
+    expect(events).toMatch(/input:colour=#[0-9a-f]{6}.* change:colour=#3366cc/)
+    // The chooser closed: the next key reaches the page again (focus is still in the input) instead of the popup.
+    const pressed = await executor.execute("await act.press('Tab')", 30000)
+    expect(pressed.isError, pressed.text).toBe(false)
+    const focus = await executor.execute('return await readPage(() => document.activeElement.id)', 30000)
+    expect(focus.text).toMatch(/badge/)
+  })
+
+  it('refuses a colour input with suggested swatches: its popup takes no choice from page input', async () => {
+    const badge = refOf(look, /Badge colour/)
+    expect(look).toMatch(/Badge colour.*\(colour input with suggested swatches: act\.fill cannot choose in its popup — ask the user\)/)
+    const result = await executor.execute(`await act.fill(${badge}, '#0000ff')`, 30000)
+    expect(result.isError).toBe(true)
+    expect(result.text).toMatch(/neither Enter nor Space picks a swatch/)
+    expect(await valueOf('badge')).toMatch(/#ff0000/)
   })
 
   it('refuses a newline in a single-line field instead of submitting the form', async () => {
@@ -660,6 +690,268 @@ describe('act across history, tabs and scroll areas', () => {
     const [, inner, documentTop] = /\[\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\s*\]/.exec(offsets.text)?.map(Number) ?? []
     expect(inner).toBeGreaterThan(0)
     expect(documentTop).toBe(0)
+  })
+
+  /** The numbers of an array readPage returned, e.g. `[ 600, 0 ]`. */
+  const numbersIn = (text: string): number[] => {
+    const list = /\[([^\]]*)\]\s*$/.exec(text.trim())?.[1]
+    if (list === undefined) throw new Error(`no array in:\n${text}`)
+    return list.split(',').map(Number)
+  }
+
+  it('lists a carousel as a scroll area and scrolls it sideways with the wheel, not the page', async () => {
+    const executor = await openFixture('act-carousel.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const carousel = refOf(look, /^SCROLL \[\d+\] region "Featured products"/)
+    expect(look).toMatch(new RegExp(`SCROLL \\[${carousel}\\] region "Featured products" — left edge, [\\d.]+ screens to the right \\(act\\.scroll\\(dir, \\{ ref: ${carousel} \\}\\)\\)`))
+    // What it hides is counted inside it, with the way to reach it — not as page content off to the side.
+    expect(look).toMatch(new RegExp(`INSIDE \\[${carousel}\\] region "Featured products" .*out of sight — act\\.scroll\\('right', \\{ ref: ${carousel} \\}\\)`))
+    expect(look).not.toMatch(/SIDEWAYS/)
+    const found = await executor.execute("await find('Product 12')", 30000)
+    expect(found.text).toMatch(new RegExp(`link "Product 12" .*— inside \\[${carousel}\\] region "Featured products", scrolled out of sight`))
+
+    const result = await executor.execute(`await act.scroll('right', { ref: ${carousel} })`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/scrolled \[\d+\] region "Featured products" \d+px to the right; \d+\.\d screens to the right/)
+    expect(result.text).toMatch(new RegExp(`SCROLL \\[${carousel}\\] region "Featured products" sideways 0 → \\d+px`))
+    const [left, pageY, pageX] = numbersIn(
+      (await executor.execute("return await readPage(() => [document.getElementById('featured').scrollLeft, window.scrollY, window.scrollX])", 30000)).text,
+    )
+    expect(left).toBeGreaterThan(100)
+    expect([pageY, pageX]).toEqual([0, 0])
+  })
+
+  it('refuses a third sideways scroll of a carousel after two that moved nothing', async () => {
+    const executor = await openFixture('act-carousel.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const carousel = refOf(look, /^SCROLL \[\d+\] region "Featured products"/)
+    const toEnd = await executor.execute(`await act.scroll('right', { ref: ${carousel}, screens: 10 })`, 30000)
+    expect(toEnd.isError, toEnd.text).toBe(false)
+    expect(toEnd.text).toMatch(/0\.0 screens to the right/)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const idle = await executor.execute(`await act.scroll('right', { ref: ${carousel} })`, 30000)
+      expect(idle.isError, idle.text).toBe(false)
+      expect(idle.text).toMatch(/nothing to scroll: \[\d+\] region "Featured products" is already at the right end/)
+    }
+    const refused = await executor.execute(`await act.scroll('right', { ref: ${carousel} })`, 30000)
+    expect(refused.isError).toBe(true)
+    expect(refused.text).toMatch(/Not done: the last 2 scrolls of \[\d+\] region "Featured products" right moved 0px each/)
+    // The other way still moves it.
+    const back = await executor.execute(`await act.scroll('left', { ref: ${carousel} })`, 30000)
+    expect(back.isError, back.text).toBe(false)
+    expect(back.text).toMatch(/\d+px to the left; \d+\.\d screens to the left/)
+  })
+
+  it('refuses a scroll direction other than down, up, right or left', async () => {
+    const executor = await openFixture('act-carousel.html')
+    await executor.execute('await observe()', 30000)
+    const result = await executor.execute("await act.scroll('sideways')", 30000)
+    expect(result.isError).toBe(true)
+    expect(result.text).toMatch(/scroll: direction must be 'down', 'up', 'right' or 'left' \(got "sideways"\)/)
+  })
+
+  it('act.scrollTo brings a card hidden to the right of a carousel into view with the wheel', async () => {
+    const executor = await openFixture('act-carousel.html')
+    await executor.execute('await observe()', 30000)
+    const product = refOf((await executor.execute("await find('Product 12')", 30000)).text, /link "Product 12"/)
+    const result = await executor.execute(`await act.scrollTo(${product})`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/scrolled with the mouse wheel to reach it: \d+px in section#featured\.carousel "Featured products"/)
+    const [linkLeft, linkRight, boxLeft, boxRight] = numbersIn(
+      (
+        await executor.execute(
+          "return await readPage(() => { const link = document.querySelector('a[href=\"#featured-12\"]').getBoundingClientRect(); const box = document.getElementById('featured').getBoundingClientRect(); return [link.left, link.right, box.left, box.right].map(Math.round) })",
+          30000,
+        )
+      ).text,
+    )
+    expect(linkLeft).toBeGreaterThanOrEqual(boxLeft)
+    expect(linkRight).toBeLessThanOrEqual(boxRight)
+  })
+
+  it('lists a right-to-left carousel at its right edge, scrolls it left, and reports how far it moved while it loaded more', async () => {
+    const executor = await openFixture('act-carousel.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const arrivals = refOf(look, /^SCROLL \[\d+\] region "New arrivals"/)
+    expect(look).toMatch(new RegExp(`SCROLL \\[${arrivals}\\] region "New arrivals" — right edge, [\\d.]+ screens to the left`))
+    expect(look).toMatch(new RegExp(`INSIDE \\[${arrivals}\\] region "New arrivals" .*out of sight — act\\.scroll\\('left', \\{ ref: ${arrivals} \\}\\)`))
+    // The carousel adds four cards on its left the first time it scrolls: the distance from its
+    // left edge grows by their width, but what moved is Chrome's own scrollLeft.
+    const result = await executor.execute(`await act.scroll('left', { ref: ${arrivals} })`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    const reported = Number(/scrolled \[\d+\] region "New arrivals" (\d+)px to the left; \d+\.\d screens to the left/.exec(result.text)?.[1])
+    // Chrome's scrollLeft of right-to-left content is 0 at its start and negative leftwards.
+    const [left, cards] = numbersIn(
+      (await executor.execute("return await readPage(() => [document.getElementById('arrivals').scrollLeft, document.querySelectorAll('#arrivals .card').length])", 30000)).text,
+    )
+    expect(cards).toBe(12)
+    expect(left).toBeLessThan(-100)
+    expect(Math.abs(reported - Math.abs(left))).toBeLessThanOrEqual(1)
+    expect(result.text).toMatch(new RegExp(`SCROLL \\[${arrivals}\\] region "New arrivals" sideways 0 → -${reported}px`))
+  })
+
+  it('does not report a right-to-left carousel as scrolled when the page only added cards to it', async () => {
+    const executor = await openFixture('act-carousel.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const result = await executor.execute(`await act.click(${refOf(look, /button "More arrivals"/)})`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/link "Arrival 12"/)
+    expect(result.text).not.toMatch(/SCROLL \[\d+\] region "New arrivals"/)
+  })
+
+  it('lists a vertical-rl reader at its right edge, and asks a carousel scrolled down to scroll the way it can move', async () => {
+    const executor = await openFixture('act-carousel.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const reader = refOf(look, /^SCROLL \[\d+\] region "Reader"/)
+    expect(look).toMatch(new RegExp(`SCROLL \\[${reader}\\] region "Reader" — right edge, [\\d.]+ screens to the left`))
+    expect(look).toMatch(new RegExp(`INSIDE \\[${reader}\\] region "Reader" .*out of sight — act\\.scroll\\('left', \\{ ref: ${reader} \\}\\)`))
+    const moved = await executor.execute(`await act.scroll('left', { ref: ${reader} })`, 30000)
+    expect(moved.isError, moved.text).toBe(false)
+    expect(moved.text).toMatch(/scrolled \[\d+\] region "Reader" \d+px to the left/)
+    // A right-to-left carousel starts at its right edge: the way it can move is left.
+    const arrivals = refOf(look, /^SCROLL \[\d+\] region "New arrivals"/)
+    const down = await executor.execute(`await act.scroll('down', { ref: ${arrivals} })`, 30000)
+    expect(down.isError, down.text).toBe(false)
+    expect(down.text).toContain(`nothing to scroll: [${arrivals}] region "New arrivals" does not scroll up or down; it scrolls sideways (act.scroll('left', { ref: ${arrivals} }))`)
+  })
+
+  it("scrolls a page whose <body> is right-to-left from its right edge, and does not list <body> as a scroll area", async () => {
+    const executor = await openFixture('act-rtl-page.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    expect(look).not.toMatch(/^SCROLL /m)
+    expect(look).toMatch(/SIDEWAYS \d+ controls off to the left\/right/)
+    const result = await executor.execute("await act.scroll('left')", 30000)
+    expect(result.isError, result.text).toBe(false)
+    const [screensLeft] = /(\d+\.\d) screens to the left/.exec(result.text)?.slice(1).map(Number) ?? []
+    expect(result.text).toMatch(/scrolled the page \d+px to the left/)
+    expect(screensLeft).toBeGreaterThan(0)
+    const [left] = numbersIn((await executor.execute('return await readPage(() => [document.scrollingElement.scrollLeft])', 30000)).text)
+    expect(left).toBeLessThan(-100)
+  })
+
+  it('lists a column-reverse chat log at its newest message as the bottom, and scrolls it up to older ones', async () => {
+    const executor = await openFixture('act-chat-log.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const chat = refOf(look, /^SCROLL \[\d+\] main "Conversation"/)
+    expect(look).toMatch(new RegExp(`SCROLL \\[${chat}\\] main "Conversation" — bottom, [\\d.]+ screens above \\(act\\.scroll\\(dir, \\{ ref: ${chat} \\}\\)\\)`))
+    expect(look).toMatch(new RegExp(`INSIDE \\[${chat}\\] main "Conversation" .*out of sight — act\\.scroll\\('up', \\{ ref: ${chat} \\}\\)`))
+    expect(look).toMatch(/link "Message 60"/)
+    const result = await executor.execute(`await act.scroll('up', { ref: ${chat} })`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    const reported = Number(/scrolled \[\d+\] main "Conversation" (\d+)px; \d+\.\d screens above/.exec(result.text)?.[1])
+    // Chrome's scrollTop of a column-reverse list is 0 at its newest message and negative upwards.
+    const [top] = numbersIn((await executor.execute("return await readPage(() => [document.getElementById('log').scrollTop])", 30000)).text)
+    expect(top).toBeLessThan(-100)
+    expect(Math.abs(reported - Math.abs(top))).toBeLessThanOrEqual(1)
+    expect(result.text).toMatch(new RegExp(`SCROLL \\[${chat}\\] main "Conversation" 0 → -${reported}px \\(now [\\d.]+ screens above, [\\d.]+ below\\)`))
+  })
+
+  it('says a column-reverse chat log at its newest message is already at the bottom, and refuses the third scroll down', async () => {
+    const executor = await openFixture('act-chat-log.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const chat = refOf(look, /^SCROLL \[\d+\] main "Conversation"/)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const idle = await executor.execute(`await act.scroll('down', { ref: ${chat} })`, 30000)
+      expect(idle.isError, idle.text).toBe(false)
+      expect(idle.text).toMatch(/nothing to scroll: \[\d+\] main "Conversation" is already at the bottom/)
+    }
+    const refused = await executor.execute(`await act.scroll('down', { ref: ${chat} })`, 30000)
+    expect(refused.isError).toBe(true)
+    expect(refused.text).toMatch(/Not done: the last 2 scrolls of \[\d+\] main "Conversation" down moved 0px each/)
+  })
+})
+
+describe('act.fill on colour inputs, when the chooser or the page gets in the way', () => {
+  const logOf = async (executor: PlaywrightExecutor): Promise<string> =>
+    (await executor.execute("return await readPage(() => document.getElementById('log').textContent)", 30000)).text
+
+  it('sets a colour input hidden from view and from the accessibility tree, through its label', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const hidden = refOf(look, /colorwell "Hidden accent"/)
+    const result = await executor.execute(`await act.fill(${hidden}, '#3366cc')`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/value read back: "#3366cc"/)
+    expect(await logOf(executor)).toMatch(/change:hidden-accent=#3366cc/)
+  })
+
+  it('stops sending keys when the page closes the chooser, and says which keys were sent', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const brand = refOf(look, /colorwell "Brand colour"/)
+    const result = await executor.execute(`await act.fill(${brand}, '#3366cc')`, 30000)
+    expect(result.isError).toBe(true)
+    expect(result.text).toMatch(/Chrome's colour chooser for \[\d+\] colorwell "Brand colour" closed before act\.fill was done \(keys sent to it: Shift\+Tab ArrowUp Shift\+Tab # 3\)/)
+    expect(result.text).not.toMatch(/Cancelled it with Escape/)
+    // No key reached the page after the chooser closed.
+    expect(await logOf(executor)).not.toMatch(/keydown:/)
+  })
+
+  it('refuses naming the dialog when the click on a colour input opens a confirm, and reads nothing from the frozen page', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const confirmed = refOf(look, /colorwell "Confirmed colour"/)
+    const result = await executor.execute(`await act.fill(${confirmed}, '#3366cc')`, 30000)
+    expect(result.isError).toBe(true)
+    expect(result.text).toMatch(/Clicked \[\d+\] colorwell "Confirmed colour", and a native confirm\("Use a custom colour\?"\) opened: the page is frozen/)
+    const dismissed = await executor.execute('await act.dialog.dismiss()', 30000)
+    expect(dismissed.isError, dismissed.text).toBe(false)
+  })
+
+  it('stops typing when a change in the chooser opens a confirm, naming the keys sent', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const asked = refOf(look, /colorwell "Asked colour"/)
+    const result = await executor.execute(`await act.fill(${asked}, '#3366cc')`, 30000)
+    expect(result.isError).toBe(true)
+    expect(result.text).toMatch(/Choosing #3366cc in Chrome's colour chooser for \[\d+\] colorwell "Asked colour" \(keys sent: Shift\+Tab ArrowUp Shift\+Tab # 3\), and a native confirm\("Apply this colour\?"\) opened/)
+    const dismissed = await executor.execute('await act.dialog.dismiss()', 30000)
+    expect(dismissed.isError, dismissed.text).toBe(false)
+    expect(await logOf(executor)).toMatch(/input:asked=#000003 confirm:false/)
+  })
+
+  it("shows a colour chooser opened by a click on the input's line, without listing the chooser's own controls", async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const plain = refOf(look, /colorwell "Plain colour"/)
+    const clicked = await executor.execute(`await act.click(${plain})`, 30000)
+    expect(clicked.isError, clicked.text).toBe(false)
+    // The report says the chooser opened, and lists nothing of the chooser's own as page controls.
+    expect(clicked.text).toContain(`~ [${plain}] colorwell "Plain colour": (no state) → [chooser open]`)
+    expect(clicked.text).not.toMatch(/Color well|Red channel|Format toggler|Eyedropper/)
+    const all = (await executor.execute('await observe({ all: true })', 30000)).text
+    expect(all).toContain(
+      `[${plain}] colorwell "Plain colour" [focused] = "#000000" (Chrome's colour chooser is open, and keys go to it, not the page: act.fill(${plain}, "#rrggbb") ` +
+        "chooses a colour; act.press('Enter') closes it keeping the colour it shows; act.press('Escape') puts back the colour it opened with, and closes it once that colour is back)",
+    )
+    expect(all).not.toMatch(/Color well|Red channel|Format toggler|Eyedropper/)
+  })
+
+  it('sets a colour input whose chooser is already open, cancelling it first the way a person does', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const plain = refOf(look, /colorwell "Plain colour"/)
+    expect((await executor.execute(`await act.click(${plain})`, 30000)).isError).toBe(false)
+    const result = await executor.execute(`await act.fill(${plain}, '#3366cc')`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/its colour chooser was already open, showing #000000: cancelled it with Escape \(once\), which left #000000/)
+    expect(result.text).toMatch(/value read back: "#3366cc"/)
+    expect(await logOf(executor)).toMatch(/input:plain=#3366cc change:plain=#3366cc/)
+    // Its chooser is closed: no key reached the page, and observe says nothing is open.
+    expect(await logOf(executor)).not.toMatch(/keydown:/)
+    expect((await executor.execute('await observe()', 30000)).text).toContain(`[${plain}] colorwell "Plain colour" [focused] = "#3366cc" (takes #rrggbb`)
+  })
+
+  it('sends no Enter when the page closes the chooser itself once the colour is typed', async () => {
+    const executor = await openFixture('act-colour.html')
+    const look = (await executor.execute('await observe()', 30000)).text
+    const palette = refOf(look, /colorwell "Palette colour"/)
+    const result = await executor.execute(`await act.fill(${palette}, '#3366cc')`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/typed #3366cc, and the page closed the chooser itself, so no Enter was sent; value read back: "#3366cc"/)
+    // No key reached the page, and the chooser did not open again.
+    expect(await logOf(executor)).not.toMatch(/keydown:/)
+    expect((await executor.execute(`return await readPage(() => document.getElementById('palette').matches(':open'))`, 30000)).text).toMatch(/false/)
   })
 })
 

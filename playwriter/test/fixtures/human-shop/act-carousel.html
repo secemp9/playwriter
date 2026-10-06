@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shop — carousel</title>
+<style>
+  /* Horizontal-only scroll areas (overflow-x scrolls, overflow-y hidden). "Featured products" has
+     most of its cards off to the right. "New arrivals" is right-to-left, so it starts at its right
+     edge with its cards off to the left (Chrome's scrollLeft is 0 there and goes negative); it
+     loads more cards (on its left) the first time it scrolls, and on "More arrivals". "Reader" is
+     vertical-rl text: its lines run top to bottom and follow each other leftwards, so it too starts
+     at its right edge. The page itself does not scroll sideways. */
+  body { margin: 0; padding: 16px; font: 14px sans-serif; }
+  .carousel { width: 600px; overflow-x: auto; overflow-y: hidden; white-space: nowrap; border: 1px solid #ccc; margin-bottom: 8px; }
+  .card { display: inline-block; width: 180px; height: 100px; margin: 8px; border: 1px solid #999; vertical-align: top; white-space: normal; }
+  .reader { writing-mode: vertical-rl; width: 600px; height: 120px; overflow-x: auto; overflow-y: hidden; border: 1px solid #ccc; margin-top: 8px; }
+  .reader p { margin: 0 0 0 12px; }
+</style>
+</head>
+<body>
+<h1>Featured</h1>
+<section id="featured" class="carousel" aria-label="Featured products"></section>
+<section id="arrivals" class="carousel" dir="rtl" aria-label="New arrivals"></section>
+<button type="button" id="more-arrivals">More arrivals</button>
+<section id="reader" class="reader" aria-label="Reader"></section>
+<script>
+  const added = {}
+  const fill = (id, name, count) => {
+    const carousel = document.getElementById(id)
+    for (let i = 0; i < count; i++) {
+      const n = (added[id] = (added[id] || 0) + 1)
+      const card = document.createElement('div')
+      card.className = 'card'
+      const link = document.createElement('a')
+      link.href = '#' + id + '-' + n
+      link.textContent = name + ' ' + n
+      card.append(link)
+      carousel.append(card)
+    }
+  }
+  fill('featured', 'Product', 12)
+  fill('arrivals', 'Arrival', 8)
+  // Lazy loading: four more cards the first time it scrolls, appended on its far (left) side.
+  const arrivals = document.getElementById('arrivals')
+  let lazyLoaded = false
+  arrivals.addEventListener('scroll', () => {
+    if (lazyLoaded) return
+    lazyLoaded = true
+    fill('arrivals', 'Arrival', 4)
+  })
+  document.getElementById('more-arrivals').addEventListener('click', () => fill('arrivals', 'Arrival', 4))
+  const reader = document.getElementById('reader')
+  for (let n = 1; n <= 8; n++) {
+    const paragraph = document.createElement('p')
+    const link = document.createElement('a')
+    link.href = '#chapter-' + n
+    link.textContent = 'Chapter ' + n
+    paragraph.append(link, ' — the story goes on across the page, column after column, the way a vertical book reads.')
+    reader.append(paragraph)
+  }
+</script>
+</body>
+</html>

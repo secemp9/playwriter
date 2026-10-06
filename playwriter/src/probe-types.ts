@@ -72,23 +72,38 @@ export interface NetworkRecord {
   seq: number
   method: string
   url: string
+  /** Address of the iframe document that sent it; absent for the main frame's and for a worker's. */
+  frame?: string
+  /** Script address of the dedicated worker that sent it (nested workers included); absent for a document's. */
+  worker?: string
   /**
    * CDP ResourceType: Document, XHR, Fetch, Script, Stylesheet, Image, EventSource, WebSocket, …
    * Absent until Chrome states it (requestWillBeSent, the response, or the failure).
    */
   resourceType?: string
+  /** When the renderer issued it: epoch ms on this process's clock (the browser's stamp, converted with the measured offset between the clocks). */
   startedAt: number
+  /** When this process learned it ended (epoch ms, this process's clock). */
   endedAt?: number
   status?: number
-  /** CDP errorText (`net::ERR_…`), or `canceled`. Absent when the request did not fail. */
+  /**
+   * Why it failed: CDP's errorText (`net::ERR_…`), `canceled`, `blocked: <Chrome's reason>` (`csp`,
+   * `mixed-content`, …) or `CORS error: <Chrome's reason>`. Absent when the request did not fail.
+   */
   failed?: string
+  /**
+   * The browser turned its response into a download (the file name it suggested). Chrome cancels a
+   * navigation for that; the request ended, it did not fail.
+   */
+  download?: string
   fromCache?: boolean
   /** Id of the previous hop when this request is a redirect target (POST /form → 303 → GET /done is two records). */
   redirectedFrom?: string
   /**
    * Set when Chrome stopped reporting this request before it finished, with why: the
-   * out-of-process iframe that sent it was removed or moved to another renderer process, and
-   * its session went with it. `endedAt` is when that happened; how the request ended is unknown.
+   * out-of-process iframe that sent it was removed or moved to another renderer process, or the
+   * worker that sent it ended, and its session went with it. `endedAt` is when that happened; how
+   * the request ended is unknown.
    */
   lost?: string
 }
@@ -100,8 +115,10 @@ export interface ConsoleRecord {
   text: string
   /** `url:line:col` of the call site when CDP reported one. */
   location?: string
-  /** URL of the iframe whose own code produced it; absent for the main frame. */
+  /** URL of the iframe whose own code produced it; absent for the main frame and for a worker. */
   frame?: string
+  /** Script address of the dedicated worker (nested ones included) whose code produced it. */
+  worker?: string
 }
 
 export interface NavigationRecord {
@@ -128,6 +145,7 @@ export interface NavigationRecord {
 /** Text shown by a live region (status/alert/log/aria-live/output), a dialog, or a newly inserted top-layer or fixed overlay — including ones that vanished again. */
 export interface LiveTextRecord {
   seq: number
+  /** When it was shown: epoch ms on this process's clock (the page's stamp, converted). */
   at: number
   role: string
   text: string

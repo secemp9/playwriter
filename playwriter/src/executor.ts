@@ -96,6 +96,8 @@ import { chooserOpener, describeOpener, type ChooserWindow } from './file-choose
 import { outgoingCallsOf, outgoingGuardsOf, openingOwnCdpSession, type OutgoingCallGuard, type OutgoingCallListener } from './playwright-client-hooks.js'
 import { callEffect, isRefusedEffect, refusalFor, unclassifiedRefusal } from './playwright-call-effects.js'
 import { readPage } from './read-page.js'
+import { SessionDownloads, jailedTarget, type SessionDownload } from './session-downloads.js'
+import { parseRelayDownloadStatus, type RelayDownloadStatus } from './download-file.js'
 
 
 const __filename = fileURLToPath(import.meta.url)
@@ -463,12 +465,6 @@ export interface ExecuteRun {
   humanGuard?: { context: BrowserContext; browser: Browser | null }
 }
 
-/** A download that started during the call. `status` settles to `completed`, `FAILED: <Chrome's reason>` or why it is unknown. */
-interface DownloadTrack {
-  download: Download
-  status: Promise<string>
-}
-
 /** What the executor tracks between "before the code ran" and the action report. */
 interface ActionScope {
   page: Page
@@ -490,7 +486,8 @@ interface ActionScope {
   rawCode: boolean
   /** Tabs opened by a watched tab during the call (`page.on('popup')`: this tab's own popups only). */
   popups: Page[]
-  downloads: DownloadTrack[]
+  /** Downloads a watched tab started during the call, each kept for the session under its id. */
+  downloads: SessionDownload[]
   /** Tabs whose file dialogs could not be held back for the code's raw input, and why. */
   watchFailures: string[]
   /** Stop watching; closes the file-dialog window of every raw call still in flight. */
@@ -1163,6 +1160,8 @@ export class PlaywrightExecutor {
   private suppressPageCloseWarnings = false
 
   private scopedFs: ScopedFS
+  /** Every download an action report saw, by id: `downloads.list()` / `downloads.save(id, path)`. */
+  private sessionDownloads: SessionDownloads
   private sandboxedRequire: NodeRequire
 
   private cdpConfig: CdpConfig
@@ -1191,6 +1190,14 @@ export class PlaywrightExecutor {
       },
     })
     this.cloudSession = options.cloudSession || null
+    // Same precedence as connectToBrowser: headless, then direct CDP (cloud or not), then the extension relay.
+    this.sessionDownloads = new SessionDownloads(
+      this.cdpConfig.headless
+        ? { kind: 'launched' }
+        : this.cdpConfig.directCdpUrl
+          ? { kind: this.cloudSession ? 'cloud' : 'direct', endpoint: this.cdpConfig.directCdpUrl }
+          : { kind: 'extension', relay: (guid) => this.relayDownloadStatus(guid) },
+    )
     // ScopedFS expects an array of allowed directories. If cwd is provided, use it; otherwise use defaults.
     this.scopedFs = new ScopedFS(
       this.sessionCwd ? [this.sessionCwd, '/tmp', os.tmpdir()] : undefined,
@@ -1686,6 +1693,26 @@ export class PlaywrightExecutor {
     }
   }
 
+  /**
+   * What the relay knows of the extension download `guid` (`GET /downloads/:guid`, download-file.ts):
+   * null when it has no record of it. Rejects with the reason when the relay cannot be asked or answers
+   * something else.
+   */
+  private async relayDownloadStatus(guid: string): Promise<RelayDownloadStatus | null> {
+    const { host = '127.0.0.1', port = 19988, token } = this.cdpConfig
+    const { httpBaseUrl } = parseRelayHost(host, port)
+    const effectiveToken = token || process.env.PLAYWRITER_TOKEN
+    const response = await fetch(`${httpBaseUrl}/downloads/${encodeURIComponent(guid)}`, {
+      signal: AbortSignal.timeout(2000),
+      headers: effectiveToken ? { Authorization: `Bearer ${effectiveToken}` } : {},
+    })
+    if (response.status === 404) return null
+    if (!response.ok) throw new Error(`the relay at ${httpBaseUrl} answered HTTP ${response.status}`)
+    const status = parseRelayDownloadStatus(await response.json())
+    if ('invalid' in status) throw new Error(`the relay at ${httpBaseUrl} answered something that is not a download status (${status.invalid})`)
+    return status
+  }
+
   private isDirectCdpMode(): boolean {
     return !!this.cdpConfig.directCdpUrl
   }
@@ -2053,15 +2080,17 @@ export class PlaywrightExecutor {
       /**
        * Human mode: the Locator / ElementHandle / FrameLocator / selector forms of the element readers
        * resolve the element with Playwright's script in the page, which Playwright runs as a user
-       * gesture. Refused before any Playwright call, naming the ref form that reads the same element
-       * over CDP. Debug mode keeps every form.
+       * gesture. The static policy refuses the forms it can read before the code runs; this refuses the
+       * rest (options built in a variable, a locator in a variable) when the reader is called, before
+       * any Playwright call of it — earlier statements of the code have run by then. Debug mode keeps
+       * every form.
        */
       const refuseScriptForm = (call: string, what: string, instead: string): void => {
         if (self.policy !== 'human') return
         throw new ActError(
           `Refused (human mode): ${call} resolves ${what} with Playwright's script in the page, which Playwright runs as a user ` +
             `gesture (the page then counts as clicked: navigator.userActivation). Pass a ref from observe() or find(): ${instead}. ` +
-            'Nothing from this call was run.',
+            'It was not run.',
         )
       }
 
@@ -2505,22 +2534,27 @@ export class PlaywrightExecutor {
         return { target: locator, page: locator.page(), cdp: await getCDPSession({ page: locator.page() }) }
       }
 
-      // Best-effort code-frame for a winning declaration. Fetches the stylesheet
-      // text by styleSheetId and renders the source region. Returns null if the
-      // text is unavailable — code-frame is a nice-to-have, never required.
+      // The code frame of a winning declaration: its stylesheet's text around the rule. A rule
+      // without a stylesheet (an inline style attribute, the browser's own defaults) has none; a
+      // stylesheet whose text cannot be read says why instead of leaving the frame out unexplained.
       const renderDeclCodeFrame = async (
         cdp: ICDPSession,
         rule: NormalizedRule | undefined,
         message: string,
       ): Promise<string | null> => {
         if (!rule || !rule.styleSheetId || !rule.source) return null
+        let text: string
         try {
-          const { text } = await cdp.send('CSS.getStyleSheetText', { styleSheetId: rule.styleSheetId })
-          if (typeof text !== 'string' || text.length === 0) return null
-          return clippedCodeFrame(text, rule.source.line, rule.source.column + 1, message)
-        } catch {
-          return null
+          ;({ text } = await withDeadline(
+            cdp.send('CSS.getStyleSheetText', { styleSheetId: rule.styleSheetId }),
+            5000,
+            `reading the stylesheet of ${rule.selector}`,
+          ))
+        } catch (error) {
+          return `(no code frame: the text of the stylesheet with ${rule.selector} could not be read — ${error instanceof Error ? error.message : String(error)})`
         }
+        if (text.length === 0) return `(no code frame: Chrome returned no text for the stylesheet with ${rule.selector})`
+        return clippedCodeFrame(text, rule.source.line, rule.source.column + 1, message)
       }
 
       // Find the NormalizedRule that produced a winning DeclRef (to recover its
@@ -3507,6 +3541,29 @@ export class PlaywrightExecutor {
           const probe = await self.probes.get(options.page ?? currentPage())
           return await probe.watch.responseBody(id)
         },
+        /**
+         * One request's WHOLE response body written to a file (an image, a large JSON response — what
+         * net.request caps at 64K characters), decoded to bytes. The path is resolved and jailed like
+         * the sandbox fs (relative to the session folder). Returns where it went and its size.
+         */
+        save: async (id: string, target: string, options: { page?: Page } = {}) => {
+          const resolved = jailedTarget({ jail: self.scopedFs, target, call: `net.save('${id}', path)`, example: `net.save('${id}', 'image.png')` })
+          const probe = await self.probes.get(options.page ?? currentPage())
+          let response: { status?: number; mimeType?: string; bytes: Buffer }
+          try {
+            response = await probe.watch.responseBytes(id)
+          } catch (error) {
+            if (error instanceof ModelFacingError) throw error
+            throw new ModelFacingError(`${error instanceof Error ? error.message : String(error)} Nothing was saved.`, { cause: error })
+          }
+          try {
+            fs.mkdirSync(path.dirname(resolved), { recursive: true })
+            fs.writeFileSync(resolved, response.bytes)
+          } catch (error) {
+            throw new ModelFacingError(`net.save('${id}', path): writing ${resolved} failed: ${error instanceof Error ? error.message : String(error)}. Nothing was saved.`, { cause: error })
+          }
+          return { id, path: resolved, bytes: response.bytes.length, status: response.status, mimeType: response.mimeType }
+        },
       }
 
       /**
@@ -3827,6 +3884,13 @@ export class PlaywrightExecutor {
         readLogpoints: readLogpointsFn,
         storeIdentity: storeIdentityFn,
         net: netFns,
+        // The downloads this session's action reports listed (`DOWNLOAD [d1] …`): list() shows each
+        // with its state, save(id, path) writes one where the sandbox fs may write, waiting for it to
+        // finish within this call.
+        downloads: {
+          list: () => self.sessionDownloads.list(),
+          save: (id: string, target: string) => self.sessionDownloads.save({ id, target, deadlineAt: run.deadlineAt, jail: self.scopedFs }),
+        },
         fiberSnapshot: fiberSnapshotFn,
         fiberDiff,
         replayPure,
@@ -4097,13 +4161,7 @@ export class PlaywrightExecutor {
 
     const watched = new Set<Page>()
     const onDownload = (download: Download): void => {
-      scope.downloads.push({
-        download,
-        status: download.failure().then(
-          (failure) => (failure === null ? 'completed' : `FAILED: ${failure}`),
-          (error: unknown) => `outcome unknown: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`,
-        ),
-      })
+      scope.downloads.push(this.sessionDownloads.track(download))
     }
     const listeners: Array<() => void> = []
     /** Watch `target` for popups and downloads. */
@@ -4435,13 +4493,13 @@ export class PlaywrightExecutor {
     // A download keeps going after the page settled; it gets what is left of the call, up to 5s.
     const downloadWaitMs = Math.max(0, Math.min(5000, run.deadlineAt - Date.now() - 500))
     const downloads = await Promise.all(
-      scope.downloads.map(async ({ download, status }) => {
-        const cap = Promise.withResolvers<string>()
-        const timer = setTimeout(() => cap.resolve(`still downloading when this report was written (${downloadWaitMs}ms later)`), downloadWaitMs)
-        const outcome = await Promise.race([status, cap.promise])
+      scope.downloads.map(async (entry) => {
+        const cap = Promise.withResolvers<null>()
+        const timer = setTimeout(() => cap.resolve(null), downloadWaitMs)
+        const outcome = await Promise.race([entry.outcome, cap.promise])
         clearTimeout(timer)
-        const where = download.page() === reportPage ? '' : ` (in the tab ${download.page().url()})`
-        return `${download.suggestedFilename()} from ${download.url()}${where} — ${outcome}`
+        const tab = entry.download.page()
+        return this.sessionDownloads.reportLine(entry, outcome, { waitedMs: downloadWaitMs, where: tab === reportPage ? '' : ` (in the tab ${tab.url()})` })
       }),
     )
 

@@ -229,6 +229,11 @@ const SANDBOX_GLOBALS = [
   // Runs the model's function in the PAGE over CDP (Runtime.callFunctionOn under V8's side-effect
   // check): its source is compiled by the page's V8, never by Node, and it gets no module loader or fs.
   'readPage',
+  // Saves a download an action report listed, through Playwright's Download.saveAs (the server copies
+  // the finished file, or streams it over a remote connection). It loads no module and hands out no
+  // fs: the only path it takes is checked with the jailed fs's own rule (ScopedFS.resolveAllowed)
+  // before anything is written — see 'downloads.save and net.save write only where the jailed fs may'.
+  'downloads',
 ].sort()
 
 describe('the sandbox global surface is a closed, reviewed set', () => {
@@ -490,6 +495,19 @@ describe('the ScopedFS write jail', () => {
     expect(() => jailed().readFileSync(link, 'utf8')).not.toThrow()
     const skill = fs.readFileSync(path.join(import.meta.dirname, 'skill.md'), 'utf8')
     expect(skill).toMatch(/symlink/i)
+  })
+
+  it('downloads.save and net.save write only where the jailed fs may', async () => {
+    // net.save checks the target before it looks the request up, so with no browser the refusal
+    // can only be the jail's. Saving inside the jail is covered end to end by executor-downloads-live.
+    await expect(vmContextObj.net.save('r1', OUTSIDE)).rejects.toThrow(`net.save('r1', path): ${OUTSIDE} is outside the folders this session may write to`)
+    await expect(vmContextObj.net.save('r1', '../../../../../../etc/sandbox-escape-probe')).rejects.toThrow(/is outside the folders this session may write to/)
+    // A path ending in a separator names a folder; path.resolve would drop the slash and write a file of that name.
+    await expect(vmContextObj.net.save('r1', 'exports/')).rejects.toThrow("net.save('r1', path): exports/ is a folder. Pass the path of the file to write inside it")
+    expect(fs.existsSync(path.join(cwd, 'exports'))).toBe(false)
+    // downloads.save looks the id up first: with nothing downloaded it never reaches a path.
+    await expect(vmContextObj.downloads.save('d1', OUTSIDE)).rejects.toThrow(/No download d1: no download has been seen in this session yet/)
+    expect(fs.existsSync(OUTSIDE)).toBe(false)
   })
 })
 

@@ -138,6 +138,62 @@ function pages(port: number): Record<string, string> {
   </body></html>`,
     '/frame': '<!doctype html><html><body><p>Frame body secret</p></body></html>',
     '/many': `<!doctype html><html><head><title>Rows</title></head><body>${Array.from({ length: 30 }, (_, index) => `<p>Row ${index + 1} match</p>`).join('')}</body></html>`,
+    // Closed roots: script cannot reach them; their text must still come out at the host's place.
+    '/closed': `<!doctype html><html><head><title>Closed roots</title></head><body>
+    <h1>Shadow page</h1>
+    <p>Before the hosts</p>
+    <open-card></open-card>
+    <closed-card><span slot="note">Slotted into closed</span><span>Unslotted closed secret</span></closed-card>
+    <p>Between the hosts</p>
+    <input value="Input value secret">
+    <iframe title="Same origin closed" src="/closed-frame"></iframe>
+    <p>After the frame</p>
+    <script>
+      customElements.define('open-card', class extends HTMLElement {
+        constructor() {
+          super()
+          this.attachShadow({ mode: 'open' }).innerHTML = '<p>Open root text</p>'
+        }
+      })
+      customElements.define('closed-card', class extends HTMLElement {
+        constructor() {
+          super()
+          this.attachShadow({ mode: 'closed' }).innerHTML =
+            '<article><h2>Closed heading</h2><p>Closed article paragraph</p><p hidden>Closed hidden secret</p>' +
+            '<p><slot name="note">Closed slot fallback secret</slot></p><nested-card></nested-card>' +
+            '<iframe title="Frame in closed root" src="/frame"></iframe></article>'
+        }
+      })
+      customElements.define('nested-card', class extends HTMLElement {
+        constructor() {
+          super()
+          this.attachShadow({ mode: 'closed' }).innerHTML = '<p>Nested closed text</p>'
+        }
+      })
+    </script>
+  </body></html>`,
+    '/closed-frame': `<!doctype html><html><body><p>Frame light text</p><frame-card></frame-card>
+    <script>
+      customElements.define('frame-card', class extends HTMLElement {
+        constructor() {
+          super()
+          this.attachShadow({ mode: 'closed' }).innerHTML = '<p>Frame closed text</p>'
+        }
+      })
+    </script></body></html>`,
+    '/closed-article': `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Mouse review</title></head><body>
+    <news-story></news-story>
+    <script>
+      customElements.define('news-story', class extends HTMLElement {
+        constructor() {
+          super()
+          this.attachShadow({ mode: 'closed' }).innerHTML = ${JSON.stringify(
+            `<article><h1>Mouse review</h1><p>${PARAGRAPH}</p><p>${PARAGRAPH}</p><h2>Design</h2><p>${PARAGRAPH}</p>` +
+              `<h2>Battery life</h2><p>${PARAGRAPH}</p><p>${PARAGRAPH}</p></article>`,
+          )}
+        }
+      })
+    </script></body></html>`,
   }
 }
 
@@ -302,6 +358,52 @@ describe('getPageMarkdown (live Chromium)', () => {
     expect(search).toContain('Row 12 match')
     expect(search).not.toContain('Row 13 match')
     expect(search.endsWith('---\n18 more matching lines not shown (30 in all); narrow the search or use filter.')).toBe(true)
+    await page.close()
+  })
+
+  it('reads closed shadow roots, nested ones and those in iframes, at their hosts, without touching any document', async () => {
+    const { page, read } = await openPage('/closed')
+    // The page, its iframe, and the iframe inside the closed root.
+    expect(page.frames()).toHaveLength(3)
+    const before = await Promise.all(page.frames().map((frame) => frame.evaluate(() => document.documentElement.outerHTML)))
+    const markdown = await read()
+    // Each root's text at its host, in document order: the open root, the closed one with its
+    // slotted light node, its nested closed root and its iframe, then the frame's closed root.
+    expect(markdown).toContain(
+      [
+        '# Shadow page',
+        'Before the hosts',
+        'Open root text',
+        '## Closed heading',
+        'Closed article paragraph',
+        'Slotted into closed',
+        'Nested closed text',
+        '[iframe "Frame in closed root"]',
+        'Frame body secret',
+        '[end of iframe "Frame in closed root"]',
+        'Between the hosts',
+        '[iframe "Same origin closed"]',
+        'Frame light text',
+        'Frame closed text',
+        '[end of iframe "Same origin closed"]',
+        'After the frame',
+      ].join('\n\n'),
+    )
+    // Hidden and unslotted content stays out of a closed root as of an open one; a user-agent root
+    // (the inside of the <input>) is not page content.
+    for (const hidden of ['Closed hidden secret', 'Unslotted closed secret', 'Closed slot fallback secret', 'Input value secret']) {
+      expect(markdown).not.toContain(hidden)
+    }
+    expect(await Promise.all(page.frames().map((frame) => frame.evaluate(() => document.documentElement.outerHTML)))).toEqual(before)
+    await page.close()
+  })
+
+  it('finds the article when the page renders it inside a closed shadow root', async () => {
+    const { page, read } = await openPage('/closed-article')
+    const markdown = await read()
+    expect(markdown).toMatch(SOURCE_ARTICLE)
+    expect(markdown).toContain('## Battery life')
+    expect(markdown).toContain(PARAGRAPH)
     await page.close()
   })
 })

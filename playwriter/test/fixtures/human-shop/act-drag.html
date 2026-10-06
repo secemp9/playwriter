@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sketch pad</title>
+<style>
+  body { font: 14px sans-serif; margin: 40px; }
+  canvas { display: block; background: #f1f5f9; margin-bottom: 24px; }
+  #rail { position: relative; width: 400px; height: 24px; margin: 24px 0 40px; }
+  #track { width: 400px; height: 24px; background: #cbd5e1; }
+  #thumb { position: absolute; top: 0; left: 0; width: 24px; height: 24px; margin-left: -12px; background: #1e293b; border-radius: 12px; touch-action: none; }
+  #dial { width: 200px; height: 100px; background: #fde68a; margin: 80px 0 100px 60px; transform: rotate(90deg); }
+  #tall { margin-top: 40px; }
+  /* At the very top-left corner of the page, which cannot scroll further up or left. */
+  #edge { position: absolute; left: 0; top: 0; width: 300px; height: 30px; background: #e9d5ff; }
+  #tilt { width: 300px; height: 100px; background: #a7f3d0; margin: 20px 0 40px; transform: perspective(400px) rotateY(50deg); }
+  #strip { width: 300px; height: 100px; overflow: auto; background: #f8fafc; }
+  #strip .spacer { height: 300px; }
+  #last-row { height: 30px; background: #fecaca; }
+  /* A fixed panel: what the logs say never moves the pads. */
+  #logs { position: fixed; top: 0; right: 0; width: 360px; height: 100vh; overflow: hidden; font: 12px monospace; background: #fff; }
+</style>
+</head>
+<body>
+  <div id="logs">
+    <p id="log"></p>
+    <p id="dial-log"></p>
+    <p id="tall-log"></p>
+    <p id="pads-log"></p>
+  </div>
+  <div id="edge" role="img" aria-label="Edge pad" tabindex="0"></div>
+  <!-- A drawing surface: it only sees pointer events, so a stroke is a held-button drag between two points of it. A badge covers its top-right corner. -->
+  <div style="position: relative; width: 300px">
+    <canvas id="sketch" width="300" height="150" role="img" aria-label="Sketch" tabindex="0"></canvas>
+    <div id="sticker" style="position: absolute; right: 0; top: 0; width: 40px; height: 20px; background: #f87171">New</div>
+  </div>
+  <!-- A custom slider: the thumb follows the pointer along the track while the button is held. -->
+  <div id="rail">
+    <div id="track" role="img" aria-label="Volume track"></div>
+    <div id="thumb" role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+  </div>
+  <!-- A pad turned a quarter turn by CSS: points are in its own (unrotated) box. -->
+  <div id="dial" role="img" aria-label="Dial" tabindex="0"></div>
+  <!-- A pad tilted in 3D: its drawn corners are no parallelogram. -->
+  <div id="tilt" role="img" aria-label="Tilted pad" tabindex="0"></div>
+  <!-- A list whose last row sits at the very end of its scroll area. -->
+  <div id="strip"><div class="spacer"></div><div id="last-row" role="img" aria-label="Last row" tabindex="0"></div></div>
+  <!-- Taller than the screen: a point near its bottom is out of view while its top is in view. -->
+  <canvas id="tall" width="300" height="1400" role="img" aria-label="Tall pad" tabindex="0"></canvas>
+  <script>
+    const sketch = document.getElementById('sketch')
+    const lines = []
+    const log = (type, event) => {
+      lines.push(`${type} ${event.offsetX} ${event.offsetY} ${event.buttons}`)
+      document.getElementById('log').textContent = lines.join('; ')
+    }
+    sketch.addEventListener('pointerdown', (event) => log('down', event))
+    sketch.addEventListener('pointermove', (event) => log('move', event))
+    sketch.addEventListener('pointerup', (event) => log('up', event))
+
+    const track = document.getElementById('track')
+    const thumb = document.getElementById('thumb')
+    const setFrom = (event) => {
+      const box = track.getBoundingClientRect()
+      const value = Math.round(Math.min(100, Math.max(0, ((event.clientX - box.left) / box.width) * 100)))
+      thumb.style.left = `${value}%`
+      thumb.setAttribute('aria-valuenow', String(value))
+    }
+    thumb.addEventListener('pointerdown', (event) => {
+      thumb.setPointerCapture(event.pointerId)
+    })
+    thumb.addEventListener('pointermove', (event) => {
+      if (thumb.hasPointerCapture(event.pointerId)) setFrom(event)
+    })
+    thumb.addEventListener('pointerup', (event) => {
+      if (thumb.hasPointerCapture(event.pointerId)) setFrom(event)
+    })
+
+    const dialLines = []
+    const dial = document.getElementById('dial')
+    const dialLog = (type, event) => {
+      dialLines.push(`${type} ${event.offsetX} ${event.offsetY}`)
+      document.getElementById('dial-log').textContent = dialLines.join('; ')
+    }
+    dial.addEventListener('pointerdown', (event) => dialLog('down', event))
+    dial.addEventListener('pointerup', (event) => dialLog('up', event))
+
+    const tall = document.getElementById('tall')
+    tall.addEventListener('pointerdown', (event) => {
+      document.getElementById('tall-log').textContent = `down ${event.offsetX} ${event.offsetY}`
+    })
+
+    const padLines = []
+    for (const id of ['edge', 'tilt', 'last-row']) {
+      const pad = document.getElementById(id)
+      const padLog = (type, event) => {
+        padLines.push(`${id} ${type} ${event.offsetX} ${event.offsetY}`)
+        document.getElementById('pads-log').textContent = padLines.join('; ')
+      }
+      pad.addEventListener('pointerdown', (event) => padLog('down', event))
+      pad.addEventListener('pointerup', (event) => padLog('up', event))
+    }
+  </script>
+</body>
+</html>

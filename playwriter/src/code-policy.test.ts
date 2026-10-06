@@ -401,6 +401,56 @@ describe('checkPolicy', () => {
     expect(verdict.refusal).toContain("page.locator('#q').fill on line 1 → act.fill(ref, 'text')")
   })
 
+  it("refuses the element readers' Playwright forms, naming the ref form, and leaves their ref forms and the page alone", () => {
+    const refused = checkPolicy(
+      analyzeCode(
+        [
+          "await debugStyle({ locator: page.locator('#save'), property: 'color' })",
+          "await pm.query({ page, rootSelector: 'main' })",
+          "await pm.anchor('role=button', { scope: 'main' })",
+          "await traceValue({ page, selector: '[data-testid=total]' })",
+          "await getCleanHTML({ locator: page.locator('form') })",
+          "await getLocatorStringForElement(page.getByRole('button'))",
+          'await humanMouse.enable({ page })',
+        ].join('\n'),
+      ),
+      human,
+    )
+    expect(refused.allowed).toBe(false)
+    expect(refused.refusal).toContain(
+      'debugStyle({ locator }) on line 1 → debugStyle({ ref: 12 }); pm.query({ rootSelector }) on line 2 → pm.query({ rootRef: 12 }); ' +
+        'pm.anchor({ scope }) on line 3 → pm.anchor({ rootRef: 12 }); traceValue({ selector }) on line 4 → traceValue({ ref: 12 }); ' +
+        'getCleanHTML({ locator }) on line 5 → getCleanHTML({ ref: 12 }); getLocatorStringForElement(<locator>) on line 6 → ' +
+        'getLocatorStringForElement({ ref: 12 }). Given a Playwright locator',
+    )
+    // enable() resolves no element itself: it is refused for what it does, not as an element form.
+    expect(refused.refusal).toContain(
+      'Refused (human mode): humanMouse.enable() on line 7 routes locator.click/dblclick/hover through human motion, ' +
+        "and those locator actions run Playwright's script in the page",
+    )
+    expect(refused.refusal).toContain('Instead, click and hover like a person with a ref from observe() or find(): act.click(12), act.hover(12).')
+    // The ref forms, a whole Page as getCleanHTML's locator (also one a call returns), and pm's query scope
+    // (`within`) read nothing through Playwright.
+    const allowed = checkPolicy(
+      analyzeCode(
+        [
+          "await debugStyle({ ref: 12, property: 'color' })",
+          'await getCleanHTML({ locator: page })',
+          "await getCleanHTML({ locator: context.pages().find((p) => p.url().includes('shop')) })",
+          'await getCleanHTML({ locator: await context.newPage() })',
+          "await pm.query({ rootRef: 12, within: 'element#main' })",
+          'await getLocatorStringForElement({ ref: 12 })',
+          'await humanMouse.plan({ ref: 12, seed: 1 })',
+        ].join('\n'),
+      ),
+      human,
+    )
+    expect(allowed).toEqual({ allowed: true, notes: [] })
+    expect(checkPolicy(analyzeCode("await debugStyle({ locator: page.locator('#save') })"), debug).notes).toEqual([
+      "elements resolved with Playwright's script in the page (a user gesture): debugStyle({ locator }) on line 1",
+    ])
+  })
+
   it('debug mode allows Playwright reads and notes them', () => {
     const verdict = checkPolicy(analyzeCode('return await page.title()'), debug)
     expect(verdict.allowed).toBe(true)

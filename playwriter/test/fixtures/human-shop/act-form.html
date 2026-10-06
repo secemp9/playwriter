@@ -24,6 +24,8 @@
   <label>Departure <input id="departure" type="date"></label>
   <label>Volume <input id="volume" type="range" min="0" max="100" step="5" value="50"></label>
   <label>Theme colour <input id="colour" type="color" value="#336699"></label>
+  <label>Badge colour <input id="badge" type="color" value="#ff0000" list="badge-swatches"></label>
+  <datalist id="badge-swatches"><option value="#ff0000"><option value="#00aa00"><option value="#0000ff"></datalist>
   <label>Passport scan <input id="passport" type="file"></label>
   <label>Attachments <input id="attachments" type="file" multiple></label>
   <button type="button" id="photo-button" onclick="document.getElementById('photo').click()">Choose photo</button>
@@ -36,5 +38,15 @@
   <button>Book</button>
 </form>
 <p id="submitted"></p>
+<p id="colour-events">Colour events:</p>
+<script>
+  // What the page heard from its colour inputs, in order: the tests read it back.
+  const colourEvents = document.getElementById('colour-events')
+  for (const id of ['colour', 'badge']) {
+    const input = document.getElementById(id)
+    input.addEventListener('input', () => { colourEvents.textContent += ' input:' + id + '=' + input.value })
+    input.addEventListener('change', () => { colourEvents.textContent += ' change:' + id + '=' + input.value })
+  }
+</script>
 </body>
 </html>

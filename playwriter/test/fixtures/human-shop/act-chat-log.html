@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chat — conversation</title>
+<style>
+  /* The chat-app pattern: the message list is a flex-direction: column-reverse scroller, so it
+     opens at the newest message, at its bottom. Chrome's scrollTop is 0 there and goes negative
+     upwards. The document itself does not scroll. */
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px sans-serif; }
+  main#log { display: flex; flex-direction: column-reverse; height: 100vh; overflow-y: auto; }
+  .message { padding: 12px; border-bottom: 1px solid #eee; }
+</style>
+</head>
+<body>
+<main id="log" aria-label="Conversation"></main>
+<script>
+  // column-reverse draws the first child at the bottom: newest first in the DOM.
+  const log = document.getElementById('log')
+  for (let n = 60; n >= 1; n--) {
+    const message = document.createElement('div')
+    message.className = 'message'
+    const link = document.createElement('a')
+    link.href = '#message-' + n
+    link.textContent = 'Message ' + n
+    message.append(link, ' — the text of message ' + n)
+    log.append(message)
+  }
+</script>
+</body>
+</html>

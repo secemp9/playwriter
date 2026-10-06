@@ -62,7 +62,7 @@ import {
   type WatchEvents,
 } from './probe-types.js'
 import type { Observation, ObservationDiff } from './page-observe.js'
-import { MIN_CLICKABLE_SIDE, liveContext, renderObservationDiff } from './page-observe.js'
+import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, liveContext, renderObservationDiff } from './page-observe.js'
 import { CLICK_LABEL_FN } from './label-control.js'
 
 const CDP_TIMEOUT_MS = 5000
@@ -302,6 +302,14 @@ export interface FillOptions {
    * for a person's Ctrl+V. For long text a person would not type.
    */
   paste?: boolean
+  /**
+   * The key a line break in `text` is typed as, in a field that takes several lines (a textarea
+   * or contenteditable). Apps disagree: in a chat composer Enter sends the message and Shift+Enter
+   * starts a new line; in a plain text area or a code editor Enter starts a new line. Required for
+   * text with a line break typed key by key there: act never guesses it. Not with `paste`, which
+   * types no keys.
+   */
+  newline?: 'Enter' | 'Shift+Enter'
 }
 
 export interface ActApi {
@@ -310,7 +318,8 @@ export interface ActApi {
   /**
    * Replace a field's text. Native date/time inputs take ISO text (`2024-05-01`, `13:45`,
    * `2024-05-01T13:45`, `2024-05`, `2024-W18`), typed digit by digit into the field's parts; a range
-   * input takes a number, reached with the arrow keys.
+   * input takes a number, reached with the arrow keys; a colour input takes `#rrggbb`, typed into
+   * the hex field of Chrome's colour chooser.
    */
   fill(ref: number | string, text: string, options?: FillOptions): Promise<ActionRecord>
   type(ref: number | string, text: string, options?: FillOptions): Promise<ActionRecord>
@@ -319,11 +328,20 @@ export interface ActApi {
   check(ref: number | string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
   uncheck(ref: number | string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
   hover(ref: number | string): Promise<ActionRecord>
-  /** Without a ref: what the wheel scrolls in the middle of the screen (an app shell's list, or the page). */
-  scroll(direction?: 'down' | 'up', options?: { screens?: number; ref?: number | string }): Promise<ActionRecord>
+  /**
+   * Turn the mouse wheel: 'down'/'up', or 'right'/'left' (horizontal wheel deltas, as a trackpad or
+   * tilt wheel sends) for a carousel or wide table. Without a ref: what the wheel scrolls that way in
+   * the middle of the screen (an app shell's list, or the page).
+   */
+  scroll(direction?: ScrollDirection, options?: { screens?: number; ref?: number | string }): Promise<ActionRecord>
   scrollTo(ref: number | string): Promise<ActionRecord>
   upload(ref: number | string, files: string | string[], options?: { whileBusy?: boolean }): Promise<ActionRecord>
-  drag(fromRef: number | string, toRef: number | string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
+  /**
+   * Press on `from`, move with the button held along a person's path, release on `to`. Each end is
+   * a ref (a point on the element that receives the pointer) or a `DragPoint`, an exact point of an
+   * element: a stroke on a canvas, a position on a custom slider's track, a map pan.
+   */
+  drag(from: number | string | DragPoint, to: number | string | DragPoint, options?: { whileBusy?: boolean }): Promise<ActionRecord>
   open(url: string, options?: { reason?: string }): Promise<ActionRecord>
   back(): Promise<ActionRecord>
   spaNavigate(pathOrUrl: string): Promise<ActionRecord>
@@ -338,6 +356,38 @@ export interface ActApi {
     /** Choose files (paths relative to the session cwd) in the file dialog that is open on the tab. */
     chooseFiles(files: string | string[]): Promise<ActionRecord>
   }
+}
+
+/**
+ * A point of an element for act.drag: `x`/`y` are CSS px from the top-left corner of the element's
+ * border box as laid out (before any CSS transform; a rotated, scaled or tilted element is mapped
+ * through its transform). x runs from 0 up to, not including, the box's width, and y from 0 up to,
+ * not including, its height: the far edges are outside the element.
+ */
+export interface DragPoint {
+  ref: number | string
+  x: number
+  y: number
+}
+
+/** One end of act.drag as the model's (untyped) code passed it: a ref, or a ref and a point of its element. */
+function dragEnd(end: unknown, which: 'from' | 'to'): { ref: number | string; offset?: Point } {
+  if (typeof end === 'number' || typeof end === 'string') return { ref: end }
+  if (typeof end !== 'object' || end === null || !('ref' in end) || (typeof end.ref !== 'number' && typeof end.ref !== 'string')) {
+    throw new ActError(
+      `act.drag: ${which} must be a ref (12 or 'e3') or { ref, x, y } with x/y in CSS px from the element's top-left corner ` +
+        `(got ${typeof end === 'object' && end !== null ? JSON.stringify(end) : String(end)}). Nothing was dragged.`,
+    )
+  }
+  const x = 'x' in end ? end.x : undefined
+  const y = 'y' in end ? end.y : undefined
+  if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new ActError(
+      `act.drag: ${which} { ref: ${JSON.stringify(end.ref)}, x: ${String(x)}, y: ${String(y)} }: x and y must be finite numbers, CSS px from ` +
+        "the element's top-left corner. Nothing was dragged.",
+    )
+  }
+  return { ref: end.ref, offset: { x, y } }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +541,8 @@ const ABSENCE_FN = `function(_, el) {
 /**
  * Shared in-page helpers for wheel scrolling, written once and spliced into the functions below.
  *  - deepHit(x, y): what a pointer at (x, y) is over, descending open shadow roots.
+ *  - fromLeft(n) and the rest of SCROLL_ORIGIN_JS (page-observe.ts): how far `n` is scrolled from
+ *    its left edge, where its horizontal scrolling starts, and which `<body>` is the viewport's.
  *  - scrollerFor(el, axis, dir): what a wheel turned over `el` scrolls. Chromium hands a wheel to
  *    the nearest ancestor that can still scroll in that direction (scroll chaining), ending at the
  *    document's scrolling element.
@@ -505,16 +557,17 @@ const WHEEL_HELPERS = `
     return el
   }
   const overflowScrolls = (value) => /(auto|scroll|overlay)/.test(value)
+  ${SCROLL_ORIGIN_JS}
   const scrollerFor = (el, axis, dir) => {
     const doc = document.scrollingElement || document.documentElement
     for (let n = el; n; n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null) {
       if (n === document.body || n === document.documentElement) return doc
       const s = getComputedStyle(n)
       if (axis === 'y' && overflowScrolls(s.overflowY) && n.scrollHeight > n.clientHeight + 1) {
-        if (dir > 0 ? n.scrollTop + n.clientHeight < n.scrollHeight - 1 : n.scrollTop > 0) return n
+        if (dir > 0 ? fromTop(n) + n.clientHeight < n.scrollHeight - 1 : fromTop(n) > 0) return n
       }
       if (axis === 'x' && overflowScrolls(s.overflowX) && n.scrollWidth > n.clientWidth + 1) {
-        if (dir > 0 ? n.scrollLeft + n.clientWidth < n.scrollWidth - 1 : n.scrollLeft > 0) return n
+        if (dir > 0 ? fromLeft(n) + n.clientWidth < n.scrollWidth - 1 : fromLeft(n) > 0) return n
       }
     }
     return doc
@@ -543,11 +596,25 @@ const WHEEL_HELPERS = `
  * visible area, the way a person scrolls to read something rather than parking it on the edge; an
  * element taller than two thirds of the area gets its top edge brought in instead. Also returns the
  * hit-tested point to wheel at (see WHEEL_HELPERS).
+ *
+ * `fn({ spot }, el)`: bring point `spot` of `el` (in this frame's viewport) into view instead: a
+ * fingertip-sized square around it, all of it inside the visible area — as far as scrolling can
+ * bring it in. At each level only the part of the square inside the scroller's content (or the
+ * document) counts: a point by the edge of a canvas that fills the page, or at the end of a
+ * list, is in view once the point itself is, though its square sticks out where nothing scrolls.
  */
-const SCROLL_PLAN_FN = `function(_, el) {
+const SCROLL_PLAN_FN = `function(args, el) {
   if (!el || !el.isConnected) return null
   ${WHEEL_HELPERS}
-  const r = el.getBoundingClientRect()
+  const spot = args && args.spot
+  const r = spot ? { top: spot.y - 12, bottom: spot.y + 12, left: spot.x - 12, right: spot.x + 12 } : el.getBoundingClientRect()
+  // \`rect\` cut to the content of scroller \`n\` (the document's scrolling element for the page), in viewport px.
+  const reachable = (rect, n, page) => {
+    if (!spot) return rect
+    const c = page ? { top: 0, left: 0 } : n.getBoundingClientRect()
+    const top = c.top + (page ? 0 : n.clientTop) - n.scrollTop, left = c.left + (page ? 0 : n.clientLeft) - fromLeft(n)
+    return { top: Math.max(rect.top, top), bottom: Math.min(rect.bottom, top + n.scrollHeight), left: Math.max(rect.left, left), right: Math.min(rect.right, left + n.scrollWidth) }
+  }
   const need = (start, end, areaStart, areaEnd) => {
     const size = end - start, area = areaEnd - areaStart
     const visible = Math.min(end, areaEnd) - Math.max(start, areaStart)
@@ -574,6 +641,7 @@ const SCROLL_PLAN_FN = `function(_, el) {
     const canX = overflowScrolls(s.overflowX) && n.scrollWidth > n.clientWidth + 1
     if (!canY && !canX) continue
     const c = n.getBoundingClientRect()
+    target = reachable(target, n, false)
     const dy = canY ? need(target.top, target.bottom, c.top, c.bottom) : 0
     const dx = canX ? need(target.left, target.right, c.left, c.right) : 0
     if (dy === 0 && dx === 0) continue
@@ -581,54 +649,75 @@ const SCROLL_PLAN_FN = `function(_, el) {
     if (area) return plan(n, area, dy, dx, labelOf(n))
     target = c
   }
+  target = reachable(target, document.scrollingElement || document.documentElement, true)
   const dy = need(target.top, target.bottom, 0, vh), dx = need(target.left, target.right, 0, vw)
   if (dy === 0 && dx === 0) return { container: null, dy, dx, label: 'page' }
   return plan(document.scrollingElement || document.documentElement, { x: 0, y: 0, width: vw, height: vh }, dy, dx, 'page')
 }`
 
 /**
- * `fn({ dir, x, y })`: what a wheel turned at (x, y) of this frame's viewport (its centre when
- * absent) is over, and what Chromium's scroll chaining scrolls from there in this document — the
- * nearest ancestor that can still scroll that way, else the document's scrolling element. Returned
- * as [hit, scroller] (nodesReturnedBy); the hit tells whether the point is over an iframe.
+ * `fn({ axis, dir, x, y })`: what a wheel turned at (x, y) of this frame's viewport (its centre
+ * when absent) is over, and what Chromium's scroll chaining scrolls from there in this document
+ * along `axis` — the nearest ancestor that can still scroll that way, else the document's
+ * scrolling element. Returned as [hit, scroller] (nodesReturnedBy); the hit tells whether the
+ * point is over an iframe.
  */
 const SCROLLER_AT_POINT_FN = `function(args) {
   ${WHEEL_HELPERS}
   const hit = deepHit(args.x === undefined ? window.innerWidth / 2 : args.x, args.y === undefined ? window.innerHeight / 2 : args.y)
-  return [hit, hit ? scrollerFor(hit, 'y', args.dir) : (document.scrollingElement || document.documentElement)]
+  return [hit, hit ? scrollerFor(hit, args.axis, args.dir) : (document.scrollingElement || document.documentElement)]
 }`
 
 /**
- * Where to turn the wheel to scroll `el` vertically (the document's scrolling element, <html> or
- * <body> mean the page). `atEnd`: it cannot scroll further that way; `scrollable: false`: it does
- * not scroll at all. Null when `el` is gone.
+ * `fn({ axis, dir }, el)`: where to turn the wheel to scroll `el` along `axis` ('y' up/down, 'x'
+ * sideways; the document's scrolling element, <html> or <body> mean the page). `atEnd`: it cannot
+ * scroll further that way; `scrollable: false`: it does not scroll on that axis at all;
+ * `otherWay`: it scrolls on the other axis instead (a carousel asked to scroll down), and can
+ * still move that way along it (1: down/right, -1: up/left). Null when `el` is gone.
  */
 const WHEEL_POINT_FN = `function(args, el) {
   ${WHEEL_HELPERS}
   if (!el || !el.isConnected) return null
   const vw = window.innerWidth, vh = window.innerHeight
   const doc = document.scrollingElement || document.documentElement
+  const y = args.axis === 'y'
   if (el === doc || el === document.documentElement || el === document.body) {
-    const atEnd = args.dir > 0 ? doc.scrollTop + vh >= doc.scrollHeight - 1 : doc.scrollTop <= 0
-    return { ...wheelPoint({ x: 0, y: 0, width: vw, height: vh }, doc, 'y', args.dir), label: 'the page', atEnd, scrollable: doc.scrollHeight > vh + 1 }
+    const at = y ? fromTop(doc) : fromLeft(doc), size = y ? doc.scrollHeight : doc.scrollWidth, client = y ? vh : doc.clientWidth
+    const atEnd = args.dir > 0 ? at + client >= size - 1 : at <= 0
+    return { ...wheelPoint({ x: 0, y: 0, width: vw, height: vh }, doc, args.axis, args.dir), label: 'the page', atEnd, scrollable: size > client + 1 }
   }
   const s = getComputedStyle(el)
-  const scrollable = overflowScrolls(s.overflowY) && el.scrollHeight > el.clientHeight + 1
-  const atEnd = !scrollable || (args.dir > 0 ? el.scrollTop + el.clientHeight >= el.scrollHeight - 1 : el.scrollTop <= 0)
+  const along = (vertical) => vertical
+    ? { at: fromTop(el), size: el.scrollHeight, client: el.clientHeight, overflow: s.overflowY }
+    : { at: fromLeft(el), size: el.scrollWidth, client: el.clientWidth, overflow: s.overflowX }
+  const own = along(y)
+  const scrollable = overflowScrolls(own.overflow) && own.size > own.client + 1
+  const atEnd = !scrollable || (args.dir > 0 ? own.at + own.client >= own.size - 1 : own.at <= 0)
   const c = el.getBoundingClientRect()
-  const x = Math.max(c.left, 0), y = Math.max(c.top, 0), right = Math.min(c.right, vw), bottom = Math.min(c.bottom, vh)
-  if (right <= x || bottom <= y) return { offscreen: true, label: labelOf(el), atEnd, scrollable }
-  if (atEnd) return { label: labelOf(el), atEnd, scrollable }
-  return { ...wheelPoint({ x, y, width: right - x, height: bottom - y }, el, 'y', args.dir), label: labelOf(el), atEnd, scrollable }
+  const left = Math.max(c.left, 0), top = Math.max(c.top, 0), right = Math.min(c.right, vw), bottom = Math.min(c.bottom, vh)
+  if (right <= left || bottom <= top) return { offscreen: true, label: labelOf(el), atEnd, scrollable }
+  if (atEnd) {
+    const other = along(!y)
+    const otherScrolls = !scrollable && overflowScrolls(other.overflow) && other.size > other.client + 1
+    return { label: labelOf(el), atEnd, scrollable, ...(otherScrolls ? { otherWay: other.at + other.client < other.size - 1 ? 1 : -1 } : {}) }
+  }
+  return { ...wheelPoint({ x: left, y: top, width: right - left, height: bottom - top }, el, args.axis, args.dir), label: labelOf(el), atEnd, scrollable }
 }`
 
-/** Vertical scroll state of `el` (the document's scrolling element, <html> or <body> mean the page), in CSS px. */
-const SCROLL_OFFSET_FN = `function(_, el) {
+/**
+ * `fn({ axis }, el)`: the scroll state of `el` along `axis` (the document's scrolling element,
+ * <html> or <body> mean the page), in CSS px: `raw` is Chrome's scrollTop/scrollLeft, which moves
+ * only when it scrolls; `at` is how far it is from its top or left edge, which for an area that
+ * starts at its bottom or right edge also grows when content is added above it or on its left.
+ */
+const SCROLL_OFFSET_FN = `function(args, el) {
   if (!el || !el.isConnected) return null
+  ${SCROLL_ORIGIN_JS}
   const doc = document.scrollingElement || document.documentElement
   const page = el === doc || el === document.documentElement || el === document.body
   const s = page ? doc : el
-  return { top: s.scrollTop, height: s.scrollHeight, client: page ? window.innerHeight : s.clientHeight }
+  if (args.axis === 'y') return { at: fromTop(s), raw: s.scrollTop, size: s.scrollHeight, client: page ? window.innerHeight : s.clientHeight }
+  return { at: fromLeft(s), raw: s.scrollLeft, size: s.scrollWidth, client: s.clientWidth }
 }`
 
 /** The deeply focused element (through open shadow roots), as a one-element array (nodesReturnedBy). */
@@ -658,14 +747,32 @@ interface WheelAim {
   offscreen?: true
   /** It cannot scroll further in the asked direction. */
   atEnd: boolean
-  /** It scrolls at all (overflow that scrolls, with more content than fits). */
+  /** It scrolls on that axis at all (overflow that scrolls, with more content than fits). */
   scrollable: boolean
+  /** It scrolls on the other axis instead, and can still move this way along it (1: down/right, -1: up/left). */
+  otherWay?: 1 | -1
 }
 
+/** A scroller's state along one axis (SCROLL_OFFSET_FN), in CSS px. */
 interface ScrollOffset {
-  top: number
-  height: number
+  /** How far it is from its top or left edge. */
+  at: number
+  /** Chrome's scrollTop or scrollLeft: changes only when it scrolls. */
+  raw: number
+  /** scrollHeight or scrollWidth. */
+  size: number
+  /** What is visible of it on that axis. */
   client: number
+}
+
+/** Which way act.scroll turns the wheel: up/down along 'y', left/right along 'x'. */
+export type ScrollDirection = 'down' | 'up' | 'right' | 'left'
+
+const SCROLL_DIRECTIONS: Record<ScrollDirection, { axis: 'x' | 'y'; dir: 1 | -1 }> = {
+  down: { axis: 'y', dir: 1 },
+  up: { axis: 'y', dir: -1 },
+  right: { axis: 'x', dir: 1 },
+  left: { axis: 'x', dir: -1 },
 }
 
 /** What FIELD_FN reports about a field right before and after typing into it. */
@@ -675,8 +782,17 @@ interface FieldFacts {
   /** A text field act.fill/act.type type into key by key. */
   editable: boolean
   contentEditable: boolean
-  /** `value` for inputs/textareas, innerText for contenteditable, null otherwise. */
+  /**
+   * `value` for inputs/textareas; for contenteditable its text line by line as a person reads it
+   * (see FIELD_FN); null otherwise.
+   */
   value: string | null
+  /**
+   * Where the selection is in the field's text: whether its start is at the very start, its end at
+   * the very end, and whether it is a caret. Null when the field exposes none to read (an email or
+   * number input has no selectionStart; a contenteditable with no selection range).
+   */
+  selection: { atStart: boolean; atEnd: boolean; collapsed: boolean } | null
   /** Whether keyboard focus is in this field (deep through shadow roots). */
   focused: boolean
   /** Where focus actually is, labelled for the model. */
@@ -691,6 +807,15 @@ interface FieldFacts {
 /**
  * Field facts needed for typing: kind, current value, focus. Native date/time, range and colour
  * inputs are not text fields: act.fill drives each the way its own UI takes input.
+ *
+ * A contenteditable's value is its text line by line, the way a person reads it: a block
+ * (paragraph, div, list item) or a <br> starts a new line, except a <br> that ends its block (it
+ * only holds an empty last line open), and the non-breaking spaces an editor stores for typed
+ * spaces read as spaces. innerText does not: it counts a paragraph's margins as a blank line and
+ * that <br> as one more, so "Line 1⏎Line 2" typed into a paragraph editor reads back as
+ * "Line 1⏎⏎Line 2". A collapsible space at the end of a line is dropped, as innerText and the
+ * screen do (indented markup: "<p>⏎  Dear Ann,⏎</p>" reads "Dear Ann,"). The selection is judged on
+ * the same lines: a caret is at the end when no line or text follows it.
  */
 const FIELD_FN = `function(_, el) {
   if (!el || !el.isConnected) return null
@@ -700,10 +825,89 @@ const FIELD_FN = `function(_, el) {
   const type = (el.getAttribute && el.getAttribute('type') || '').toLowerCase()
   const notText = ['checkbox','radio','button','submit','reset','file','image','range','color','hidden','date','time','datetime-local','month','week']
   const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !notText.includes(type))
-  const value = 'value' in el && typeof el.value === 'string' ? el.value : (el.isContentEditable ? el.innerText : null)
+  // With \`stop\` ({ node, offset }, a selection boundary in DOM terms), the text before that point only.
+  const linesOf = (root, stop) => {
+    // \`pending\`: a collapsible space shown only if more text follows on its line.
+    let out = '', atLineStart = true, owe = false, started = false, done = false, pending = ''
+    const isBlock = (n) => { const d = getComputedStyle(n).display; return d !== 'contents' && !d.startsWith('inline') }
+    // Collapsible white space (white-space normal, nowrap, pre-line) reads as one space, none at a line start or end.
+    const collapses = (n) => ['normal', 'nowrap', 'pre-line'].includes(getComputedStyle(n.parentNode).whiteSpace)
+    const collapse = (n, data) => { const ws = getComputedStyle(n.parentNode).whiteSpace; return ws === 'pre-line' ? data.replace(/[ \\t]+/g, ' ') : collapses(n) ? data.replace(/[ \\t\\n\\r\\f]+/g, ' ') : data }
+    const shown = (n) => n.nodeType === 3 ? (collapses(n) ? !/^ ?$/.test(collapse(n, n.data)) : n.data !== '') : n.nodeType === 1 && n.localName !== 'script' && n.localName !== 'style' && getComputedStyle(n).display !== 'none'
+    const endsBlock = (br) => {
+      for (let n = br; ; n = n.parentNode) {
+        for (let next = n.nextSibling; next; next = next.nextSibling) if (shown(next)) return false
+        if (!n.parentNode || n.parentNode === root || isBlock(n.parentNode)) return true
+      }
+    }
+    const walk = (node) => {
+      const children = node.childNodes
+      for (let i = 0; i < children.length; i++) {
+        if (stop && stop.node === node && stop.offset === i) { done = true; return }
+        const child = children[i]
+        if (child.nodeType === 3) {
+          const cut = !!stop && stop.node === child
+          const collapsible = collapses(child)
+          let text = collapse(child, cut ? child.data.slice(0, stop.offset) : child.data)
+          if (collapsible && (atLineStart || pending)) text = text.replace(/^ +/, '')
+          let tail = ''
+          if (collapsible && text.endsWith(' ')) { tail = ' '; text = text.replace(/ +$/, '') }
+          if (text !== '') {
+            if (owe) { out += '\\n'; owe = false }
+            out += pending + text.replace(/\\u00a0/g, ' ')
+            pending = ''
+            atLineStart = out.endsWith('\\n')
+            started = true
+          }
+          if (tail && !atLineStart) pending = tail
+          if (cut) { done = true; return }
+          continue
+        }
+        if (!shown(child)) continue
+        if (child.localName === 'br') {
+          if (owe) { out += '\\n'; owe = false }
+          if (!endsBlock(child)) out += '\\n'
+          atLineStart = true
+          started = true
+          pending = ''
+          continue
+        }
+        const block = isBlock(child)
+        if (block) pending = ''
+        if (block && !atLineStart) { owe = true; atLineStart = true }
+        walk(child)
+        if (done) return
+        if (block && started) { owe = true; atLineStart = true; pending = '' }
+      }
+      if (stop && stop.node === node) done = true
+    }
+    walk(root)
+    // A boundary right after a finished block is on the line that block's end opens.
+    if (done && owe) out += '\\n'
+    return out
+  }
+  const value = 'value' in el && typeof el.value === 'string' ? el.value : (el.isContentEditable ? linesOf(el) : null)
+  const selection = (() => {
+    if (typeof el.selectionStart === 'number' && typeof el.value === 'string') {
+      return { atStart: el.selectionStart === 0, atEnd: el.selectionEnd === el.value.length, collapsed: el.selectionStart === el.selectionEnd }
+    }
+    if (!el.isContentEditable) return null
+    const root = el.getRootNode()
+    const sel = root.getSelection ? root.getSelection() : getSelection()
+    if (!sel || sel.rangeCount === 0) return null
+    const range = sel.getRangeAt(0)
+    if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) return { atStart: false, atEnd: false, collapsed: range.collapsed }
+    return {
+      atStart: linesOf(el, { node: range.startContainer, offset: range.startOffset }) === '',
+      // Past the last block (an editor's select-all, or Chrome's Ctrl+End after a final <hr>) reads as the
+      // line that block's end opens, value + newline: nothing shown comes after it.
+      atEnd: [value, value + '\\n'].includes(linesOf(el, { node: range.endContainer, offset: range.endOffset })),
+      collapsed: range.collapsed,
+    }
+  })()
   const describe = (n) => n ? (n.tagName ? n.tagName.toLowerCase() : n.nodeName) + (n.id ? '#' + n.id : '') + (n.getAttribute && n.getAttribute('aria-label') ? ' "' + n.getAttribute('aria-label') + '"' : '') : 'nothing'
   return {
-    tag, type, editable, contentEditable: !!el.isContentEditable, value, focused, activeLabel: describe(active),
+    tag, type, editable, contentEditable: !!el.isContentEditable, value, selection, focused, activeLabel: describe(active),
     autocomplete: (el.getAttribute && el.getAttribute('autocomplete')) || '',
     textSecurity: getComputedStyle(el).webkitTextSecurity || 'none',
     disabled: !!el.disabled, readOnly: !!el.readOnly,
@@ -794,6 +998,17 @@ const RANGE_FN = `function(_args, el) {
   const max = Math.max(min, num(el.max, 100))
   const step = (el.getAttribute('step') || '').toLowerCase() === 'any' ? 'any' : (num(el.step, 1) > 0 ? num(el.step, 1) : 1)
   return { min, max, step, value: parseFloat(el.value) }
+}`
+
+/**
+ * A colour input's value (`#rrggbb`), whether it has a `list` (Chrome then opens its swatch popup,
+ * color_suggestion_picker.js, instead of the colour chooser, color_picker.js), and whether its
+ * chooser is open: Chrome sets `:open` on the input exactly while it is (measured on Chrome 133,
+ * headless and headed, for inputs that are display:none, visibility:hidden or aria-hidden too).
+ */
+const COLOUR_INPUT_FN = `function(_args, el) {
+  if (!el || !el.isConnected) return null
+  return { value: el.value, swatches: el.hasAttribute('list'), open: el.matches(':open') }
 }`
 
 /** A person's typing pace: ~70ms per key on average, longer after spaces and punctuation. */
@@ -1127,15 +1342,20 @@ export function createActApi(deps: ActDeps): ActApi {
    * What a pointer at `point` (main viewport) is over, as Chromium routes input: the page session's
    * hit test descends into same-process iframes by itself and stops at an out-of-process iframe's
    * element, where the hit test goes on in that frame's own session at the point in its viewport.
+   * `DOM.getNodeForLocation` takes the point in DOCUMENT coordinates of the session's root frame
+   * (Chromium maps it with DocumentToFrame): the viewport point plus how far that document is
+   * scrolled. Measured: on a page scrolled 720px, (100, 100) answers "No node found at given
+   * location" and (100, 820) answers the element drawn at (100, 100).
    */
   async function hitTest(probe: ActProbe, point: Point, what: string): Promise<{ frameId: string; backendNodeId: number }> {
     let frame: FrameHandle = probe.frames.main
     let local = point
     for (;;) {
+      const scrolled = await frame.world.evaluate<Point>('({ x: scrollX, y: scrollY })', { what: `reading how far the page is scrolled, ${what}` })
       const location = await send<Protocol.DOM.GetNodeForLocationResponse>(
         frame.cdp,
         'DOM.getNodeForLocation',
-        { x: Math.round(local.x), y: Math.round(local.y), includeUserAgentShadowDOM: false },
+        { x: Math.round(local.x + scrolled.x), y: Math.round(local.y + scrolled.y), includeUserAgentShadowDOM: false },
         what,
       )
       // Only an out-of-process iframe stops the page's hit test; a same-process one was descended already.
@@ -1160,11 +1380,11 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /**
-   * What a wheel turned in the middle of the screen scrolls, as Chromium chains it: the scroller
-   * under that point in the innermost iframe there; when it cannot move that way, the one around
-   * the iframe in its parent, and so on out to the page's.
+   * What a wheel turned in the middle of the screen scrolls along `axis`, as Chromium chains it:
+   * the scroller under that point in the innermost iframe there; when it cannot move that way, the
+   * one around the iframe in its parent, and so on out to the page's.
    */
-  async function scrollerAtCentre(probe: ActProbe, dir: number): Promise<{ frame: FrameHandle; backendNodeId: number }> {
+  async function scrollerAtCentre(probe: ActProbe, axis: 'x' | 'y', dir: number): Promise<{ frame: FrameHandle; backendNodeId: number }> {
     const viewport = await viewportRect(probe)
     const centre = { x: viewport.width / 2, y: viewport.height / 2 }
     const chain: Array<{ frame: FrameHandle; backendNodeId: number }> = []
@@ -1172,7 +1392,7 @@ export function createActApi(deps: ActDeps): ActApi {
     let local: Point = centre
     for (;;) {
       const [hit, scroller] = await frame.world.nodesReturnedBy([], SCROLLER_AT_POINT_FN, {
-        args: { dir, x: local.x, y: local.y },
+        args: { axis, dir, x: local.x, y: local.y },
         what: 'finding what the mouse wheel scrolls in the middle of the screen',
       })
       if (scroller === undefined || scroller === null) throw new ActError('The page has no document to scroll right now. Call observe() to see its state.')
@@ -1185,7 +1405,7 @@ export function createActApi(deps: ActDeps): ActApi {
     }
     for (const link of [...chain].reverse()) {
       const aim = await link.frame.world.callFunctionOnNodes<WheelAim | null>([link.backendNodeId], WHEEL_POINT_FN, {
-        args: { dir },
+        args: { axis, dir },
         what: 'reading whether the scroll area can move',
       })
       if (aim && !aim.atEnd) return link
@@ -1228,9 +1448,10 @@ export function createActApi(deps: ActDeps): ActApi {
    * (an outer one first when that scroller is itself off-screen), at a point the wheel really
    * reaches (hit-tested, so not over a sticky header or a nested list), one flick at a time.
    * There is no programmatic scroll behind this: when the page ignores the wheel the action stops
-   * and says so.
+   * and says so. With `offset` (CSS px in the target's border box, see `borderBox`) it is that
+   * point of the target that is brought into view.
    */
-  async function bringIntoView(step: Step, target: RefTarget): Promise<{ rects: Rect[]; viewport: Rect; notes: string[] }> {
+  async function bringIntoView(step: Step, target: RefTarget, offset?: Point): Promise<{ rects: Rect[]; viewport: Rect; notes: string[] }> {
     const { page, probe, record } = step
     const notes: string[] = []
     const inIframe = target.frameId !== probe.frames.mainFrameId()
@@ -1248,7 +1469,15 @@ export function createActApi(deps: ActDeps): ActApi {
         throw new ActError(`${describeTarget(target)} is not rendered right now (display:none, collapsed, or zero size). observe() shows what is visible.`)
       }
       const viewport = await visibleArea(probe, target.frameId)
+      // The point, re-measured each flick, in the frame's own viewport, where the plan measures.
+      let spot: Point | undefined
+      if (offset) {
+        const at = (await borderBox(probe, target)).at(offset)
+        const box = await probe.frames.box(target.frameId)
+        spot = { x: (at.x - box.x) / box.scale, y: (at.y - box.y) / box.scale }
+      }
       const plan = await frame.world.callFunctionOnNodes<ScrollPlan | null>([target.backendNodeId], SCROLL_PLAN_FN, {
+        args: spot ? { spot } : undefined,
         what: `planning a scroll to ${describeTarget(target)}`,
       })
       if (!plan) throw goneError(target)
@@ -1327,30 +1556,98 @@ export function createActApi(deps: ActDeps): ActApi {
       { x: box.x + box.width * 0.3, y: box.y + box.height * 0.7 },
       { x: box.x + box.width * 0.7, y: box.y + box.height * 0.7 },
     ]
-    const frame = await probe.frames.handle(target.frameId)
     let cover: { frameId: string; backendNodeId: number } | null = null
     for (const candidate of candidates) {
-      const hit = await hitTest(probe, candidate, `hit-testing ${describeTarget(target)}`)
-      const there = await asNodeOf(probe, hit.frameId, hit.backendNodeId, target.frameId)
-      if (there === target.backendNodeId) {
-        return { point: candidate, hit: describeTarget(target) }
-      }
-      if (there !== null) {
-        const inside = await frame.world.callFunctionOnNodes<boolean | null>([target.backendNodeId, there], CONTAINS_FN, {
-          what: 'checking which element the click point belongs to',
-        })
-        if (inside === true) {
-          return { point: candidate, hit: describeTarget(target) }
-        }
-        if (inside === null) throw goneError(target)
-      }
-      cover ??= hit
+      const over = await coverAt(probe, target, candidate)
+      if (over === null) return { point: candidate, hit: describeTarget(target) }
+      cover ??= over
     }
     const coverLabel = cover !== null ? await labelNode(probe, cover.frameId, cover.backendNodeId) : 'another element'
     throw new ActError(
       `Not done: ${describeTarget(target)} is covered by ${coverLabel} at every point a person could click. ` +
         'A person would first deal with what is on top (close it, accept it, or scroll it away). observe() lists the covering layer and its controls.',
     )
+  }
+
+  /**
+   * What a pointer at `point` is over instead of `target`, hit-tested the way input is routed
+   * (through iframes); null when it reaches the target: the target itself or something inside it,
+   * in the target's own document or in an iframe within the target.
+   */
+  async function coverAt(probe: ActProbe, target: RefTarget, point: Point): Promise<{ frameId: string; backendNodeId: number } | null> {
+    const hit = await hitTest(probe, point, `hit-testing ${describeTarget(target)}`)
+    const there = await asNodeOf(probe, hit.frameId, hit.backendNodeId, target.frameId)
+    if (there === target.backendNodeId) return null
+    if (there === null) return hit
+    const inside = await (await worldOf(probe, target)).callFunctionOnNodes<boolean | null>([target.backendNodeId, there], CONTAINS_FN, {
+      what: 'checking which element the click point belongs to',
+    })
+    if (inside === null) throw goneError(target)
+    return inside ? null : hit
+  }
+
+  /**
+   * `target`'s border box as `DOM.getBoxModel` gives it: its size as laid out (CSS px, before any
+   * transform), and where a point of it (CSS px from its top-left corner) is on the screen (main
+   * viewport), through the four corners where the box is drawn — so a rotated, scaled, skewed or
+   * perspective-tilted element maps right.
+   */
+  async function borderBox(probe: ActProbe, target: RefTarget): Promise<{ width: number; height: number; at: (offset: Point) => Point }> {
+    const frame = await probe.frames.handle(target.frameId)
+    let model: Protocol.DOM.BoxModel
+    try {
+      ;({ model } = await send<Protocol.DOM.GetBoxModelResponse>(frame.cdp, 'DOM.getBoxModel', { backendNodeId: target.backendNodeId }, `measuring ${describeTarget(target)}`))
+    } catch (error) {
+      if (isNodeGoneError(error)) throw goneError(target)
+      if (!/Could not compute box model/i.test(errorMessage(error))) throw error
+      // No layout box: quadsOf tells a removed node (gone) from an unrendered one.
+      await quadsOf(probe, target)
+      throw new ActError(`${describeTarget(target)} is not rendered right now (display:none, collapsed, or zero size). observe() shows what is visible.`)
+    }
+    const origin = await probe.frames.sessionBox(frame)
+    const [p0, p1, p2, p3] = [0, 2, 4, 6].map((i): Point => ({ x: origin.x + model.border[i] * origin.scale, y: origin.y + model.border[i + 1] * origin.scale }))
+    const { width, height } = model
+    // The projective map from the unit square to the drawn corners (0,0)→p0, (1,0)→p1, (1,1)→p2,
+    // (0,1)→p3 (Heckbert, "Fundamentals of Texture Mapping", 1989): exact for any planar transform,
+    // perspective and 3D included; for a parallelogram (any 2D transform) g = h = 0 and it is affine.
+    const sx = p0.x - p1.x + p2.x - p3.x
+    const sy = p0.y - p1.y + p2.y - p3.y
+    const det = (p1.x - p2.x) * (p3.y - p2.y) - (p3.x - p2.x) * (p1.y - p2.y)
+    const g = det === 0 ? 0 : (sx * (p3.y - p2.y) - (p3.x - p2.x) * sy) / det
+    const h = det === 0 ? 0 : ((p1.x - p2.x) * sy - sx * (p1.y - p2.y)) / det
+    return {
+      width,
+      height,
+      at: ({ x, y }) => {
+        const u = width > 0 ? x / width : 0
+        const v = height > 0 ? y / height : 0
+        const w = g * u + h * v + 1
+        return {
+          x: ((p1.x - p0.x + g * p1.x) * u + (p3.x - p0.x + h * p3.x) * v + p0.x) / w,
+          y: ((p1.y - p0.y + g * p1.y) * u + (p3.y - p0.y + h * p3.y) * v + p0.y) / w,
+        }
+      },
+    }
+  }
+
+  /**
+   * Point `offset` of `target` on the screen, checked the way a click point is, but exactly there:
+   * inside what of the page is visible (`outOfView` is the refusal when it is not), and reaching the
+   * target (refuses naming what covers it).
+   */
+  async function pointOn(probe: ActProbe, target: RefTarget, offset: Point, viewport: Rect, outOfView: string): Promise<Point> {
+    const point = (await borderBox(probe, target)).at(offset)
+    if (point.x < viewport.x || point.x >= viewport.x + viewport.width || point.y < viewport.y || point.y >= viewport.y + viewport.height) {
+      throw new ActError(outOfView)
+    }
+    const cover = await coverAt(probe, target, point)
+    if (cover !== null) {
+      throw new ActError(
+        `Not done: at (${offset.x}, ${offset.y}) ${describeTarget(target)} is covered by ${await labelNode(probe, cover.frameId, cover.backendNodeId)}. ` +
+          'A person would first deal with what is on top (close it, accept it, or scroll it away), or pick a point that is not covered. observe() lists the covering layer and its controls.',
+      )
+    }
+    return point
   }
 
   async function guard(probe: ActProbe, kind: ActKind, options: { whileBusy?: boolean } = {}): Promise<void> {
@@ -1426,7 +1723,7 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /** A third scroll of the same scroller in the same direction after two that moved nothing. */
-  function scrollRepeatGuard(probe: ActProbe, record: ActionRecord, label: string, direction: 'down' | 'up'): void {
+  function scrollRepeatGuard(probe: ActProbe, record: ActionRecord, label: string, direction: ScrollDirection): void {
     if (deps.mode !== 'human') return
     const recent = probe.history.filter((r) => (r.ok || r.dispatched) && !UNCOUNTED_KINDS[r.kind]).slice(-2)
     if (recent.length === 2 && recent.every((r) => r.kind === 'scroll' && r.ok && r.repeatKey === record.repeatKey && r.scrollMoved === 0)) {
@@ -1608,11 +1905,21 @@ export function createActApi(deps: ActDeps): ActApi {
     return { ...target, backendNodeId: label, role: `label of ${target.role}` }
   }
 
-  /** Bring what a person points at for `target` into view and pick a point on it that reaches it. */
-  async function aimAt(step: Step, target: RefTarget): Promise<Point> {
-    const surface = await pointerSurface(step.probe, target, step.record)
-    const { rects, viewport, notes } = await bringIntoView(step, surface)
+  /**
+   * Bring what a person points at for `target` into view and pick a point on it that reaches it;
+   * with `offset` (a point of `target`'s border box the model chose), bring that point into view
+   * and aim exactly there.
+   */
+  async function aimAt(step: Step, target: RefTarget, offset?: Point): Promise<Point> {
+    const surface = offset ? target : await pointerSurface(step.probe, target, step.record)
+    const { rects, viewport, notes } = await bringIntoView(step, surface, offset)
     step.record.notes.push(...notes)
+    if (offset) {
+      const outOfView = `(${offset.x}, ${offset.y}) of ${describeTarget(target)} is outside the visible page even after scrolling.`
+      const point = await pointOn(step.probe, target, offset, viewport, outOfView)
+      step.record.hit = describeTarget(target)
+      return point
+    }
     const { point, hit } = await hitPoint(step.probe, surface, rects, viewport)
     step.record.hit = hit
     return point
@@ -1673,6 +1980,64 @@ export function createActApi(deps: ActDeps): ActApi {
       const pause = /[\s,.;:!?]/.test(char) ? KEY_MEAN_MS * randomBetween(1.4, 2.6) : KEY_MEAN_MS * randomBetween(0.55, 1.35)
       await sleep(pause)
     }
+  }
+
+  /** A line break as text holds it: `\r\n`, `\r` or `\n`, each one key when typed. */
+  const LINE_BREAK = /\r\n|\r|\n/
+
+  /**
+   * Type `text` at a person's pace, each line break as the `newline` key. Never a line break as a
+   * character: Playwright's keyboard types `\n` and `\r` as Enter, which a chat composer takes as
+   * "send". refuseUnsaidNewline has made sure `newline` is given whenever the text has one.
+   */
+  async function typeLines(page: Page, text: string, newline: FillOptions['newline']): Promise<void> {
+    const [first, ...rest] = text.split(LINE_BREAK)
+    await typeHuman(page, first)
+    for (const line of rest) {
+      if (newline === undefined) throw new ActError('A line break reached the keyboard without a newline key to type it as; the text after it was not typed.')
+      checkAbort()
+      await page.keyboard.press(newline, { delay: Math.round(randomBetween(40, 90)) })
+      await sleep(KEY_MEAN_MS * randomBetween(1.4, 2.6))
+      await typeHuman(page, line)
+    }
+  }
+
+  /**
+   * Select a field's whole text, or put the caret after it, with the chord a person uses on the
+   * platform of the browser being driven: Ctrl+A / Ctrl+End, or ⌘A / ⌘↓ on macOS (End only
+   * scrolls there). Returns the chord's name.
+   *
+   * Chrome on macOS runs these chords only as the editing commands its own key handling derives
+   * from them (Blink's key table binds neither there), so the key events carry those commands, the
+   * way Playwright's keyboard sends `macEditingCommands`. Playwright decides "macOS" from the user
+   * agent the connection's Browser.getVersion reports (an extension older than the relay still
+   * answers with the relay's own name), and resolves `ControlOrMeta` from this process's platform,
+   * which is not the browser's when the browser runs on another machine. So the platform is read
+   * here from the page's own user agent, with Playwright's test ("Macintosh"), and the keys are
+   * dispatched with their commands directly.
+   */
+  async function pressEditingChord(probe: ActProbe, action: 'select all' | 'end of text'): Promise<string> {
+    checkAbort()
+    const userAgent = await probe.frames.main.world.evaluate<string>('navigator.userAgent', { what: "reading the browser's platform from its user agent" })
+    const mac = userAgent.includes('Macintosh')
+    const modifier = mac ? { key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, mask: 4, label: '⌘' } : { key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17, mask: 2, label: 'Ctrl+' }
+    const key =
+      action === 'select all'
+        ? { key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, label: 'A' }
+        : mac
+          ? { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40, label: '↓' }
+          : { key: 'End', code: 'End', windowsVirtualKeyCode: 35, label: 'End' }
+    const commands = mac ? [action === 'select all' ? 'selectAll' : 'moveToEndOfDocument'] : []
+    const held = { key: modifier.key, code: modifier.code, windowsVirtualKeyCode: modifier.windowsVirtualKeyCode, location: 1 }
+    const pressed = { key: key.key, code: key.code, windowsVirtualKeyCode: key.windowsVirtualKeyCode }
+    const chord = `${modifier.label}${key.label}`
+    await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: modifier.mask, ...held }, `pressing ${chord}`)
+    await sleep(randomBetween(30, 70))
+    await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: modifier.mask, ...pressed, commands }, `pressing ${chord}`)
+    await sleep(randomBetween(40, 90))
+    await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: modifier.mask, ...pressed }, `releasing ${chord}`)
+    await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 0, ...held }, `releasing ${chord}`)
+    return chord
   }
 
   /** Refuse key-by-key input that cannot finish at a person's pace before this call times out. */
@@ -1738,6 +2103,39 @@ export function createActApi(deps: ActDeps): ActApi {
       throw new ActError(
         `Not done: ${describeTarget(field)} is a single-line field; a newline typed there is the Enter key, which submits its form. ` +
           "Fill it without the newline; if submitting is what you want, act.press('Enter') in the next call.",
+      )
+    }
+  }
+
+  /**
+   * In a field that takes several lines, the key for a new line is the app's to decide: a chat
+   * composer sends on Enter and starts a new line on Shift+Enter; a plain text area or a code
+   * editor starts one on Enter. Typed key by key, text with a line break needs `newline` to say
+   * which; act never guesses (a wrong Enter sends half a message, irreversibly).
+   */
+  function refuseUnsaidNewline(kind: 'fill' | 'type', field: RefTarget, facts: FieldFacts, text: string, options: FillOptions): void {
+    if (options.paste || options.newline !== undefined || facts.tag === 'input') return
+    const breaks = text.split(LINE_BREAK).length - 1
+    if (breaks === 0) return
+    throw new ActError(
+      `Not done: the text has ${breaks} line break${breaks === 1 ? '' : 's'} and ${describeTarget(field)} takes several lines, where the key for a new line ` +
+        'depends on the app: in a chat composer Enter sends the message and Shift+Enter starts a new line; in a plain text area or a code editor Enter ' +
+        `starts a new line. Say which: act.${kind}(${field.ref}, text, { newline: 'Shift+Enter' }), or { newline: 'Enter' }, or { paste: true }, which ` +
+        'inserts the text, line breaks included, without key events. Nothing was typed.',
+    )
+  }
+
+  /** `newline` checked at run time (the model's code is untyped): one of the two keys, and never with `paste`. */
+  function refuseBadNewlineOption(kind: 'fill' | 'type', options: FillOptions): void {
+    const newline: unknown = options.newline
+    if (newline === undefined) return
+    if (newline !== 'Enter' && newline !== 'Shift+Enter') {
+      throw new ActError(`${kind}: newline must be 'Enter' or 'Shift+Enter' (got ${JSON.stringify(newline)}). Nothing was typed.`)
+    }
+    if (options.paste) {
+      throw new ActError(
+        `${kind}: { newline } and { paste: true } contradict each other: paste types no keys, so no line break is typed as a key. ` +
+          'Pass newline to type the text key by key, or paste to insert it. Nothing was typed.',
       )
     }
   }
@@ -2034,13 +2432,191 @@ export function createActApi(deps: ActDeps): ActApi {
     record.notes.push(`moved the slider from ${fromNow.value} to ${after.value}${route.start ? ` (${route.start}, then` : ' ('}${Math.abs(route.presses)} × ${key})`)
   }
 
+  /**
+   * A native colour input, set the way a keyboard user does in Chrome's colour chooser (a Blink
+   * page popup, color_picker.js). Chrome sends the page's keys to an open popup
+   * (WebFrameWidgetImpl::HandleKeyEvent), so after a real click opens it: Shift+Tab wraps focus to
+   * its format switch (the last of its controls), ArrowUp switches the switch from RGB (where it
+   * always starts) to hex, Shift+Tab goes back into the hex field (focusing it selects its text),
+   * the colour is typed, Enter closes the chooser. Each key in the hex field sets the input (an
+   * `input` event), closing it fires `change`. Measured on Chrome 133, headless and headed.
+   *
+   * Whether the chooser is open is the input's `:open` state, read in the isolated world before
+   * every key: Chrome sets it exactly while the chooser is open (ColorInputType::OpenPopupView /
+   * DidEndChooser), for an input hidden from view or from the accessibility tree too. A key sent
+   * after the chooser closed would act on the page, so none is. A native dialog the page opens on
+   * the click or on an `input` event freezes the page: nothing more is sent or read.
+   *
+   * A chooser already open (from an act.click on the input) is cancelled first with Escape, as a
+   * person would: which of its controls has focus is unknown, so the keys would not reach the hex
+   * field. Then the steps above.
+   *
+   * The value read back must be the one asked for; when it is not, Escape cancels the chooser (the
+   * first press puts back the colour it opened with, the next closes it).
+   */
+  async function fillColour(step: Step, target: RefTarget, text: string): Promise<void> {
+    const { page, probe, record } = step
+    if (!/^#[0-9a-f]{6}$/i.test(text)) {
+      throw new ActError(
+        `${describeTarget(target)} is a colour input: give the colour as #rrggbb, six hex digits (e.g. act.fill(${target.ref}, '#3366cc')); "${text}" is not in that form.`,
+      )
+    }
+    const wanted = text.toLowerCase()
+    record.detail = wanted
+    const world = await worldOf(probe, target)
+    const sent: string[] = []
+    /** Refuse to go on while a native dialog freezes the page: nothing in it can be read or used until it is answered. */
+    const stopIfDialog = (): void => {
+      const dialog = probe.dialogs.current()
+      if (dialog?.handling !== 'agent') return
+      throw new ActError(
+        `${sent.length ? `Choosing ${wanted} in Chrome's colour chooser for ${describeTarget(target)} (keys sent: ${sent.join(' ')})` : `Clicked ${describeTarget(target)}`}, ` +
+          `and a native ${dialog.type}("${dialog.message}") opened: the page is frozen until it is answered. Answer it (act.dialog.accept() or ` +
+          `act.dialog.dismiss()); observe() then shows what the colour input reads and whether its chooser is still open.`,
+      )
+    }
+    const readColour = async (): Promise<{ value: string; swatches: boolean; open: boolean }> => {
+      stopIfDialog()
+      const facts = await world.callFunctionOnNodes<{ value: string; swatches: boolean; open: boolean } | null>([target.backendNodeId], COLOUR_INPUT_FN, {
+        what: `reading ${describeTarget(target)}`,
+      })
+      if (!facts) throw goneError(target)
+      return facts
+    }
+    /** Read until the chooser is open (`wanted`) or closed, or `ms` have passed: the last reading. */
+    const readWhen = async (open: boolean, ms: number): Promise<{ value: string; swatches: boolean; open: boolean }> => {
+      const deadline = Date.now() + ms
+      for (;;) {
+        const facts = await readColour()
+        if (facts.open === open || Date.now() > deadline) return facts
+        await sleep(50)
+      }
+    }
+    /** One key to the open chooser, at a person's pace; refused once it has closed, since the key would act on the page. */
+    const pressInChooser = async (key: string, pause: number): Promise<void> => {
+      checkAbort()
+      const now = await readColour()
+      if (!now.open) {
+        throw new ActError(
+          `Chrome's colour chooser for ${describeTarget(target)} closed before act.fill was done (keys sent to it: ${sent.length ? sent.join(' ') : 'none'}). ` +
+            `No more keys were sent: they would act on the page. The input reads ${now.value}. If the chooser closed while a key was on its way, that ` +
+            'key reached the page: observe() shows what it did.',
+        )
+      }
+      await untilDialog(probe, key.length === 1 ? page.keyboard.type(key) : page.keyboard.press(key), record)
+      sent.push(key)
+      stopIfDialog()
+      await sleep(pause)
+    }
+    let before = await readColour()
+    if (before.swatches) {
+      // Measured on Chrome 133: ArrowDown focuses a swatch, but Enter and Space then do nothing,
+      // and a click where the popup is goes to the page and closes it, choosing nothing.
+      throw new ActError(
+        `${describeTarget(target)} is a colour input with suggested colours (a list): Chrome opens its swatch popup for it, not the colour chooser. ` +
+          'From the keyboard that popup takes only the arrow keys and Escape — its script cancels every other key, so neither Enter nor Space picks a ' +
+          'swatch or "Other…" — and a click on it reaches the page instead, which closes it. A person can only choose there with the mouse ' +
+          'inside the popup, which page input cannot reach: ask the user to pick the colour.',
+      )
+    }
+    if (before.open) {
+      // Which of its controls has focus is unknown, so the keys below would not reach the hex field.
+      // Start from a closed chooser, the way a person cancels it: Escape puts back the colour it
+      // opened with (it stays open when that changed something), the next Escape closes it.
+      const shown = before.value
+      record.dispatched = true
+      let escapes = 0
+      while (before.open) {
+        if (escapes === 2) {
+          throw new ActError(
+            `Chrome's colour chooser for ${describeTarget(target)} was open and is still open after Escape twice, showing ${before.value}; keys go to it ` +
+              `rather than the page. act.press('Enter') closes it keeping ${before.value}.`,
+          )
+        }
+        checkAbort()
+        await untilDialog(probe, page.keyboard.press('Escape'), record)
+        sent.push('Escape')
+        escapes += 1
+        stopIfDialog()
+        await sleep(randomBetween(150, 260))
+        before = await readColour()
+      }
+      record.notes.push(
+        `its colour chooser was already open, showing ${shown}: cancelled it with Escape (${escapes === 1 ? 'once' : 'twice'}), which left ${before.value}`,
+      )
+    }
+    if (before.value === wanted) {
+      record.notes.push(`${wanted} was already chosen; nothing to do`)
+      return
+    }
+    refuseIfTooSlow(wanted.length + 4, `Choosing ${wanted} in the colour chooser`, '')
+    await clickTarget(step, target, 1, 'left')
+    if (!(await readWhen(true, 1000)).open) {
+      throw new ActError(
+        `Clicked ${describeTarget(target)} but Chrome's colour chooser did not open (the page may handle the click itself). observe() shows what the click did.`,
+      )
+    }
+    // A person takes in the chooser before reaching for the keys; its script is up by then too.
+    await sleep(randomBetween(450, 800))
+    for (const key of ['Shift+Tab', 'ArrowUp', 'Shift+Tab']) await pressInChooser(key, KEY_MEAN_MS * randomBetween(1.2, 2.2))
+    for (const char of wanted) await pressInChooser(char, KEY_MEAN_MS * randomBetween(0.55, 1.35))
+    await sleep(randomBetween(80, 160))
+    const typed = await readColour()
+    if (typed.value !== wanted) {
+      let escapes = 0
+      for (let now = typed; now.open && escapes < 2; now = await readColour()) {
+        await untilDialog(probe, page.keyboard.press('Escape'), record)
+        sent.push('Escape')
+        escapes += 1
+        stopIfDialog()
+        await sleep(randomBetween(150, 260))
+      }
+      const now = await readColour()
+      const cancelled =
+        escapes === 0
+          ? 'The chooser had already closed, so no Escape was sent.'
+          : now.open
+            ? `Pressed Escape ${escapes} times, but the chooser is still open: act.press('Escape') closes it.`
+            : `Cancelled it with Escape (${escapes === 1 ? 'once' : 'twice'}).`
+      throw new ActError(
+        `Typed ${wanted} where the hex field of Chrome's colour chooser for ${describeTarget(target)} should be, but the input reads ${typed.value}: ` +
+          `the chooser did not take it there. ${cancelled} The input reads ${now.value}. Ask the user to pick the colour.`,
+      )
+    }
+    // The page may close the chooser itself once the colour is typed (a re-render on `input`). Enter
+    // would then reach the page: submit its form, or reopen the chooser on the focused input.
+    const beforeEnter = await readColour()
+    if (beforeEnter.open) {
+      await untilDialog(probe, page.keyboard.press('Enter'), record)
+      sent.push('Enter')
+      // A dialog the page opened on `change` waits for the agent; nothing in the page can be read
+      // until it is answered, and the report names it.
+      if (probe.dialogs.current()?.handling === 'agent') return
+    }
+    const after = await readWhen(false, 1000)
+    if (after.open) {
+      throw new ActError(
+        `${describeTarget(target)} reads ${after.value}, but Chrome's colour chooser is still open after Enter, and keys go to it rather than the page. ` +
+          `act.press('Enter') closes it keeping ${after.value}; Escape would put back ${before.value} first (a second Escape closes it).`,
+      )
+    }
+    if (after.value !== wanted) {
+      throw new ActError(`Chose ${wanted} in the colour chooser of ${describeTarget(target)}, but once it closed the input reads ${after.value}: the page changed or rejected it.`)
+    }
+    record.notes.push(
+      `chose it in Chrome's colour chooser: Shift+Tab to its format switch, ArrowUp to hex, Shift+Tab into the hex field, typed ${wanted}, ` +
+        `${beforeEnter.open ? 'Enter' : 'and the page closed the chooser itself, so no Enter was sent'}; value read back: "${after.value}"`,
+    )
+  }
+
   async function fillOrType(ref: number | string, text: string, options: FillOptions, append: boolean): Promise<ActionRecord> {
-    const kind: ActKind = append ? 'type' : 'fill'
+    const kind = append ? 'type' : 'fill'
     return run(
       kind,
       async (step) => {
         const { page, probe, record } = step
         const [target] = step.targets
+        refuseBadNewlineOption(kind, options)
         const before = await readField(probe, target)
         if (before.disabled || before.readOnly) {
           throw new ActError(`${describeTarget(target)} is ${before.disabled ? 'disabled' : 'read-only'}; a person cannot type into it.`)
@@ -2056,21 +2632,24 @@ export function createActApi(deps: ActDeps): ActApi {
           return
         }
         if (before.tag === 'input' && before.type === 'color') {
-          throw new ActError(
-            `${describeTarget(target)} is a colour input: choosing a colour opens Chrome's own colour picker, which is browser UI that page input ` +
-              'cannot operate, so there is no way to set it the way a person would here. Ask the user to pick the colour.',
-          )
+          if (append) throw new ActError(`${describeTarget(target)} is a colour input: set it with act.fill(${target.ref}, '#rrggbb').`)
+          await fillColour(step, target, text)
+          return
         }
         if (!before.editable) {
           throw new ActError(`${describeTarget(target)} is not a text field (it is <${before.tag}${before.type ? ` type=${before.type}` : ''}>). Use act.click / act.select / act.check for it.`)
         }
         refuseNewlineInInput(target, before, text)
+        refuseUnsaidNewline(kind, target, before, text, options)
         const secret = isSecret(before)
         record.detail = maskIfSecret(text, secret)
         if (secret) await refuseUntoldSecret(page, probe, target, options)
+        // What the field holds once typed: a line break is one key, and fields hold it as \n.
+        const typed = text.split(LINE_BREAK).join('\n')
+        const lineBreaks = typed.split('\n').length - 1
         // Always a person's pace, never sped up to fit the call: if it does not fit, say so first.
         if (!options.paste) {
-          refuseIfTooSlow(text.length, `Typing these ${text.length} characters`, ', or pass { paste: true } for text a person would paste rather than type')
+          refuseIfTooSlow(typed.length, `Typing these ${typed.length} characters`, ', or pass { paste: true } for text a person would paste rather than type')
         }
         const point = await clickTarget(step, target, 1, 'left')
         const { field, facts: focused } = await fieldUnderCaret(step, target, point, 'when it was clicked')
@@ -2078,6 +2657,7 @@ export function createActApi(deps: ActDeps): ActApi {
         if (field !== target) {
           // The field the page swapped in gets the clicked one's refusals before a key reaches it.
           refuseNewlineInInput(field, focused, text)
+          refuseUnsaidNewline(kind, field, focused, text, options)
           typedSecret = isSecret(focused)
           if (typedSecret) {
             record.detail = maskIfSecret(text, true)
@@ -2088,20 +2668,40 @@ export function createActApi(deps: ActDeps): ActApi {
           throw new ActError(`Clicked ${describeTarget(target)} but the keyboard focus went to ${focused.activeLabel}, so typing would land there. observe() and check what took focus.`)
         }
         if (!append && focused.value) {
-          await page.keyboard.press('ControlOrMeta+A')
+          const chord = await pressEditingChord(probe, 'select all')
           await sleep(randomBetween(60, 140))
+          const selected = (await readField(probe, field)).selection
+          if (selected && !(selected.atStart && selected.atEnd)) {
+            throw new ActError(
+              `Not done: pressed ${chord} in ${describeTarget(field)} to select its text for replacing, but not all of it is selected (the page handles ` +
+                `that key itself), so typing would not replace it. Nothing was typed. Clear it the way the page offers (observe() lists a clear button), or ` +
+                `act.type(${field.ref}, text) to add to it.`,
+            )
+          }
           if (text.length === 0) {
             await page.keyboard.press('Backspace')
           }
           record.notes.push(`replaced the previous value ${typedSecret ? '(masked)' : `"${maskIfSecret(focused.value, false)}"`}`)
         } else if (append && focused.value) {
-          await page.keyboard.press('End')
+          // End only reaches the end of the clicked line in a text area or editor; this reaches the end of the text.
+          const chord = await pressEditingChord(probe, 'end of text')
+          await sleep(randomBetween(40, 90))
+          const caret = (await readField(probe, field)).selection
+          if (caret && !(caret.collapsed && caret.atEnd)) {
+            throw new ActError(
+              `Not done: pressed ${chord} in ${describeTarget(field)} to put the caret after its text, but the caret is not at the end (the page moved ` +
+                `it or handles that key itself), so the text would land in the middle. Nothing was typed. act.fill(${field.ref}, …) with the whole text ` +
+                'replaces it instead.',
+            )
+          }
+          record.notes.push(`put the caret after the text with ${chord}`)
         }
         if (options.paste) {
-          await page.keyboard.insertText(text)
-          record.notes.push(`inserted ${text.length} characters as IME text (no paste event)`)
+          await page.keyboard.insertText(typed)
+          record.notes.push(`inserted ${typed.length} characters as IME text (no paste event)`)
         } else {
-          await typeHuman(page, text)
+          await typeLines(page, text, options.newline)
+          if (lineBreaks > 0) record.notes.push(`typed ${lineBreaks} line break${lineBreaks === 1 ? '' : 's'} as ${options.newline}`)
           if (typedSecret) record.notes.push('typed a secret (masked in this report)')
         }
         await sleep(randomBetween(80, 160))
@@ -2112,7 +2712,7 @@ export function createActApi(deps: ActDeps): ActApi {
           record.detail = maskIfSecret(text, true)
         }
         if (after.value !== null) {
-          const expected = append ? `${focused.value ?? ''}${text}` : text
+          const expected = append ? `${focused.value ?? ''}${typed}` : typed
           if (after.value !== expected) {
             record.notes.push(
               typedSecret
@@ -2160,10 +2760,10 @@ export function createActApi(deps: ActDeps): ActApi {
     )
   }
 
-  /** Vertical scroll offset of node `scrollerId` (in the frame of `world`) once smooth scrolling has come to rest. */
-  async function restingOffset(world: IsolatedWorld, scrollerId: number, gone: () => ActError): Promise<ScrollOffset> {
+  /** Scroll state of node `scrollerId` (in the frame of `world`) along `axis`, once smooth scrolling has come to rest (its raw offset still). */
+  async function restingOffset(world: IsolatedWorld, scrollerId: number, axis: 'x' | 'y', gone: () => ActError): Promise<ScrollOffset> {
     const read = async (): Promise<ScrollOffset> => {
-      const offset = await world.callFunctionOnNodes<ScrollOffset | null>([scrollerId], SCROLL_OFFSET_FN, { what: 'reading the scroll position' })
+      const offset = await world.callFunctionOnNodes<ScrollOffset | null>([scrollerId], SCROLL_OFFSET_FN, { args: { axis }, what: 'reading the scroll position' })
       if (!offset) throw gone()
       return offset
     }
@@ -2172,7 +2772,7 @@ export function createActApi(deps: ActDeps): ActApi {
     while (Date.now() < deadline) {
       await sleep(50)
       const now = await read()
-      if (Math.abs(now.top - last.top) < 0.5) return now
+      if (Math.abs(now.raw - last.raw) < 0.5) return now
       last = now
     }
     return last
@@ -2181,12 +2781,18 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * Turn the wheel over a scroller: `container` (a ref), or — without one — what Chromium's scroll
    * chaining scrolls from the middle of the screen, which in an app shell is its main list, not the
-   * document, and over an iframe is what scrolls inside it. The scroller's own offset is measured
-   * before and after.
+   * document, and over an iframe is what scrolls inside it. Left and right turn it sideways with
+   * horizontal wheel deltas (a trackpad's or tilt wheel's), which Chrome scrolls a carousel with
+   * (measured on Chrome 133, headless and headed; so does Shift+wheel). The scroller's own offset
+   * is measured before and after.
    */
-  async function scrollBy(step: Step, direction: 'down' | 'up', screens: number, container: RefTarget | undefined): Promise<void> {
+  async function scrollBy(step: Step, direction: ScrollDirection, screens: number, container: RefTarget | undefined): Promise<void> {
     const { page, probe, record } = step
-    const dir = direction === 'down' ? 1 : -1
+    const { axis, dir } = SCROLL_DIRECTIONS[direction]
+    const words =
+      axis === 'y'
+        ? { more: dir > 0 ? 'below' : 'above', end: dir > 0 ? 'bottom' : 'top' }
+        : { more: dir > 0 ? 'to the right' : 'to the left', end: dir > 0 ? 'right end' : 'left end' }
     let scrollerId: number
     let scrollerRef: RefTarget | null
     let frame: FrameHandle
@@ -2195,7 +2801,7 @@ export function createActApi(deps: ActDeps): ActApi {
       scrollerRef = container
       frame = await probe.frames.handle(container.frameId)
     } else {
-      const found = await scrollerAtCentre(probe, dir)
+      const found = await scrollerAtCentre(probe, axis, dir)
       scrollerId = found.backendNodeId
       frame = found.frame
       scrollerRef = deps.registry.refFor(probe.targetId, frame.frameId, found.backendNodeId)
@@ -2205,7 +2811,7 @@ export function createActApi(deps: ActDeps): ActApi {
     const goneScroller = (): ActError =>
       container ? goneError(container) : new ActError('The scroll area in the middle of the screen disappeared while scrolling it. Call observe() again.')
     const aim = await frame.world.callFunctionOnNodes<WheelAim | null>([scrollerId], WHEEL_POINT_FN, {
-      args: { dir },
+      args: { axis, dir },
       what: 'finding where to turn the mouse wheel',
     })
     if (!aim) throw goneScroller()
@@ -2229,8 +2835,11 @@ export function createActApi(deps: ActDeps): ActApi {
       record.scrollMoved = 0
       record.notes.push(
         aim.scrollable
-          ? `nothing to scroll: ${label} is already at the ${dir > 0 ? 'bottom' : 'top'} (a wheel over it would scroll what contains it instead)`
-          : `nothing to scroll: ${label} does not scroll (its content fits)`,
+          ? `nothing to scroll: ${label} is already at the ${words.end} (a wheel over it would scroll what contains it instead)`
+          : aim.otherWay !== undefined
+            ? `nothing to scroll: ${label} does not scroll ${axis === 'y' ? 'up or down; it scrolls sideways' : 'sideways; it scrolls up and down'} ` +
+              `(act.scroll('${axis === 'y' ? (aim.otherWay > 0 ? 'right' : 'left') : aim.otherWay > 0 ? 'down' : 'up'}', { ref: ${container.ref} }))`
+            : `nothing to scroll: ${label} does not scroll${axis === 'x' ? ' sideways' : ''} (its content fits)`,
       )
       return
     }
@@ -2240,7 +2849,7 @@ export function createActApi(deps: ActDeps): ActApi {
           `the pointer is over ${aim.blockedBy} instead, which scrolls something else or nothing. Deal with that first (observe() shows it).`,
       )
     }
-    const before = await restingOffset(frame.world, scrollerId, goneScroller)
+    const before = await restingOffset(frame.world, scrollerId, axis, goneScroller)
     record.dispatched = true
     await deps.humanMouse.moveTo({ page, x: point.x, y: point.y })
     const total = Math.max(40, screens * before.client) * dir
@@ -2248,26 +2857,30 @@ export function createActApi(deps: ActDeps): ActApi {
     while (Math.abs(done) < Math.abs(total)) {
       checkAbort()
       const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(done), randomBetween(180, 420))
-      await page.mouse.wheel(0, flick)
+      if (axis === 'y') await page.mouse.wheel(0, flick)
+      else await page.mouse.wheel(flick, 0)
       done += flick
       await sleep(randomBetween(70, 150))
     }
-    const after = await restingOffset(frame.world, scrollerId, goneScroller)
-    const moved = after.top - before.top
+    const after = await restingOffset(frame.world, scrollerId, axis, goneScroller)
+    // Chrome's own offset: the distance from the top or left edge of an area that starts at its
+    // bottom or right edge also grows when the page adds content there while it scrolls (a chat
+    // log loading older messages).
+    const moved = after.raw - before.raw
     record.scrollMoved = Math.round(Math.abs(moved))
-    const remaining = dir > 0 ? after.height - after.top - after.client : after.top
-    const where = `${(Math.max(0, remaining) / after.client).toFixed(1)} screens ${dir > 0 ? 'below' : 'above'}`
+    const remaining = dir > 0 ? after.size - after.at - after.client : after.at
+    const where = `${(Math.max(0, remaining) / after.client).toFixed(1)} screens ${words.more}`
     if (Math.abs(moved) < 1) {
       record.scrollMoved = 0
       record.notes.push(
         remaining >= 1
-          ? `nothing moved although ${label} has more ${dir > 0 ? 'below' : 'above'} (${where}): the page handles the mouse wheel itself here`
+          ? `nothing moved although ${label} has more ${words.more} (${where}): the page handles the mouse wheel itself here`
           : container
-            ? `nothing moved: ${label} is at the ${dir > 0 ? 'bottom' : 'top'}`
-            : `nothing moved: nothing in the middle of the screen can scroll further ${direction} (${label} and every scroll area there are at the ${dir > 0 ? 'bottom' : 'top'})`,
+            ? `nothing moved: ${label} is at the ${words.end}`
+            : `nothing moved: nothing in the middle of the screen can scroll further ${direction} (${label} and every scroll area there are at the ${words.end})`,
       )
     } else {
-      record.notes.push(`scrolled ${label} ${Math.round(Math.abs(moved))}px; ${where}`)
+      record.notes.push(`scrolled ${label} ${Math.round(Math.abs(moved))}px${axis === 'x' ? ` ${words.more}` : ''}; ${where}`)
     }
   }
 
@@ -2406,6 +3019,10 @@ export function createActApi(deps: ActDeps): ActApi {
       run(
         'scroll',
         async (step) => {
+          // The model's code is untyped: anything else would silently scroll some other way.
+          if (!Object.hasOwn(SCROLL_DIRECTIONS, direction)) {
+            throw new ActError(`scroll: direction must be 'down', 'up', 'right' or 'left' (got ${JSON.stringify(direction)}).`)
+          }
           const screens = options.screens ?? 0.8
           if (!(screens > 0 && screens <= 10)) {
             throw new ActError('scroll: screens must be between 0 and 10.')
@@ -2490,14 +3107,37 @@ export function createActApi(deps: ActDeps): ActApi {
         },
         { refs: [ref], whileBusy: options.whileBusy },
       ),
-    drag: (fromRef, toRef, options = {}) =>
-      run(
+    drag: (fromArg, toArg, options = {}) => {
+      // The model's code is untyped: a malformed end is refused before anything runs.
+      const fromEnd = dragEnd(fromArg, 'from')
+      const toEnd = dragEnd(toArg, 'to')
+      return run(
         'drag',
         async (step) => {
           const { page, probe, record } = step
           const [from, to] = step.targets
-          record.detail = `onto ${describeTarget(to)}`
-          const fromPoint = await aimAt(step, from)
+          const pointIn = (offset: Point, target: RefTarget): string => `(${offset.x}, ${offset.y}) in ${describeTarget(target)}`
+          const onto = toEnd.offset ? pointIn(toEnd.offset, to) : describeTarget(to)
+          record.detail = fromEnd.offset ? `from ${pointIn(fromEnd.offset, from)} ${toEnd.offset ? 'to' : 'onto'} ${onto}` : `onto ${onto}`
+          for (const { target, offset } of [{ target: from, offset: fromEnd.offset }, { target: to, offset: toEnd.offset }]) {
+            if (!offset) continue
+            if (target.viaLabel) {
+              throw new ActError(
+                `Not done: ${describeTarget(target)} is hidden and worked through its label, so it has no box of its own to point into. ` +
+                  `Drag from or onto [${target.ref}] itself, without x/y. Nothing was dragged.`,
+              )
+            }
+            const box = await borderBox(probe, target)
+            const width = Math.round(box.width * 10) / 10
+            const height = Math.round(box.height * 10) / 10
+            if (offset.x < 0 || offset.x >= box.width || offset.y < 0 || offset.y >= box.height) {
+              throw new ActError(
+                `Not done: ${describeTarget(target)} is ${width}×${height} px: x must be from 0 up to, not including, ${width}, and y from 0 up to, ` +
+                  `not including, ${height} (got ${offset.x}, ${offset.y}), CSS px from its top-left corner. Nothing was dragged.`,
+              )
+            }
+          }
+          const fromPoint = await aimAt(step, from, fromEnd.offset)
           record.dispatched = true
           await deps.humanMouse.moveTo({ page, x: fromPoint.x, y: fromPoint.y })
           // An HTML drag (draggable=true, links, images) is intercepted the way Playwright's
@@ -2520,13 +3160,18 @@ export function createActApi(deps: ActDeps): ActApi {
               await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: at.x, y: at.y, button: 'left', buttons: 1, clickCount: 1 }, 'pressing the mouse button')
               pressed = true
               await sleep(randomBetween(120, 220))
-              const toSurface = await pointerSurface(probe, to, record)
-              const toRects = await quadsOf(probe, toSurface)
-              const viewport = await visibleArea(probe, toSurface.frameId)
-              if (!toRects.some((rect) => intersectRects(rect, viewport) !== null)) {
-                throw new ActError(`${describeTarget(to)} is not visible while dragging; bring both into view first.`)
+              if (toEnd.offset) {
+                const outOfView = `(${toEnd.offset.x}, ${toEnd.offset.y}) of ${describeTarget(to)} is not visible while dragging; bring both points into view first.`
+                toPoint = await pointOn(probe, to, toEnd.offset, await visibleArea(probe, to.frameId), outOfView)
+              } else {
+                const toSurface = await pointerSurface(probe, to, record)
+                const toRects = await quadsOf(probe, toSurface)
+                const viewport = await visibleArea(probe, toSurface.frameId)
+                if (!toRects.some((rect) => intersectRects(rect, viewport) !== null)) {
+                  throw new ActError(`${describeTarget(to)} is not visible while dragging; bring both into view first.`)
+                }
+                ;({ point: toPoint } = await hitPoint(probe, toSurface, toRects, viewport))
               }
-              ;({ point: toPoint } = await hitPoint(probe, toSurface, toRects, viewport))
               const trajectory = await deps.humanMouse.plan({ page, from: at, x: toPoint.x, y: toPoint.y })
               const startedAt = Date.now()
               for (const sample of trajectory.samples) {
@@ -2560,8 +3205,9 @@ export function createActApi(deps: ActDeps): ActApi {
             }
           }
         },
-        { refs: [fromRef, toRef], whileBusy: options.whileBusy },
-      ),
+        { refs: [fromEnd.ref, toEnd.ref], whileBusy: options.whileBusy },
+      )
+    },
     open: (url, options = {}) =>
       run(
         'open',
@@ -2905,7 +3551,7 @@ export function renderActionReport(input: ActionReportInput): string {
     const listed = events.failedRequests.filter(isDependency)
     const others = events.failedRequests.filter((request) => !isDependency(request))
     for (const request of listed.slice(-REPORT_LIST_MAX)) {
-      errors.push(request.failed ? `request failed ${request.method} ${shortUrl(request.url)}: ${request.failed} (${request.id})` : `HTTP ${request.status} ${request.method} ${shortUrl(request.url)} (${request.id})`)
+      errors.push(request.failed !== undefined ? `request failed ${request.method} ${shortUrl(request.url)}: ${request.failed} (${request.id})` : `HTTP ${request.status} ${request.method} ${shortUrl(request.url)} (${request.id})`)
     }
     if (listed.length > REPORT_LIST_MAX) errors.push(`+${listed.length - REPORT_LIST_MAX} more failed requests — net.requests({ failedOnly: true })`)
     if (others.length) {

@@ -84,6 +84,14 @@ export type UnanalysableSite = CodeSite & { why: string }
  */
 export type ScriptReadSite = CodeSite & { note?: string }
 
+/**
+ * A playwriter element reader given a Playwright form of its element (`debugStyle({ locator })`,
+ * `pm.query({ rootSelector })`): the reader resolves it with Playwright's script in the page, as a
+ * user gesture. `instead` is the same call with a ref from observe(). `why`, when set, is the site's
+ * own reason, for a call that resolves no element itself (`humanMouse.enable()`).
+ */
+export type ScriptFormSite = CodeSite & { instead: string; why?: string }
+
 export interface CodeAnalysis {
   parseError?: string
   /** A ReturnStatement not inside a nested function (nor inside page-evaluated code). */
@@ -94,6 +102,7 @@ export interface CodeAnalysis {
   apiBypass: CodeSite[]
   waits: CodeSite[]
   scriptReads: ScriptReadSite[]
+  scriptForms: ScriptFormSite[]
   unanalysable: UnanalysableSite[]
 }
 
@@ -285,6 +294,52 @@ const PAGE_FUNCTION_ARGUMENT: Record<string, number> = {
 
 /** Sandbox globals whose function argument runs inside the page, and the index of that argument. */
 const PAGE_FUNCTION_GLOBALS: Record<string, number> = { readPage: 0 }
+
+/**
+ * Sandbox element readers and the option keys that give them a Playwright form of the element, which
+ * they resolve with Playwright's script in the page; `instead` is the ref form. Matched on an object
+ * literal written as the first argument (the run-time check in the executor covers every other way).
+ * `getCleanHTML({ locator })` also takes a whole Page (read over CDP), so only a value that makes a
+ * Locator or ElementHandle there (`page.locator(…)`, `…getByRole(…)`) is a script form.
+ */
+const READER_SCRIPT_FORMS: Record<string, { keys: readonly string[]; instead: string; locatorCallsOnly?: true }> = {
+  snapshot: { keys: ['locator'], instead: 'snapshot({ ref: 12 })' },
+  getCleanHTML: { keys: ['locator'], instead: 'getCleanHTML({ ref: 12 })', locatorCallsOnly: true },
+  getStylesForLocator: { keys: ['locator'], instead: 'getStylesForLocator({ ref: 12 })' },
+  debugStyle: { keys: ['locator', 'node'], instead: 'debugStyle({ ref: 12 })' },
+  whyOccluded: { keys: ['locator', 'node'], instead: 'whyOccluded({ ref: 12 })' },
+  getReactSource: { keys: ['locator'], instead: 'getReactSource({ ref: 12 })' },
+  getReactComponentInfo: { keys: ['locator'], instead: 'getReactComponentInfo({ ref: 12 })' },
+  fiberSnapshot: { keys: ['locator'], instead: 'fiberSnapshot({ ref: 12 })' },
+  traceValue: { keys: ['selector', 'locator'], instead: 'traceValue({ ref: 12 })' },
+  queryPage: { keys: ['rootSelector', 'scope'], instead: 'queryPage({ rootRef: 12 })' },
+}
+
+/** Methods that make a Playwright Locator or ElementHandle from a Page, Frame, Locator or handle. */
+const LOCATOR_FACTORY_METHODS: Record<string, true> = {
+  locator: true,
+  getByRole: true,
+  getByText: true,
+  getByLabel: true,
+  getByPlaceholder: true,
+  getByAltText: true,
+  getByTitle: true,
+  getByTestId: true,
+  first: true,
+  last: true,
+  nth: true,
+  filter: true,
+  and: true,
+  or: true,
+  $: true,
+  elementHandle: true,
+}
+
+/** `pm.<m>(…, options)`: the options argument's position, by method. */
+const PM_OPTIONS_ARGUMENT: Record<string, number> = { query: 0, renderText: 0, debugMode: 0, anchor: 1, anchorAt: 1 }
+
+/** `humanMouse.<m>({ locator })` measures (and clicks) the element with Playwright's script. */
+const HUMAN_MOUSE_TARGET_METHODS: Record<string, true> = { moveTo: true, click: true, hover: true, plan: true }
 
 /** `page.request` / `context.request` — Playwright's APIRequestContext talks to the server directly. */
 const API_REQUEST_METHODS: Record<string, true> = { get: true, post: true, put: true, patch: true, delete: true, head: true, fetch: true }
@@ -529,6 +584,13 @@ function isFreshValue(path: AnyPath): boolean {
   return path.scope.getBinding('Array') === undefined
 }
 
+/** A call that makes a Playwright Locator or ElementHandle (`page.locator(…)`, `…getByRole(…).first()`), awaited or not. */
+function makesLocator(value: AnyPath): boolean {
+  const call = value.isAwaitExpression() ? value.get('argument') : value
+  if (!call.isCallExpression() && !call.isOptionalCallExpression()) return false
+  return listed(LOCATOR_FACTORY_METHODS, propertyKey(call.get('callee')))
+}
+
 /** `[root, ...chain]` of a global access, without `window.`/`globalThis.` prefixes and with `document.location` → `location`. */
 function globalNames(access: Access): Array<string | null> | null {
   if (access.kind !== 'global') return null
@@ -700,6 +762,7 @@ class Analyzer {
     apiBypass: [],
     waits: [],
     scriptReads: [],
+    scriptForms: [],
     unanalysable: [],
   }
   /** Function nodes the page evaluates: their bodies are page code. */
@@ -935,12 +998,33 @@ class Analyzer {
         else if (root === 'require') {
           const moduleName = args[0]?.isStringLiteral() ? args[0].node.value : null
           if (listed(BYPASS_MODULES, moduleName)) this.result.apiBypass.push({ api: `require('${moduleName}')`, line })
+        } else if (listed(READER_SCRIPT_FORMS, root)) {
+          this.classifyReaderOptions(root, args[0], READER_SCRIPT_FORMS[root], line)
+        } else if (root === 'getLocatorStringForElement' && args[0] !== undefined && makesLocator(args[0])) {
+          // A Locator or ElementHandle made right there: the reader resolves it with Playwright's script.
+          this.result.scriptForms.push({ api: 'getLocatorStringForElement(<locator>)', line, instead: 'getLocatorStringForElement({ ref: 12 })' })
         }
         return
       }
       if (root === 'act') return this.classifyActCall(path, rest, args, line)
+      if (root === 'pm' && rest.length === 1 && listed(PM_OPTIONS_ARGUMENT, rest[0])) {
+        this.classifyReaderOptions(`pm.${rest[0]}`, args[PM_OPTIONS_ARGUMENT[rest[0]]], { keys: ['rootSelector', 'scope'], instead: `pm.${rest[0]}({ rootRef: 12 })` }, line)
+        return
+      }
       if (root === 'humanMouse') {
         if (rest.length === 1 && listed(HUMAN_MOUSE_INPUT_METHODS, rest[0])) this.pushInput(path, { api: `humanMouse.${rest[0]}`, line }, false)
+        if (rest.length === 1 && rest[0] === 'enable') {
+          this.result.scriptForms.push({
+            api: 'humanMouse.enable()',
+            line,
+            why:
+              "routes locator.click/dblclick/hover through human motion, and those locator actions run Playwright's script in the page, " +
+              'which Playwright runs as a user gesture (the page then counts as clicked: navigator.userActivation).',
+            instead: 'click and hover like a person with a ref from observe() or find(): act.click(12), act.hover(12)',
+          })
+        } else if (rest.length === 1 && listed(HUMAN_MOUSE_TARGET_METHODS, rest[0])) {
+          this.classifyReaderOptions(`humanMouse.${rest[0]}`, args[0], { keys: ['locator'], instead: `humanMouse.${rest[0]}({ ref: 12 })` }, line)
+        }
         return
       }
       if (root === 'net') {
@@ -1008,6 +1092,21 @@ class Analyzer {
     if (listed(SCRIPT_READ_METHODS, method) && !otherGlobal) {
       const { note } = SCRIPT_READ_METHODS[method]
       this.result.scriptReads.push({ api, line, ...(note ? { note } : {}) })
+    }
+  }
+
+  /** A Playwright form of the element given to an element reader in an object literal: `reader({ locator: … })`. */
+  private classifyReaderOptions(
+    reader: string,
+    options: AnyPath | undefined,
+    forms: { keys: readonly string[]; instead: string; locatorCallsOnly?: true },
+    line: number,
+  ): void {
+    for (const key of forms.keys) {
+      const value = objectPropertyValue(options, key)
+      if (value === null) continue
+      if (forms.locatorCallsOnly && !makesLocator(value)) continue
+      this.result.scriptForms.push({ api: `${reader}({ ${key} })`, line, instead: forms.instead })
     }
   }
 
@@ -1222,13 +1321,14 @@ export function analyzeCode(code: string): CodeAnalysis {
       apiBypass: [],
       waits: [],
       scriptReads: [],
+      scriptForms: [],
       unanalysable: [],
     }
   }
   const analyzer = new Analyzer()
   analyzer.analyze(parsed, code)
   const result = analyzer.result
-  for (const list of [result.inputActions, result.navigations, result.forcedState, result.apiBypass, result.waits, result.scriptReads, result.unanalysable]) {
+  for (const list of [result.inputActions, result.navigations, result.forcedState, result.apiBypass, result.waits, result.scriptReads, result.scriptForms, result.unanalysable]) {
     list.sort((a: CodeSite, b: CodeSite) => a.line - b.line)
   }
   return result
@@ -1307,6 +1407,9 @@ function describeAnalysis(analysis: CodeAnalysis): string[] {
   }
   if (analysis.apiBypass.length > 0) notes.push(`direct backend calls: ${siteList(analysis.apiBypass)}`)
   if (analysis.scriptReads.length > 0) notes.push(`Playwright script in the page (a user gesture): ${siteList(analysis.scriptReads)}`)
+  const resolving = analysis.scriptForms.filter((site) => site.why === undefined)
+  if (resolving.length > 0) notes.push(`elements resolved with Playwright's script in the page (a user gesture): ${siteList(resolving)}`)
+  for (const site of analysis.scriptForms) if (site.why !== undefined) notes.push(`${site.api} on line ${site.line} ${site.why}`)
   if (analysis.unanalysable.length > 0) {
     notes.push(`not analysable: ${analysis.unanalysable.map((site) => `${site.api} on line ${site.line} (${site.why})`).join(', ')}`)
   }
@@ -1359,6 +1462,20 @@ export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode;
         'refs, explain(ref) says what an element does, getPageMarkdown() reads the text. To wait for something, ' +
         'act.waitForIdle() and then observe().',
     )
+  }
+
+  const resolving = analysis.scriptForms.filter((site) => site.why === undefined)
+  if (resolving.length > 0) {
+    const sites = resolving.map((site) => `${site.api} on line ${site.line} → ${site.instead}`).join('; ')
+    reasons.push(
+      `${REFUSED} ${sites}. Given a Playwright locator, selector or element handle, these resolve the element with ` +
+        "Playwright's script in the page, which Playwright runs as a user gesture (the page then counts as clicked: " +
+        'navigator.userActivation). Pass the ref observe() or find() printed for the element: it is read over CDP, without ' +
+        'running anything in the page.',
+    )
+  }
+  for (const site of analysis.scriptForms) {
+    if (site.why !== undefined) reasons.push(`${REFUSED} ${site.api} on line ${site.line} ${site.why} Instead, ${site.instead}.`)
   }
 
   const scripted = analysis.inputActions.filter((site) => site.viaScript)

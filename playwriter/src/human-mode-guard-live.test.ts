@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { PlaywrightExecutor } from './executor.js'
+import { isPatchrightEnabled } from './playwright-import.js'
 
 const PAGE = '<!doctype html><html><head><title>Guarded</title></head><body><h1>Hello</h1><button>Go</button></body></html>'
 
@@ -99,9 +100,16 @@ describe('human mode refuses Playwright script in the page at run time', () => {
   })
 
   it("refuses Playwright's internal calls, which its instrumentation never reports", async () => {
-    const result = await human.execute("const name = ['_snapshot', 'ForAI'].join('')\nreturn await page[name]({ timeout: 2000 })", 30000)
+    // Frame.resolveSelector is internal on both servers (protocolMetainfo `internal: true`): Playwright
+    // 1.59's client sends it from locator._resolveSelector(), 1.61's (patchright) from locator.normalize().
+    const result = await human.execute(
+      "const locator = page[['loc', 'ator'].join('')]('h1')\n" +
+        "const name = ['_resolve', 'Selector'].join('')\n" +
+        "return await (typeof locator[name] === 'function' ? locator[name]() : locator[['norm', 'alize'].join('')]())",
+      30000,
+    )
     expect(result.isError).toBe(true)
-    expect(result.text).toContain('Refused (human mode): it (Playwright protocol call Page.snapshotForAI)')
+    expect(result.text).toContain('Refused (human mode): it (Playwright protocol call Frame.resolveSelector)')
   })
 
   it('keeps raw CDP read-only: no new session, no way around the read-only one', async () => {
@@ -147,6 +155,13 @@ describe("the page's own console.log(element)", () => {
 
   it("still gives Playwright's element preview, computed without the gesture", async () => {
     const debug = await open('debug', 'logs')
+    if (isPatchrightEnabled()) {
+      // Patchright's server never enables Runtime on a page session (the automation tell it removes), so it
+      // receives the page's console messages only once another client of the session enables Runtime, as a
+      // second relay client on the extension's debugger session does. Playwright's server enables it itself.
+      const enabled = await debug.execute("const cdp = await getCDPSession({ page })\nawait cdp.send('Runtime.enable')", 30000)
+      expect(enabled.isError, enabled.text).toBe(false)
+    }
     const preview = await debug.execute(
       [
         'state.previews = []',

@@ -121,7 +121,7 @@ describe('action report', () => {
     const exportLink = refOf(observation, /link "Export CSV"/)
     const result = await executor.execute(`await act.click(${exportLink})`, 30000)
     expect(result.isError, result.text).toBe(false)
-    expect(result.text).toMatch(/DOWNLOAD report\.csv from .*\/export.* — completed/)
+    expect(result.text).toMatch(/DOWNLOAD \[d1\] report\.csv from .*\/export.* — completed → downloads\.save\('d1', 'report\.csv'\)/)
     expect(result.text).not.toMatch(/NO VISIBLE CHANGE/)
   })
 

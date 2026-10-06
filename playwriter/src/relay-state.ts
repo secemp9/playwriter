@@ -37,6 +37,37 @@ export type ExtensionInfo = {
   installId?: string
   /** playwriter package version the extension was built with (sent as ?v= query param) */
   version?: string
+  /** The browser's own navigator.userAgent (?userAgent=). Absent from extensions built before it was sent. */
+  userAgent?: string
+  /** The browser's Chromium product version (?browserVersion=), what follows 'Chrome/' in Browser.getVersion's product. */
+  browserVersion?: string
+}
+
+/**
+ * What the relay answers Browser.getVersion with for one extension connection, from the identity
+ * that extension sent on connect. Playwright's CRBrowser.connect reads only `product` (the text
+ * after '/' is browser.version(), its leading number majorVersion()) and `userAgent` (_platform():
+ * 'Macintosh' means mac, which decides whether its keyboard sends macOS editing commands; 'Headless'
+ * decides headful; it is also APIRequestContext's default User-Agent). It ignores `revision` and
+ * `jsVersion`, which the extension cannot read: they stay empty rather than invented.
+ *
+ * An extension built before it sent its user agent gets the relay's former answer, and
+ * `missing` names what is wrong because of it; the relay logs that once per connection.
+ */
+export function browserVersionFor(info: ExtensionInfo): {
+  response: Protocol.Browser.GetVersionResponse
+  missing: string | null
+} {
+  const product = info.browserVersion ? `Chrome/${info.browserVersion}` : 'Chrome/Extension-Bridge'
+  const userAgent = info.userAgent || 'CDP-Bridge-Server/1.0.0'
+  const lacks = [info.userAgent ? null : 'its user agent', info.browserVersion ? null : 'its browser version'].filter((x) => x !== null)
+  const missing = lacks.length
+    ? `The Playwriter extension did not send ${lacks.join(' or ')}. Until it is updated, Browser.getVersion answers ` +
+      `product "${product}" and user agent "${userAgent}": browser.version() is wrong` +
+      (info.userAgent ? '' : ", and Playwright treats the browser as Linux, so macOS keyboard shortcuts (Meta+A, Meta+ArrowLeft, Alt+Backspace…) do nothing in text fields") +
+      '. Update or reload the extension at chrome://extensions.'
+    : null
+  return { response: { protocolVersion: '1.3', product, revision: '', userAgent, jsVersion: '' }, missing }
 }
 
 export type ExtensionPendingRequest = {

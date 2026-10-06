@@ -308,14 +308,15 @@ describe('Relay Core Tests', () => {
     // Also toEqual rather than an inline snapshot, and for a sharper reason than the one above:
     // when the shared cdp.jsonl was wiped by a concurrent suite every flag here read false, and
     // `vitest run -u` would have written that all-false object in as the expected result — a
-    // green test asserting that downloads emit nothing. All six must be true: Playwright asks
-    // once at the browser level, cdp-relay rewrites that to a per-page Page.setDownloadBehavior
-    // (cdp-relay.ts:741-783), and each Page.download* event is mirrored back up to its
-    // Browser.download* form for Playwright's benefit (maybeEmitBrowserDownloadCompatEvent,
-    // cdp-relay.ts:713).
+    // green test asserting that downloads emit nothing. Playwright asks once at the browser level
+    // and the relay answers that itself: chrome.debugger refuses Page.setDownloadBehavior
+    // ("Cannot not access browser-level commands", measured with the real extension), so nothing
+    // is sent to the extension, and Chrome saves where its own settings say. Each Page.download*
+    // event is mirrored up to its Browser.download* form for Playwright's benefit
+    // (maybeEmitBrowserDownloadCompatEvent).
     expect(summary).toEqual({
       hasBrowserSetDownloadBehavior: true,
-      hasPageSetDownloadBehavior: true,
+      hasPageSetDownloadBehavior: false,
       hasPageDownloadWillBegin: true,
       hasPageDownloadProgress: true,
       hasBrowserDownloadWillBegin: true,
@@ -1716,7 +1717,7 @@ describe('Relay Core Tests', () => {
     await ensureConnectedTabForExecute()
 
     // Create a fresh page and set content with a collapsed details element
-    await client.callTool({
+    const setup = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
@@ -1731,6 +1732,9 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
+    // The click below reads state.errorTestPage: a setup that failed must say so here, not as an
+    // undefined page there.
+    expect((setup as any).isError, (setup as any).content[0].text).toBeFalsy()
     const result = await client.callTool({
       name: 'execute',
       arguments: {
@@ -1758,7 +1762,7 @@ describe('Relay Core Tests', () => {
   it('should show descriptive error when clicking an element covered by another', async () => {
     await ensureConnectedTabForExecute()
 
-    await client.callTool({
+    const setup = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
@@ -1773,6 +1777,7 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
+    expect((setup as any).isError, (setup as any).content[0].text).toBeFalsy()
     const result = await client.callTool({
       name: 'execute',
       arguments: {
@@ -1800,7 +1805,7 @@ describe('Relay Core Tests', () => {
   it('should show descriptive error when clicking a display:none element', async () => {
     await ensureConnectedTabForExecute()
 
-    await client.callTool({
+    const setup = await client.callTool({
       name: 'execute',
       arguments: {
         code: js`
@@ -1810,6 +1815,7 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
+    expect((setup as any).isError, (setup as any).content[0].text).toBeFalsy()
     const result = await client.callTool({
       name: 'execute',
       arguments: {

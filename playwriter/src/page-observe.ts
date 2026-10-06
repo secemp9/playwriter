@@ -139,7 +139,11 @@ export interface ObservedElement {
   errorText?: string
   /** Ref of the active descendant (the option Enter picks), when it is listed. */
   activeRef?: number
-  /** Ref of the nearest scroll area (see `Observation.scrollers`) the element sits in. */
+  /**
+   * Ref of the scroll area (see `Observation.scrollers`) that brings the element into view: the
+   * nearest it sits in that scrolls up and down when it is above or below, sideways when it is off
+   * to the left or right; else the nearest of any kind.
+   */
   scroller?: number
   /** Refs of the listed elements (and the modal) that contain this one, nearest first. Drives `scope`. */
   inside?: number[]
@@ -149,7 +153,7 @@ export interface ObservedElement {
   order: number
 }
 
-/** Attributes of a native `<input>`/`<select>`/`<textarea>` that say what it accepts. */
+/** Attributes of a native `<input>`/`<select>`/`<textarea>` that say what it accepts (and, for a colour input, whether its chooser is open). */
 export interface WidgetFacts {
   /** `type` of an `<input>` ('' for none). */
   type: string
@@ -161,12 +165,16 @@ export interface WidgetFacts {
   multiple?: true
   accept?: string
   maxLength?: number
+  /** A colour input with a `list`: Chrome opens its swatch popup for it instead of the full colour chooser. */
+  swatches?: true
+  /** A colour input whose chooser (Chrome's page popup) is open now: keys go to the chooser, not the page. Read live (`:open`). */
+  chooserOpen?: true
 }
 
 /**
  * An element whose own content scrolls (overflow auto/scroll/overlay with more content than
- * fits): an app shell's message list, a sidebar, a code panel. It has a ref, so
- * `act.scroll(dir, { ref })` and `observe({ scope })` work on it.
+ * fits), vertically, horizontally or both: an app shell's message list, a sidebar, a code panel,
+ * a carousel. It has a ref, so `act.scroll(dir, { ref })` and `observe({ scope })` work on it.
  */
 export interface ObservedScroller {
   ref: number
@@ -176,11 +184,27 @@ export interface ObservedScroller {
   role: string
   /** Its accessible name, or `tag#id.class` when it has none. */
   name: string
+  /** It scrolls up and down: overflow-y lets it, and its content is taller than its box. */
+  vertical: boolean
+  /** It scrolls sideways (a carousel, a wide table): overflow-x lets it, and its content is wider than its box. */
+  horizontal: boolean
+  /** Chrome's scrollTop: moves only when the area scrolls; 0 or negative for an area that starts at its bottom (a `column-reverse` chat log). */
   scrollTop: number
+  /** How far it is scrolled from its top edge (0: at the top). */
+  scrolledFromTop: number
   scrollHeight: number
   clientHeight: number
   screensAbove: number
   screensBelow: number
+  /** Chrome's scrollLeft: moves only when the area scrolls; 0 or negative for an area that starts at its right edge (right-to-left, vertical-rl). */
+  scrollLeft: number
+  /** How far it is scrolled from its left edge (0: at the left edge). */
+  scrolledFromLeft: number
+  scrollWidth: number
+  clientWidth: number
+  /** Screens of its own width to its left and right edges. */
+  screensLeft: number
+  screensRight: number
   visibility: Visibility
   box?: Box
 }
@@ -225,7 +249,7 @@ export interface TextBlock {
   inModal?: true
   /** The live region it is in (`log "Conversation"`): the page announces changes here. */
   live?: string
-  /** Ref of the nearest scroll area it sits in. */
+  /** Ref of the scroll area that brings it into view (as `ObservedElement.scroller`). */
   scroller?: number
   order: number
   box?: Box
@@ -681,12 +705,93 @@ const TEXT_SECURITY_FN = `function (_args, ...fields) {
 }`
 
 /**
- * `fn(args, ...elements)`: each element's own scroll state, or null for a node that is gone or is
- * the document's scrolling element (the page's own scroll is read from the layout metrics).
+ * In-page helpers that say where a scroller's scrolling starts on each axis, spliced into the
+ * functions that read scroll state here and in human-actions.ts (one source, so the two agree).
+ * From Chromium 133's source, and measured on it:
+ *  - viewportBody(): the `<body>` whose style Blink gives the viewport — its writing-mode and
+ *    direction always, its overflow when `<html>`'s is visible on both axes — or null when there is
+ *    no `<body>` child of `<html>`, or `<html>` or `<body>` is not laid out or has containment
+ *    (StyleResolver::PropagateStyleToViewport, ShouldStopBodyPropagation).
+ *  - scrollsViewport(n): `n` is that `<body>` and its overflow is the viewport's: it is not a
+ *    scroll container itself, and its scrollLeft/scrollTop read 0 whatever the page's scroll.
+ *  - origin(n): whether `n`'s scrolling starts at its bottom (`top`: its content overflows
+ *    upwards) and at its right edge (`left`). Chrome's scrollTop/scrollLeft are 0 there and go
+ *    negative upwards/leftwards. Content overflows towards the logical end sides (LayoutBox::
+ *    HasTopOverflow/HasLeftOverflow); a flex container swaps the main axis's for a reversed
+ *    direction and the cross axis's for wrap-reverse (LayoutFlexibleBox's GetOverflowConverter):
+ *    a `flex-direction: column-reverse` chat log starts at its bottom, a `row-reverse` strip at its
+ *    right. Writing mode and direction map the sides: right-to-left horizontal text and
+ *    vertical-rl/sideways-rl blocks start at the right; vertical text with direction rtl, and
+ *    sideways-lr text with direction ltr, at the bottom. For the document's scrolling element the
+ *    viewport's style decides (the viewport is no flex container).
+ *  - fromTop(n), fromLeft(n): how far `n` is scrolled from its top and left edges.
+ */
+export const SCROLL_ORIGIN_JS = `
+  let viewportBodyFound
+  const viewportBody = () => {
+    if (viewportBodyFound !== undefined) return viewportBodyFound
+    const html = document.documentElement
+    const body = html instanceof HTMLHtmlElement ? Array.prototype.find.call(html.children, (child) => child instanceof HTMLBodyElement) : undefined
+    const stops = (n) => {
+      const s = getComputedStyle(n)
+      return s.display === 'none' || s.display === 'contents' || s.contain !== 'none' || s.containerType !== 'normal' || s.contentVisibility !== 'visible'
+    }
+    viewportBodyFound = body && !stops(html) && !stops(body) ? body : null
+    return viewportBodyFound
+  }
+  const scrollsViewport = (n) => {
+    if (n !== viewportBody()) return false
+    const s = getComputedStyle(document.documentElement)
+    return s.overflowX === 'visible' && s.overflowY === 'visible'
+  }
+  const origin = (n) => {
+    const page = n === (document.scrollingElement || document.documentElement)
+    const s = getComputedStyle(page ? viewportBody() || document.documentElement : n)
+    // Whether content overflows at the inline-start, inline-end, block-start and block-end sides.
+    let is = false, ie = true, bs = false, be = true
+    const webkitBox = s.display === '-webkit-box' || s.display === '-webkit-inline-box'
+    if (!page && (webkitBox || s.display === 'flex' || s.display === 'inline-flex')) {
+      const column = webkitBox ? s.getPropertyValue('-webkit-box-orient') === 'vertical' : s.flexDirection.startsWith('column')
+      const reverse = webkitBox ? s.getPropertyValue('-webkit-box-direction') === 'reverse' : s.flexDirection.endsWith('-reverse')
+      const wrapReverse = s.flexWrap === 'wrap-reverse'
+      if (column ? reverse : wrapReverse) [bs, be] = [be, bs]
+      if (column ? wrapReverse : reverse) [is, ie] = [ie, is]
+    }
+    const rtl = s.direction === 'rtl'
+    switch (s.writingMode) {
+      case 'vertical-rl':
+      case 'sideways-rl':
+        return { top: rtl ? ie : is, left: be }
+      case 'vertical-lr':
+        return { top: rtl ? ie : is, left: bs }
+      case 'sideways-lr':
+        return { top: rtl ? is : ie, left: bs }
+      default:
+        return { top: bs, left: rtl ? ie : is }
+    }
+  }
+  const fromTop = (n) => (origin(n).top ? n.scrollHeight - n.clientHeight + n.scrollTop : n.scrollTop)
+  const fromLeft = (n) => (origin(n).left ? n.scrollWidth - n.clientWidth + n.scrollLeft : n.scrollLeft)
+`
+
+/**
+ * `fn(args, ...elements)`: each element's own scroll state on both axes, or null for a node that
+ * is gone, is the document's scrolling element (the page's own scroll is read from the layout
+ * metrics), or is a `<body>` whose overflow is the viewport's (SCROLL_ORIGIN_JS). `scrollTop` and
+ * `scrollLeft` are Chrome's own, which move only when the area scrolls; `top` and `left` are how
+ * far it is scrolled from its top and left edges, which also change when content is added on that
+ * side of an area that starts at its bottom or right (SCROLL_ORIGIN_JS's origin).
  */
 const SCROLL_METRICS_FN = `function (_args, ...elements) {
+  ${SCROLL_ORIGIN_JS}
   const root = document.scrollingElement || document.documentElement
-  return elements.map((el) => (!el || el === root ? null : { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight }))
+  return elements.map((el) => {
+    if (!el || el === root || scrollsViewport(el)) return null
+    return {
+      top: fromTop(el), scrollTop: el.scrollTop, height: el.scrollHeight, client: el.clientHeight,
+      left: fromLeft(el), scrollLeft: el.scrollLeft, width: el.scrollWidth, clientWidth: el.clientWidth,
+    }
+  })
 }`
 
 /**
@@ -738,6 +843,7 @@ function widgetOf(tag: string, attributes: Record<string, string>): WidgetFacts 
     ...(attributes.pattern ? { pattern: attributes.pattern } : {}),
     ...(attributes.multiple !== undefined ? { multiple: true as const } : {}),
     ...(attributes.accept ? { accept: attributes.accept } : {}),
+    ...(tag === 'input' && (attributes.type ?? '').toLowerCase() === 'color' && attributes.list !== undefined ? { swatches: true as const } : {}),
     ...(Number.isFinite(maxLength) && maxLength >= 0 ? { maxLength } : {}),
   }
 }
@@ -1245,6 +1351,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     if (frameRead === mainRead && collected.modalDialog) modalDialog = collected.modalDialog
     await addLabelOperatedControls({ world: frameRead.entry.world, model: frameRead.model, frame: frameRead.frame, candidates: collected.elements })
     await maskSecretValues(frameRead.entry.world, collected.elements)
+    await markOpenColourChoosers(frameRead.entry.world, collected.elements)
     occludeAcrossFrames(frameRead, reads, [...collected.elements, ...collected.texts])
     candidates.push(...collected.elements)
     texts.push(...collected.texts)
@@ -1490,18 +1597,38 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       backendNodeId: area.backendNodeId,
       role,
       name,
-      scrollTop: area.top,
+      vertical: area.vertical,
+      horizontal: area.horizontal,
+      scrollTop: area.scrollTop,
+      scrolledFromTop: area.top,
       scrollHeight: area.height,
       clientHeight: area.client,
       screensAbove: screens(area.top, area.client),
       screensBelow: screens(Math.max(0, area.height - area.client - area.top), area.client),
+      scrollLeft: area.scrollLeft,
+      scrolledFromLeft: area.left,
+      scrollWidth: area.width,
+      clientWidth: area.clientWidth,
+      screensLeft: screens(area.left, area.clientWidth),
+      screensRight: screens(Math.max(0, area.width - area.clientWidth - area.left), area.clientWidth),
       visibility: classifyVisibility(area.measured, viewport),
       ...(area.measured.box ? { box: area.measured.box } : {}),
     }
   })
-  const scrollerKeys = new Set(scrollAreas.map((area) => area.key))
-  const scrollerOf = (ancestors: NodeKey[]): number | undefined => {
-    const key = ancestors.find((ancestor) => scrollerKeys.has(ancestor))
+  const areaByKey = new Map(scrollAreas.map((area) => [area.key, area]))
+  /**
+   * The scroll area that scrolls an item with `visibility` into view: for one above or below, the
+   * nearest that scrolls vertically; off to the left or right, the nearest that scrolls sideways;
+   * otherwise the nearest of any kind. A carousel around an item below the screen is not what
+   * brings it up.
+   */
+  const scrollerOf = (ancestors: NodeKey[], visibility: Visibility): number | undefined => {
+    const scrolls = (area: ScrollArea): boolean =>
+      visibility === 'above' || visibility === 'below' ? area.vertical : visibility === 'left' || visibility === 'right' ? area.horizontal : true
+    const key = ancestors.find((ancestor) => {
+      const area = areaByKey.get(ancestor)
+      return area !== undefined && scrolls(area)
+    })
     return key === undefined ? undefined : refByKey.get(key)
   }
 
@@ -1534,7 +1661,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     const errorText = candidate.states?.errorMessage?.map((id) => textOf(candidate.frameId, id)).filter(Boolean).join(' ')
     const activeRef = candidate.states?.activeDescendant !== undefined ? refByKey.get(`${candidate.frameId}:${candidate.states.activeDescendant}` as NodeKey) : undefined
     const ref = refByKey.get(candidate.key)!
-    const scroller = scrollerOf(ancestors)
+    const scroller = scrollerOf(ancestors, visibility)
     const region = regionOf(candidate.anchor)
     return {
       ref,
@@ -1618,7 +1745,8 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     const liveKey = [block.anchor.key, ...ancestors].find((key) => liveByKey.has(key))
     const liveRegion = liveKey !== undefined ? liveByKey.get(liveKey) : undefined
     if (liveKey !== undefined) liveTexts.set(liveKey, [...(liveTexts.get(liveKey) ?? []), block.text])
-    const scroller = scrollerOf(ancestors)
+    const visibility = classifyVisibility(block.measured, viewport)
+    const scroller = scrollerOf(ancestors, visibility)
     text.push({
       key: block.key,
       frameId: block.frameId,
@@ -1626,7 +1754,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       text: block.text,
       ...(block.level !== undefined ? { level: block.level } : {}),
       ...(region ? { region } : {}),
-      visibility: classifyVisibility(block.measured, viewport),
+      visibility,
       ...(documentShown && !registry.wasShown(targetId, documentId, `${block.key}\u0000${block.text}`) ? { isNew: true } : {}),
       ...(inside.length ? { inside } : {}),
       ...(modal && modal.contains(ancestors, block.key) ? { inModal: true as const } : {}),
@@ -1741,7 +1869,30 @@ async function maskSecretValues(world: IsolatedWorld, candidates: Candidate[]): 
   })
 }
 
-/** An element whose own content scrolls vertically, with its scroll state. */
+/** `fn(args, ...inputs)`: whether each colour input's chooser is open (`:open`, set by Chrome exactly while it is). */
+const CHOOSER_OPEN_FN = `function (_args, ...inputs) {
+  return inputs.map((el) => !!el && el.matches(':open'))
+}`
+
+/**
+ * Mark colour inputs whose chooser is open. The chooser is Chrome's page popup: while it is open,
+ * keys go to it instead of the page, and its own controls are not the page's (aria-snapshot.ts
+ * leaves them out), so the input's line is where a person's view of it goes.
+ */
+async function markOpenColourChoosers(world: IsolatedWorld, candidates: Candidate[]): Promise<void> {
+  const colours = candidates.filter((candidate) => candidate.widget?.type === 'color')
+  if (colours.length === 0) return
+  const open = await world.callFunctionOnNodes<boolean[]>(
+    colours.map((candidate) => candidate.backendNodeId),
+    CHOOSER_OPEN_FN,
+    { timeoutMs: PROBE_TIMEOUT_MS, what: "reading whether a colour input's chooser is open" },
+  )
+  colours.forEach((candidate, index) => {
+    if (open[index] && candidate.widget) candidate.widget = { ...candidate.widget, chooserOpen: true }
+  })
+}
+
+/** An element whose own content scrolls vertically, horizontally or both, with its scroll state. */
 interface ScrollArea {
   key: NodeKey
   frameId: string
@@ -1749,28 +1900,45 @@ interface ScrollArea {
   role: string
   name: string
   measured: Measured
+  vertical: boolean
+  horizontal: boolean
+  /** Scrolled this far from its top edge (see SCROLL_METRICS_FN). */
   top: number
+  /** Chrome's own scrollTop. */
+  scrollTop: number
   height: number
   client: number
+  /** Scrolled this far from its left edge (see SCROLL_METRICS_FN). */
+  left: number
+  /** Chrome's own scrollLeft. */
+  scrollLeft: number
+  width: number
+  clientWidth: number
 }
 
+const SCROLLING_OVERFLOW = /^(auto|scroll|overlay)$/
+
 /**
- * Scroll areas: laid-out, visible elements whose computed `overflow-y` lets them scroll
- * (auto/scroll/overlay, from the layout snapshot) and whose content is taller than their box
- * (scrollHeight vs clientHeight, read in the isolated world). The document's own scroller is the
- * page's scroll, not one of these. Horizontal-only scrollers (carousels) are not listed; what they
- * hide is reported as off to the left/right.
+ * Scroll areas: laid-out, visible elements that scroll on an axis whose computed overflow lets
+ * them (`overflow-y`/`overflow-x` auto/scroll/overlay, from the layout snapshot) and whose content
+ * is taller or wider than their box on that axis (scrollHeight vs clientHeight, scrollWidth vs
+ * clientWidth, read in the isolated world). A horizontal-only one is a carousel or a wide table.
+ * The document's own scroller is the page's scroll, not one of these.
  */
 async function findScrollAreas({ world, frame, model }: { world: IsolatedWorld; frame: FrameGeometry; model: PageModel }): Promise<ScrollArea[]> {
   const cache = new Map<number, boolean>()
   const records = [...frame.byNodeIndex.values()]
     .filter(
       (record) =>
-        record.nodeType === 1 && /^(auto|scroll|overlay)$/.test(record.styles['overflow-y'] ?? '') && measureLaidOutRecord(record, frame, cache).visible,
+        record.nodeType === 1 &&
+        (SCROLLING_OVERFLOW.test(record.styles['overflow-y'] ?? '') || SCROLLING_OVERFLOW.test(record.styles['overflow-x'] ?? '')) &&
+        measureLaidOutRecord(record, frame, cache).visible,
     )
     .sort((a, b) => a.nodeIndex - b.nodeIndex)
   if (records.length === 0) return []
-  const metrics = await world.callFunctionOnNodes<Array<{ top: number; height: number; client: number } | null>>(
+  const metrics = await world.callFunctionOnNodes<
+    Array<{ top: number; scrollTop: number; height: number; client: number; left: number; scrollLeft: number; width: number; clientWidth: number } | null>
+  >(
     records.map((record) => record.backendNodeId),
     SCROLL_METRICS_FN,
     { timeoutMs: PROBE_TIMEOUT_MS, what: 'reading the scroll state of scrollable areas' },
@@ -1778,7 +1946,10 @@ async function findScrollAreas({ world, frame, model }: { world: IsolatedWorld; 
   const areas: ScrollArea[] = []
   records.forEach((record, index) => {
     const metric = metrics[index]
-    if (!metric || metric.height <= metric.client + 1) return
+    if (!metric) return
+    const vertical = SCROLLING_OVERFLOW.test(record.styles['overflow-y'] ?? '') && metric.height > metric.client + 1
+    const horizontal = SCROLLING_OVERFLOW.test(record.styles['overflow-x'] ?? '') && metric.width > metric.clientWidth + 1
+    if (!vertical && !horizontal) return
     const key = `${frame.frameId}:${record.backendNodeId}` as NodeKey
     const node = model.byKey.get(key)
     const role = node?.role && node.role !== 'generic' && node.role !== 'none' ? node.role : 'scroll area'
@@ -1790,9 +1961,16 @@ async function findScrollAreas({ world, frame, model }: { world: IsolatedWorld; 
       role,
       name: (node && modelName(node)) || cssLabelOf(record),
       measured: { visible, ...(inViewport !== undefined ? { inViewport } : {}), box: { ...record.box } },
+      vertical,
+      horizontal,
       top: metric.top,
+      scrollTop: metric.scrollTop,
       height: metric.height,
       client: metric.client,
+      left: metric.left,
+      scrollLeft: metric.scrollLeft,
+      width: metric.width,
+      clientWidth: metric.clientWidth,
     })
   })
   return areas
@@ -2459,6 +2637,21 @@ function describeField(element: ObservedElement, line: string): string {
     if (form) parts.push(`(takes ${form}: act.fill(${element.ref}, "${form}"))`)
     // A file input reads as a button ("Choose File"): say what clicking it opens and how to answer.
     else if (widget.type === 'file') parts.push(`(file input: its click opens a file dialog — act.upload(${element.ref}, path))`)
+    // A colour input's value is #rrggbb; act.fill sets it through Chrome's chooser, except the
+    // swatch popup a `list` brings up, which takes no choice from the keyboard.
+    else if (widget.type === 'color') {
+      if (widget.chooserOpen && widget.swatches) {
+        parts.push("(its swatch popup is open, and keys go to it, not the page: act.press('Escape') closes it; choosing in it needs the user)")
+      } else if (widget.chooserOpen) {
+        // color_picker.js: Enter closes it; Escape puts back the colour it opened with, or closes it when that is still the colour.
+        parts.push(
+          `(Chrome's colour chooser is open, and keys go to it, not the page: act.fill(${element.ref}, "#rrggbb") chooses a colour; act.press('Enter') ` +
+            "closes it keeping the colour it shows; act.press('Escape') puts back the colour it opened with, and closes it once that colour is back)",
+        )
+      } else {
+        parts.push(widget.swatches ? '(colour input with suggested swatches: act.fill cannot choose in its popup — ask the user)' : `(takes #rrggbb: act.fill(${element.ref}, "#rrggbb"))`)
+      }
+    }
     // A text field's type (email, tel, url, password) is not in its role; other roles say it already.
     else if (element.role === 'textbox' && widget.type && widget.type !== 'text') parts.push(`type=${widget.type}`)
     if (widget.placeholder && widget.placeholder !== element.name && !element.value) parts.push(`placeholder ${quote(widget.placeholder, 40)}`)
@@ -2537,11 +2730,20 @@ function scrollerLabel(obs: Observation, ref: number): string {
   return scroller ? `[${ref}] ${scroller.role} ${quote(scroller.name, 40)}` : `[${ref}]`
 }
 
+const SCROLLED_OUT: Partial<Record<Visibility, true>> = { above: true, below: true, clipped: true, left: true, right: true }
+
+/**
+ * Out of sight inside a scroll area, which is what scrolls it into view, not the page. `scroller`
+ * is already the area that scrolls on the axis it is hidden along (observePage's scrollerOf).
+ */
+function inScroller(item: { visibility: Visibility; scroller?: number }): boolean {
+  return item.scroller !== undefined && SCROLLED_OUT[item.visibility] === true
+}
+
 /** Where an element is, in words a person would use, with what to do about it. */
 function describeWhere(item: { visibility: Visibility; box?: Box; coveredBy?: string; scroller?: number }, obs: Observation): string {
   const distance = screensFromTop(item.box, obs)
-  // Off-screen inside a scroll area: that area is what scrolls it into view, not the page.
-  if (item.scroller !== undefined && (item.visibility === 'above' || item.visibility === 'below' || item.visibility === 'clipped')) {
+  if (item.scroller !== undefined && inScroller(item)) {
     return `inside ${scrollerLabel(obs, item.scroller)}, scrolled out of sight (act.scrollTo(ref), or act.scroll(dir, { ref: ${item.scroller} }))`
   }
   switch (item.visibility) {
@@ -2575,11 +2777,89 @@ function describeText(block: TextBlock): string {
   return `${prefix}${label}: ${quote(block.text, TEXT_SHOWN_CHARS)}`
 }
 
-/** Where a scroll area is scrolled to: `top, 3.2 screens below`. */
+/** Pixels a scroll area still hides past each edge (0 at that edge; ≤ 1 counts as at it, as Chrome rounds). */
+function hiddenPx(scroller: ObservedScroller): { above: number; below: number; left: number; right: number } {
+  return {
+    above: scroller.scrolledFromTop,
+    below: scroller.scrollHeight - scroller.clientHeight - scroller.scrolledFromTop,
+    left: scroller.scrolledFromLeft,
+    right: scroller.scrollWidth - scroller.clientWidth - scroller.scrolledFromLeft,
+  }
+}
+
+/**
+ * An amount a scroll area hides past one edge: screens of the area (one decimal), or pixels when
+ * that rounds to 0 — an area that scrolls 14px is not "0 screens" from its end. `unit` false leaves
+ * the unit implied by the amount before it (`2 screens above, 3 below`).
+ */
+function hiddenAmount(screens: number, px: number, unit: boolean): string {
+  if (screens > 0) return unit ? `${screens} screens` : `${screens}`
+  return `${Math.round(px)}px`
+}
+
+/**
+ * Where a scroll area is scrolled to, on each axis it scrolls: `top, 3.2 screens below`,
+ * `left edge, 2.5 screens to the right`, or both joined by `; `. Which edge it is at is decided in
+ * pixels, never from the rounded screens: 10px from the bottom is not the bottom.
+ */
 function scrollPosition(scroller: ObservedScroller): string {
-  if (scroller.scrollTop <= 1) return `top, ${scroller.screensBelow} screens below`
-  if (scroller.screensBelow <= 0) return `bottom, ${scroller.screensAbove} screens above`
-  return `${scroller.screensAbove} screens above, ${scroller.screensBelow} below`
+  const hidden = hiddenPx(scroller)
+  const parts: string[] = []
+  if (scroller.vertical) {
+    if (hidden.above <= 1) parts.push(`top, ${hiddenAmount(scroller.screensBelow, hidden.below, true)} below`)
+    else if (hidden.below <= 1) parts.push(`bottom, ${hiddenAmount(scroller.screensAbove, hidden.above, true)} above`)
+    else {
+      const above = hiddenAmount(scroller.screensAbove, hidden.above, true)
+      parts.push(`${above} above, ${hiddenAmount(scroller.screensBelow, hidden.below, !above.endsWith('screens'))} below`)
+    }
+  }
+  if (scroller.horizontal) {
+    if (hidden.left <= 1) parts.push(`left edge, ${hiddenAmount(scroller.screensRight, hidden.right, true)} to the right`)
+    else if (hidden.right <= 1) parts.push(`right edge, ${hiddenAmount(scroller.screensLeft, hidden.left, true)} to the left`)
+    else {
+      const left = hiddenAmount(scroller.screensLeft, hidden.left, true)
+      parts.push(`${left} to the left, ${hiddenAmount(scroller.screensRight, hidden.right, !left.endsWith('screens'))} to the right`)
+    }
+  }
+  return parts.join('; ')
+}
+
+type ScrollDirection = 'up' | 'down' | 'left' | 'right'
+
+/**
+ * Which way to turn a scroll area to bring what it hides into view: towards the side most of its
+ * hidden items are on — by each item's box against the area's, or by the side of the viewport it is
+ * off to when either has no box — and between equal counts, towards the side that hides more
+ * pixels. Only sides of an axis the area scrolls on count.
+ */
+function insideDirection(scroller: ObservedScroller, items: Array<{ box?: Box; visibility: Visibility }>): ScrollDirection {
+  const allowed: ScrollDirection[] = [...(scroller.vertical ? (['up', 'down'] as const) : []), ...(scroller.horizontal ? (['left', 'right'] as const) : [])]
+  const votes: Record<ScrollDirection, number> = { up: 0, down: 0, left: 0, right: 0 }
+  const area = scroller.box
+  for (const item of items) {
+    const box = item.box
+    const sides: ScrollDirection[] =
+      area && box
+        ? [
+            ...(box.y + box.height <= area.y ? (['up'] as const) : []),
+            ...(box.y >= area.y + area.height ? (['down'] as const) : []),
+            ...(box.x + box.width <= area.x ? (['left'] as const) : []),
+            ...(box.x >= area.x + area.width ? (['right'] as const) : []),
+          ]
+        : item.visibility === 'above'
+          ? ['up']
+          : item.visibility === 'below'
+            ? ['down']
+            : item.visibility === 'left' || item.visibility === 'right'
+              ? [item.visibility]
+              : []
+    for (const side of sides) votes[side]++
+  }
+  const hidden = hiddenPx(scroller)
+  const hiddenOn: Record<ScrollDirection, number> = { up: hidden.above, down: hidden.below, left: hidden.left, right: hidden.right }
+  return allowed.reduce((best, side) =>
+    votes[side] > votes[best] || (votes[side] === votes[best] && hiddenOn[side] > hiddenOn[best]) ? side : best,
+  )
 }
 
 /** One scroll area as a person sees it: `[57] list "Inbox" — top, 3.2 screens below`. */
@@ -2758,9 +3038,6 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
   }
 
   const tail: string[] = []
-  // Out of sight inside a scroll area: that area scrolls it into view, so it is counted there.
-  const inScroller = (item: { visibility: Visibility; scroller?: number }): boolean =>
-    item.scroller !== undefined && (item.visibility === 'above' || item.visibility === 'below' || item.visibility === 'clipped')
   const offscreen = (visibility: Visibility): ObservedElement[] =>
     elements.filter((e) => e.visibility === visibility && !inScroller(e) && !(modal && e.inModal))
   /** Off-screen lists print no nesting: an item in an iframe names it instead. */
@@ -2839,10 +3116,10 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
     for (const [ref, away] of scrolledAway) {
       const scroller = obs.scrollers.find((candidate) => candidate.ref === ref)
       const count = away.elements.filter((e) => !e.frame).length
-      const dir = scroller && scroller.screensBelow <= 0 ? 'up' : 'down'
+      const dir = scroller ? insideDirection(scroller, [...away.elements, ...away.texts]) : undefined
       tail.push(
         `INSIDE ${scroller ? describeScroller(scroller) : `[${ref}]`}: ${count} more control${count === 1 ? '' : 's'} and ` +
-          `${away.texts.length} text block${away.texts.length === 1 ? '' : 's'} out of sight — act.scroll('${dir}', { ref: ${ref} })`,
+          `${away.texts.length} text block${away.texts.length === 1 ? '' : 's'} out of sight${dir ? ` — act.scroll('${dir}', { ref: ${ref} })` : ''}`,
       )
     }
     const clipped = offscreen('clipped').filter((e) => !e.frame)
@@ -2886,8 +3163,11 @@ export interface ObservationDiff {
   jsDialogOpened?: JsDialogState
   jsDialogClosed?: JsDialogState
   scrolled?: { fromY: number; toY: number }
-  /** Scroll areas whose own offset moved (an inner list, a sidebar). */
-  scrolledAreas: Array<{ scroller: ObservedScroller; fromTop: number }>
+  /**
+   * Scroll areas whose own offset moved (an inner list, a sidebar, a carousel), with where each
+   * was: `fromTop` Chrome's scrollTop, `fromLeft` its scrollLeft when it moved sideways.
+   */
+  scrolledAreas: Array<{ scroller: ObservedScroller; fromTop: number; fromLeft?: number }>
   /**
    * This many listed controls and text blocks went inert while staying in the document — the
    * accessibility tree says why (behind a modal dialog, `inert`, `aria-hidden`) — or went under a
@@ -2910,10 +3190,12 @@ function visibilityClass(visibility: Visibility): 'hidden' | 'covered' | 'in-vie
   return 'offscreen'
 }
 
+/** The states a diff compares: the AX states but focus, and a colour input's open chooser (keys go to it then). */
 function statesWithoutFocus(element: ObservedElement): string {
-  if (!element.states) return ''
+  const chooser = element.widget?.chooserOpen ? '[chooser open]' : ''
+  if (!element.states) return chooser
   const { focused: _focused, ...rest } = element.states
-  return formatAxStates(rest, element.role).trim()
+  return [formatAxStates(rest, element.role).trim(), chooser].filter(Boolean).join(' ')
 }
 
 /**
@@ -2951,7 +3233,12 @@ export function diffObservations(before: Observation, after: Observation): Obser
   const scrollersBefore = new Map(before.scrollers.map((scroller) => [scroller.key, scroller]))
   for (const scroller of after.scrollers) {
     const old = scrollersBefore.get(scroller.key)
-    if (old && Math.abs(old.scrollTop - scroller.scrollTop) >= 1) diff.scrolledAreas.push({ scroller, fromTop: old.scrollTop })
+    // Sideways only for an area that scrolls sideways, by Chrome's own scrollLeft: the distance from
+    // the left edge of a right-to-left area also grows when content is added on its left.
+    const sideways = old !== undefined && (old.horizontal || scroller.horizontal) && Math.abs(old.scrollLeft - scroller.scrollLeft) >= 1
+    if (old && (Math.abs(old.scrollTop - scroller.scrollTop) >= 1 || sideways)) {
+      diff.scrolledAreas.push({ scroller, fromTop: old.scrollTop, ...(sideways ? { fromLeft: old.scrollLeft } : {}) })
+    }
   }
 
   const absentBefore = new Map(before.absent.map((item) => [item.key, item]))
@@ -3070,8 +3357,11 @@ export function renderObservationDiff(diff: ObservationDiff, options: { maxChars
     head.push(`FOCUS ${diff.focus.from ? shortElement(diff.focus.from) : '(nothing listed)'} → ${diff.focus.to ? shortElement(diff.focus.to) : '(nothing listed)'}`)
   }
   if (diff.scrolled) head.push(`SCROLL page y ${Math.round(diff.scrolled.fromY)} → ${Math.round(diff.scrolled.toY)}`)
-  for (const { scroller, fromTop } of diff.scrolledAreas) {
-    head.push(`SCROLL [${scroller.ref}] ${scroller.role} ${quote(scroller.name, 40)} ${Math.round(fromTop)} → ${Math.round(scroller.scrollTop)}px (now ${scrollPosition(scroller)})`)
+  for (const { scroller, fromTop, fromLeft } of diff.scrolledAreas) {
+    const moves: string[] = []
+    if (Math.abs(fromTop - scroller.scrollTop) >= 1) moves.push(`${Math.round(fromTop)} → ${Math.round(scroller.scrollTop)}px`)
+    if (fromLeft !== undefined) moves.push(`sideways ${Math.round(fromLeft)} → ${Math.round(scroller.scrollLeft)}px`)
+    head.push(`SCROLL [${scroller.ref}] ${scroller.role} ${quote(scroller.name, 40)} ${moves.join(', ')} (now ${scrollPosition(scroller)})`)
   }
 
   const absentAfter = new Map(after.absent.map((item) => [item.key, item]))
@@ -3137,6 +3427,20 @@ function excerpt(text: string, terms: string[]): string {
   return `${before}"${start > 0 ? '…' : ''}${clean.slice(start, end).replace(/"/g, '\\"')}${end < clean.length ? '…' : ''}"${after}`
 }
 
+/**
+ * The page's own words in a repeated control's context: `under heading "Shipping address"` →
+ * `Shipping address`. The context is one of `assignContexts`' templates — `in <role> "…"`,
+ * `under heading "…"`, `after "…"`, `<ordinal> of <n>` — whose framing words are observe()'s, not
+ * the page's, so find() must not match them (find("head") matched every control under a heading).
+ * The framing holds no quote, so the first and last quotes delimit the page's words exactly.
+ */
+function contextWords(context: string | undefined): string | undefined {
+  if (context === undefined) return undefined
+  const open = context.indexOf('"')
+  const close = context.lastIndexOf('"')
+  return open !== -1 && close > open ? context.slice(open + 1, close) : undefined
+}
+
 export function findInObservation(obs: Observation, query: string, options: { limit?: number } = {}): string {
   const limit = options.limit ?? 20
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
@@ -3152,7 +3456,7 @@ export function findInObservation(obs: Observation, query: string, options: { li
   for (const element of obs.elements) {
     const role = element.role === 'clickable' ? `clickable ${element.cssLabel ?? element.tag}` : element.role
     const behind = obs.modal && !element.inModal ? ' (behind the modal)' : ''
-    if (matches([role, element.name, element.value, element.href, element.context, element.region])) {
+    if (matches([role, element.name, element.value, element.href, contextWords(element.context), element.region])) {
       total++
       if (lines.length < limit) {
         const nameExcerpt = element.name.length > NAME_MAX_CHARS && matches([element.name]) ? ` — name ${excerpt(element.name, terms)}` : ''

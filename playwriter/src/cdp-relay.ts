@@ -34,6 +34,8 @@ import { RecordingRelay } from './recording-relay.js'
 import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
 import { deriveWorkspace, type Workspace } from './workspace-key.js'
+import { RelayDownloads } from './download-file.js'
+import type { DownloadFileReport } from './protocol.js'
 
 /**
  * Checks if a target should be filtered out (not exposed to Playwright).
@@ -139,7 +141,15 @@ export async function startPlayWriterCDPRelayServer({
 } = {}): Promise<RelayServer> {
   const emitter = new EventEmitter()
   const store = relayState.createRelayStore()
-  const extensionDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
+  /**
+   * Each Playwright client's own Browser.setDownloadBehavior, by client id: the folder its Playwright
+   * reads a finished download from (`<folder>/<guid>`). chrome.debugger cannot set where Chrome saves
+   * downloads (it refuses Page.setDownloadBehavior and has no Browser domain), so nothing is sent to
+   * the browser; the file Chrome saved is put into these folders when it finishes (download-file.ts).
+   */
+  const clientDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
+  /** Every extension download's file and outcome, for `GET /downloads/:guid` (download-file.ts). */
+  const relayDownloads = new RelayDownloads()
   /**
    * `${extensionId}:${child sessionId}` → the session an out-of-process iframe's
    * Target.attachedToTarget was routed on (the page, or the iframe, that owns its frame). A client
@@ -148,6 +158,8 @@ export async function startPlayWriterCDPRelayServer({
    * which tears the iframe's session down for every client).
    */
   const iframeOwnerSessions = new Map<string, string>()
+  /** Sessions whose Page.setFontFamilies the relay declined and logged, so it logs each tab once. */
+  const fontOverrideDeclined = new Set<string>()
 
   const resolvedCdpLogger = cdpLogger || createCdpLogger()
   const logCdpJson = (entry: CdpLogEntry) => {
@@ -701,15 +713,14 @@ export async function startPlayWriterCDPRelayServer({
       // no prefix stripping, no claiming, no fallback).
       //
       // A message with NO resolvable target is BROWSER-LEVEL: it has no owning
-      // workspace and MUST still reach every client of the extension. The canonical
-      // case is Browser.downloadWillBegin / Browser.downloadProgress synthesized by
-      // maybeEmitBrowserDownloadCompatEvent — those carry no sessionId, so they
-      // resolve to no target and broadcast unchanged. Dropping them because they
-      // "match no workspace" would silently break downloads for EVERY client. This
-      // is the ONE place where the absence of a target legitimately means "not
+      // workspace and MUST still reach every client of the extension. That is the
+      // ONE place where the absence of a target legitimately means "not
       // target-scoped, broadcast it" — it is NOT the forbidden "if we can't tell,
       // show everything" fallback: any message that DOES resolve to a target is
-      // strictly filtered to that target's owner below.
+      // strictly filtered to that target's owner below. (Browser.downloadWillBegin /
+      // Browser.downloadProgress, which carry no sessionId, are not sent through this
+      // broadcast: maybeEmitBrowserDownloadCompatEvent addresses them to the clients
+      // that own the tab the download came from.)
       const messageSessionId = typeof message.sessionId === 'string' ? message.sessionId : null
       const owningExtensionId =
         extensionId ?? (messageSessionId ? findExtensionIdByCdpSession(messageSessionId) : null)
@@ -1007,28 +1018,34 @@ export async function startPlayWriterCDPRelayServer({
     }
   }
 
-  function getPageTargetSessionIds({ extensionId }: { extensionId: string }): string[] {
-    const extensionState = store.getState().extensions.get(extensionId)
-    if (!extensionState) {
-      return []
-    }
-    return Array.from(extensionState.connectedTargets.values())
-      .filter((target) => {
-        return target.targetInfo.type === 'page'
-      })
-      .map((target) => {
-        return target.sessionId
-      })
+  /** The clients on `extensionId` whose workspace owns the tab on `sessionId` — the ones a download there belongs to. */
+  function tabOwners({ extensionId, sessionId }: { extensionId: string; sessionId: string | undefined }): relayState.PlaywrightClient[] {
+    const state = store.getState()
+    const tab = sessionId ? state.extensions.get(extensionId)?.connectedTargets.get(sessionId) : undefined
+    if (!tab) return []
+    return [...state.playwrightClients.values()].filter((client) => client.extensionId === extensionId && visibleToWorkspace(tab, client.workspaceKey))
   }
 
+  /**
+   * Playwright learns of downloads from Browser.downloadWillBegin / Browser.downloadProgress, which
+   * chrome.debugger cannot produce: the relay makes them from the tab's Page.download* events. They
+   * carry no sessionId, so they are addressed here to the clients whose workspace owns that tab, one
+   * by one — a download's URL and file name are the tab's data, and another worktree must not see them.
+   * A completion carries the file's path, as CDP's own Browser.downloadProgress does.
+   */
   function maybeEmitBrowserDownloadCompatEvent({
     method,
     params,
     extensionId,
+    sessionId,
+    filePath,
   }: {
     method: string
     params: unknown
     extensionId: string
+    /** The tab session the Page.download* event came on. */
+    sessionId: string | undefined
+    filePath: string | undefined
   }): void {
     const browserEventMethod =
       method === 'Page.downloadWillBegin'
@@ -1039,58 +1056,59 @@ export async function startPlayWriterCDPRelayServer({
     if (!browserEventMethod) {
       return
     }
-    sendToPlaywright({
-      message: {
-        method: browserEventMethod,
-        params,
-      } as CDPEventBase,
-      source: 'server',
-      extensionId,
-    })
-  }
-
-  async function applyDownloadBehaviorToTargets({
-    extensionId,
-    behavior,
-    source,
-    targetSessionIds,
-  }: {
-    extensionId: string
-    behavior: Protocol.Browser.SetDownloadBehaviorRequest
-    source?: CDPCommand['source']
-    targetSessionIds?: string[]
-  }): Promise<void> {
-    const pageBehavior: Protocol.Page.SetDownloadBehaviorRequest['behavior'] =
-      behavior.behavior === 'allowAndName' ? 'allow' : behavior.behavior
-    const pageParams: Protocol.Page.SetDownloadBehaviorRequest = (() => {
-      if (pageBehavior === 'allow' && behavior.downloadPath) {
-        return { behavior: pageBehavior, downloadPath: behavior.downloadPath }
-      }
-      return { behavior: pageBehavior }
-    })()
-    const sessions = targetSessionIds || getPageTargetSessionIds({ extensionId })
-    if (sessions.length === 0) {
+    const owners = tabOwners({ extensionId, sessionId })
+    if (owners.length === 0) {
+      logger?.log(pc.gray(`[Server] ${method} on ${sessionId ?? 'no session'} belongs to no client's tab: no client is told of it`))
       return
     }
-    await Promise.all(
-      sessions.map(async (targetSessionId) => {
-        try {
-          await sendToExtension({
-            extensionId,
-            method: 'forwardCDPCommand',
-            params: {
-              sessionId: targetSessionId,
-              method: 'Page.setDownloadBehavior',
-              params: pageParams,
-              source,
-            },
-          })
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          logger?.log(pc.yellow(`[Server] Failed to apply Page.setDownloadBehavior to ${targetSessionId}: ${message}`))
-        }
-      }),
-    )
+    const eventParams = filePath !== undefined && typeof params === 'object' && params !== null ? { ...params, filePath } : params
+    for (const client of owners) {
+      sendToPlaywright({
+        message: {
+          method: browserEventMethod,
+          params: eventParams,
+        } as CDPEventBase,
+        source: 'server',
+        clientId: client.id,
+      })
+    }
+  }
+
+  /**
+   * A tab's Page.download* event, before Playwright hears of it: keep the download for
+   * `GET /downloads/:guid`, and on completion put the file Chrome saved (the extension's report) at
+   * `<folder>/<guid>` for every client that owns the tab now, so its Download finds it there.
+   */
+  function trackExtensionDownload({
+    method,
+    params,
+    extensionId,
+    sessionId,
+    report,
+  }: {
+    method: string
+    params: unknown
+    extensionId: string
+    sessionId: string | undefined
+    report: DownloadFileReport | undefined
+  }): void {
+    if (method === 'Page.downloadWillBegin') {
+      const begin = params as Protocol.Page.DownloadWillBeginEvent
+      relayDownloads.begin({ guid: begin.guid, extensionId, clientIds: tabOwners({ extensionId, sessionId }).map((client) => client.id) })
+      return
+    }
+    if (method !== 'Page.downloadProgress') return
+    const progress = params as Protocol.Page.DownloadProgressEvent
+    if (progress.state === 'canceled') {
+      relayDownloads.canceled(progress.guid)
+      return
+    }
+    if (progress.state !== 'completed') return
+    const owners = tabOwners({ extensionId, sessionId }).map((client) => {
+      const behavior = clientDownloadBehavior.get(client.id)
+      return { clientId: client.id, folder: behavior?.behavior === 'allowAndName' && behavior.downloadPath ? behavior.downloadPath : null }
+    })
+    logger?.log(pc.gray(`[Server] ${relayDownloads.complete({ guid: progress.guid, extensionId, report, owners })}`))
   }
 
   async function routeCdpCommand({
@@ -1099,6 +1117,7 @@ export async function startPlayWriterCDPRelayServer({
     params,
     sessionId,
     source,
+    clientId,
     workspaceKey,
     workspaceLabel,
   }: {
@@ -1107,6 +1126,8 @@ export async function startPlayWriterCDPRelayServer({
     params: CDPCommand['params']
     sessionId?: CDPCommand['sessionId']
     source?: CDPCommand['source']
+    /** The Playwright client that sent the command: Browser.setDownloadBehavior is kept per client. */
+    clientId: string
     // The requesting client's workspace (from getCdpUrl's ?workspace= param, read at the
     // /cdp handler). null only in a disconnect race (I1). Used by the Target.setAutoAttach
     // case to auto-create a tab for THIS workspace. Todo 16 consumes these further for
@@ -1119,13 +1140,12 @@ export async function startPlayWriterCDPRelayServer({
     const resolvedExtensionId = conn?.id || extensionId
     switch (method) {
       case 'Browser.getVersion': {
-        return {
-          protocolVersion: '1.3',
-          product: 'Chrome/Extension-Bridge',
-          revision: '1.0.0',
-          userAgent: 'CDP-Bridge-Server/1.0.0',
-          jsVersion: 'V8',
-        } satisfies Protocol.Browser.GetVersionResponse
+        // The browser this client's connection is bound to, as its extension identified it on
+        // connect: with several browsers or profiles connected, each client gets its own.
+        if (!conn) {
+          throw new Error('Extension not connected')
+        }
+        return relayState.browserVersionFor(conn.info).response
       }
 
       case 'Browser.setDownloadBehavior': {
@@ -1133,13 +1153,21 @@ export async function startPlayWriterCDPRelayServer({
         if (!downloadBehaviorParams?.behavior) {
           throw new Error('behavior is required for Browser.setDownloadBehavior')
         }
-        if (resolvedExtensionId) {
-          extensionDownloadBehavior.set(resolvedExtensionId, downloadBehaviorParams)
-          await applyDownloadBehaviorToTargets({
-            extensionId: resolvedExtensionId,
-            behavior: downloadBehaviorParams,
-            source,
-          })
+        // Kept per client and answered here: chrome.debugger cannot set it on the browser.
+        clientDownloadBehavior.set(clientId, downloadBehaviorParams)
+        return {}
+      }
+
+      // Playwright sets default font families on every page it initializes in a headless browser
+      // (crPage.ts: `if (!browser.options.headful) _setDefaultFontFamilies`), deciding "headless" from
+      // the user agent Browser.getVersion reports. The tabs behind the relay are the user's pages,
+      // shared by every session of the worktree: a font override changes what the page renders, and
+      // Chrome takes it only once per page, so a second session's init failed with "Font families can
+      // only be set once" and its newPage() with it. The relay never changes a tab's fonts.
+      case 'Page.setFontFamilies': {
+        if (sessionId && !fontOverrideDeclined.has(sessionId)) {
+          fontOverrideDeclined.add(sessionId)
+          logger?.log(pc.yellow(`[Server] Page.setFontFamilies on ${sessionId} not forwarded: the relay does not change the fonts of a user's tab`))
         }
         return {}
       }
@@ -1490,6 +1518,17 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ extensions })
   })
 
+  /**
+   * What became of an extension download (download-file.ts RelayDownloadStatus): whether Chrome waits
+   * for the user to choose where to save it, where it saved the file, and whether each owning client's
+   * folder got it. A session's `downloads.save` asks this when its Playwright cannot find the file.
+   * 404: the relay never saw that download, or every client that could ask about it has left.
+   */
+  app.get('/downloads/:guid', (c) => {
+    const status = relayDownloads.status(c.req.param('guid'))
+    return status ? c.json(status) : c.json({ error: `no download ${c.req.param('guid')} is known to this relay` }, 404)
+  })
+
   // CDP Discovery Endpoints - Standard Chrome DevTools Protocol HTTP API
   // Allows tools like Playwright to discover the WebSocket URL via http://host:port
   // Spec: https://chromium.googlesource.com/chromium/src/+/main/content/browser/devtools/devtools_http_handler.cc
@@ -1759,6 +1798,7 @@ export async function startPlayWriterCDPRelayServer({
               params,
               sessionId,
               source,
+              clientId,
               workspaceKey: requestingClient?.workspaceKey ?? null,
               workspaceLabel: requestingClient?.workspaceLabel ?? null,
             })
@@ -1968,6 +2008,8 @@ export async function startPlayWriterCDPRelayServer({
 
         onClose() {
           store.setState((s) => relayState.removePlaywrightClient(s, { clientId }))
+          clientDownloadBehavior.delete(clientId)
+          relayDownloads.forgetClient(clientId)
           dropClientOrdering(clientId)
           logger?.log(pc.yellow(`Playwright client disconnected: ${clientId} (${store.getState().playwrightClients.size} remaining)`))
         },
@@ -1987,12 +2029,16 @@ export async function startPlayWriterCDPRelayServer({
     const id = c.req.query('id')
     const installId = c.req.query('installId')
     const version = c.req.query('v')
+    const userAgent = c.req.query('userAgent')
+    const browserVersion = c.req.query('browserVersion')
     return {
       browser: browser || undefined,
       email: email || undefined,
       id: id || undefined,
       installId: installId || undefined,
       version: version || undefined,
+      userAgent: userAgent || undefined,
+      browserVersion: browserVersion || undefined,
     }
   }
 
@@ -2054,6 +2100,10 @@ export async function startPlayWriterCDPRelayServer({
 
           startExtensionPing(connectionId)
           logger?.log(`Extension connected (${connectionId})`)
+          const { missing } = relayState.browserVersionFor(incomingExtensionInfo)
+          if (missing) {
+            logger?.log(pc.yellow(`IMPORTANT: ${missing}`))
+          }
         },
 
         async onMessage(event, ws) {
@@ -2134,6 +2184,10 @@ export async function startPlayWriterCDPRelayServer({
             if (relay) {
               relay.handleRecordingCancelled(message as RecordingCancelledMessage)
             }
+          } else if (message.method === 'downloadState') {
+            const { guid, asking } = message.params
+            relayDownloads.asking(guid, asking)
+            logger?.log(pc.gray(`[Server] download ${guid}: ${asking ? 'Chrome waits for the user to choose where to save it' : 'Chrome no longer waits for the user'}`))
           } else {
             const extensionEvent = message as ExtensionEventMessage
 
@@ -2167,7 +2221,17 @@ export async function startPlayWriterCDPRelayServer({
             const cdpEvent: CDPEventBase = { method, sessionId, params }
             emitter.emit('cdp:event', { event: cdpEvent, sessionId })
 
-            maybeEmitBrowserDownloadCompatEvent({ method, params, extensionId: connectionId })
+            // Before Playwright hears of the completion (the compat event below): the file must already
+            // be at `<folder>/<guid>` when its Download reports finished.
+            const report = extensionEvent.params.downloadFile
+            trackExtensionDownload({ method, params, extensionId: connectionId, sessionId, report })
+            maybeEmitBrowserDownloadCompatEvent({
+              method,
+              params,
+              extensionId: connectionId,
+              sessionId,
+              filePath: report && 'filePath' in report ? report.filePath : undefined,
+            })
 
             if (method === 'Target.attachedToTarget') {
               const targetParams = params as Protocol.Target.AttachedToTargetEvent
@@ -2237,15 +2301,6 @@ export async function startPlayWriterCDPRelayServer({
                   workspaceKey: extensionEvent.params.workspaceKey ?? null,
                 }),
               )
-
-              const cachedDownloadBehavior = extensionDownloadBehavior.get(connectionId)
-              if (cachedDownloadBehavior && targetParams.targetInfo.type === 'page') {
-                void applyDownloadBehaviorToTargets({
-                  extensionId: connectionId,
-                  behavior: cachedDownloadBehavior,
-                  targetSessionIds: [targetParams.sessionId],
-                })
-              }
 
               // Only forward to Playwright if this is a new target to avoid duplicates
               const iframeOwnerSession = targetParams.targetInfo.type === 'iframe' ? (iframeOwnerSessionId ?? incomingSessionId) : incomingSessionId
@@ -2325,6 +2380,7 @@ export async function startPlayWriterCDPRelayServer({
                 relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
               )
               iframeOwnerSessions.delete(`${connectionId}:${detachParams.sessionId}`)
+              fontOverrideDeclined.delete(detachParams.sessionId)
 
               sendToPlaywright({
                 message: {
@@ -2472,6 +2528,7 @@ export async function startPlayWriterCDPRelayServer({
             })
           }
           recordingRelays.delete(connectionId)
+          relayDownloads.forgetExtension(connectionId)
 
           // Reject all pending I/O requests (state cleanup happens in removeExtension below)
           const closingExt = store.getState().extensions.get(connectionId)

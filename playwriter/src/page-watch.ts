@@ -31,12 +31,15 @@
  * Nothing is added to the page under test. Network and console facts come from CDP events on
  * Playwright's own sessions, which Playwright already enabled (this module never sends
  * `*.enable`/`*.disable`): the page's session, which also carries every same-process iframe,
- * and the session of each out-of-process iframe (a cross-site iframe under site isolation),
- * whose requests and console Chrome reports there only. Request and execution context ids are
- * per session, so everything keyed by them is kept per session. Such a session is followed
- * from when Playwright reports its frame: Playwright resumes the iframe's renderer as it
- * attaches, so requests the iframe sent in the first moments of a new process, before the
- * session could be borrowed, are not in the journal. Navigations are the main frame's (an
+ * the session of each out-of-process iframe (a cross-site iframe under site isolation), whose
+ * requests and console Chrome reports there only, and the session of each dedicated worker
+ * (nested ones too), whose requests, console and exceptions Chrome reports there only (a worker
+ * runs nothing but its own code, so its console needs no identifying). Request and execution context ids
+ * are per session, so everything keyed by them is kept per session. Iframe and worker sessions are
+ * followed from their first event: Playwright resumes the iframe's renderer or the worker as it
+ * attaches, before this module could borrow the session (and a worker's cannot be borrowed at
+ * all), so their events are taken from a tap on Playwright's in-process server that holds them
+ * from the session's creation (`session-tap.ts`). Navigations are the main frame's (an
  * iframe loading is not the page navigating). Native dialogs come from the page's
  * DialogController (one state machine for the whole layer). DOM facts come from a
  * MutationObserver in every frame's own CDP isolated world (`page-frames.ts`), one journal per
@@ -53,16 +56,19 @@
  * action began (a clock, a ticker, a reply still streaming from an earlier step): they are
  * listed once in the settle result and do not hold this action's quiet.
  *
- * Clocks: in-page journal entries are stamped with the page's `Date.now()`, CDP entries and
- * checkpoints with Node's. Both read the same system clock when Chrome and the executor run
- * on one machine (the playwriter setup: local Chrome + local relay). Quiet windows are
- * measured as durations on one side only, so they are skew-free; only the attribution of
- * in-page entries to "before/after the checkpoint" relies on the shared clock.
+ * Clocks: the browser stamps in-page journal entries (the isolated world's `Date.now()`) and
+ * requests (`wallTime`); this process stamps checkpoints, input ends and every event's arrival.
+ * Chrome may run on another machine (a cloud browser, a remote relay), whose clock can be minutes
+ * off, so the two are never compared directly: every journal read is a timed round trip that
+ * measures the offset between them (`browser-clock.ts`), checkpoints are converted to the
+ * browser's clock before they are compared with its stamps, and browser times are converted to
+ * this process's clock before they leave this module. Quiet windows are durations on one clock.
  */
 
 import type { Frame } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
+import { BrowserClock } from './browser-clock.js'
 import type { ICDPSession } from './cdp-session.js'
 import { PageUnresponsiveError, withDeadline } from './isolated-world.js'
 import type { IsolatedWorld } from './isolated-world.js'
@@ -81,6 +87,7 @@ import {
   type WatchEvents,
   type WebSocketFrameRecord,
 } from './probe-types.js'
+import { PageSessionTap, type SessionTap, type TapListener, type TappedEvent, type TappedSession, type TappedWorker } from './session-tap.js'
 
 const REQUEST_CAP = 500
 const CONSOLE_CAP = 500
@@ -709,18 +716,26 @@ interface DocumentJournal {
 }
 
 /**
- * Whose code runs in an execution context: the page's own main world — of the main frame (no
- * `frame`) or of the iframe whose document URL is `frame` —, or null for any other world (an
- * isolated world such as ours or Playwright's, an extension's content script).
+ * Whose code runs in an execution context: the page's own — the main frame's main world (no
+ * `frame`), the main world of the iframe whose document URL is `frame`, or the dedicated worker
+ * whose script is `worker` —, or null for any other world (an isolated world such as ours or
+ * Playwright's, an extension's content script).
  */
-type ContextOwner = { frame?: string } | null
+type ContextOwner = { frame?: string; worker?: string } | null
 
-/** A followed session: the page's own, or an out-of-process iframe's. Request and context ids are per session. */
+/**
+ * A followed session: the page's own, an out-of-process iframe's or a dedicated worker's. Context
+ * and WebSocket ids are per session; request ids are not (see `PageWatch.requestsById`).
+ */
 interface SessionWatch {
+  /** What commands go through: Playwright's session, borrowed (a worker's: its server session). */
   cdp: ICDPSession
-  /** The out-of-process iframe whose session this is; null for the page's own session. */
+  /** Where an iframe's or a worker's events come from, from its first one; null for the page's own session, whose events `cdp` carries. */
+  tapped: TappedSession | null
+  /** The out-of-process iframe whose session this is; null for the page's own session and a worker's. */
   rootFrame: Frame | null
-  requests: Map<string, RequestEntry>
+  /** The script address of the dedicated worker whose session this is; null for a document's session. */
+  worker: string | null
   /** WebSocket request id → its URL, from Network.webSocketCreated. */
   socketUrls: Map<string, string>
   /** Execution context id → whose code runs in it. */
@@ -728,19 +743,27 @@ interface SessionWatch {
   off: Array<() => void>
 }
 
-interface RequestEntry extends NetworkRecord {
-  /** The session Chrome reports it on, which also holds its response body. */
+/** A journaled request. Its start is the browser's stamp, converted to this process's clock when it is compared or shown. */
+interface RequestEntry extends Omit<NetworkRecord, 'startedAt'> {
+  /**
+   * The session that last reported it, which holds its response body. A cross-site iframe's document
+   * is announced on the parent's session and its body arrives, and it ends, on the iframe's own.
+   */
   session: SessionWatch
   mimeType?: string
   isAdRelated?: boolean
-  /** Start of the first hop of this redirect chain: causality belongs to the chain, not the hop. */
-  chainStartedAt: number
-  /** Response headers arrived (Node clock). */
+  /** When the renderer issued it: Chrome's `wallTime`, browser clock (epoch ms). */
+  issuedAt: number
+  /** `issuedAt` of the first hop of this redirect chain: causality belongs to the chain, not the hop. */
+  chainIssuedAt: number
+  /** Response headers arrived (this process's clock). */
   headersAt?: number
-  /** Last body bytes arrived (Node clock). */
+  /** Last body bytes arrived (this process's clock). */
   lastDataAt?: number
   /** Id of the hop this one was redirected to. */
   redirectedTo?: string
+  /** The frame Chrome said it is for (a navigation's: the frame navigating). */
+  frameId?: string
 }
 
 /** The page's dialog state machine (DialogController); PageWatch only reads it. */
@@ -846,22 +869,38 @@ function clipText(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
-function publicRecord(entry: RequestEntry): NetworkRecord {
+/** The record the model reads: its start on this process's clock. */
+function publicRecord(entry: RequestEntry, clock: BrowserClock): NetworkRecord {
   const {
     session: _session,
     mimeType: _mimeType,
     isAdRelated: _isAdRelated,
-    chainStartedAt: _chainStartedAt,
+    issuedAt,
+    chainIssuedAt: _chainIssuedAt,
     headersAt: _headersAt,
     lastDataAt: _lastDataAt,
     redirectedTo: _redirectedTo,
+    frameId: _frameId,
     ...record
   } = entry
-  return { ...record }
+  return { ...record, startedAt: Math.round(clock.toLocal(issuedAt)) }
 }
 
-function isFailed(entry: NetworkRecord): boolean {
+function isFailed(entry: Pick<NetworkRecord, 'failed' | 'status'>): boolean {
   return entry.failed !== undefined || (entry.status !== undefined && entry.status >= 400)
+}
+
+/**
+ * Why Chrome says a request failed. Its `errorText` is empty for a request it blocked (measured:
+ * GitHub's fetch whose cross-origin redirect the page's CSP refused came with `errorText: ""` and
+ * `blockedReason: "csp"`); the block or CORS reason it gave is the reason then.
+ */
+function failureOf(e: Protocol.Network.LoadingFailedEvent): string {
+  if (e.canceled) return 'canceled'
+  if (e.errorText) return e.errorText
+  if (e.blockedReason) return `blocked: ${e.blockedReason}`
+  if (e.corsErrorStatus) return `CORS error: ${e.corsErrorStatus.corsError}${e.corsErrorStatus.failedParameter ? ` (${e.corsErrorStatus.failedParameter})` : ''}`
+  return 'failed; Chrome gave no reason'
 }
 
 function axProperty(node: Protocol.Accessibility.AXNode, name: string): unknown {
@@ -908,19 +947,32 @@ export class PageWatch {
   private readonly isClosed?: () => boolean
   private readonly dialogs: WatchDialogs
   private readonly logger: { error: (...args: unknown[]) => void }
+  /** The browser's clock against this process's: every browser stamp is compared through it. */
+  private readonly clock = new BrowserClock()
+  private readonly openSessionTap: (onWorker: (worker: TappedWorker) => void) => SessionTap
+  /** Out-of-process iframes' and workers' sessions, held from their first event in Playwright's server; set by start(). */
+  private tap: SessionTap | null = null
 
   private started = false
   private seq = 0
   private requestCounter = 0
-  /** Listeners that are not on a followed session: frame changes, dialogs. */
+  /** Listeners that are not on a followed session: frame changes, dialogs, the page's navigations. */
   private readonly unlisten: Array<() => void> = []
-  /** Every session whose network and console are journaled: the page's own and each out-of-process iframe's. */
-  private readonly sessions = new Map<ICDPSession, SessionWatch>()
+  /** Every session whose network and console are journaled: the page's own, each out-of-process iframe's and each worker's. */
+  private readonly sessions = new Set<SessionWatch>()
   /** Out-of-process iframe id → the watch of its session. */
   private readonly oopifSessions = new Map<string, SessionWatch>()
   /** Frame id → the work following its changes, chained so a frame's attach, navigations and removal are handled in order. */
   private readonly frameWork = new Map<string, Promise<void>>()
   private readonly requestLog: RequestEntry[] = []
+  /**
+   * Chrome's request id → the latest hop of that request, across all the page's sessions. The id is
+   * unique in the browser (a document's is its loader id, a subresource's carries its renderer
+   * process), and one request can be reported on two sessions: a cross-site iframe's document is
+   * announced (requestWillBeSent, responseReceived) on the parent's session, and its data and its end
+   * on the iframe's own session once the new renderer commits it (measured).
+   */
+  private readonly requestsById = new Map<string, RequestEntry>()
   private readonly consoleLog: ConsoleEntry[] = []
   private readonly navigationLog: NavigationRecord[] = []
   private readonly dialogLog: DialogEntry[] = []
@@ -941,42 +993,56 @@ export class PageWatch {
   /** Woken on every dialog change. */
   private readonly dialogWaiters = new Set<() => void>()
 
-  constructor(options: { frames: PageFrames; dialogs: WatchDialogs; isClosed?: () => boolean; logger?: { error: (...args: unknown[]) => void } }) {
+  constructor(options: {
+    frames: PageFrames
+    dialogs: WatchDialogs
+    isClosed?: () => boolean
+    logger?: { error: (...args: unknown[]) => void }
+    /** Where out-of-process iframes' and workers' sessions come from; Playwright's in-process server by default (`session-tap.ts`). */
+    openSessionTap?: (onWorker: (worker: TappedWorker) => void) => SessionTap
+  }) {
     this.frames = options.frames
     this.cdp = options.frames.cdp
     this.dialogs = options.dialogs
     this.isClosed = options.isClosed
     this.logger = options.logger ?? console
+    this.openSessionTap =
+      options.openSessionTap ??
+      ((onWorker) =>
+        new PageSessionTap({ page: this.frames.page, onWorker, onError: (error) => this.reportBackgroundError('following a new iframe’s or worker’s session', error) }))
   }
 
   /** Attach CDP listeners and install the in-page journal in every frame. Idempotent; returns immediately. */
   start(): void {
     if (this.started) return
+    // First: an iframe or worker whose session is created from here on is held from its first event.
+    // The workers that already run are handed over at once.
+    this.tap = this.openSessionTap((worker) => this.followWorker(worker))
     this.started = true
     this.frames.addSetup(SETUP_NAME, WATCH_SOURCE)
 
-    const page = this.watchSession(this.cdp, null)
-    this.listen(page, 'Page.frameStartedNavigating', (e) => {
+    this.watchSession(this.cdp, null, null, null)
+    this.listenPage('Page.frameStartedNavigating', (e) => {
       if (e.frameId !== this.frames.mainFrameId() || SAME_DOCUMENT_NAVIGATIONS[e.navigationType]) return
       this.startedNavigations.set(e.loaderId, e.navigationType)
     })
-    this.listen(page, 'Page.frameNavigated', (e) => this.onFrameNavigated(e))
-    this.listen(page, 'Page.navigatedWithinDocument', (e) => {
+    this.listenPage('Page.frameNavigated', (e) => this.onFrameNavigated(e))
+    this.listenPage('Page.navigatedWithinDocument', (e) => {
       if (e.frameId !== this.frames.mainFrameId()) return
       this.currentUrl = e.url
       this.pushNavigation('same-document', e.url, e.navigationType)
     })
-    this.listen(page, 'Page.frameStartedLoading', (e) => {
+    this.listenPage('Page.frameStartedLoading', (e) => {
       if (e.frameId !== this.frames.mainFrameId()) return
       this.mainFrameLoading = true
       this.readBeforeLeaving()
     })
-    this.listen(page, 'Page.frameStoppedLoading', (e) => {
+    this.listenPage('Page.frameStoppedLoading', (e) => {
       if (e.frameId !== this.frames.mainFrameId()) return
       this.mainFrameLoading = false
       this.wake()
     })
-    this.listen(page, 'Page.loadEventFired', () => {
+    this.listenPage('Page.loadEventFired', () => {
       this.mainFrameLoading = false
       this.wake()
     })
@@ -1007,6 +1073,8 @@ export class PageWatch {
     }
     this.sessions.clear()
     this.oopifSessions.clear()
+    this.tap?.dispose()
+    this.tap = null
     if (this.started) {
       // Future copies of the frames' worlds get no journal; the current copies stop observing.
       this.frames.addSetup(SETUP_NAME, 'void 0')
@@ -1044,18 +1112,20 @@ export class PageWatch {
         if (!this.dialogs.current() && !this.isClosed?.()) throw error
       }
     }
-    const network = this.requestLog.filter((r) => r.seq > checkpoint.seq).map(publicRecord)
+    const network = this.requestLog.filter((r) => r.seq > checkpoint.seq).map((r) => publicRecord(r, this.clock))
     const live: LiveTextRecord[] = []
     const mutations = { content: 0, cosmetic: 0 }
     const dropped = new Set<NonNullable<WatchEvents['dropped']>[number]>()
     for (const doc of this.documents.values()) {
+      // The in-page journal stamps with the browser's clock (a document is only known from a read, which measured it).
+      const at = this.clock.toBrowser(checkpoint.at)
       const current = this.currentDocuments.get(doc.frameId) === doc
       for (const rec of doc.live.values()) {
-        if (rec.at < checkpoint.at && (rec.updatedAt === null || rec.updatedAt < checkpoint.at)) continue
+        if (rec.at < at && (rec.updatedAt === null || rec.updatedAt < at)) continue
         const transient = rec.transient || !current
         live.push({
           seq: rec.seq,
-          at: rec.at,
+          at: Math.round(this.clock.toLocal(rec.at)),
           role: rec.role,
           text: rec.text,
           ...(transient ? { transient: true } : {}),
@@ -1063,12 +1133,12 @@ export class PageWatch {
         })
       }
       for (const batch of doc.batches.values()) {
-        if (batch.at < checkpoint.at) continue
+        if (batch.at < at) continue
         mutations.content += batch.content
         mutations.cosmetic += batch.cosmetic
       }
-      if (doc.droppedAt.live !== null && doc.droppedAt.live >= checkpoint.at) dropped.add('live')
-      if (doc.droppedAt.mutations !== null && doc.droppedAt.mutations >= checkpoint.at) dropped.add('mutations')
+      if (doc.droppedAt.live !== null && doc.droppedAt.live >= at) dropped.add('live')
+      if (doc.droppedAt.mutations !== null && doc.droppedAt.mutations >= at) dropped.add('mutations')
     }
     live.sort((a, b) => a.at - b.at || a.seq - b.seq)
     const console = await this.ownConsole(checkpoint.seq)
@@ -1101,7 +1171,8 @@ export class PageWatch {
    */
   async busySignals(options: BusyOptions = {}): Promise<BusySignal[]> {
     await this.waitOutAutoDialog('reading busy signals')
-    const sinceAt = options.since?.at ?? null
+    // Compared in the page with the journal's stamps: on the browser's clock.
+    const sinceAt = options.since ? await this.onBrowserClock(options.since.at) : null
     const perFrame = await this.eachFrame(await this.readableFrames(), (entry) => this.frameBusySignals(entry, sinceAt))
     const out = perFrame.flatMap(({ value }) => value)
     out.push(...this.networkBusy())
@@ -1159,43 +1230,12 @@ export class PageWatch {
         (!filter.failedOnly || isFailed(r)),
     )
     const limited = filter.limit !== undefined && filter.limit >= 0 ? matches.slice(Math.max(0, matches.length - filter.limit)) : matches
-    return limited.map(publicRecord)
+    return limited.map((r) => publicRecord(r, this.clock))
   }
 
   /** Response body of a journaled request (Network.getResponseBody on the session that reported it), textual bodies decoded, capped at 64K chars. */
   async responseBody(id: string): Promise<{ status?: number; mimeType?: string; body: string; truncated: boolean; base64Encoded: boolean }> {
-    const entry = this.requestLog.find((r) => r.id === id)
-    if (!entry) {
-      throw new Error(`No request ${id} in the journal. Ids come from requests(); the journal keeps the last ${REQUEST_CAP} requests of this page.`)
-    }
-    if (entry.redirectedTo !== undefined) {
-      throw new Error(
-        `Request ${id} (${entry.method} ${entry.url}) was answered with a redirect (HTTP ${entry.status}) to ${entry.redirectedTo}; a redirect has no body. Read ${entry.redirectedTo}.`,
-      )
-    }
-    if (entry.endedAt === undefined) {
-      throw new Error(`Request ${id} (${entry.method} ${entry.url}) has not finished yet; its body is available once it has.`)
-    }
-    if (entry.lost !== undefined) {
-      throw new Error(`Request ${id} (${entry.method} ${entry.url}) has no body to read: Chrome stopped reporting it before it finished (${entry.lost}).`)
-    }
-    if (entry.failed !== undefined && entry.status === undefined) {
-      throw new Error(`Request ${id} (${entry.method} ${entry.url}) failed (${entry.failed}) before any response; there is no body.`)
-    }
-    let result: Protocol.Network.GetResponseBodyResponse
-    try {
-      result = await withDeadline(
-        entry.session.cdp.send('Network.getResponseBody', { requestId: entry.requestId }),
-        PROBE_TIMEOUT_MS,
-        `reading the response body of ${id}`,
-      )
-    } catch (error) {
-      if (error instanceof PageUnresponsiveError) throw error
-      throw new Error(
-        `Chrome has no body for request ${id} (${entry.method} ${entry.url}): ${errorMessage(error)}. ` +
-          'Bodies are dropped when the page (or the iframe that sent the request) navigates away or is closed, or when Chrome evicts its network buffer.',
-      )
-    }
+    const { entry, result } = await this.fetchResponseBody(id)
     let body = result.body
     let base64Encoded = result.base64Encoded
     const mime = entry.mimeType?.split(';', 1)[0]!.trim()
@@ -1210,6 +1250,52 @@ export class PageWatch {
       body: truncated ? body.slice(0, BODY_CAP_CHARS) : body,
       truncated,
       base64Encoded,
+    }
+  }
+
+  /** The whole response body of a journaled request as bytes, uncapped: net.save writes it to a file. Throws responseBody's reasons when there is none. */
+  async responseBytes(id: string): Promise<{ status?: number; mimeType?: string; bytes: Buffer }> {
+    const { entry, result } = await this.fetchResponseBody(id)
+    return { status: entry.status, mimeType: entry.mimeType, bytes: Buffer.from(result.body, result.base64Encoded ? 'base64' : 'utf8') }
+  }
+
+  /** The journal entry for `id` and Chrome's body for it (Network.getResponseBody on the session that reported it), or the precise reason there is none. */
+  private async fetchResponseBody(id: string): Promise<{ entry: RequestEntry; result: Protocol.Network.GetResponseBodyResponse }> {
+    const entry = this.requestLog.find((r) => r.id === id)
+    if (!entry) {
+      throw new Error(`No request ${id} in the journal. Ids come from requests(); the journal keeps the last ${REQUEST_CAP} requests of this page.`)
+    }
+    if (entry.redirectedTo !== undefined) {
+      const answer = entry.status !== undefined ? `answered with a redirect (HTTP ${entry.status})` : 'redirected (Chrome did not report the redirect response)'
+      throw new Error(`Request ${id} (${entry.method} ${entry.url}) was ${answer} to ${entry.redirectedTo}; a redirect has no body. Read ${entry.redirectedTo}.`)
+    }
+    if (entry.download !== undefined) {
+      throw new Error(
+        `Request ${id} (${entry.method} ${entry.url}) became the download "${entry.download}": its body went to the download, not to the page. The report's DOWNLOAD line names it; downloads.save saves it.`,
+      )
+    }
+    if (entry.endedAt === undefined) {
+      throw new Error(`Request ${id} (${entry.method} ${entry.url}) has not finished yet; its body is available once it has.`)
+    }
+    if (entry.lost !== undefined) {
+      throw new Error(`Request ${id} (${entry.method} ${entry.url}) has no body to read: Chrome stopped reporting it before it finished (${entry.lost}).`)
+    }
+    if (entry.failed !== undefined && entry.status === undefined) {
+      throw new Error(`Request ${id} (${entry.method} ${entry.url}) failed (${entry.failed}) before any response; there is no body.`)
+    }
+    try {
+      const result = await withDeadline(
+        entry.session.cdp.send('Network.getResponseBody', { requestId: entry.requestId }),
+        PROBE_TIMEOUT_MS,
+        `reading the response body of ${id}`,
+      )
+      return { entry, result }
+    } catch (error) {
+      if (error instanceof PageUnresponsiveError) throw error
+      throw new Error(
+        `Chrome has no body for request ${id} (${entry.method} ${entry.url}): ${errorMessage(error)}. ` +
+          'Bodies are dropped when the page (or the iframe that sent the request) navigates away or is closed, or when Chrome evicts its network buffer.',
+      )
     }
   }
 
@@ -1232,7 +1318,9 @@ export class PageWatch {
     // Endpoints that were already open when the action began: a re-poll of one is the page's
     // background channel reconnecting, not the action's effect.
     const openAtStart = new Set(
-      this.requestLog.filter((r) => r.chainStartedAt < goal.causalFrom && (r.endedAt ?? Infinity) >= goal.causalFrom).map((r) => `${r.method} ${r.url}`),
+      this.requestLog
+        .filter((r) => this.clock.toLocal(r.chainIssuedAt) < goal.causalFrom && (r.endedAt ?? Infinity) >= goal.causalFrom)
+        .map((r) => `${r.method} ${r.url}`),
     )
     let origin = goal.origin
     let rootsLookedAt = 0
@@ -1364,7 +1452,12 @@ export class PageWatch {
 
   /** The action's own requests: the chain started at/after `causalFrom`, and not a re-poll of an endpoint already open then. */
   private caused(entry: RequestEntry, causalFrom: number, openAtStart: Set<string>): boolean {
-    return entry.chainStartedAt >= causalFrom && !openAtStart.has(`${entry.method} ${entry.url}`)
+    return this.clock.toLocal(entry.chainIssuedAt) >= causalFrom && !openAtStart.has(`${entry.method} ${entry.url}`)
+  }
+
+  /** When the renderer issued `entry`, on this process's clock. */
+  private startOf(entry: RequestEntry): number {
+    return this.clock.toLocal(entry.issuedAt)
   }
 
   /** Whether an open request is one a person would wait on, from Chrome's own facts about it. */
@@ -1373,7 +1466,7 @@ export class PageWatch {
     const type = entry.resourceType
     if (type !== undefined && NEVER_HOLDS[type]) return false
     if (entry.mimeType === EVENT_STREAM_MIME) return false
-    if (type !== undefined && STALLABLE[type] && now - (entry.lastDataAt ?? entry.startedAt) > STALLED_ASSET_MS) return false
+    if (type !== undefined && STALLABLE[type] && now - (entry.lastDataAt ?? this.startOf(entry)) > STALLED_ASSET_MS) return false
     return true
   }
 
@@ -1387,7 +1480,7 @@ export class PageWatch {
   }
 
   private pending(entry: RequestEntry, now: number): PendingRequest {
-    return { method: entry.method, url: entry.url, ...(entry.resourceType !== undefined ? { resourceType: entry.resourceType } : {}), ageMs: now - entry.startedAt }
+    return { method: entry.method, url: entry.url, ...(entry.resourceType !== undefined ? { resourceType: entry.resourceType } : {}), ageMs: Math.round(now - this.startOf(entry)) }
   }
 
   private networkQuietFor(now: number, origin: number, causalFrom: number, openAtStart: Set<string>): number {
@@ -1396,7 +1489,7 @@ export class PageWatch {
       if (!this.caused(r, causalFrom, openAtStart)) continue
       if (this.holdsQuiet(r, now)) return 0
       if (r.isAdRelated || (r.resourceType !== undefined && NEVER_HOLDS[r.resourceType])) continue
-      last = Math.max(last, r.startedAt, r.endedAt ?? 0)
+      last = Math.max(last, this.startOf(r), r.endedAt ?? 0)
     }
     return now - last
   }
@@ -1407,20 +1500,20 @@ export class PageWatch {
     const out: BusySignal[] = []
     for (const r of this.requestLog) {
       if (r.endedAt !== undefined || r.isAdRelated) continue
-      const age = `${((now - r.startedAt) / 1000).toFixed(1)}s`
+      const age = `${((now - this.startOf(r)) / 1000).toFixed(1)}s`
       if (r.headersAt !== undefined) {
         const streamable = (r.resourceType !== undefined && STREAMABLE[r.resourceType]) || r.mimeType === EVENT_STREAM_MIME
         if (streamable && r.lastDataAt !== undefined && now - r.lastDataAt < STREAM_RECENT_MS) {
           out.push({ strength: 'strong', kind: 'network-streaming', label: `response still arriving (${age}): ${r.method} ${this.shortUrl(r.url)}` })
         }
-      } else if (this.holdsQuiet(r, now) && now - r.startedAt > HELD_REQUEST_MS) {
+      } else if (this.holdsQuiet(r, now) && now - this.startOf(r) > HELD_REQUEST_MS) {
         out.push({ strength: 'weak', kind: 'network-waiting', label: `no response yet after ${age}: ${r.method} ${this.shortUrl(r.url)}` })
       }
     }
     return out
   }
 
-  /** One frame's busy signals: its accessibility tree, its journal's busy read and its spinners. */
+  /** One frame's busy signals: its accessibility tree, its journal's busy read and its spinners. `sinceAt` is on the browser's clock. */
   private async frameBusySignals(entry: FrameHandle, sinceAt: number | null): Promise<BusySignal[]> {
     const where = this.inFrame(entry)
     // A session answers for the frame it is rooted at by default; its same-process iframes are named.
@@ -1491,9 +1584,8 @@ export class PageWatch {
       timeoutMs: PROBE_TIMEOUT_MS,
       what: `identifying animated elements${where}`,
     })
-    // Spinner centres are in the frame's own viewport: `box` puts them on the screen, `origin` is where the frame's session coordinates start.
+    // Spinner centres are in the frame's own viewport: `box` puts them on the screen.
     const box = entry.parentId === null ? IDENTITY_BOX : await this.frames.box(entry.frameId)
-    const origin = await this.frames.sessionBox(entry)
     const pairs: number[] = []
     const candidates: Array<{ spinner: WorldSpinner; pair: number; x: number; y: number }> = []
     for (const [index, spinner] of spinners.list.entries()) {
@@ -1501,7 +1593,7 @@ export class PageWatch {
       if (target === null || target === undefined) continue
       const x = box.x + spinner.x * box.scale
       const y = box.y + spinner.y * box.scale
-      const hit = await this.nodeAt(entry.cdp, origin, x, y, `hit-testing the animated ${spinner.label}${where}`)
+      const hit = await this.nodeAt(entry, x, y, `hit-testing the animated ${spinner.label}${where}`)
       // Nothing there, or another document on top of it (the parent's overlay, a child iframe).
       if (hit === null || hit.frameId !== entry.frameId) continue
       candidates.push({ spinner, pair: pairs.length / 2, x, y })
@@ -1531,26 +1623,32 @@ export class PageWatch {
     for (let rootId = entry.sessionRootId; rootId !== mainFrameId; ) {
       const owner = await this.frames.owner(rootId)
       const parent = await this.frames.handle(owner.parentId)
-      const hit = await this.nodeAt(parent.cdp, await this.frames.sessionBox(parent), x, y, `hit-testing the iframe around the animated ${label}`)
+      const hit = await this.nodeAt(parent, x, y, `hit-testing the iframe around the animated ${label}`)
       if (hit === null || hit.backendNodeId !== owner.backendNodeId) return false
       rootId = parent.sessionRootId
     }
     return true
   }
 
-  /** Chrome's hit test at screen point (x, y) on a session whose coordinates start at `origin`; null when nothing is there. */
-  private async nodeAt(
-    cdp: ICDPSession,
-    origin: { x: number; y: number; scale: number },
-    x: number,
-    y: number,
-    what: string,
-  ): Promise<{ backendNodeId: number; frameId: string } | null> {
+  /**
+   * Chrome's hit test at screen point (x, y) in the session of `handle`; null when nothing is there.
+   * `DOM.getNodeForLocation` takes the point in DOCUMENT coordinates of the session's root frame
+   * (Chromium maps it with DocumentToFrame): the point in that frame's viewport plus how far its
+   * document is scrolled, read now in its isolated world. Measured: on a page scrolled 720px,
+   * (100, 100) answers "No node found at given location" and (100, 820) the element drawn at (100, 100).
+   */
+  private async nodeAt(handle: FrameHandle, x: number, y: number, what: string): Promise<{ backendNodeId: number; frameId: string } | null> {
+    const origin = await this.frames.sessionBox(handle)
+    const root = handle.sessionRootId === handle.frameId ? handle : await this.frames.handle(handle.sessionRootId)
+    const scrolled = await root.world.evaluate<{ x: number; y: number }>('({ x: scrollX, y: scrollY })', {
+      timeoutMs: PROBE_TIMEOUT_MS,
+      what: `reading how far the document is scrolled, ${what}`,
+    })
     try {
       const location = await withDeadline(
-        cdp.send('DOM.getNodeForLocation', {
-          x: Math.round((x - origin.x) / origin.scale),
-          y: Math.round((y - origin.y) / origin.scale),
+        handle.cdp.send('DOM.getNodeForLocation', {
+          x: Math.round((x - origin.x) / origin.scale + scrolled.x),
+          y: Math.round((y - origin.y) / origin.scale + scrolled.y),
           includeUserAgentShadowDOM: false,
           ignorePointerEventsNone: true,
         }),
@@ -1623,10 +1721,15 @@ export class PageWatch {
   /**
    * Content state of every frame, combined: counts summed, the newest change and journal install
    * of any frame, the ambient elements of all. `cutoff`: churn that predates it does not count as
-   * content; `from` with `labels`: also name the ambient elements that changed since then.
+   * content; `from` with `labels`: also name the ambient elements that changed since then. Both are
+   * on this process's clock; the state's times are on the browser's.
    */
   private async readState(cutoff: number | null, from: number | null, timeoutMs: number, labels = from !== null): Promise<ContentState> {
-    const arg = JSON.stringify({ cutoff, from, labels })
+    const arg = JSON.stringify({
+      cutoff: cutoff === null ? null : await this.onBrowserClock(cutoff),
+      from: from === null ? null : await this.onBrowserClock(from),
+      labels,
+    })
     const reads = await this.eachFrame(await this.readableFrames(), async (entry) => {
       const state = await this.callReader<WorldState>(entry.world, `state(${arg})`, timeoutMs, `reading the page journal state${this.inFrame(entry)}`)
       this.noteDocument(entry, state.token)
@@ -1652,14 +1755,17 @@ export class PageWatch {
     return combined
   }
 
+  /** Read every frame's journal from `sinceAt` (this process's clock) on, into `documents`. */
   private async readJournal(sinceAt: number, timeoutMs: number): Promise<void> {
     const entries = await this.readableFrames()
     // A frame that is gone, or cannot be read now, shows none of its documents.
     for (const frameId of [...this.currentDocuments.keys()]) {
       if (!entries.some((entry) => entry.frameId === frameId)) this.currentDocuments.delete(frameId)
     }
+    // The earliest browser time `sinceAt` can be, so no entry after it is left behind; unmeasured, everything.
+    const from = this.clock.known() ? this.clock.earliestBrowser(sinceAt) : 0
     await this.eachFrame(entries, async (entry) => {
-      const read = await this.callReader<WorldRead>(entry.world, `read(${Number(sinceAt)})`, timeoutMs, `reading the page journal${this.inFrame(entry)}`)
+      const read = await this.callReader<WorldRead>(entry.world, `read(${Number(from)})`, timeoutMs, `reading the page journal${this.inFrame(entry)}`)
       const doc = this.noteDocument(entry, read.token)
       for (const rec of read.live) {
         const known = doc.live.get(rec.id)
@@ -1676,16 +1782,34 @@ export class PageWatch {
     })
   }
 
-  /** Call a method of a frame's in-page reader, installing the journal first if this world copy has none. */
+  /**
+   * Call a method of a frame's in-page reader, installing the journal first if this world copy has
+   * none. Every call is a timed round trip that measures the browser's clock.
+   */
   private async callReader<T>(world: IsolatedWorld, call: string, timeoutMs: number, what: string): Promise<T> {
-    const expression = `globalThis.${READER} ? { ok: true, value: globalThis.${READER}.${call} } : { ok: false }`
+    const expression = `globalThis.${READER} ? { now: Date.now(), ok: true, value: globalThis.${READER}.${call} } : { now: Date.now(), ok: false }`
     for (let attempt = 0; attempt < 2; attempt++) {
-      const result = await world.evaluate<{ ok: boolean; value?: T }>(expression, { timeoutMs, what })
+      const sentAt = Date.now()
+      const result = await world.evaluate<{ now: number; ok: boolean; value?: T }>(expression, { timeoutMs, what })
+      this.clock.roundTrip(sentAt, result.now, Date.now())
       if (result.ok) return result.value as T
       // The world was created before start() registered the setup (setups only run in new copies).
       await world.evaluate(WATCH_SOURCE, { timeoutMs, what: 'installing the page journal' })
     }
     throw new Error(`The page journal could not be installed in the isolated world (${what}).`)
+  }
+
+  /**
+   * `local` (this process's clock) on the browser's clock, for a comparison with the journal's
+   * stamps. Before any round trip measured the offset, one bounded round trip does.
+   */
+  private async onBrowserClock(local: number): Promise<number> {
+    if (!this.clock.measured()) {
+      const sentAt = Date.now()
+      const browser = await this.frames.main.world.evaluate<number>('Date.now()', { timeoutMs: PROBE_TIMEOUT_MS, what: 'reading the browser’s clock' })
+      this.clock.roundTrip(sentAt, browser, Date.now())
+    }
+    return this.clock.toBrowser(local)
   }
 
   /**
@@ -1831,53 +1955,68 @@ export class PageWatch {
     } catch (error) {
       // Removed meanwhile: its `detached` change is next in this frame's queue.
       if (!this.frames.page.frames().some((frame) => frame.frameId() === frameId)) return
+      // Its session cannot be borrowed, so it is not followed: what the tap holds for it is let go.
+      // (A failure of the journal install below is not one: a frame that has just moved to another
+      // process fails it, and the follow of its navigation takes the new session.)
+      this.tap?.discard(frameId)
       throw error
     }
     if (!this.started) return
-    await this.followOutOfProcess(handle)
+    this.followOutOfProcess(handle)
     if (kind !== 'listed') await this.installJournals([handle])
   }
 
-  /** Journal the network and console of the iframe's own session while it is out of process. */
-  private async followOutOfProcess(handle: FrameHandle): Promise<void> {
+  /**
+   * Journal the network and console of the iframe's own session while it is out of process, from
+   * the session's first event: the tap has held them since Playwright created the session.
+   */
+  private followOutOfProcess(handle: FrameHandle): void {
     const tracked = this.oopifSessions.get(handle.frameId)
     if (!handle.outOfProcess) {
       if (tracked) this.retireSession(tracked, 'the iframe that sent it moved into its parent’s renderer process')
       return
     }
+    const tapped = this.tap?.session(handle.frameId) ?? null
+    if (tapped === null) {
+      throw new Error(`Playwright's server holds no session of its own for the out-of-process iframe ${handle.frame.url() || handle.frameId}.`)
+    }
     if (tracked) {
-      if (tracked.cdp === handle.cdp) return
       // An iframe that stays out of process keeps its target, and Playwright its session, across
-      // navigations (measured): the new adapter wraps the session already followed, unless that one closed.
-      if (await this.sessionOpen(tracked.cdp)) return
+      // navigations (measured): only the adapter that commands go through can be new.
+      if (tracked.tapped === tapped) {
+        tracked.cdp = handle.cdp
+        return
+      }
       this.retireSession(tracked, 'the iframe that sent it moved to another renderer process')
     }
-    if (!this.started) return
-    this.oopifSessions.set(handle.frameId, this.watchSession(handle.cdp, handle.frame))
-  }
-
-  private async sessionOpen(cdp: ICDPSession): Promise<boolean> {
-    try {
-      await withDeadline(cdp.send('Target.getTargetInfo'), PROBE_TIMEOUT_MS, 'checking an iframe’s renderer session (Target.getTargetInfo)')
-      return true
-    } catch (error) {
-      if (CLOSED_RE.test(errorMessage(error))) return false
-      throw error
-    }
+    this.oopifSessions.set(handle.frameId, this.watchSession(handle.cdp, handle.frame, tapped, null))
+    tapped.start()
   }
 
   /**
-   * Stop following an out-of-process iframe's session that no longer carries the frame. Chrome
-   * reports nothing more about the requests it had open there: they end as `lost`, with why.
+   * Journal a dedicated worker's requests (nested workers too), from its session's first event; the
+   * tap hands it over as Playwright creates the session. The requests it still had open when it ended
+   * end as `lost`.
+   */
+  private followWorker(worker: TappedWorker): void {
+    const session = this.watchSession(worker.cdp, null, worker.session, worker.url)
+    worker.session.onClose(() => this.retireSession(session, `the worker ${worker.url} that sent it ended`))
+    worker.session.start()
+  }
+
+  /**
+   * Stop following a session that no longer carries the frame (or whose worker ended). Chrome
+   * reports nothing more about the requests it last reported there: they end as `lost`, with why.
    */
   private retireSession(session: SessionWatch, reason: string): void {
     for (const off of session.off.splice(0)) off()
-    this.sessions.delete(session.cdp)
+    this.sessions.delete(session)
     for (const [frameId, tracked] of this.oopifSessions) {
       if (tracked === session) this.oopifSessions.delete(frameId)
     }
     const now = Date.now()
-    for (const entry of session.requests.values()) {
+    for (const entry of this.requestsById.values()) {
+      if (entry.session !== session) continue
       if (entry.endedAt !== undefined) continue
       entry.endedAt = now
       entry.lost = reason
@@ -1888,35 +2027,62 @@ export class PageWatch {
   // CDP events
   // ---------------------------------------------------------------------------
 
-  /** Journal the requests, WebSocket frames, console and exceptions a session reports. */
-  private watchSession(cdp: ICDPSession, rootFrame: Frame | null): SessionWatch {
-    const session: SessionWatch = { cdp, rootFrame, requests: new Map(), socketUrls: new Map(), contexts: new Map(), off: [] }
-    this.sessions.set(cdp, session)
-    this.listen(session, 'Network.requestWillBeSent', (e) => this.onRequestWillBeSent(session, e))
-    this.listen(session, 'Network.responseReceived', (e) => this.onResponseReceived(session, e))
-    this.listen(session, 'Network.dataReceived', (e) => {
-      const entry = session.requests.get(e.requestId)
-      if (entry && entry.endedAt === undefined) entry.lastDataAt = Date.now()
+  /**
+   * Journal the requests, WebSocket frames, console and exceptions a session reports. A worker's
+   * session runs only the worker's own code (it has no other world), so its console is the page's own
+   * code and is named by the worker, without asking its session anything.
+   */
+  private watchSession(cdp: ICDPSession, rootFrame: Frame | null, tapped: TappedSession | null, worker: string | null): SessionWatch {
+    const session: SessionWatch = { cdp, tapped, rootFrame, worker, socketUrls: new Map(), contexts: new Map(), off: [] }
+    this.sessions.add(session)
+    this.listen(session, 'Network.requestWillBeSent', (e, at) => this.onRequestWillBeSent(session, e, at))
+    this.listen(session, 'Network.responseReceived', (e, at) => this.onResponseReceived(session, e, at))
+    this.listen(session, 'Network.dataReceived', (e, at) => {
+      const entry = this.reportedBy(session, e.requestId)
+      if (entry && entry.endedAt === undefined) entry.lastDataAt = at
     })
-    this.listen(session, 'Network.loadingFinished', (e) => this.onRequestEnded(session, e.requestId))
-    this.listen(session, 'Network.loadingFailed', (e) => this.onRequestEnded(session, e.requestId, e.canceled ? 'canceled' : e.errorText, e.type))
+    this.listen(session, 'Network.loadingFinished', (e, at) => this.onRequestEnded(session, e.requestId, at))
+    this.listen(session, 'Network.loadingFailed', (e, at) => this.onRequestEnded(session, e.requestId, at, failureOf(e), e.type))
     this.listen(session, 'Network.requestServedFromCache', (e) => {
-      const entry = session.requests.get(e.requestId)
+      const entry = this.reportedBy(session, e.requestId)
       if (entry) entry.fromCache = true
     })
     this.listen(session, 'Network.webSocketCreated', (e) => session.socketUrls.set(e.requestId, e.url))
     this.listen(session, 'Network.webSocketClosed', (e) => session.socketUrls.delete(e.requestId))
-    this.listen(session, 'Network.webSocketFrameSent', (e) => this.onSocketFrame(session, e, 'sent'))
-    this.listen(session, 'Network.webSocketFrameReceived', (e) => this.onSocketFrame(session, e, 'received'))
+    this.listen(session, 'Network.webSocketFrameSent', (e, at) => this.onSocketFrame(session, e, 'sent', at))
+    this.listen(session, 'Network.webSocketFrameReceived', (e, at) => this.onSocketFrame(session, e, 'received', at))
+    this.listen(session, 'Runtime.consoleAPICalled', (e, at) => this.onConsole(session, e, at))
+    this.listen(session, 'Runtime.exceptionThrown', (e, at) => this.onException(session, e, at))
+    if (worker !== null) return session
     this.listen(session, 'Runtime.executionContextCreated', (e) => this.onContextCreated(session, e))
     this.listen(session, 'Runtime.executionContextDestroyed', (e) => session.contexts.delete(e.executionContextId))
     this.listen(session, 'Runtime.executionContextsCleared', () => session.contexts.clear())
-    this.listen(session, 'Runtime.consoleAPICalled', (e) => this.onConsole(session, e))
-    this.listen(session, 'Runtime.exceptionThrown', (e) => this.onException(session, e))
+    this.listen(session, 'Page.downloadWillBegin', (e, at) => this.onDownload(e, at))
     return session
   }
 
-  private listen<K extends keyof ProtocolMapping.Events>(session: SessionWatch, event: K, handler: (params: ProtocolMapping.Events[K][0]) => void): void {
+  /** Journal `event` of a followed session, with when it reached this process: an iframe's from its tap, the page's from its session. */
+  private listen<K extends TappedEvent>(session: SessionWatch, event: K, handler: TapListener<K>): void {
+    const guarded: TapListener<K> = (params, arrivedAt) => {
+      try {
+        handler(params, arrivedAt)
+      } catch (error) {
+        this.logger.error(`[page-watch] handling ${event} failed:`, errorMessage(error))
+      }
+    }
+    const { tapped, cdp } = session
+    if (tapped) {
+      tapped.on(event, guarded)
+      session.off.push(() => tapped.off(event, guarded))
+      return
+    }
+    const arrive = (params: ProtocolMapping.Events[K][0]): void => guarded(params, Date.now())
+    cdp.on(event, arrive)
+    session.off.push(() => cdp.off(event, arrive))
+  }
+
+  /** The page session's navigation and loading events. */
+  private listenPage<K extends keyof ProtocolMapping.Events>(event: K, handler: (params: ProtocolMapping.Events[K][0]) => void): void {
     const guarded = (params: ProtocolMapping.Events[K][0]): void => {
       try {
         handler(params)
@@ -1924,73 +2090,121 @@ export class PageWatch {
         this.logger.error(`[page-watch] handling ${event} failed:`, errorMessage(error))
       }
     }
-    session.cdp.on(event, guarded)
-    session.off.push(() => session.cdp.off(event, guarded))
+    this.cdp.on(event, guarded)
+    this.unlisten.push(() => this.cdp.off(event, guarded))
   }
 
-  private onRequestWillBeSent(session: SessionWatch, e: Protocol.Network.RequestWillBeSentEvent): void {
-    const now = Date.now()
-    // When the renderer issued it (browser wall clock, the clock checkpoints use too): an event
-    // that reaches us a few ms late must not turn a request from before the action into one of its.
-    const startedAt = Math.round(e.wallTime * 1000)
-    const previous = e.redirectResponse ? session.requests.get(e.requestId) : undefined
+  private onRequestWillBeSent(session: SessionWatch, e: Protocol.Network.RequestWillBeSentEvent, arrivedAt: number): void {
+    // When the renderer issued it, on the browser's clock: an event that reaches this process late
+    // must not turn a request from before the action into one of its. Its arrival bounds the clock.
+    const issuedAt = e.wallTime * 1000
+    this.clock.arrived(issuedAt, arrivedAt)
+    const url = e.request.url + (e.request.urlFragment ?? '')
+    const known = this.requestsById.get(e.requestId)
+    // The same hop announced again by another of the page's sessions: one request, one record.
+    if (known && known.endedAt === undefined && known.issuedAt === issuedAt && known.url === url) {
+      known.session = session
+      return
+    }
+    // A new hop of the request: one Chrome reports with its redirect response, or — measured on a
+    // fetch whose redirect the page's Content Security Policy then blocked — one it moves the still
+    // open request on to without reporting the redirect response.
+    const previous = e.redirectResponse || (known && known.endedAt === undefined) ? known : undefined
     const entry: RequestEntry = {
       id: `r${++this.requestCounter}`,
       requestId: e.requestId,
       session,
       seq: ++this.seq,
       method: e.request.method,
-      url: e.request.url + (e.request.urlFragment ?? ''),
+      url,
+      ...(e.frameId !== undefined ? { frameId: e.frameId } : {}),
+      // Sent by a worker: named by its script's address; by an iframe's document: by that document's, as console records are.
+      ...(session.worker !== null
+        ? { worker: session.worker }
+        : e.frameId !== undefined && e.frameId !== this.frames.mainFrameId()
+          ? { frame: e.documentURL }
+          : {}),
       ...(e.type !== undefined ? { resourceType: e.type } : {}),
-      startedAt,
-      chainStartedAt: previous?.chainStartedAt ?? startedAt,
+      issuedAt,
+      chainIssuedAt: previous?.chainIssuedAt ?? issuedAt,
       ...(e.request.isAdRelated ? { isAdRelated: true } : {}),
     }
-    if (previous && e.redirectResponse) {
+    if (previous) {
       // A redirect keeps Chrome's requestId; each hop is its own record, so a POST answered
       // with 303 stays a POST and the GET that follows is a new request.
-      previous.status = e.redirectResponse.status
-      previous.mimeType = e.redirectResponse.mimeType
-      previous.headersAt ??= now
-      previous.endedAt = now
+      if (e.redirectResponse) {
+        previous.status = e.redirectResponse.status
+        previous.mimeType = e.redirectResponse.mimeType
+        previous.headersAt ??= arrivedAt
+      }
+      previous.endedAt ??= arrivedAt
       previous.redirectedTo = entry.id
       entry.redirectedFrom = previous.id
     }
     this.requestLog.push(entry)
-    session.requests.set(e.requestId, entry)
+    this.requestsById.set(e.requestId, entry)
     while (this.requestLog.length > REQUEST_CAP) {
       const dropped = this.requestLog.shift()!
       this.droppedSeq.network = dropped.seq
-      if (dropped.session.requests.get(dropped.requestId) === dropped) dropped.session.requests.delete(dropped.requestId)
+      if (this.requestsById.get(dropped.requestId) === dropped) this.requestsById.delete(dropped.requestId)
     }
   }
 
-  private onResponseReceived(session: SessionWatch, e: Protocol.Network.ResponseReceivedEvent): void {
-    const entry = session.requests.get(e.requestId)
+  /** The journaled request `requestId`, now reported by `session` — the one that holds what Chrome reports of it from here on, its body included. */
+  private reportedBy(session: SessionWatch, requestId: string): RequestEntry | undefined {
+    const entry = this.requestsById.get(requestId)
+    if (entry) entry.session = session
+    return entry
+  }
+
+  private onResponseReceived(session: SessionWatch, e: Protocol.Network.ResponseReceivedEvent, arrivedAt: number): void {
+    const entry = this.reportedBy(session, e.requestId)
     if (!entry) return
     entry.status = e.response.status
     entry.mimeType = e.response.mimeType
     entry.resourceType = e.type
-    entry.headersAt = Date.now()
+    entry.headersAt = arrivedAt
     if (e.response.fromDiskCache || e.response.fromPrefetchCache) entry.fromCache = true
   }
 
-  private onRequestEnded(session: SessionWatch, requestId: string, failed?: string, type?: Protocol.Network.ResourceType): void {
-    const entry = session.requests.get(requestId)
+  private onRequestEnded(session: SessionWatch, requestId: string, arrivedAt: number, failed?: string, type?: Protocol.Network.ResourceType): void {
+    const entry = this.reportedBy(session, requestId)
     if (!entry || entry.endedAt !== undefined) return
-    entry.endedAt = Date.now()
+    entry.endedAt = arrivedAt
     if (failed !== undefined) entry.failed = failed
     if (type !== undefined) entry.resourceType = type
   }
 
-  private onSocketFrame(session: SessionWatch, e: Protocol.Network.WebSocketFrameSentEvent, direction: WebSocketFrameRecord['direction']): void {
+  /**
+   * A frame's navigation became a download. Chrome cancels the navigation request for it
+   * (`loadingFailed` net::ERR_ABORTED, canceled) and then announces the download for the frame with
+   * the request's final URL (measured, in that order, locally and on GitHub). That request ended by
+   * becoming the download: it did not fail.
+   */
+  private onDownload(e: Protocol.Page.DownloadWillBeginEvent, arrivedAt: number): void {
+    const entry = this.requestLog.findLast(
+      (candidate) =>
+        candidate.frameId === e.frameId &&
+        candidate.url === e.url &&
+        candidate.resourceType === 'Document' &&
+        candidate.download === undefined &&
+        candidate.redirectedTo === undefined &&
+        (candidate.endedAt === undefined || candidate.failed === 'canceled'),
+    )
+    if (!entry) return
+    entry.download = e.suggestedFilename
+    delete entry.failed
+    entry.endedAt ??= arrivedAt
+  }
+
+  private onSocketFrame(session: SessionWatch, e: Protocol.Network.WebSocketFrameSentEvent, direction: WebSocketFrameRecord['direction'], arrivedAt: number): void {
     const url = session.socketUrls.get(e.requestId)
     this.socketLog.push({
       seq: ++this.seq,
       requestId: e.requestId,
       ...(url !== undefined ? { url } : {}),
       direction,
-      at: Date.now(),
+      at: arrivedAt,
       opcode: e.response.opcode,
       bytes: payloadBytes(e.response),
     })
@@ -2036,7 +2250,7 @@ export class PageWatch {
     if (frame) session.contexts.set(e.context.id, Promise.resolve({ frame: frame.url() }))
   }
 
-  private onConsole(session: SessionWatch, e: Protocol.Runtime.ConsoleAPICalledEvent): void {
+  private onConsole(session: SessionWatch, e: Protocol.Runtime.ConsoleAPICalledEvent, arrivedAt: number): void {
     const level = e.type === 'error' || e.type === 'assert' ? 'error' : e.type === 'warning' ? 'warning' : null
     if (!level) return
     const body = e.args.map(formatRemoteObject).join(' ')
@@ -2044,31 +2258,34 @@ export class PageWatch {
     const top = e.stackTrace?.callFrames[0]
     this.pushConsole(
       session,
-      { seq: ++this.seq, at: Date.now(), level, text: clipText(text, CONSOLE_TEXT_CAP), location: top ? formatLocation(top.url, top.lineNumber, top.columnNumber) : undefined },
+      { seq: ++this.seq, at: arrivedAt, level, text: clipText(text, CONSOLE_TEXT_CAP), location: top ? formatLocation(top.url, top.lineNumber, top.columnNumber) : undefined },
       e.executionContextId,
     )
   }
 
-  private onException(session: SessionWatch, e: Protocol.Runtime.ExceptionThrownEvent): void {
+  private onException(session: SessionWatch, e: Protocol.Runtime.ExceptionThrownEvent, arrivedAt: number): void {
     const d = e.exceptionDetails
     const description = d.exception?.description?.split('\n', 1)[0]
     const text = description ? `${d.text && d.text !== description ? `${d.text} ` : ''}${description}` : d.text
     const top = d.stackTrace?.callFrames[0]
     const location = d.url ? formatLocation(d.url, d.lineNumber, d.columnNumber) : top ? formatLocation(top.url, top.lineNumber, top.columnNumber) : undefined
-    this.pushConsole(session, { seq: ++this.seq, at: Date.now(), level: 'exception', text: clipText(text, CONSOLE_TEXT_CAP), location }, d.executionContextId)
+    this.pushConsole(session, { seq: ++this.seq, at: arrivedAt, level: 'exception', text: clipText(text, CONSOLE_TEXT_CAP), location }, d.executionContextId)
   }
 
   /**
-   * Journal a console record of the page's own code, in any frame. Isolated worlds
+   * Journal a console record of the page's own code, in any frame or worker. Isolated worlds
    * (playwriter's probes, Playwright's utility world) and extensions' content scripts are not
-   * the app: a record is kept only when its context is a frame's main world.
+   * the app: a document's record is kept only when its context is a frame's main world. A worker's
+   * is its own code.
    */
   private pushConsole(session: SessionWatch, record: ConsoleRecord, contextId: number | undefined): void {
     if (record.location === undefined) delete record.location
     const owner =
-      contextId !== undefined
-        ? this.ownerOf(session, contextId)
-        : Promise.resolve(session.rootFrame === null ? {} : { frame: session.rootFrame.url() })
+      session.worker !== null
+        ? Promise.resolve({ worker: session.worker })
+        : contextId !== undefined
+          ? this.ownerOf(session, contextId)
+          : Promise.resolve(session.rootFrame === null ? {} : { frame: session.rootFrame.url() })
     this.consoleLog.push({ record, owner })
     if (this.consoleLog.length > CONSOLE_CAP) this.droppedSeq.console = this.consoleLog.shift()!.record.seq
   }
@@ -2083,7 +2300,7 @@ export class PageWatch {
     const out: ConsoleRecord[] = []
     entries.forEach((entry, index) => {
       const owner = owners[index]
-      if (owner) out.push({ ...entry.record, ...(owner.frame !== undefined ? { frame: owner.frame } : {}) })
+      if (owner) out.push({ ...entry.record, ...(owner.frame !== undefined ? { frame: owner.frame } : {}), ...(owner.worker !== undefined ? { worker: owner.worker } : {}) })
     })
     return out
   }

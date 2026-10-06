@@ -8,7 +8,7 @@
  * optional patchright dep being installed.
  */
 
-import { installElementPreviewWithoutGesture } from './playwright-server.js'
+import { prepareServer } from './playwright-server.js'
 
 export type {
   Page,
@@ -36,23 +36,25 @@ export async function getChromium(): Promise<Chromium> {
   if (_chromium) {
     return _chromium
   }
+  // Before any connection exists: the server previews the handles of the page's own
+  // console.log(element) as soon as it receives them (playwright-server.ts).
   if (isPatchrightEnabled()) {
+    let mod: { chromium: Chromium }
     try {
       // Dynamic import — @playwriter/patchright-core is an optional dependency.
       // Types come from @xmorse/playwright-core (identical API surface).
-      const mod: { chromium: Chromium } = await import('@playwriter/patchright-core' as string)
-      _chromium = mod.chromium
+      mod = await import('@playwriter/patchright-core' as string)
     } catch (e: unknown) {
       throw new Error(
         '@playwriter/patchright-core is not installed. Install it with: pnpm add @playwriter/patchright-core',
         { cause: e },
       )
     }
+    prepareServer('patchright')
+    _chromium = mod.chromium
   } else {
     const mod = await import('@xmorse/playwright-core')
-    // Before any connection exists: the server previews the handles of the page's own
-    // console.log(element) as soon as it is attached (playwright-server.ts).
-    installElementPreviewWithoutGesture()
+    prepareServer('playwright')
     _chromium = mod.chromium
   }
   return _chromium!

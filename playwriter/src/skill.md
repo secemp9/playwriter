@@ -7,17 +7,17 @@ You drive a real browser, often the user's own logged-in Chrome. Work like a car
 1. **Look** — `await observe()` prints what is on screen right now:
    - `PAGE` url, title, tab, how far down you are · `TABS` when several are open · `BUSY` the app is still working · `MODAL` / `DIALOG` something blocks the page · `FOCUS` · `LIVE` a live region (chat log, status line) and its newest text.
    - `IN VIEW` — every control with a **ref** in brackets, plus its state and value: `[12] button "Send"`, `[7] textbox "Message" [focused] = "hi"`, `[9] checkbox "Remember me" [unchecked]`, `[4] combobox "Sort" = "Relevance" (options: Relevance · Newest · …)`, `[5] date "Check-in" (takes YYYY-MM-DD: act.fill(ref, "YYYY-MM-DD"))`, `[20] clickable div.card "Free shipping"` (a click target that is not a semantic control), `img "Product" BROKEN`, `partly covered by …`. A control drawn by its styling (`transparent control`) or hidden behind its label (`worked through its label`) is listed and acted on like any other. Long text is kept whole; a printed line cut short says `(+N chars)`.
-   - `BELOW` / `ABOVE` — what is off-screen (counts and headings), so you do not have to scroll to find out. In apps whose page does not scroll (mail, chat, dashboards), `SCROLL [57] main "Messages" — 4 screens below` names the scroll area and `INSIDE [57] …` counts what it hides. `*` marks what is new since your last look.
+   - `BELOW` / `ABOVE` — what is off-screen (counts and headings), so you do not have to scroll to find out. In apps whose page does not scroll (mail, chat, dashboards), `SCROLL [57] main "Messages" — 4 screens below` names the scroll area and `INSIDE [57] …` counts what it hides. A carousel or wide table is a scroll area too: `SCROLL [58] region "Featured products" — left edge, 3 screens to the right`. `*` marks what is new since your last look.
    - Iframes are part of the page: `[7] iframe "Secure card payment" — 4 controls` with its controls (refs) indented under it, cross-site ones (payment fields, embedded sign-in, consent walls) included. An iframe that cannot be read says why on its line. `act.*`, `find()` (`· in iframe [n]`), `explain()` and `getPageMarkdown()` work inside iframes the same way.
 2. **Do one thing** with a ref from that output: `await act.click(12)` · `await act.fill(7, 'red running shoes size 10')` · `await act.press('Enter')` · `await act.select(4, 'Price: low to high')` · `await act.check(9)`.
-3. **Read the report** printed after the call. It always says what was hit, whether the page `SETTLED` (or what it is still waiting for), navigation (`in-app route`, `NEW DOCUMENT` = full reload, or a back/forward-cache restore), dialogs, live text (also text that vanished), console errors and failed requests, new tabs (`act.switchTab(i)`), downloads, a `FILE DIALOG` your input opened (it waits for `act.dialog.chooseFiles(path)` or `act.dialog.dismiss()`), and the `CHANGES` (`+` appeared, `-` gone, `~` state or value changed, text that grew). `NO VISIBLE CHANGE` means it probably did not work. Do not assume it did.
+3. **Read the report** printed after the call. It always says what was hit, whether the page `SETTLED` (or what it is still waiting for), navigation (`in-app route`, `NEW DOCUMENT` = full reload, or a back/forward-cache restore), dialogs, live text (also text that vanished), console errors and failed requests, new tabs (`act.switchTab(i)`), downloads (`DOWNLOAD [d1] …` — `downloads.save('d1', 'name.csv')` saves the file), a `FILE DIALOG` your input opened (it waits for `act.dialog.chooseFiles(path)` or `act.dialog.dismiss()`), and the `CHANGES` (`+` appeared, `-` gone, `~` state or value changed, text that grew). `NO VISIBLE CHANGE` means it probably did not work. Do not assume it did.
 4. **If the app is still working** (`BUSY`, `NOT SETTLED`, an AI reply streaming in): `await act.waitForIdle()`, then read what changed. Never act while it is busy: that is how replies get interrupted and messages get posted twice. Give long waits a bigger call `timeout`.
 5. Repeat. One input action per call; waits and reads are free.
 
 ### Finding things
 
 - `await find('Checkout')` — every match on the whole page, off-screen included, whole texts and drop-down options too, with its ref and where it is.
-- `await act.scrollTo(ref)` brings an element into view with the mouse wheel; `await act.scroll('down')` scrolls what the wheel reaches in the middle of the screen (in an app shell, the main list); `act.scroll('down', { ref: 57 })` scrolls that scroll area.
+- `await act.scrollTo(ref)` brings an element into view with the mouse wheel; `await act.scroll('down')` scrolls what the wheel reaches in the middle of the screen (in an app shell, the main list); `act.scroll('down', { ref: 57 })` scrolls that scroll area; `act.scroll('right', { ref: 58 })` turns a carousel sideways.
 - `await observe({ all: true })` also lists off-screen elements; `await observe({ scope: ref })` shows only that part of the page.
 - Before clicking something you do not understand: `await explain(ref)` — what it is wired to (React component, handler source, the requests and navigation it triggers).
 - Not sure which element the user means? Ask them to point at it: right-click the page → **Pin an element for Playwriter**, then click it — `observe()` lists it under `PINNED` with its ref. Or tell them what to click, then `await pickElement()` with a long call `timeout` (e.g. 120000): Chrome's picker highlights elements under their pointer, and the call returns the ref of the one they click.
@@ -29,11 +29,11 @@ You drive a real browser, often the user's own logged-in Chrome. Work like a car
 | Call | What it does |
 |---|---|
 | `act.click(ref)` / `act.dblclick(ref)` | moves the pointer like a person, hit-tests the target (refuses and names the cover if something is on top), clicks |
-| `act.fill(ref, text)` / `act.type(ref, text)` | clicks the field, replaces (`fill`) or appends (`type`) key by key at a person's pace; the report reads the value back. A newline in a single-line field is refused (it is Enter: submit with `act.press('Enter')` next). Date/time inputs take ISO text (`2024-05-01`, `13:45`) typed into the field's parts; a slider takes a number on its step; a colour input cannot be set (its picker is browser UI — ask the user). `{ paste: true }` inserts long text in one go as IME text (no paste event fires) |
+| `act.fill(ref, text)` / `act.type(ref, text)` | clicks the field, replaces (`fill`) or appends (`type`) key by key at a person's pace; the report reads the value back. A newline in a single-line field is refused (it is Enter: submit with `act.press('Enter')` next). In a text area or rich editor a line break is a key the app decides, so text with one needs `{ newline: 'Shift+Enter' }` (chat composers: Enter sends) or `{ newline: 'Enter' }` (plain text areas, code editors), or `{ paste: true }`; without it the call is refused and nothing is typed. Date/time inputs take ISO text (`2024-05-01`, `13:45`) typed into the field's parts; a slider takes a number on its step; a colour input takes `#rrggbb`, typed into the hex field of Chrome's colour chooser (one with suggested swatches — a `list` — is refused: ask the user). `{ paste: true }` inserts the text, line breaks included, in one go as IME text (no key events, no paste event; not combinable with `newline`) |
 | `act.press(key, { ref })` | a key or chord (`'Enter'`, `'Escape'`, `'Tab'`, `'Control+A'`) where focus is, or on `ref` |
 | `act.select(ref, option)` | native `<select>`: clicks it, moves to the option with the arrow keys and presses Enter, as a person does (observe() lists the options; a disabled one is refused). Custom dropdowns: click to open, then click the option |
 | `act.check(ref)` / `act.uncheck(ref)` | sets the state and verifies it took |
-| `act.hover(ref)` · `act.scrollTo(ref)` · `act.scroll('down' \| 'up', { screens, ref })` · `act.drag(from, to)` · `act.upload(ref, files)` | scrolling is the mouse wheel over the area that actually scrolls; if the page ignores the wheel, the action says so, and a third scroll that moves nothing is refused. `upload` clicks the control and chooses the files in the file dialog it opens (more files than it takes is refused); when that control's dialog is already open, it chooses in it without clicking again |
+| `act.hover(ref)` · `act.scrollTo(ref)` · `act.scroll('down' \| 'up' \| 'right' \| 'left', { screens, ref })` · `act.drag(from, to)` (each a ref, or `{ ref, x, y }` — a point of the element in CSS px from the top-left corner of its box as laid out: x from 0 up to, not including, its width; y from 0 up to, not including, its height) · `act.upload(ref, files)` | scrolling is the mouse wheel over the area that actually scrolls (sideways: horizontal wheel deltas, as from a trackpad); if the page ignores the wheel, the action says so, and a third scroll that moves nothing is refused. `drag` presses on the first point, moves with the button held along a person's path and releases on the second; a point is wheeled into view, must be inside the element's box (the refusal names its size, e.g. `300×150 px`) and is hit-tested exactly there (a covered point is refused naming the cover); rotated, scaled and perspective-tilted elements are mapped through their transform. `upload` clicks the control and chooses the files in the file dialog it opens (more files than it takes is refused); when that control's dialog is already open, it chooses in it without clicking again |
 | `act.waitForIdle({ timeoutMs })` | waits until nothing is loading, streaming or changing (AI replies, searches) |
 | `act.dialog.accept(text?)` / `act.dialog.dismiss()` / `act.dialog.chooseFiles(files)` | answers a native `confirm()` / `prompt()` / `beforeunload` ("Leave site?"); they block the page until answered — leaving with unsaved work is a decision, never made for you. Alerts are accepted automatically and reported. A dialog the user answered at the browser is reported as closed. A file dialog your input opened (`FILE DIALOG OPEN`) stays open like a real one: `chooseFiles` picks files in it, `dismiss` cancels it, and until then the page cannot be used |
 | `act.open(url, { reason })` | a full page load: free on a blank tab, otherwise only with a reason (it wipes client caches) |
@@ -519,7 +519,7 @@ await observe()
 await act.click(12)
 ```
 
-What the report contains, in order: the action (`✓`/`✗`, what the pointer actually hit, notes such as "scrolled 640px in main to reach it"), `SETTLED` or `NOT SETTLED` (with the requests your action started that are still open, and where content is still changing), `NAV` (`in-app route` = same document, `NEW DOCUMENT` = full load, or a back/forward-cache restore where the earlier page comes back with its state), `DIALOG`, `LIVE` (live-region and toast text, including text that already vanished), `ERRORS` (console errors from the page's own code, uncaught exceptions, HTTP ≥ 400 and failed requests with their `net.requests` id), `TAB` (a new tab this page opened, with `act.switchTab(i)`), `DOWNLOAD` (`completed`, `FAILED: …` or still downloading), `FILE DIALOG OPEN, opened by your click [12] button "Upload photo" (one file) — … act.dialog.chooseFiles(path) chooses the files, act.dialog.dismiss() cancels` (a file dialog your input opened, held back by the browser and waiting for your answer — also one that opened after a confirm you answered, or from a page timer a moment after your call returned: then it is in the next report, `… 3.0s after that action ended`), then `CHANGES` (`+` appeared, `-` gone, `~` state/value/name changed, `~ text grew by N chars: "…tail"`, `SCROLL [57] … 0 → 840px`), possible duplicates, and `BUSY` if the app is still working. `NO VISIBLE CHANGE` is printed only when a before/after comparison was made and found nothing — navigations, dialogs, new tabs, downloads and file dialogs count as changes. Treat it as "did not work" until proven otherwise. If part of the report could not be produced, that line says why (`NOT SETTLED — …`, `EVENTS UNAVAILABLE — …`, `AFTER-STATE UNAVAILABLE — …`); the ✓/✗ lines and other events are still listed, so do not repeat an action because the after-state is missing.
+What the report contains, in order: the action (`✓`/`✗`, what the pointer actually hit, notes such as "scrolled 640px in main to reach it"), `SETTLED` or `NOT SETTLED` (with the requests your action started that are still open, and where content is still changing), `NAV` (`in-app route` = same document, `NEW DOCUMENT` = full load, or a back/forward-cache restore where the earlier page comes back with its state), `DIALOG`, `LIVE` (live-region and toast text, including text that already vanished), `ERRORS` (console errors from the page's own code — its iframes' and workers' included — uncaught exceptions, HTTP ≥ 400 and failed requests with their `net.requests` id), `TAB` (a new tab this page opened, with `act.switchTab(i)`), `DOWNLOAD [d1] …` (`completed → downloads.save('d1', 'name.csv')`, `FAILED: …`, still downloading, or why the file cannot be copied here), `FILE DIALOG OPEN, opened by your click [12] button "Upload photo" (one file) — … act.dialog.chooseFiles(path) chooses the files, act.dialog.dismiss() cancels` (a file dialog your input opened, held back by the browser and waiting for your answer — also one that opened after a confirm you answered, or from a page timer a moment after your call returned: then it is in the next report, `… 3.0s after that action ended`), then `CHANGES` (`+` appeared, `-` gone, `~` state/value/name changed, `~ text grew by N chars: "…tail"`, `SCROLL [57] … 0 → 840px`), possible duplicates, and `BUSY` if the app is still working. `NO VISIBLE CHANGE` is printed only when a before/after comparison was made and found nothing — navigations, dialogs, new tabs, downloads and file dialogs count as changes. Treat it as "did not work" until proven otherwise. If part of the report could not be produced, that line says why (`NOT SETTLED — …`, `EVENTS UNAVAILABLE — …`, `AFTER-STATE UNAVAILABLE — …`); the ✓/✗ lines and other events are still listed, so do not repeat an action because the after-state is missing.
 
 Raw Playwright input on the page — `page.mouse.*`, `page.keyboard.*`, `page.touchscreen.tap` — still works and is reported, but it gets no human pointer path, no busy check and no cover check; the report marks it `(raw Playwright)`. Locator and element actions (`locator.click()`, `page.fill(selector, …)`, …) are refused in human mode: Playwright runs them through its injected script. Raw input or a navigation on a tab other than the one you control (`state.page = await context.newPage()` in one call, then `await state.page.goto(url)` in the next) is followed on that tab: the line names it (`ACTION  (raw Playwright) goto https://… on tab 1 "Title"`) and SETTLED, NAV and errors are read from it. No before-picture of that tab was taken, so the report shows no element diff and never claims NO VISIBLE CHANGE for it; a navigation counts as a change. `act.switchTab(1)` then `observe()` to see it.
 
@@ -527,7 +527,7 @@ Playwright reads are not neutral either. `page.title()`, `page.content()`, `page
 
 **When the page is still working** (an AI reply streaming, a search running): `await act.waitForIdle({ timeoutMs: 90000 })` in a call with a larger `timeout`, then read the CHANGES it reports — the new reply text is in them.
 
-**Waiting and busy.** After every input the report waits for the page's reaction. Quiet is measured from the end of your last input, so a search the page debounces after your last key is still waited for. Only requests your action caused can hold a settle: a long-poll, a stream or a poller the page opened earlier is listed as "open before the action" and never waited on. Chrome's own request facts decide the rest — beacons, prefetches, CSP reports, ad-tagged requests, WebSockets and EventSource channels never hold, and images, fonts and media stop holding once they stall. Ticking clocks, timers, marquees, `aria-live=off` regions, and anything already churning before your action (a reply still streaming from an earlier step) are listed once as ambient and do not keep the page "not settled".
+**Waiting and busy.** After every input the report waits for the page's reaction. Quiet is measured from the end of your last input, so a search the page debounces after your last key is still waited for. Only requests your action caused — in the page, its iframes or its workers — can hold a settle: a long-poll, a stream or a poller the page opened earlier is listed as "open before the action" and never waited on. Chrome's own request facts decide the rest — beacons, prefetches, CSP reports, ad-tagged requests, WebSockets and EventSource channels never hold, and images, fonts and media stop holding once they stall. Ticking clocks, timers, marquees, `aria-live=off` regions, and anything already churning before your action (a reply still streaming from an earlier step) are listed once as ambient and do not keep the page "not settled".
 
 `BUSY` means the page itself says it is working: something marked `aria-busy`, a progressbar with no value or one that moved since your action, an endlessly repeating animation that is on screen and on top (a spinner) and started since your action, content still streaming, or a response body still arriving. Words such as "Loading" or "Processing", class names, and a progressbar standing still never block. A spinner that was already turning before your action is reported but does not block. An alert is accepted automatically and the wait resumes after it closes; a confirm, prompt or "Leave site?" stays open and stops the wait until you answer it.
 
@@ -535,10 +535,10 @@ Playwright reads are not neutral either. `page.title()`, `page.content()`, `page
 - Long text is kept whole; lines are cut only when printed, marked `(+N chars)`. `find("words")` searches the whole text and shows the match in context: `text: (212 chars before) "…costs $14.99 and ships tomorrow."`.
 - Repeated controls (the same role and name more than once) carry what tells them apart, in this order: the item they are in (`(in listitem "Buy milk")`, `(in row "Alice")`), the heading above them (`(under heading "Reviews")`), the text right before their group (`(after "Width")` — the caption above a set of options), else their position (`(2nd of 3)`). A label's words are its control's name and are not repeated as text.
 - Live regions (chat logs, status lines, alerts) stay readable as normal text. `LIVE  log "Conversation" — latest: "…"` names the region and its newest message; changes inside it are marked `— in live region log "Conversation"`.
-- Scroll areas: in apps whose page does not scroll the header says `the page itself does not scroll`; `SCROLL [57] main "Messages" — top, 4 screens below` gives the area a ref, `INSIDE [57] …: N more controls … — act.scroll('down', { ref: 57 })` counts what it hides, and `observe({ scope: 57 })` lists its contents.
+- Scroll areas: in apps whose page does not scroll the header says `the page itself does not scroll`; `SCROLL [57] main "Messages" — top, 4 screens below` gives the area a ref, `INSIDE [57] …: N more controls … — act.scroll('down', { ref: 57 })` counts what it hides, and `observe({ scope: 57 })` lists its contents. A carousel or wide table is one too: `SCROLL [58] region "Featured products" — left edge, 3 screens to the right`, `INSIDE [58] …: … — act.scroll('right', { ref: 58 })`, and after a sideways scroll the report says `SCROLL [58] region "Featured products" sideways 0 → 540px (now 0.9 screens to the left, 2.1 to the right)`. An area that starts at its right edge (right-to-left content, vertical-rl text, a `row-reverse` strip) is listed from there: `— right edge, 2 screens to the left`, `act.scroll('left', { ref })`. The diff's `sideways a → bpx` is Chrome's scrollLeft, which is 0 or negative for such an area. A list that starts at its bottom — a chat log built with `flex-direction: column-reverse`, which opens at the newest message — is listed from there too: `SCROLL [57] main "Conversation" — bottom, 12 screens above`, and its INSIDE line says `act.scroll('up', { ref: 57 })`. The diff's `a → bpx` is Chrome's scrollTop, which is 0 or negative for such a list.
 - Tabs: with several open, `TABS  0: "Shop" (controlled) · 1: "Docs"` lists them for `act.switchTab(n)`. Refs are unique across tabs.
-- Iframes: every iframe is an element of the page around it, `[7] iframe "Secure card payment" — 4 controls`, with its content indented under it; `observe({ scope: 7 })` shows only what is inside it. Cross-site iframes, which Chrome runs in their own process, are read the same way. An iframe whose content cannot be read says why on its line (`— not read: the iframe is hidden …`, `… still loading`, `… removed while being read`). Something drawn over an iframe covers what is inside it (`covered by iframe "Cookie consent" [12]`). Acting on a ref inside an iframe scrolls the page to the iframe, then the iframe itself, and hit-tests through it; an iframe's requests and console errors are in the report and journal, and a POST sent from inside an iframe counts for the repeat guard.
-- Fields say what they take: `[range 0–100 step 5]`, `(takes YYYY-MM-DD: …)` on date inputs (dates, datetimes and times are roles `date`, `datetime`, `inputtime`; colour inputs `colorwell`), `(file input: its click opens a file dialog — act.upload(3, path))` on a file input (it reads as a button), `type=email`, `placeholder "…"`, `max 64 chars`, `accepts ".pdf"`, `[multiline]`, `[autocomplete=list] [active=[7]]`, and for an invalid field the page's own message: `[invalid] error "Enter a valid email address"`.
+- Iframes: every iframe is an element of the page around it, `[7] iframe "Secure card payment" — 4 controls`, with its content indented under it; `observe({ scope: 7 })` shows only what is inside it. Cross-site iframes, which Chrome runs in their own process, are read the same way. An iframe whose content cannot be read says why on its line (`— not read: the iframe is hidden …`, `… still loading`, `… removed while being read`). Something drawn over an iframe covers what is inside it (`covered by iframe "Cookie consent" [12]`). Acting on a ref inside an iframe scrolls the page to the iframe, then the iframe itself, and hit-tests through it; an iframe's requests and console errors are in the report and journal — a cross-site iframe's from the moment its document starts — each request naming the iframe that sent it (`frame`), and a POST sent from inside an iframe counts for the repeat guard.
+- Fields say what they take: `[range 0–100 step 5]`, `(takes YYYY-MM-DD: …)` on date inputs (dates, datetimes and times are roles `date`, `datetime`, `inputtime`; colour inputs `colorwell`), `(file input: its click opens a file dialog — act.upload(3, path))` on a file input (it reads as a button), `(takes #rrggbb: act.fill(10, "#rrggbb"))` on a colour input (`(colour input with suggested swatches: act.fill cannot choose in its popup — ask the user)` when it has a `list`), `type=email`, `placeholder "…"`, `max 64 chars`, `accepts ".pdf"`, `[multiline]`, `[autocomplete=list] [active=[7]]`, and for an invalid field the page's own message: `[invalid] error "Enter a valid email address"`.
 - Secrets are shown as `••••`: password fields, one-time-code and card-security fields, and any field the page draws as bullets.
 - While a native dialog is open, observe shows only the dialog; title, viewport and scroll say `not readable while the dialog is open`.
 - An open file dialog shows at the top: `FILE DIALOG open, opened by your click [12] button "Upload photo" (one file)`. The page behind it stays readable, but nothing on it can be used until you answer it (`act.dialog.chooseFiles(path)` or `act.dialog.dismiss()`), as for a person facing the browser's file dialog.
@@ -554,9 +554,9 @@ Playwright reads are not neutral either. `page.title()`, `page.content()`, `page
 - **Tabs:** acting on a ref from another tab brings that tab to the front and makes it the controlled page; the report says `switched to the tab "…" this ref belongs to`. `act.switchTab(i)` does it without acting and does not use up the call's one action.
 - **Upload:** `act.upload(ref, 'file.pdf')` (or an array) clicks the control; the files are chosen in the file dialog that click opens. A control that opens no dialog within 4s is not an upload control; if the click opens a confirm() first, answer it — the file dialog that follows is reported, and `act.dialog.chooseFiles(path)` chooses in it. More files than the dialog takes is refused, and the dialog stays open. A file dialog can open as long as the browser lets the page act on your input (5 s after it): it is held back and waits for you; cancelling it with `act.dialog.dismiss()` is not told to the page (the browser sends no cancel event for a dialog it held back).
 - **Back:** `act.back()` goes to the previous entry of this tab's history; with no earlier page it is refused (`Nothing to go back to`). If the page holds the navigation ("Leave site?"), the report says so.
-- **Scroll:** `act.scroll('down')` with no ref scrolls what the mouse wheel reaches in the middle of the screen, and the note names it (`scrolled [57] main "Messages" 840px; 2.1 screens below`). A third scroll in the same direction after two that moved 0px is refused: you are at the end, so read the screen or use find().
-- **Date, time, slider and colour fields:** `act.fill(ref, value)` on a native date/time input takes ISO text — `2024-05-01` (date), `13:45` (time), `2024-05-01T13:45` (datetime-local), `2024-05` (month), `2024-W18` (week) — typed into the field's parts in the order the field shows them; the value read back must equal what you asked for, or the action fails. A slider (`type=range`) takes a number on its step grid and is moved with the arrow keys. A colour input cannot be set: its picker is browser UI that page input cannot operate, so ask the user.
-- **Text fields:** a newline in a single-line field is refused (it is the Enter key and submits the form): `act.press('Enter')` in the next call. `{ paste: true }` inserts text as IME text in one go — no paste event fires, so apps that react to pasting will not see one.
+- **Scroll:** `act.scroll('down')` with no ref scrolls what the mouse wheel reaches in the middle of the screen, and the note names it (`scrolled [57] main "Messages" 840px; 2.1 screens below`). `act.scroll('right' | 'left', { ref })` turns a carousel sideways (`scrolled [58] region "Featured products" 480px to the right; 2.2 screens to the right`); scrolling an area the way it does not scroll names the direction it can still move (`it scrolls sideways (act.scroll('left', { ref: 58 }))`). A third scroll in the same direction after two that moved 0px is refused: you are at the end, so read the screen or use find().
+- **Date, time, slider and colour fields:** `act.fill(ref, value)` on a native date/time input takes ISO text — `2024-05-01` (date), `13:45` (time), `2024-05-01T13:45` (datetime-local), `2024-05` (month), `2024-W18` (week) — typed into the field's parts in the order the field shows them; the value read back must equal what you asked for, or the action fails. A slider (`type=range`) takes a number on its step grid and is moved with the arrow keys. A colour input takes `#rrggbb` (`act.fill(10, '#3366cc')`): act clicks it and, in Chrome's colour chooser, does what a keyboard user does — Shift+Tab to its format switch, ArrowUp to hex, Shift+Tab into the hex field, type the colour, Enter. The page gets `input` and `change`, and the value read back must be the one asked for. A colour input with suggested colours (a `list`) opens Chrome's swatch popup instead, which takes no choice from the keyboard: that is refused — ask the user. If the chooser closes before it is done (the page re-renders the input), no more keys are sent and the error names the keys that were; a native dialog the page opens on the click or while the colour is typed stops it and names the dialog. A colour input hidden behind its label works the same way. After act.click on a colour input its line says `(Chrome's colour chooser is open, and keys go to it, not the page: …)`: act.fill then cancels the chooser with Escape and chooses the colour, act.press('Enter') closes it keeping the colour it shows, act.press('Escape') puts back the colour it opened with (and closes it once that colour is back). The chooser's own controls are not page controls and are not listed. If the page closes the chooser itself once the colour is typed, no Enter is sent (it would reach the page), and the report says so.
+- **Text fields:** a newline in a single-line field is refused (it is the Enter key and submits the form): `act.press('Enter')` in the next call. In a field that takes several lines, text with a line break needs `{ newline: 'Shift+Enter' }` or `{ newline: 'Enter' }` (see common mistake 5), or `{ paste: true }`; otherwise it is refused before anything is typed. `act.type` adds to the end of the whole text (Ctrl+End, or ⌘↓ on macOS — End alone only reaches the end of the clicked line); `act.fill` selects everything first (Ctrl+A / ⌘A). Both check where the caret or selection landed and refuse before typing when the page kept it elsewhere (an app that takes those keys for its own shortcuts). `{ paste: true }` inserts text as IME text in one go — no key events and no paste event fire, so apps that react to pasting will not see one. The report reads the value back; a rich editor's text is read line by line as shown (one line per paragraph or line break).
 - **When the element changed since you looked:** act refuses instead of clicking it — `Not done: [12] now reads button "Unfollow" (you saw button "Follow")`, or `[7] button "Delete" is now in listitem "Bob" (you saw it in listitem "Alice")`. Call observe() and decide again.
 - **One action per call, also at run time:** a second action reached while the code runs (through helpers, aliases, or raw Playwright input) is refused — `Not done: this call already performed click [3] button "Send" — one action per call in human mode.` Waiting (`act.wait`, `act.waitForIdle`) and `act.switchTab` do not count.
 
@@ -567,11 +567,13 @@ Playwright reads are not neutral either. `page.title()`, `page.content()`, `page
 const errors = await getLatestLogs({ page: state.page, search: /error|fail/i, count: 20 })
 // Every request the page made, failed ones only
 const failed = await net.requests({ failedOnly: true })
-// The response body of one of them
+// The response body of one of them (cut at 64K characters; `truncated` says so)
 const body = await net.request('r17')
+// The whole body as a file: images, PDFs, large JSON
+await net.save('r17', 'response.json')
 ```
 
-`getLatestLogs({ search })` for targeted debugging, `net.requests()` for what the page sent and got back, screenshots only for visual layout issues.
+`getLatestLogs({ search })` for targeted debugging, `net.requests()` for what the page sent and got back, screenshots only for visual layout issues. A request record names who sent it besides the page itself: `frame` is the address of the iframe document, `worker` the script of the dedicated worker (a nested one too). Its `startedAt` / `endedAt` are epoch ms on the machine running playwriter, also when the browser runs elsewhere (a cloud browser, a remote relay) with its clock minutes off. A navigation whose response became a download ends with `download: "<file name>"`, not as a failure; a blocked request says why in `failed` (`blocked: csp`, `CORS error: …`).
 
 ## debugging: symptom → cause
 
@@ -694,12 +696,10 @@ backwardSlice({ startFile, startExpr: 'total', maxHops: 16 })  // the static sli
 ## common mistakes to avoid
 
 **1. Not verifying actions succeeded**
-Always check page state after important actions (form submissions, uploads, typing). Your mental model can diverge from actual browser state:
+Read the report after every action: it names what the pointer hit, reads a typed value back and lists what changed. `NO VISIBLE CHANGE` means it probably did not work; `NOT SETTLED` means the page is still working. Your mental model can diverge from the browser's state:
 
 ```js
-await state.page.keyboard.type('my text')
-await snapshot({ page: state.page, search: /my text/ })
-// If verifying visual layout specifically, use screenshotWithAccessibilityLabels instead
+await act.type(7, 'my text')   // the report: value read back: "my text"
 ```
 
 **2. Assuming paste/upload worked**
@@ -708,18 +708,21 @@ Clipboard paste (`Meta+v`) can silently fail. For file uploads, do what a person
 ```js
 // Reliable, and the way a user does it: the report says whether a file dialog opened
 await act.upload(ref, '/path/to/image.png')
-
-// Unreliable: clipboard paste may silently fail, need to focus textarea first for example
-await state.page.keyboard.press('Meta+v') // always verify with observe() or a screenshot
 ```
-
-**3. Using stale locators from old snapshots**
-Locators (especially ones with `>> nth=`) can change when the page updates. Always get a fresh snapshot before clicking, then immediately use locators from that output:
 
 ```js
-await snapshot({ page: state.page, showDiffSinceLastCall: true })
-// Now use the NEW locators from this output
+// Unreliable: a clipboard paste may silently fail (the field needs focus first) — read the report after it
+await state.page.keyboard.press('Meta+v')
 ```
+
+**3. Acting on a ref from an old observation**
+A ref stays bound to its element for the life of its document; a navigation retires it, and an element the app re-rendered gets a new one. `act.*` refuses a stale ref, or one whose element now reads differently, and says why — observe again and decide again:
+
+```js
+await observe()   // fresh refs; * marks what is new since your last look
+```
+
+In debug mode the same goes for snapshot locators (especially ones with `>> nth=`): take a fresh `snapshot()` before using one.
 
 **4. Wrong assumptions about current page/element**
 Before destructive actions (delete, submit), verify you're targeting the right thing:
@@ -730,89 +733,80 @@ await observe()          // the Delete button's context names its row: (in listi
 await explain(ref)       // the request it sends, before you click
 ```
 
-**5. Text concatenation without line breaks**
-`keyboard.type()` doesn't insert newlines from `\n` in strings. Use `keyboard.press('Enter')` between lines:
+**5. Multi-line text**
+In a field that takes several lines, a line break is a key, and apps disagree on which: in a chat composer Enter sends the message and Shift+Enter starts a new line; in a plain text area or a code editor Enter starts a new line (and in a notebook Shift+Enter runs the cell). `act.type` / `act.fill` never guess: text with `\n` needs `{ newline: 'Shift+Enter' }` or `{ newline: 'Enter' }`, or `{ paste: true }`, which inserts it in one go as IME text (no key events, so nothing is sent; no paste event fires either). Without one of them the call is refused and nothing is typed. A newline in a single-line field is refused: there it is Enter, which submits the form.
 
 ```js
-await state.page.keyboard.type('Line 1')
-await state.page.keyboard.press('Enter')
-await state.page.keyboard.type('Line 2')
+await act.type(9, 'Line 1\nLine 2', { newline: 'Shift+Enter' })   // a chat composer: a bare Enter would send "Line 1"
 ```
 
-**6. Using screenshots when snapshots suffice**
-Screenshots + image analysis is expensive and slow. Only use screenshots for visual/CSS issues. Use snapshot for text checks:
+**6. Using screenshots when text suffices**
+Screenshots + image analysis is expensive and slow, and impossible without vision. Only use screenshots for visual/CSS issues. Use text for text checks:
 
 ```js
-await snapshot({ page: state.page, search: /expected text/i })
+await find('expected text')
 ```
 
 **7. Assuming page content loaded**
-Even after `goto()`, dynamic content may not be ready:
+The report after an action waits until the page settles (`SETTLED`), or says what it is still waiting for (`NOT SETTLED`, `BUSY`). For content that keeps arriving (an AI reply, search results), wait for it:
 
 ```js
-await state.page.goto('https://example.com')
-// Content may still be loading via JavaScript!
-await state.page.waitForSelector('article', { timeout: 10000 })
-// Or use waitForPageLoad utility
-await waitForPageLoad({ page: state.page, timeout: 5000 })
+await act.waitForIdle({ timeoutMs: 30000 })   // then read what changed in its report
 ```
+
+In debug mode `state.page.waitForSelector('article')` waits for one element.
 
 **8. Not using playwriter for JS-rendered sites**
 Do NOT waste context trying webfetch, curl, or Playwright CLI screenshots on SPAs (Instagram, Twitter, etc.). These return empty HTML shells. Use playwriter directly:
 
 ```js
+// A blank tab: its first load is free
 state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
 await state.page.goto('https://www.instagram.com/p/ABC123/', { waitUntil: 'domcontentloaded' })
 await waitForPageLoad({ page: state.page, timeout: 8000 })
-await snapshot({ page: state.page, search: /cookie|consent|accept/i }).then(console.log)
+await observe()
 ```
 
 **9. Login buttons that open popups**
-Popup windows (`window.open` with features, OAuth buttons) are auto-relocated to tabs in the main window by the Playwriter extension. The new tab appears in `context.pages()` and is fully controllable. You will receive a `[WARNING] New page opened from current page (index N, initial url: ...)` message pointing to the new tab — the `initial url` may be `about:blank` for blank-then-scripted popups, so check `context.pages()[N].url()` for the final URL:
+Popup windows (`window.open` with features, OAuth buttons) are moved into the main window as tabs by the Playwriter extension, and cookies are shared with the original page. The report of the click that opened one names it: `TAB a new tab opened by this page: "Sign in" https://accounts.example.com/… — act.switchTab(1) to work in it`:
 
 ```js
-await state.page.locator('button:has-text("Login with Google")').click()
-await state.page.waitForTimeout(1000)
-
-// New tab is the last page in the context
-const pages = context.pages()
-const loginPage = pages[pages.length - 1]
-
-// Complete login flow in loginPage, cookies are shared with original page
-await loginPage.locator('[data-email]').first().click()
-await loginPage.waitForURL('**/callback**')
-// Original page should now be authenticated
+await act.click(12)   // "Login with Google"
 ```
 
-**10. Click times out or does nothing — ask what is on top, don't guess**
-When a click times out, a **modal or overlay** is likely intercepting pointer events. Do not retry with different selectors or `{ force: true }` — name the blocker:
+```js
+await act.switchTab(1)   // then observe() and act on the login tab's refs
+```
+
+In debug mode the new tab is also the last of `context.pages()`, and a `[WARNING] New page opened from current page (index N, initial url: …)` line names it (`initial url` may be `about:blank` for a popup the page fills in by script).
+
+**10. Click refused or does nothing — ask what is on top, don't guess**
+`act.click` hit-tests before it clicks and refuses when something covers the target, naming the cover. When a click did nothing, do not retry with other selectors or force it — name the blocker:
 
 ```js
-// click timed out → whyOccluded names the covering nodes AND hit-tests the box centre
-const why = await whyOccluded({ locator: state.page.locator('button:has-text("Submit")') })
-console.log(why.text)
-// why.hitTest.label is what a click actually lands on; why.occludedByLabels is the inference
-await snapshot({ page: state.page, search: /dialog|modal/i })  // then interact with the blocker properly
-await state.page.getByRole('radio', { name: 'Nope, Vanilla' }).click()
+// whyOccluded names the covering nodes AND hit-tests the box centre
+const why = await whyOccluded({ ref: 12 })
+console.log(why.text)   // why.hitTest.label is what a click actually lands on
+await observe()         // a MODAL / DIALOG line names the blocker: deal with it the way a person would
 ```
 
 **11. Never use `dispatchEvent` or `{ force: true }` to bypass blockers**
-`dispatchEvent(new MouseEvent(...))`, `{ force: true }`, and `element.click()` inside `page.evaluate()` bypass Playwright checks but **do not trigger React/Vue/Svelte handlers** — state won't update. Use snapshot to find the real interactive element:
+Synthetic events and forced clicks skip what a real click goes through, and often do not trigger React/Vue/Svelte handlers — state won't update. Human mode refuses them. Click the real control:
 
 ```js
-await state.page.getByRole('radio', { name: 'Node.js' }).click()
+await act.click(14)   // the radio "Node.js" from observe()
 ```
 
 **12. Over-investigating instead of just interacting**
-When something doesn't respond to a click, do NOT start hand-walking CDP event listeners, reading canvas pixel data, or writing `page.evaluate()` to dump class names and bounding boxes. That wastes massive context. (If the question genuinely is "what props did React render here", use `fiberSnapshot({ locator })` or a `pm.anchor` handle's `reactFiber()` — those are cheap and token-capped. What is wasteful is reconstructing them by hand.) Instead:
+When something doesn't respond to a click, do NOT start hand-walking CDP event listeners, reading canvas pixel data, or writing page functions to dump class names and bounding boxes. That wastes massive context. (If the question genuinely is "what props did React render here", use `fiberSnapshot({ ref })` or a `pm.anchor` handle's `reactFiber()` — those are cheap and token-capped. What is wasteful is reconstructing them by hand.) Instead:
 
-1. Take a `snapshot()` — it shows every interactive element and what to click
-2. Try a different interaction pattern if `click()` didn't work:
-   - **Drawing/annotation tools, canvas paint** → `mouse.down`, move with steps, `mouse.up` (see drag section)
-   - **Keyboard-activated modes** → press the shortcut key (snapshot shows tooltip text like "Draw mode D")
-   - **Sliders, timeline scrubbers** → drag pattern
-   - **Collapsed/toggled toolbars** → click the toggle first, wait, then interact
-3. Take another `snapshot()` to see what changed
+1. `observe()` — it shows every control with its ref, its state and what covers it; `explain(ref)` says what one is wired to
+2. Try a different interaction pattern if a click didn't work:
+   - **Drawing/annotation tools, canvas paint** → a held-button drag (see the drag section)
+   - **Keyboard-activated modes** → press the shortcut key (`act.press('d')`; the control's description often names it, like "Draw mode D")
+   - **Sliders, timeline scrubbers** → `act.fill(sliderRef, '40')`, or a drag
+   - **Collapsed/toggled toolbars** → click the toggle first, then `observe()` again
+3. `observe()` again to see what changed
 4. Only investigate DOM internals if correct interaction patterns produce zero response after 2–3 attempts
 
 **13. Asserting about CSS, React, or source code instead of running the tool that knows**
@@ -848,24 +842,25 @@ Example output:
     - link "Blog" role=link[name="Blog"]
 ```
 
-Each interactive line ends with a Playwright locator you can pass to `state.page.locator()`.
+Each interactive line ends with a Playwright locator you can pass to `state.page.locator()` in debug mode (human mode refuses locators — act on the refs `observe()` prints).
 If multiple elements share the same locator, a `>> nth=N` suffix is added (0-based)
 to make it unique.
 
-**Use snapshot locators directly — never invent selectors.** The snapshot output IS the selector. Do not guess CSS selectors or `getByText` when the snapshot already gives you the exact match:
+**Debug mode: use snapshot locators directly — never invent selectors.** The snapshot output IS the selector. Do not guess CSS selectors or `getByText` when the snapshot already gives you the exact match:
 
 ```js
-// Snapshot shows: role=radio[name="Nope, Vanilla"]  →  use it directly
+// Debug mode. Snapshot shows: role=radio[name="Nope, Vanilla"]  →  use it directly
 await state.page.getByRole('radio', { name: 'Nope, Vanilla' }).click()
 // Snapshot shows: role=link[name="SIGN IN"]  →  or pass raw string to locator()
 await state.page.locator('role=link[name="SIGN IN"]').click()
 ```
 
-**Beware CSS text-transform**: snapshots show visual text (`heading "NODE.JS"`) but DOM may be `"Node.js"`. Use case-insensitive regex: `getByRole('heading', { name: /node\.js/i })`.
+**Beware CSS text-transform**: snapshots show visual text (`heading "NODE.JS"`) but DOM may be `"Node.js"`. In a debug-mode locator use a case-insensitive regex: `getByRole('heading', { name: /node\.js/i })`; `find('node.js')` is case-insensitive already.
 
 Debug mode: if a screenshot shows snapshot ref labels like `e3`, resolve them to locators using the last snapshot (human mode refuses locators — act on the refs `observe()` prints):
 
 ```js
+// Debug mode
 const snap = await snapshot({ page: state.page })
 const locator = refToLocator({ ref: 'e3', page: state.page })
 if (!locator) throw new Error('ref e3 is not in the last snapshot for this page')
@@ -904,6 +899,8 @@ Use `snapshot` for text-heavy pages (forms, articles) — fast, cheap, searchabl
 
 ## selector best practices
 
+**Debug mode.** In human mode you act on refs from `observe()` / `find()` and never write a selector; this section is for debug-mode scripts.
+
 **For unknown websites**: use `snapshot()` - it shows what's actually interactive with stable locators. `pm.query({ page: state.page, select: 'Interactive' })` emits those same locators as data rows, so you can filter them in JS instead of eyeballing the tree.
 
 **For development** (when you have source code access), prefer stable selectors in this order:
@@ -918,13 +915,15 @@ Use `snapshot` for text-heavy pages (forms, articles) — fast, cheap, searchabl
 Combine locators for precision:
 
 ```js
-state.page.locator('tr').filter({ hasText: 'John' }).locator('button').click()
-state.page.locator('button').nth(2).click()
+// Debug mode
+await state.page.locator('tr').filter({ hasText: 'John' }).locator('button').click()
+await state.page.locator('button').nth(2).click()
 ```
 
 If a locator matches multiple elements, Playwright throws "strict mode violation". Use `.first()`, `.last()`, or `.nth(n)`:
 
 ```js
+// Debug mode
 await state.page.locator('button').first().click() // first match
 await state.page.locator('.item').last().click() // last match
 await state.page.locator('li').nth(3).click() // 4th item (0-indexed)
@@ -947,13 +946,14 @@ await state.page.goto('https://example.com')
 
 **Handle page closures gracefully:**
 
-The user may close your page by accident (e.g., closing a tab in Chrome). Always check before using it and recreate if needed:
+The user may close your page by accident (e.g., closing a tab in Chrome). Check before using it, and take a blank tab if it is gone — its first load is free:
 
 ```js
+// A blank tab when yours was closed
 if (!state.page || state.page.isClosed()) {
   state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
+  await state.page.goto('https://example.com')
 }
-await state.page.goto('https://example.com')
 ```
 
 **Use an existing page only when the user asks:**
@@ -988,9 +988,10 @@ await state.page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
 
 ## common patterns
 
-**Authenticated fetches** - fetch from within page context to include session cookies automatically:
+**Authenticated fetches** (debug mode: human mode refuses calling the backend from page code — `net.requests()` / `net.request(id)` give the body of any request the page itself made) - fetch from within page context to include session cookies automatically:
 
 ```js
+// Debug mode
 const data = await state.page.evaluate(async (url) => {
   const resp = await fetch(url)
   return await resp.text()
@@ -1009,9 +1010,10 @@ MUST use this for page-scoped cookies in extension mode. `Storage.getCookies` is
 
 **NEVER use `Network.clearBrowserCookies` or `Network.clearBrowserCache`** — these CDP commands are **profile-wide destructive operations** that wipe ALL cookies/cache across every domain in the user's Chrome profile. They will log the user out of Gmail, GitHub, and every authenticated session.
 
-**Clear cookies for a specific domain** — use `Network.getCookies` to fetch cookies scoped to URLs, then delete them individually with `Network.deleteCookies`:
+**Clear cookies for a specific domain** (debug mode: it changes the browser's state, and human mode's CDP session only reads) — use `Network.getCookies` to fetch cookies scoped to URLs, then delete them individually with `Network.deleteCookies`:
 
 ```js
+// Debug mode
 const cdp = await getCDPSession({ page: state.page })
 const { cookies } = await cdp.send('Network.getCookies', {
   urls: ['https://example.com', 'https://www.example.com'],
@@ -1021,10 +1023,10 @@ for (const cookie of cookies) {
 }
 ```
 
-**Downloading large data** - console output truncates large strings. Trigger a browser download instead:
+**Downloading large data** (debug mode: it fetches from page code and adds an element to the page) - console output truncates large strings. Trigger a browser download instead:
 
 ```js
-// Fetch protected data and trigger download to user's Downloads folder
+// Debug mode: fetch protected data and trigger a download to the user's Downloads folder
 await state.page.evaluate(async (url) => {
   const resp = await fetch(url)
   const data = await resp.text()
@@ -1046,60 +1048,59 @@ await state.page.evaluate(async (url) => {
 
 Instead, use simpler alternatives (single download via `a.click()`, store data in `state`, etc).
 
-**Downloads** - capture and save:
+**Downloads** - a download a click starts, in this tab or in a popup it opened, appears in the action report with an id and the call that saves it: `DOWNLOAD [d1] report.csv from <url> — completed → downloads.save('d1', 'report.csv') …`. Save it, then read it:
 
 ```js
+const saved = await downloads.save('d1', 'report.csv')   // { id, file, path, bytes }
+const text = require('node:fs').readFileSync(saved.path, 'utf8')
+```
+
+The path is resolved from the session folder and must stay where the sandbox `fs` may write (the session folder, `/tmp`, the OS temp folder). A download still running is waited for within the call; if it does not finish, the error says so — call `downloads.save` again later. A failed download has no file and cannot be saved. `downloads.list()` lists every download of the session with its state (`downloading`, `completed`, `failed`, `unknown`). `downloads.save` copies the file when it is on this machine: headless sessions, direct-CDP sessions to a Chrome running here, and extension sessions (the user's Chrome with the relay on this machine: Chrome saves the file where its settings say, the extension finds it, and the relay hands each session its own copy). When it cannot, the `DOWNLOAD` line says why and `downloads.save` refuses with that reason (`downloads.list()` shows it as `cannotCopy`): a cloud browser or a browser on another machine saved it there; Chrome is waiting for the user to choose where to save it (its "Ask where to save each file" setting): ask the user to pick a place, then save again; or the extension could not match the download.
+
+```js
+// Debug mode: catch one yourself (download.saveAs has the same reach as downloads.save)
 const [download] = await Promise.all([state.page.waitForEvent('download'), state.page.click('button.download')])
 await download.saveAs(`/absolute/path/${download.suggestedFilename()}`)
 ```
 
-**iFrames** - two approaches depending on what you need:
+**iFrames** - `observe()` lists what is inside each iframe (cross-site ones too) under its `[n] iframe "title"` line, with refs: act on them like any other ref, and `readPage(fn, { ref })` runs in that ref's frame. For a snapshot of one frame, pass its `Frame` (from `page.frames()`):
 
 ```js
-// frameLocator: for chaining locator operations (click, fill, etc.)
+await act.fill(31, 'ana@example.com')   // a field inside the newsletter iframe, by its ref
+await snapshot({ frame: state.page.frames()[1] })
+```
+
+```js
+// Debug mode: frameLocator chains locator operations
 const frame = state.page.frameLocator('#my-iframe')
 await frame.locator('button').click()
-
-// contentFrame: returns a Frame object, needed for snapshot({ frame })
-const frame2 = await state.page.locator('iframe').contentFrame()
-await snapshot({ frame: frame2 })
 ```
 
-**Dialogs** - handle alerts/confirms/prompts:
+**Dialogs** - a `confirm()` / `prompt()` / `beforeunload` blocks the page until it is answered: the report says `DIALOG … is OPEN`, and `observe()` puts it first. Answer it like a person — `act.dialog.accept()` (with the text for a prompt) or `act.dialog.dismiss()`. Alerts are accepted automatically and reported.
 
 ```js
-state.page.on('dialog', async (dialog) => {
-  console.log(dialog.message())
-  await dialog.accept()
-})
-await state.page.click('button.trigger-alert')
+await act.dialog.accept()
 ```
 
-**Handling page obstacles (cookie modals, login walls, age gates)** - most major websites show blocking overlays. Always check for these with `snapshot()` right after navigation and dismiss them before doing anything else:
+**Handling page obstacles (cookie modals, login walls, age gates)** - most major websites show blocking overlays. `observe()` puts a modal first, with its controls under it, and marks a control behind an overlay `partly covered by …`; deal with the overlay first, the way a person would:
 
 ```js
-// After navigating, check for common obstacles
-await waitForPageLoad({ page: state.page, timeout: 5000 })
-const snap = await snapshot({
-  page: state.page,
-  search: /cookie|consent|accept|reject|decline|allow|age|verify|login|sign.in/i,
-})
-console.log(snap)
-// Look for dismiss/accept/decline buttons in the snapshot, then click them:
-// await state.page.locator('button:has-text("Accept")').click();
-// await state.page.locator('button:has-text("Decline optional")').click();
-// Then re-snapshot to confirm the modal is gone before proceeding
+await observe()
+// MODAL dialog "We use cookies" [13] — only its controls work right now:
+//   [14] button "Accept all"
+//   [15] button "Reject optional"
+```
+
+```js
+await act.click(15)   // then observe() again: the MODAL line is gone
 ```
 
 If the page requires login and the user is already logged into Chrome, their session cookies are available — just navigate and the page should load authenticated. If not, ask the user for help or use their existing logged-in tab via `context.pages()`.
 
-**Extracting and downloading media (images, videos)** - use `page.evaluate()` to extract URLs from the rendered DOM, then download via Node.js in the sandbox. This is far more reliable than parsing raw HTML:
-
-`page.evaluate` is right here for one specific reason: `naturalWidth` (like `videoWidth` and `scrollHeight`) is a live media property the page model does not carry. Drop the size field and this becomes `pm.query({ page: state.page, roles: ['image'], fields: ['attributes.src', 'attributes.alt'] })` — if you are only pulling attributes, switch.
+**Extracting media (images, videos)** - read the URLs from the rendered page. `naturalWidth` (like `videoWidth` and `scrollHeight`) is a live media property the page model does not carry, so this is a page function; drop the size field and it becomes `pm.query({ page: state.page, roles: ['image'], fields: ['attributes.src', 'attributes.alt'] })`:
 
 ```js
-// Extract all image URLs from rendered DOM
-const images = await state.page.evaluate(() =>
+const images = await readPage(() =>
   Array.from(document.querySelectorAll('img[src]')).map((img) => ({
     src: img.src,
     alt: img.alt,
@@ -1107,8 +1108,12 @@ const images = await state.page.evaluate(() =>
   })),
 )
 console.log(JSON.stringify(images, null, 2))
+```
 
-// Download a specific image to disk
+The page loaded those images itself: `net.requests({ urlIncludes: images[0].src })` finds the request, and its body is the file. In debug mode the sandbox can also fetch it again:
+
+```js
+// Debug mode: download it again from Node (human mode refuses calling servers directly)
 const fs = require('node:fs')
 const resp = await fetch(images[0].src)
 const buf = Buffer.from(await resp.arrayBuffer())
@@ -1140,7 +1145,7 @@ const hydrationErrors = await getLatestLogs({ page: state.page, search: /hydrati
 
 ```js
 clearAllLogs()
-await state.page.click('button')
+await act.click(12)
 console.log(await getLatestLogs({ page: state.page, sinceLastCall: true }))  // just this action's logs
 ```
 
@@ -1153,7 +1158,7 @@ await getCleanHTML({ locator, search?, showDiffSinceLastCall?, includeStyles?, m
 // Examples:
 const form = await getCleanHTML({ ref: 12 })  // a ref from observe() or find()
 const html = await getCleanHTML({ locator: state.page.locator('body') })  // debug mode only
-const html = await getCleanHTML({ locator: state.page, search: /button/i })
+const buttons = await getCleanHTML({ locator: state.page, search: /button/i })
 const fullHtml = await getCleanHTML({ locator: state.page, showDiffSinceLastCall: false })  // disable diff
 const wide = await getCleanHTML({ locator: state.page, maxAttrLen: 500, maxContentLen: 2000 })
 ```
@@ -1162,7 +1167,7 @@ const wide = await getCleanHTML({ locator: state.page, maxAttrLen: 500, maxConte
 
 **The truncation is real and it is capped by default**: attribute values are cut at `maxAttrLen` (**200** chars) and text content at `maxContentLen` (**500**). A long `data-*` payload or a paragraph past those limits comes back cut, so raise them before concluding the page does not contain something.
 
-**getPageMarkdown** - what is on screen, as markdown: the main content when Mozilla Readability (Firefox Reader View's algorithm) finds an article, otherwise the whole visible page. Every result starts with its source: `source: article — N words (visible page: M words)` (M > N means there is on-screen content outside the article: nav, sidebars, other panels) or `source: visible page — M words (no article: <why>)`. Hidden content never appears: inactive tab panels, `display:none` templates and errors, closed `<details>` bodies, unslotted light DOM. Open shadow-DOM components (Lit, Shoelace, …) are read in flat-tree order, slotted content included; closed shadow roots are not readable from script and are not read. Iframes are read inline, in page order, under `[iframe "title"]` … `[end of iframe "title"]`; one that cannot be read says why. Headings stay headings, so you can read the outline first and then one section. It runs in a private world: nothing is added to the page.
+**getPageMarkdown** - what is on screen, as markdown: the main content when Mozilla Readability (Firefox Reader View's algorithm) finds an article, otherwise the whole visible page. Every result starts with its source: `source: article — N words (visible page: M words)` (M > N means there is on-screen content outside the article: nav, sidebars, other panels) or `source: visible page — M words (no article: <why>)`. Hidden content never appears: inactive tab panels, `display:none` templates and errors, closed `<details>` bodies, unslotted light DOM. Shadow-DOM components (Lit, Shoelace, …) are read in flat-tree order, slotted content included — closed shadow roots too, in iframes as well; the inside of form controls and media is not content. Iframes are read inline, in page order, under `[iframe "title"]` … `[end of iframe "title"]`; one that cannot be read says why. Headings stay headings, so you can read the outline first and then one section. It runs in a private world: nothing is added to the page.
 
 ```js
 await getPageMarkdown({ page: state.page, search?, outline?, filter?, showDiffSinceLastCall? })
@@ -1232,19 +1237,17 @@ const { ref } = await pickElement({ page: state.page })   // timeoutMs defaults 
 const btn = await getStylesForLocator({ ref: 12 })
 console.log(formatStylesAsText(btn))
 
-const styles = await getStylesForLocator({ locator: state.page.locator('.btn') })  // debug mode only
-console.log(formatStylesAsText(styles))
-
 // Include the browser's own default rules — off by default, and usually noise.
-const withDefaults = await getStylesForLocator({
-  locator: state.page.locator('input[type="text"]'),
-  includeUserAgentStyles: true,
-})
+const withDefaults = await getStylesForLocator({ ref: 7, includeUserAgentStyles: true })
 
-// Reuse a session you already have. Optional: one is opened for the locator's page
-// when you omit it, so passing it only saves a round-trip.
+// Reuse a session you already have. Optional: the element's own session is used when you omit it
+// (an out-of-process iframe's element is read in its frame's session).
 const cdp = await getCDPSession({ page: state.page })
-const again = await getStylesForLocator({ locator: state.page.locator('.btn'), cdp })
+const again = await getStylesForLocator({ ref: 12, cdp })
+
+// Debug mode only: by Playwright locator
+const styles = await getStylesForLocator({ locator: state.page.locator('.btn') })
+console.log(formatStylesAsText(styles))
 ```
 
 **createDebugger** - set breakpoints, step through code, inspect variables at runtime (debug mode: it drives the Debugger through `getCDPSession()`, which only reads in human mode). Useful for debugging issues that only reproduce in browser, understanding code flow, and inspecting state at specific points. Can pause on exceptions, evaluate expressions in scope, and blackbox framework code. ALWAYS fetch `https://playwriter.dev/resources/debugger-api.md` first. The Debugger is enabled once per page and never disabled, and the page's own `debugger;` statements do NOT pause it: pauses are allowed only while you have armed something meant to pause — `setBreakpoint` without a provably non-pausing condition, `setPauseOnExceptions({ state: 'uncaught' | 'all' })`, `setXHRBreakpoint`, or `pauseOnDebuggerStatements({ enabled: true })`. Removing it makes the page pause-free again. Logpoints never pause. A pause nobody asked for is resumed automatically and noted.
@@ -1288,7 +1291,7 @@ Labels are colour-coded by role (links, buttons, inputs, checkboxes, sliders, me
 
 **recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Requires user to have clicked the Playwriter extension icon on the tab. The viewport is left as it is: a fixed aspect is made afterwards (`ffmpeg -i in.mp4 -vf "pad=ceil(ih*16/9/2)*2:ih:(ow-iw)/2:0" out.mp4`); `aspectRatio: { width, height }` is an explicit opt-in that DOES perturb the page — it resizes the viewport (resize events, media queries), restores it on stop/cancel, and throws on a page with no emulated viewport. `recording.stop()` burns the pointer into the video from the inputs that were dispatched (nothing is added to the page) and returns `pointer: { drawn, samples, segments, pulses, note? }`; `pointer: false` at start turns it off, an object (`sizePx`, `fillColor`, `outlineColor`, `pulseColor`, `pulseMs`) styles it. It needs an ffmpeg with libass: left at the default without libass the pointer is skipped with a note, asked for explicitly it is an error; it is also not drawn (note, or error if explicit) when the video's shape does not match the viewport. Auto-stops after 15 min (override with `maxDurationMs`).
 
-For demos, act through the page (`act.*`, `locator.click()`) instead of `goto()`, so the recording shows the steps a person would take.
+For demos, act through the page (`act.*`) instead of `goto()`, so the recording shows the steps a person would take.
 
 ```js
 await recording.start({
@@ -1300,14 +1303,16 @@ await recording.start({
   // aspectRatio: { width: 16, height: 9 }, // opt-in: resizes the page's viewport while recording
   maxDurationMs: 15 * 60 * 1000, // default, set 0 to disable
 })
+```
 
-// Recording survives navigation
-await state.page.click('a')
-await state.page.waitForLoadState('domcontentloaded')
+```js
+// Then one action per call, as usual: the recording survives navigation
+await act.click(12)
+```
 
+```js
 // Stop — save full result including executionTimestamps for createDemoVideo
 state.recordingResult = await recording.stop({ page: state.page })
-
 // Other: recording.isRecording({ page }), recording.cancel({ page })
 ```
 
@@ -1346,17 +1351,25 @@ It never errors and never returns a stale frame; it simply *blocks*, for up to 2
 **recording.caption / recording.clearCaption** — narrate the clip so a human can follow a repro without you there. `caption(text)` stamps at call time and stays up until the next caption; `clearCaption()` blanks it. Burned into the pixels by default, because GitHub comments, Slack previews and bare `<video>` tags never show a soft subtitle track. Throws if no `startCdp` recording is running.
 
 ```js
+// Call 1: start, and the first beat
 await recording.startCdp({ outputPath: '/abs/path/cart-badge-bug.mp4', fps: 8 })
 recording.caption('1. Cart holds 3 items, badge reads 3')
-await state.page.goto('https://shop.test/cart')
 await recording.hold()                     // let the beat be readable — see pacing below
+```
+
+```js
+// Each next call: the caption, then the one action it narrates
 recording.caption('2. Remove every item')
-for (const b of await state.page.getByRole('button', { name: 'Remove' }).all()) await b.click()
+await act.click(31)                        // the first row's "Remove"; one call per row
 await recording.hold()
+```
+
+```js
+// Last call: the broken state, alone, long enough to see
 recording.caption('3. BUG: cart is empty, badge still reads 3')
 await recording.hold()
 recording.clearCaption()
-await recording.hold({ minMs: 3000 })      // the broken state, alone, long enough to see
+await recording.hold({ minMs: 3000 })
 const r = await recording.stopCdp()
 ```
 
@@ -1388,9 +1401,14 @@ await recording.startCdp({
   mode: 'screenshot',            // keeps chips on frames while typing — but it foregrounds the tab, see above
   inputOverlay: true,
 })
-await state.page.fill('#email', 'alice@example.com')   // chip: Fill ••••••
-await state.page.keyboard.press('Control+A')           // chip: Ctrl+A
-const r = await recording.stopCdp()                    // r.inputEvents[] in VIDEO time
+```
+
+```js
+await act.press('Control+A')    // chip: Ctrl+A (the next calls: one input each, each with its chip)
+```
+
+```js
+const r = await recording.stopCdp()   // r.inputEvents[] in VIDEO time
 ```
 
 - **Captures** every input this session drives through Playwright — `click`/`dblclick`/`hover`/`fill`/`type`/`press`/`check`/`selectOption`/`setInputFiles`/`focus` on `page`, `locator`, `frame` or `ElementHandle`, plus all of `page.keyboard.*` and `page.mouse.*`. A chip appears only when the action SUCCEEDS; one that timed out or threw gets none, because it never happened.
@@ -1537,6 +1555,7 @@ require('node:fs').writeFileSync('/absolute/path/to/shot.png', Buffer.from(data,
 In debug mode `page.screenshot()` works; always use `scale: 'css'` to avoid 2-4x larger images on high-DPI displays, and `caret: 'initial'` to keep it from styling the page:
 
 ```js
+// Debug mode
 await state.page.screenshot({ path: '/absolute/path/to/shot.png', scale: 'css', caret: 'initial' })
 ```
 
@@ -1597,7 +1616,7 @@ await state.page.locator('textarea').fill(content)         // debug mode only
 
 ## network interception
 
-**Observing is always allowed; faking is not (human mode).** Every request the page makes is already journaled: `await net.requests({ urlIncludes: '/api/' })` lists them (method, url, status, timing, `r…` id) and `await net.request('r12')` returns one response body. Listeners like the ones below also only observe. What human mode refuses is changing traffic — `page.route`, `fulfill`, `net.delay`, `routeWebSocket` — because a bug "reproduced" through faked responses is not one a user can hit; those need a debug session (`--policy debug`). For scraping or reverse-engineering APIs, listening beats scrolling the DOM. Store results in `state` to analyze across calls:
+**Observing is always allowed; faking is not (human mode).** Every request the page makes is already journaled: `await net.requests({ urlIncludes: '/api/' })` lists them (method, url, status, timing, `r…` id), `await net.request('r12')` returns one response body (cut at 64K characters, with `truncated` set), and `await net.save('r12', 'file.png')` writes the whole body to a file — decoded to bytes, under the same folder rules as `downloads.save`; it returns `{ id, path, bytes, status, mimeType }`, and a redirect, a failed request or a body Chrome dropped gets the same reason `net.request` gives. Listeners like the ones below also only observe. What human mode refuses is changing traffic — `page.route`, `fulfill`, `net.delay`, `routeWebSocket` — because a bug "reproduced" through faked responses is not one a user can hit; those need a debug session (`--policy debug`). For scraping or reverse-engineering APIs, listening beats scrolling the DOM. Store results in `state` to analyze across calls:
 
 ```js
 state.requests = []
@@ -1631,6 +1650,7 @@ console.log(JSON.stringify(resp.body, null, 2).slice(0, 2000))
 Replay API directly (useful for pagination) — debug mode only: human mode refuses calling the backend from page code:
 
 ```js
+// Debug mode
 const { url, headers } = state.requests.find((r) => r.url.includes('feed'))
 const data = await state.page.evaluate(
   async ({ url, headers }) => {
@@ -1646,12 +1666,17 @@ Clean up listeners when done: `state.page.removeAllListeners('request'); state.p
 
 ## computer use (low-level mouse/keyboard)
 
-In human mode act on refs — `act.click(ref)`, `act.hover(ref)`, `act.scrollTo(ref)` / `act.scroll('down', { ref })`, `act.drag(from, to)` — and use the raw `page.mouse` / `page.keyboard` calls below only where there is no element to name (a canvas, a map, a drawn stroke); they run in both modes and are reported as raw Playwright. The locator forms (`locator.click()`, `.hover()`, `.dragTo()`, `.scrollIntoViewIfNeeded()`, `locator.evaluate`), `setViewportSize` and `page.screenshot` run Playwright's script in the page or force a state, so they are debug mode only.
+In human mode act on refs — `act.click(ref)`, `act.hover(ref)`, `act.scrollTo(ref)` / `act.scroll('down', { ref })`, `act.drag(from, to)` — and use the raw `page.mouse` / `page.keyboard` calls below only where there is no element to name (a canvas, a map, a drawn stroke), one input per call; they run in both modes and are reported as raw Playwright. The locator forms (`locator.click()`, `.hover()`, `.dragTo()`, `.scrollIntoViewIfNeeded()`, `locator.evaluate`), `setViewportSize` and `page.screenshot` run Playwright's script in the page or force a state, so they are debug mode only.
 
 ### clicking
 
 ```js
-// Debug mode: by locator (stable, auto-waits, no coordinates needed)
+// By coordinates, one per call (when there is no element to name, e.g. canvas, maps, custom widgets)
+await state.page.mouse.click(450, 320) // left click; { button: 'right' }, { clickCount: 3 }, { modifiers: ['Shift'] } as needed
+```
+
+```js
+// Debug mode: by locator (stable, auto-waits, no coordinates needed), or several clicks in one call
 await state.page.locator('button[name="Submit"]').click()
 await state.page.locator('text=Login').click({ button: 'right' })
 await state.page.locator('text=Login').dblclick()
@@ -1659,39 +1684,31 @@ await state.page
   .locator('a')
   .first()
   .click({ modifiers: ['Meta'] }) // cmd+click opens link in new background tab
-
-// By coordinates, any mode (when there is no element to name, e.g. canvas, maps, custom widgets)
-await state.page.mouse.click(450, 320) // left click
-await state.page.mouse.click(450, 320, { button: 'right' }) // right click
 await state.page.mouse.dblclick(450, 320) // double click
-await state.page.mouse.click(450, 320, { clickCount: 3 }) // triple click
-await state.page.mouse.click(450, 320, { modifiers: ['Shift'] }) // shift+click
 ```
 
 ### hover
 
 ```js
-await state.page.locator('.tooltip-trigger').hover() // by locator (debug mode)
 await state.page.mouse.move(450, 320) // by coordinates
+```
+
+```js
+await state.page.locator('.tooltip-trigger').hover() // by locator (debug mode)
 ```
 
 ### scroll
 
 ```js
-// By locator (debug mode)
+// By pixel, one wheel turn per call (for canvas, maps, infinite scroll); over an element, act.scroll('down', { ref }) aims for you
+await state.page.mouse.wheel(0, 300) // down 300px; (0, -300) up, (300, 0) right, (-300, 0) left
+```
+
+```js
+// Debug mode: by locator, at a position, or from page code
 await state.page.locator('#footer').scrollIntoViewIfNeeded()
-
-// By pixel (for canvas, maps, infinite scroll)
-await state.page.mouse.wheel(0, 300) // scroll down 300px
-await state.page.mouse.wheel(0, -300) // scroll up
-await state.page.mouse.wheel(300, 0) // scroll right
-await state.page.mouse.wheel(-300, 0) // scroll left
-
-// Scroll at a specific position
 await state.page.mouse.move(450, 320)
 await state.page.mouse.wheel(0, 500)
-
-// Scroll inside a container (debug mode: it writes scrollTop from page code)
 await state.page.locator('.scrollable-list').evaluate((el) => {
   el.scrollTop += 500
 })
@@ -1700,20 +1717,32 @@ await state.page.locator('.scrollable-list').evaluate((el) => {
 ### drag
 
 ```js
-// By locator (debug mode)
-await state.page.locator('#item').dragTo(state.page.locator('#target'))
+await act.drag(12, 18)   // from the element of [12] onto [18], with a held button and a person's path
+```
 
-// By coordinates (for canvas, sliders, custom drag targets)
+```js
+await act.drag(31, { ref: 30, x: 300, y: 12 })   // custom slider: thumb [31] onto 75% of its 400px track [30]
+```
+
+```js
+// Debug mode: by locator, or by coordinates (several inputs in one call)
+await state.page.locator('#item').dragTo(state.page.locator('#target'))
 await state.page.mouse.move(100, 200)
 await state.page.mouse.down()
 await state.page.mouse.move(400, 500, { steps: 10 }) // steps for smooth drag
 await state.page.mouse.up()
 ```
 
-**Freehand drawing, annotation widgets, and canvas tools** use this same `mouse.down → move → up` pattern. If a widget expects a drawn stroke (paint tools, annotation overlays, range sliders, timeline scrubbers), always use held-mouse motion — not `mouse.click()`:
+**Freehand drawing, annotation widgets, and canvas tools** need a held-button stroke, not a click. In human mode a stroke is one action — `act.drag` between two points of the element, each a ref with an `x`/`y` offset into its box:
 
 ```js
-// Draw a stroke across a canvas or annotation layer
+await act.drag({ ref: 40, x: 20, y: 30 }, { ref: 40, x: 260, y: 140 })   // a stroke across canvas [40]
+```
+
+x/y are CSS px from the top-left of the element's border box as laid out, x from 0 up to, not including, the width and y from 0 up to, not including, the height (the far edges are outside it; for a slider's maximum use `x: width - 1`); rotated, scaled and perspective-tilted elements are mapped through their transform. An offset outside that range is refused and the refusal gives the box size. Both points are hit-tested; the from-point is wheeled into view first (a point by the page edge or at the end of a list needs no scrolling), the to-point must already be visible.
+
+```js
+// Debug mode: the raw stroke, several inputs in one call
 await state.page.mouse.move(startX, startY)
 await state.page.mouse.down()
 await state.page.mouse.move(endX, endY, { steps: 15 }) // steps = smoother stroke
@@ -1724,18 +1753,22 @@ await state.page.waitForTimeout(500) // let the widget process the stroke
 ### key hold / release / repeat
 
 ```js
-// Hold modifier while pressing another key
+// Hold a modifier while pressing another key: one chord, one action
+await act.press('Shift+ArrowDown')
+```
+
+```js
+// Debug mode: hold and release as separate inputs, or repeat a key in a loop
 await state.page.keyboard.down('Shift')
 await state.page.keyboard.press('ArrowDown')
 await state.page.keyboard.up('Shift')
-
-// Repeat a key
 for (let i = 0; i < 5; i++) await state.page.keyboard.press('ArrowDown')
 ```
 
 ### resize viewport (debug mode)
 
 ```js
+// Debug mode
 await state.page.setViewportSize({ width: 1280, height: 720 })
 ```
 

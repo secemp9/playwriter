@@ -52,6 +52,10 @@ After the user picks an element with one of the context-menu items, the extensio
 
 The offscreen document hosts tab recording (`MediaRecorder` for `chrome.tabCapture`) and the clipboard copy described above.
 
+### downloads
+
+When an automated tab (one the user connected) downloads a file, the automation script needs that file. The debugger connection reports the download but not where Chrome saved it, and an extension's debugger cannot choose where Chrome saves it. The extension reads only the download items matching a connected tab's download (same URL, started at that moment) with `chrome.downloads.search`, takes the saved file's path once Chrome finishes it, and passes that path to the local Playwriter relay, which puts a copy where the script reads it. It also tells the relay when Chrome is waiting for the user to choose where to save such a file. It does not start, pause, cancel, open, rename or delete downloads, and reads nothing for downloads of tabs the user did not connect.
+
 ### host_permissions (<all_urls>)
 
 Required to attach the debugger to tabs on any domain the user chooses to automate. This permission does not allow the extension to modify page content or inject scripts - it only enables CDP debugger attachment for automation. Users need this flexibility to test and automate workflows across all websites.

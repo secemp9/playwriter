@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8">
+<title>Wide page — right to left</title>
+<style>
+  /* dir="rtl" only on <body>: Blink gives the viewport <body>'s direction, so the page's own
+     sideways scrolling starts at its right edge (scrollLeft 0, negative leftwards) although <html>
+     is left-to-right. overflow-y: scroll on <body> makes its overflow-x compute to auto; with
+     <html>'s overflow visible, that overflow is the viewport's, and <body> is no scroll area. */
+  body { margin: 0; font: 14px sans-serif; overflow-y: scroll; }
+  .strip { width: 3000px; display: flex; gap: 8px; }
+  .strip a { flex: 0 0 280px; height: 80px; border: 1px solid #999; }
+</style>
+</head>
+<body dir="rtl">
+<h1>Wide page</h1>
+<div class="strip" id="strip"></div>
+<script>
+  const strip = document.getElementById('strip')
+  for (let n = 1; n <= 10; n++) {
+    const link = document.createElement('a')
+    link.href = '#item-' + n
+    link.textContent = 'Item ' + n
+    strip.append(link)
+  }
+</script>
+</body>
+</html>

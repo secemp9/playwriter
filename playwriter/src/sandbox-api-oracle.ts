@@ -71,6 +71,8 @@ const PAGE_REALM_CALLS = new Set([
   'waitForFunction',
   'addInitScript',
   'evaluateAll',
+  // readPage(fn) — the page function of human mode
+  'readPage',
 ])
 
 /**
@@ -181,7 +183,8 @@ function collectCalls(program: Node, api: DocumentedApi): void {
     if (n.type === 'CallExpression' || n.type === 'OptionalCallExpression') {
       const callee = n.callee
       const isMember = callee?.type === 'MemberExpression' || callee?.type === 'OptionalMemberExpression'
-      const entersPageRealm = isMember && !callee.computed && PAGE_REALM_CALLS.has(callee.property?.name)
+      const entersPageRealm =
+        (isMember && !callee.computed && PAGE_REALM_CALLS.has(callee.property?.name)) || (callee?.type === 'Identifier' && PAGE_REALM_CALLS.has(callee.name))
 
       if (!inPageRealm) {
         if (callee?.type === 'Identifier' && !bound.has(callee.name)) {

@@ -38,15 +38,28 @@ export class ScopedFS {
   }
 
   /**
+   * `filePath` resolved the way every method here resolves it (a relative path from the session
+   * cwd, `..` collapsed), or null when that falls outside the allowed directories. `downloads.save`
+   * and `net.save` check their target with this before anything is written, so they write where
+   * this fs may write and nowhere else.
+   */
+  resolveAllowed(filePath: string): string | null {
+    const resolved = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(this.baseDir, filePath)
+    return this.isPathAllowed(resolved) ? resolved : null
+  }
+
+  /** The directories this fs may touch, for messages that say where a path may go. */
+  allowedDirectories(): readonly string[] {
+    return this.allowedDirs
+  }
+
+  /**
    * Resolve a path and ensure it stays within allowed directories.
    * Throws EPERM if the resolved path escapes the sandbox.
    */
   private resolvePath(filePath: string): string {
-    // If it's an absolute path, use it directly
-    // If it's relative, resolve from the session cwd captured when the sandbox was created.
-    const resolved = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(this.baseDir, filePath)
-
-    if (!this.isPathAllowed(resolved)) {
+    const resolved = this.resolveAllowed(filePath)
+    if (resolved === null) {
       const error = new Error(
         `EPERM: operation not permitted, access outside allowed directories: ${filePath}`,
       ) as NodeJS.ErrnoException

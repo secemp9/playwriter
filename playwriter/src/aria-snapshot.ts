@@ -1181,6 +1181,19 @@ export async function getAriaSnapshot({
     axById.set(node.nodeId, node)
   }
 
+  // An open page popup — Chrome's colour chooser, date picker or `<select>` list, drawn by the
+  // browser — is in the accessibility tree as a child of the `<input>`/`<select>` that opened it
+  // (AXNodeObject::AddPopupChildren): the root of the popup's own document, which is no node of
+  // this page's DOM. Its controls are not the page's and take no page input, so they are left out.
+  for (const node of axNodes) {
+    const owner = node.backendDOMNodeId !== undefined ? domByBackendId.get(node.backendDOMNodeId) : undefined
+    if (!node.childIds || (owner?.nodeName !== 'INPUT' && owner?.nodeName !== 'SELECT')) continue
+    node.childIds = node.childIds.filter((childId) => {
+      const child = axById.get(childId)
+      return child?.backendDOMNodeId === undefined || domByBackendId.has(child.backendDOMNodeId)
+    })
+  }
+
   // Index AX nodes by backendDOMNodeId for O(1) lookups during promotion
   // and root finding (instead of repeated O(n) axNodes.find() calls)
   const axByBackendId = new Map<Protocol.DOM.BackendNodeId, Protocol.Accessibility.AXNode>()

@@ -21,6 +21,7 @@ import type { ICDPSession } from './cdp-session.js'
 import { PageFrames } from './page-frames.js'
 import { PageWatch, type WatchDialogs } from './page-watch.js'
 import type { JsDialogState } from './probe-types.js'
+import type { TappedWorker } from './session-tap.js'
 
 const MAIN = 'MAIN_FRAME'
 /** The execution context of the isolated world PageFrames creates on the main frame. */
@@ -57,17 +58,38 @@ function fakeDialogs() {
   }
 }
 
-function setup(options: { closed?: () => boolean } = {}) {
+/**
+ * `browserAheadMs`: how far the browser's clock (the isolated world's `Date.now()`, Chrome's
+ * `wallTime`) is ahead of this process's — a browser on another machine. The journal is read in
+ * timed round trips, as against a real browser; every stamp it hands out is on the browser's clock.
+ * `ticker`: an element changes its content every 50ms from setup on — the in-page journal's churn
+ * rule (three changes, each within 2s of the last) makes it ambient for a cutoff after its third.
+ */
+function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticker?: boolean } = {}) {
   const emitter = new EventEmitter()
   const probes: string[] = []
-  // The isolated world's journal: empty, installed long ago.
+  const browserNow = (): number => Date.now() + (options.browserAheadMs ?? 0)
+  const tickerFrom = browserNow()
+  /** Live text the page showed, stamped by the page. */
+  const live: Array<{ id: number; at: number; updatedAt: number | null; role: string; text: string; transient: boolean }> = []
+  // The isolated world's journal: installed long ago, no mutations but the ticker's, the live text above.
   const journal = (expression: string): unknown => {
     probes.push(expression)
-    const now = Date.now()
-    if (expression.includes('.read(')) return { ok: true, value: { token: 'doc', now, live: [], batches: [], droppedAt: null, liveDroppedAt: null } }
-    if (expression.includes('.busy(')) return { ok: true, value: { streaming: null, announced: [], spinners: { set: 1, list: [] } } }
-    if (expression.includes('.sweep(')) return { ok: true, value: 'doc' }
-    return { ok: true, value: { token: 'doc', now, installedAt: now - 10000, lastContentAt: null, hot: null, ambient: [], content: 0, cosmetic: 0 } }
+    const now = browserNow()
+    if (expression === 'Date.now()') return now
+    const read = /\.read\((-?[\d.e+]+)\)/.exec(expression)
+    if (read) {
+      const from = Number(read[1])
+      return { now, ok: true, value: { token: 'doc', now, live: live.filter((rec) => rec.at >= from), batches: [], droppedAt: null, liveDroppedAt: null } }
+    }
+    if (expression.includes('.busy(')) return { now, ok: true, value: { streaming: null, announced: [], spinners: { set: 1, list: [] } } }
+    if (expression.includes('.sweep(')) return { now, ok: true, value: 'doc' }
+    const state = /\.state\((\{.*\})\)/.exec(expression)
+    const cutoff: unknown = state ? JSON.parse(state[1]!).cutoff : null
+    const churningBefore = typeof cutoff === 'number' && tickerFrom + 100 < cutoff
+    const lastTick = now - ((now - tickerFrom) % 50)
+    const lastContentAt = options.ticker && !churningBefore ? lastTick : null
+    return { now, ok: true, value: { token: 'doc', now, installedAt: now - 10000, lastContentAt, hot: null, ambient: [], content: 0, cosmetic: 0 } }
   }
   // Contexts that existed before start() are identified through their `document`: every context
   // here shows the one main document; the main world's object is `doc-main`, context 3 is that
@@ -116,13 +138,45 @@ function setup(options: { closed?: () => boolean } = {}) {
   const page = { mainFrame: () => mainFrame, frames: () => [mainFrame, childFrame], on: () => {}, off: () => {} } as unknown as Page
   const errors: unknown[][] = []
   const fake = fakeDialogs()
+  // A dedicated worker the page runs, handed over at start as the tap does. Its session is a stand-in
+  // that records every command sent to it.
+  const workerEvents = new EventEmitter()
+  const workerCommands: string[] = []
+  const worker: TappedWorker = {
+    url: 'http://app.test/parser.js',
+    session: {
+      on(event, listener) {
+        workerEvents.on(event, listener)
+      },
+      off(event, listener) {
+        workerEvents.off(event, listener)
+      },
+      start() {},
+      onClose() {},
+    },
+    cdp: {
+      send: async (method: string) => {
+        workerCommands.push(method)
+        return method === 'Network.getResponseBody' ? { body: 'held by the worker session', base64Encoded: false } : {}
+      },
+      on: () => {},
+      off: () => {},
+      detach: async () => {},
+    } as unknown as ICDPSession,
+  }
   const watch = new PageWatch({
     frames: new PageFrames({ page, cdp }),
     dialogs: fake.dialogs,
     isClosed: options.closed,
     logger: { error: (...args: unknown[]) => errors.push(args) },
+    // No out-of-process iframes in this stand-in page; one worker.
+    openSessionTap: (onWorker) => {
+      onWorker(worker)
+      return { session: () => null, discard: () => {}, dispose: () => {} }
+    },
   })
   watch.start()
+  const emitWorker = (event: string, params: unknown) => workerEvents.emit(event, params, Date.now())
   const emit = (event: string, params: unknown) => emitter.emit(event, params)
   let n = 0
   const request = (url: string, type: string | null = 'Fetch', method = 'GET', extra: Record<string, unknown> = {}) => {
@@ -130,7 +184,7 @@ function setup(options: { closed?: () => boolean } = {}) {
     emit('Network.requestWillBeSent', {
       requestId,
       loaderId: 'LOADER_0',
-      wallTime: Date.now() / 1000,
+      wallTime: browserNow() / 1000,
       ...(type ? { type } : {}),
       frameId: MAIN,
       request: { url, method, ...extra },
@@ -141,7 +195,11 @@ function setup(options: { closed?: () => boolean } = {}) {
     emit('Network.responseReceived', { requestId, type, response: { status, mimeType: 'application/json' } })
     emit('Network.loadingFinished', { requestId })
   }
-  return { emit, request, finish, watch, probes, errors, dialog: fake }
+  /** The page shows `text` in a live region now. */
+  const announce = (text: string): void => {
+    live.push({ id: live.length + 1, at: browserNow(), updatedAt: null, role: 'status', text, transient: false })
+  }
+  return { emit, emitWorker, workerCommands, request, finish, announce, watch, probes, errors, dialog: fake }
 }
 
 beforeEach(() => {
@@ -413,5 +471,207 @@ describe('console, navigation and dialogs', () => {
     const result = await watch.settle()
     expect(result).toMatchObject({ settled: false, reason: 'page-closed' })
     expect(probes.length).toBe(before)
+  })
+})
+
+// A cloud browser or a remote relay runs Chrome on another machine: its clock can be minutes off
+// this process's, either way. Every comparison must come out as on one machine.
+describe.each([
+  { label: '5 minutes ahead', browserAheadMs: 5 * 60_000 },
+  { label: '5 minutes behind', browserAheadMs: -5 * 60_000 },
+])('a browser whose clock is $label', ({ browserAheadMs }) => {
+  it('the action’s own request holds the settle and an older open one is only reported, with their true ages', async () => {
+    const { request, watch } = setup({ browserAheadMs })
+    request('http://app.test/channel/poll')
+    vi.advanceTimersByTime(50)
+    const cp = watch.checkpoint()
+    vi.advanceTimersByTime(10)
+    request('http://app.test/api/save', 'Fetch', 'POST')
+    const result = await settled(watch.settle({ since: cp, timeoutMs: 400 }), 500)
+    expect(result).toMatchObject({ settled: false, reason: 'timeout' })
+    expect(result.pendingRequests.map((r) => `${r.method} ${r.url} ${r.ageMs}`)).toEqual([`POST http://app.test/api/save ${result.waitedMs}`])
+    expect(result.uncaused?.map((r) => `${r.method} ${r.url} ${r.ageMs}`)).toEqual([`GET http://app.test/channel/poll ${result.waitedMs + 60}`])
+  })
+
+  it('quiet is measured from the end of the last input: the POST ending 200ms after it pushes the settle back by exactly that', async () => {
+    const { request, finish, watch } = setup({ browserAheadMs })
+    const cp = watch.checkpoint()
+    const save = request('http://app.test/api/save', 'Fetch', 'POST')
+    const origin = Date.now()
+    const settling = watch.settle({ since: cp, origin, timeoutMs: 5000 })
+    await vi.advanceTimersByTimeAsync(200)
+    finish(save)
+    const result = await settled(settling, 1000)
+    expect(result).toMatchObject({ settled: true, reason: 'quiet' })
+    // 500ms of network quiet after the POST ended at +200ms, found by the next 75ms poll.
+    expect(result.waitedMs).toBeGreaterThanOrEqual(700)
+    expect(result.waitedMs).toBeLessThan(800)
+  })
+
+  it('an element that was already changing before the action does not hold the settle', async () => {
+    const { watch } = setup({ browserAheadMs, ticker: true })
+    vi.advanceTimersByTime(500)
+    const cp = watch.checkpoint()
+    const result = await settled(watch.settle({ since: cp, timeoutMs: 2000 }), 2100)
+    expect(result).toMatchObject({ settled: true, reason: 'quiet' })
+    expect(result.waitedMs).toBeLessThan(600)
+  })
+
+  it('live text is the action’s when the page showed it after the checkpoint, and is reported at this process’s time', async () => {
+    const { announce, watch } = setup({ browserAheadMs })
+    announce('Draft restored')
+    vi.advanceTimersByTime(20)
+    const cp = watch.checkpoint()
+    vi.advanceTimersByTime(30)
+    const shownAt = Date.now()
+    announce('Message sent')
+    const events = await watch.since(cp)
+    expect(events.live.map(({ text, at }) => ({ text, at }))).toEqual([{ text: 'Message sent', at: shownAt }])
+  })
+
+  it('a request starts when it was issued, on this process’s clock', () => {
+    const { request, watch } = setup({ browserAheadMs })
+    const issuedAt = Date.now()
+    request('http://app.test/api/save', 'Fetch', 'POST')
+    expect(watch.requests().map((r) => r.startedAt)).toEqual([issuedAt])
+  })
+})
+
+describe('a dedicated worker', () => {
+  it('its console errors and uncaught exceptions are the page’s own, named by the worker, and read without asking its session anything', async () => {
+    const { emitWorker, workerCommands, watch } = setup()
+    const cp = watch.checkpoint()
+    const frame = { url: 'http://app.test/parser.js', lineNumber: 1, columnNumber: 10, functionName: 'onmessage', scriptId: '9' }
+    emitWorker('Runtime.consoleAPICalled', { type: 'log', executionContextId: 1, args: [{ type: 'string', value: 'parsing' }], stackTrace: { callFrames: [frame] } })
+    emitWorker('Runtime.consoleAPICalled', { type: 'error', executionContextId: 1, args: [{ type: 'string', value: 'bad row 7' }], stackTrace: { callFrames: [frame] } })
+    emitWorker('Runtime.exceptionThrown', {
+      exceptionDetails: {
+        text: 'Uncaught',
+        lineNumber: 2,
+        columnNumber: 8,
+        url: 'http://app.test/parser.js',
+        executionContextId: 1,
+        exception: { type: 'object', description: 'Error: crashed on row 7\n    at onmessage (parser.js:3:9)' },
+      },
+    })
+    const events = await watch.since(cp)
+    expect(events.console.map(({ level, text, location, frame: inFrame, worker }) => ({ level, text, location, frame: inFrame, worker }))).toEqual([
+      { level: 'error', text: 'bad row 7', location: 'http://app.test/parser.js:2:11', frame: undefined, worker: 'http://app.test/parser.js' },
+      { level: 'exception', text: 'Uncaught Error: crashed on row 7', location: 'http://app.test/parser.js:3:9', frame: undefined, worker: 'http://app.test/parser.js' },
+    ])
+    expect(workerCommands).toEqual([])
+  })
+})
+
+describe('a request reported on two of the page’s sessions', () => {
+  // Measured: a cross-site iframe's document is announced (requestWillBeSent, responseReceived) on
+  // the parent's session; its data and its end arrive on the iframe's own session, under the same
+  // Chrome request id (the document's loader id). Here the second session is the worker's stand-in.
+  it('is one record, which ends when the other session says so, and whose body is read where it arrived', async () => {
+    const { emit, emitWorker, workerCommands, watch } = setup()
+    const cp = watch.checkpoint()
+    const announced = {
+      requestId: 'LOADER_IFRAME',
+      loaderId: 'LOADER_IFRAME',
+      wallTime: Date.now() / 1000,
+      type: 'Document',
+      frameId: 'CHILD',
+      documentURL: 'http://ads.test/frame',
+      request: { url: 'http://ads.test/frame', method: 'GET' },
+    }
+    emit('Network.requestWillBeSent', announced)
+    // The same hop announced again by the other session is the same request.
+    emitWorker('Network.requestWillBeSent', announced)
+    emit('Network.responseReceived', { requestId: 'LOADER_IFRAME', type: 'Document', response: { status: 200, mimeType: 'text/html' } })
+    emitWorker('Network.dataReceived', { requestId: 'LOADER_IFRAME', dataLength: 10, encodedDataLength: 10 })
+    vi.advanceTimersByTime(30)
+    emitWorker('Network.loadingFinished', { requestId: 'LOADER_IFRAME' })
+    const result = await settled(watch.settle({ since: cp, timeoutMs: 2000 }), 2100)
+    expect(result).toMatchObject({ settled: true, reason: 'quiet', pendingRequests: [] })
+    expect(watch.requests().map(({ id, url, resourceType, status, frame, endedAt }) => ({ id, url, resourceType, status, frame, ended: endedAt !== undefined }))).toEqual([
+      { id: 'r1', url: 'http://ads.test/frame', resourceType: 'Document', status: 200, frame: 'http://ads.test/frame', ended: true },
+    ])
+    expect(await watch.responseBody('r1')).toMatchObject({ body: 'held by the worker session' })
+    expect(workerCommands).toEqual(['Network.getResponseBody'])
+  })
+
+  it('a redirect announced on both sessions is one more hop, not two', () => {
+    const { emit, emitWorker, watch } = setup()
+    const first = { requestId: 'LOADER_R', loaderId: 'LOADER_R', wallTime: Date.now() / 1000, type: 'Document', frameId: 'CHILD', documentURL: 'http://ads.test/a', request: { url: 'http://ads.test/a', method: 'GET' } }
+    emit('Network.requestWillBeSent', first)
+    vi.advanceTimersByTime(5)
+    const hop = {
+      ...first,
+      wallTime: Date.now() / 1000,
+      documentURL: 'http://ads.test/b',
+      request: { url: 'http://ads.test/b', method: 'GET' },
+      redirectResponse: { status: 302, mimeType: 'text/html' },
+    }
+    emit('Network.requestWillBeSent', hop)
+    emitWorker('Network.requestWillBeSent', hop)
+    emitWorker('Network.loadingFinished', { requestId: 'LOADER_R' })
+    expect(watch.requests().map(({ url, status, redirectedFrom, endedAt }) => ({ url, status, redirectedFrom, ended: endedAt !== undefined }))).toEqual([
+      { url: 'http://ads.test/a', status: 302, redirectedFrom: undefined, ended: true },
+      { url: 'http://ads.test/b', status: undefined, redirectedFrom: 'r1', ended: true },
+    ])
+  })
+})
+
+// The event sequences measured on GitHub's archive link (and reproduced in journal-clock-live): the
+// page fetches the link, which its CSP refuses at the cross-origin redirect, then navigates to it,
+// and the navigation's response becomes a download.
+describe('a link that redirects to a download', () => {
+  it('a fetch Chrome moves on to its redirect target without reporting the redirect closes the first hop; the block is its reason', async () => {
+    const { emit, watch } = setup()
+    const cp = watch.checkpoint()
+    const wallTime = Date.now() / 1000
+    emit('Network.requestWillBeSent', { requestId: '7.205', loaderId: 'LOADER_0', wallTime, type: 'Fetch', frameId: MAIN, request: { url: 'http://app.test/archive.zip', method: 'GET' } })
+    vi.advanceTimersByTime(5)
+    emit('Network.requestWillBeSent', { requestId: '7.205', loaderId: 'LOADER_0', wallTime: Date.now() / 1000, type: 'Fetch', frameId: MAIN, request: { url: 'http://codeload.test/archive.zip', method: 'GET' } })
+    emit('Network.loadingFailed', { requestId: '7.205', type: 'Fetch', errorText: '', canceled: false, blockedReason: 'csp' })
+    emit('Network.loadingFailed', { requestId: '7.205', type: 'Fetch', errorText: 'net::ERR_ABORTED', canceled: true })
+    const result = await settled(watch.settle({ since: cp, timeoutMs: 2000 }), 2100)
+    expect(result).toMatchObject({ settled: true, reason: 'quiet', pendingRequests: [] })
+    expect(watch.requests().map(({ url, status, failed, redirectedFrom, endedAt }) => ({ url, status, failed, redirectedFrom, ended: endedAt !== undefined }))).toEqual([
+      { url: 'http://app.test/archive.zip', status: undefined, failed: undefined, redirectedFrom: undefined, ended: true },
+      { url: 'http://codeload.test/archive.zip', status: undefined, failed: 'blocked: csp', redirectedFrom: 'r1', ended: true },
+    ])
+    await expect(watch.responseBody('r1')).rejects.toThrow('was redirected (Chrome did not report the redirect response) to r2')
+  })
+
+  it('a navigation canceled because its response became a download ended as that download, and is not a failure', async () => {
+    const { emit, watch } = setup()
+    const cp = watch.checkpoint()
+    const navigation = { requestId: 'NAV', loaderId: 'NAV', type: 'Document', frameId: MAIN, documentURL: 'http://app.test/archive.zip' }
+    emit('Network.requestWillBeSent', { ...navigation, wallTime: Date.now() / 1000, request: { url: 'http://app.test/archive.zip', method: 'GET' } })
+    vi.advanceTimersByTime(5)
+    emit('Network.requestWillBeSent', {
+      ...navigation,
+      wallTime: Date.now() / 1000,
+      request: { url: 'http://codeload.test/archive.zip', method: 'GET' },
+      redirectResponse: { status: 302, mimeType: 'text/html' },
+    })
+    emit('Network.responseReceived', { requestId: 'NAV', type: 'Document', response: { status: 200, mimeType: 'application/zip' } })
+    emit('Network.loadingFailed', { requestId: 'NAV', type: 'Document', errorText: 'net::ERR_ABORTED', canceled: true })
+    emit('Page.downloadWillBegin', { frameId: MAIN, guid: 'g1', url: 'http://codeload.test/archive.zip', suggestedFilename: 'archive.zip' })
+    const events = await watch.since(cp)
+    expect(events.failedRequests).toEqual([])
+    expect(events.network.map(({ url, status, failed, download, endedAt }) => ({ url, status, failed, download, ended: endedAt !== undefined }))).toEqual([
+      { url: 'http://app.test/archive.zip', status: 302, failed: undefined, download: undefined, ended: true },
+      { url: 'http://codeload.test/archive.zip', status: 200, failed: undefined, download: 'archive.zip', ended: true },
+    ])
+    await expect(watch.responseBody('r2')).rejects.toThrow('became the download "archive.zip"')
+  })
+
+  it('a canceled navigation with no download for its frame and address stays a failure', async () => {
+    const { emit, watch } = setup()
+    const cp = watch.checkpoint()
+    emit('Network.requestWillBeSent', { requestId: 'NAV', loaderId: 'NAV', type: 'Document', frameId: MAIN, wallTime: Date.now() / 1000, request: { url: 'http://app.test/next', method: 'GET' } })
+    emit('Network.loadingFailed', { requestId: 'NAV', type: 'Document', errorText: 'net::ERR_ABORTED', canceled: true })
+    emit('Page.downloadWillBegin', { frameId: 'CHILD', guid: 'g2', url: 'http://app.test/next', suggestedFilename: 'next' })
+    emit('Page.downloadWillBegin', { frameId: MAIN, guid: 'g3', url: 'http://app.test/other.zip', suggestedFilename: 'other.zip' })
+    expect((await watch.since(cp)).failedRequests.map(({ url, failed, download }) => ({ url, failed, download }))).toEqual([
+      { url: 'http://app.test/next', failed: 'canceled', download: undefined },
+    ])
   })
 })
