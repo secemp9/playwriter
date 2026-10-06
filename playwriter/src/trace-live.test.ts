@@ -195,11 +195,12 @@ describe('storeIdentity — a probe that did not measure can never read as a pas
     if (!result.measured) throw new Error('unreachable')
     expect(result.discovery.via).toBe('react-fiber')
     expect(result.discovery.path).toBe('<ReduxProvider>.props.store')
-    expect(result.discovery.pinnedAs).toBe('globalThis.__playwriter_trace_store')
     expect(result.sameReference).toBe(true)
     expect(result.changedKeys).toEqual(['n'])
-    // The pinned expression is reusable as a storeExpr afterwards.
-    expect(await page.evaluate('typeof globalThis.__playwriter_trace_store.getState')).toBe('function')
+    // Nothing was pinned on the page; the reported expression re-finds the store on its own
+    // and is reusable as a storeExpr afterwards.
+    expect(await page.evaluate(() => Object.keys(globalThis).filter((k) => k.startsWith('__playwriter')))).toEqual([])
+    expect(await page.evaluate(`(${result.discovery.expr}).n`)).toBe(2)
     await page.close()
   }, 60000)
 
@@ -301,13 +302,12 @@ describe('net.timeline — survives the execute call that created it', () => {
 describe('net.delay — a live interceptor cannot hide', () => {
   it('delays matching requests, refuses an overlap, and is visible until stopped', async () => {
     const page = await freshPage()
-    const cdp = new PlaywrightCDPSessionAdapter(await context.newCDPSession(page))
 
-    const delay = await netDelay({ cdp, urlPattern: '/slow.json', ms: 400 })
+    const delay = await netDelay({ page, urlPattern: '/slow.json', ms: 400 })
     try {
       // A second overlapping delay is REFUSED, naming the live one.
-      await expect(netDelay({ cdp, urlPattern: '/slow.json', ms: 10 })).rejects.toThrow(/refusing to start a second net.delay/)
-      await expect(netDelay({ cdp, urlPattern: '/slow.json', ms: 10 })).rejects.toThrow(new RegExp(delay.id.replace('#', '#')))
+      await expect(netDelay({ page, urlPattern: '/slow.json', ms: 10 })).rejects.toThrow(/refusing to start a second net.delay/)
+      await expect(netDelay({ page, urlPattern: '/slow.json', ms: 10 })).rejects.toThrow(new RegExp(delay.id.replace('#', '#')))
 
       // Every later trace can see that measurements are being perturbed.
       const warnings = tracePerturbationWarnings()
@@ -342,8 +342,7 @@ describe('net.delay — a live interceptor cannot hide', () => {
 
   it('auto-expires so a forgotten interceptor cannot poison the session', async () => {
     const page = await freshPage()
-    const cdp = new PlaywrightCDPSessionAdapter(await context.newCDPSession(page))
-    const delay = await netDelay({ cdp, urlPattern: '/slow.json', ms: 50, ttlMs: 300 })
+    const delay = await netDelay({ page, urlPattern: '/slow.json', ms: 50, ttlMs: 300 })
     expect(getTraceProbe(delay.id)!.expiresAt).toBeGreaterThan(Date.now())
     await page.waitForTimeout(700)
     const info = getTraceProbe(delay.id)!
@@ -355,8 +354,7 @@ describe('net.delay — a live interceptor cannot hide', () => {
 
   it('records an explicitly unbounded delay as unbounded', async () => {
     const page = await freshPage()
-    const cdp = new PlaywrightCDPSessionAdapter(await context.newCDPSession(page))
-    const delay = await netDelay({ cdp, urlPattern: '/slow.json', ms: 10, ttlMs: 0 })
+    const delay = await netDelay({ page, urlPattern: '/slow.json', ms: 10, ttlMs: 0 })
     const info = getTraceProbe(delay.id)!
     expect(info.expiresAt).toBeNull()
     expect(info.spec.unbounded).toBe(true)
@@ -367,22 +365,13 @@ describe('net.delay — a live interceptor cannot hide', () => {
 })
 
 describe('fiberSnapshot({ identity: true }) — handler churn across the process boundary', () => {
-  // A fake `__bippy` with the same surface the real one exposes, over a synthetic
-  // fiber. That keeps the test off a full React build while still exercising the
-  // REAL page-side identity walk (the WeakMap token registry, the projection and
-  // the nested-function paths), which is the part a synthetic unit test cannot cover.
+  // A synthetic fiber shaped the way React leaves it (`__reactFiber$…` on the host node, a
+  // composite `tag: 0` parent). That keeps the test off a full React build while still
+  // exercising the REAL identity walk (the shared fiber reader, the CDP-held token
+  // registry, the projection and the nested-function paths), which a unit test cannot cover.
   const installFakeReact = async (page: Page) => {
     await page.evaluate(() => {
       const g = globalThis as any
-      g.__bippy = {
-        getFiberFromHostInstance: (el: any) => el.__testFiber ?? null,
-        getSource: async () => ({ fileName: 'src/Row.tsx', lineNumber: 10, columnNumber: 1, functionName: 'Row' }),
-        getOwnerStack: async () => [],
-        getDisplayName: (t: any) => (t && (t.displayName || t.name)) || null,
-        isCompositeFiber: (f: any) => !!f.__composite,
-        normalizeFileName: (f: string) => f,
-        isSourceFile: () => true,
-      }
       // Both handler flavours are built by the SAME factory, so a fresh one is
       // byte-identical to the stable one and only the reference differs — the exact
       // shape of the inline-arrow bug.
@@ -391,14 +380,16 @@ describe('fiberSnapshot({ identity: true }) — handler churn across the process
       g.__stable = mkHandler()
       g.__stableRow = mkRowRender()
       const el = g.document.getElementById('root')
-      el.__testFiber = {
-        __composite: true,
+      const row: { tag: number; type: { displayName: string }; return: null; alternate: null; memoizedProps: unknown } = {
+        tag: 0,
         type: { displayName: 'Row' },
         return: null,
+        alternate: null,
         memoizedProps: null,
       }
+      el['__reactFiber$test'] = { tag: 5, type: 'div', stateNode: el, return: row, alternate: null, memoizedProps: {} }
       g.__render = (freshHandlers: boolean) => {
-        el.__testFiber.memoizedProps = {
+        row.memoizedProps = {
           onClick: freshHandlers ? mkHandler() : g.__stable,
           style: { color: 'red' },
           count: 3,

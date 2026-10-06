@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trip — form fixture</title>
+<style>
+  body { font: 14px sans-serif; margin: 16px; }
+  label { display: block; margin: 12px 0; }
+  input[type=range] { width: 300px; }
+  .cover { position: absolute; left: 0; top: 0; width: 220px; height: 40px; background: #fee; }
+  .covered { position: relative; height: 40px; margin: 12px 0; }
+</style>
+</head>
+<body>
+<h1>Plan a trip</h1>
+<div style="display: flex; gap: 24px">
+  <div id="card" role="button" aria-label="Card Lyon" draggable="true" style="width: 120px; height: 40px; background: #ddf"
+       ondragstart="event.dataTransfer.setData('text/plain', 'Lyon')">Lyon</div>
+  <div id="done" role="button" aria-label="Done column" style="width: 200px; height: 60px; background: #dfd"
+       ondragover="event.preventDefault()" ondrop="event.preventDefault(); this.textContent = 'Done: ' + event.dataTransfer.getData('text/plain')">Done column</div>
+</div>
+<form onsubmit="event.preventDefault(); document.getElementById('submitted').textContent = 'Submitted'">
+  <label>Traveller name <input id="name" name="name"></label>
+  <label>Departure <input id="departure" type="date"></label>
+  <label>Volume <input id="volume" type="range" min="0" max="100" step="5" value="50"></label>
+  <label>Theme colour <input id="colour" type="color" value="#336699"></label>
+  <label>Passport scan <input id="passport" type="file"></label>
+  <label>Attachments <input id="attachments" type="file" multiple></label>
+  <button type="button" id="photo-button" onclick="document.getElementById('photo').click()">Choose photo</button>
+  <input id="photo" type="file" hidden>
+  <div class="covered">
+    <button type="button" id="report-button" onclick="document.getElementById('report').click()">Upload report</button>
+    <input id="report" type="file" hidden>
+    <div class="cover">Maintenance banner</div>
+  </div>
+  <button>Book</button>
+</form>
+<p id="submitted"></p>
+</body>
+</html>

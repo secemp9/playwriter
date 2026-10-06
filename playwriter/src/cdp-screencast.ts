@@ -77,12 +77,25 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import type { Page } from '@xmorse/playwright-core'
+import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
+import { IsolatedWorld, PageUnresponsiveError, withDeadline } from './isolated-world.js'
+import { pointerTrackFor, type PointerSample, type PointerTimeline } from './pointer-track.js'
 
 /** A single captured frame: JPEG bytes plus the ms offset from recording start. */
 interface CapturedFrame {
   data: Buffer
   offsetMs: number
+  /**
+   * Where a CSS-px position lands on this frame. Screencast frames carry the viewport
+   * width in CSS px (`metadata.deviceWidth`) and the content's top offset, which with the
+   * JPEG width give the scale. A `Page.captureScreenshot` frame has no metadata; it is the
+   * viewport at the device pixel ratio, so `screenshot` marks it for that scale. A frame with
+   * neither has no known geometry, and the pointer is not drawn on it.
+   */
+  screencast?: { deviceWidth: number; offsetTop: number }
+  screenshot?: true
 }
 
 /* ------------------------------------------------------------------ captions */
@@ -1062,6 +1075,13 @@ const SECRET_TARGET_RE =
 /** What the viewer sees instead of a secret. Fixed length: even the character count leaks. */
 const MASKED_TEXT = '••••••'
 
+/**
+ * How long `startCdpScreencast` waits for its first-frame capture. A visible tab answers in
+ * ~65ms over direct CDP and ~118ms through the extension (measured, see `mode`); a hidden one
+ * blocks for up to 26s, which is what this bounds.
+ */
+const SEED_CAPTURE_DEADLINE_MS = 2000
+
 export interface CdpScreencastOptions {
   cdp: ICDPSession
   /** Where to write the .mp4 */
@@ -1069,43 +1089,32 @@ export interface CdpScreencastOptions {
   /**
    * How frames are obtained.
    *
-   * - `'screencast'` — `Page.startScreencast`. Cheap and change-driven; works through
-   *   the extension too. Yields (almost) nothing on a page that never repaints. It does
-   *   NOT need a foreground tab — that half of this sentence used to be here and was
-   *   wrong; see the file header for the 31-backgrounded-vs-30-foreground measurement.
+   * - `'screencast'` (default) — `Page.startScreencast`. Cheap and change-driven; works
+   *   through the extension too, and NEVER foregrounds the tab: it does not need a
+   *   foreground tab (see the file header for the 31-backgrounded-vs-30-foreground and the
+   *   60.0-hidden-vs-59.8-foreground measurements). A page that never repaints sends at
+   *   most its initial surface (through the extension, possibly nothing), so on a visible
+   *   tab the recorder takes ONE unclipped `Page.captureScreenshot` at start as the clip's
+   *   first frame (a hidden tab is not seeded: a capture there blocks). The encoder holds
+   *   each frame until the next one (the last until `stop()`), at a constant `fps`, so a
+   *   static page still yields a clip as long as the recording, with the pointer layer and
+   *   captions drawn on every output frame.
    * - `'screenshot'` — poll `Page.captureScreenshot` (~8.5fps / 118ms per frame
    *   measured through the extension; 15.3fps / 65ms per frame measured over direct CDP
-   *   to headless Chromium 145, so the extension hop is most of that cost). Produces
-   *   frames even on a static page.
-   * - `'auto'` (default) — try screencast, and if no frame arrives within `probeMs`,
-   *   switch to screenshot polling. Covers the static-page case and any environment
-   *   where screencast frames do not arrive.
+   *   to headless Chromium 145, so the extension hop is most of that cost). An explicit
+   *   opt-in that PERTURBS THE SESSION: it calls `page.bringToFront()` once before polling,
+   *   stealing the user's focus, because on a hidden tab a 10fps poll measures 0.08-0.18 fps
+   *   with single calls blocking up to 26 seconds (file header).
    *
-   * **THE SCREENSHOT PATH FOREGROUNDS THE TAB, AND `'auto'` CAN REACH IT.** `'screencast'`
-   * never does and does not need to (measured 60fps on a hidden tab; see the file header).
-   * `'screenshot'` calls `page.bringToFront()` once before polling, and `'auto'` does the
-   * same the moment it falls back — which is exactly the static-page case it exists for.
-   * So the DEFAULT mode will steal the user's focus on a page that does not repaint within
-   * `probeMs`.
-   *
-   * That is not gold-plating: on a hidden tab a 10fps poll measures 0.08-0.18 fps with
-   * single calls blocking up to 26 seconds, so without it the fallback produces a
-   * near-empty video. If foregrounding is unacceptable for a given recording, pass
-   * `mode: 'screencast'` — it captures a hidden tab at full rate and never foregrounds,
-   * at the cost of capturing (almost) nothing from a page that never repaints.
+   * There is no automatic switch between the two: a recorder that silently falls back to
+   * the foregrounding path is exactly the behind-the-caller's-back perturbation this
+   * default exists to rule out.
    */
-  mode?: 'auto' | 'screencast' | 'screenshot'
-  /** How long `'auto'` waits for a screencast frame before falling back (default 1500ms). */
-  probeMs?: number
+  mode?: 'screencast' | 'screenshot'
   /**
-   * Page handle, used for one thing: `bringToFront()` before screenshot polling starts.
-   *
-   * Reached by `'screenshot'` always and by `'auto'` whenever it falls back, so this is
-   * the option through which the DEFAULT mode can foreground a tab. Omitting it does not
-   * make the recording focus-safe in any useful sense — it makes the fallback capture at
-   * 0.08-0.18 fps instead of ~10 (file header for the numbers), because nothing then
-   * un-hides the tab. To avoid foregrounding, choose `mode: 'screencast'`; do not simply
-   * withhold the page.
+   * Page handle. `mode: 'screenshot'` calls its `bringToFront()` before polling (without it
+   * that path polls a hidden tab at 0.08-0.18 fps); `mode: 'screencast'` never calls it.
+   * When it is a Playwright Page it is also where the pointer track comes from (`pointer`).
    */
   page?: { bringToFront(): Promise<void> }
   /** JPEG quality 0-100 (default 70). Lower = smaller files, faster frames. */
@@ -1139,6 +1148,22 @@ export interface CdpScreencastOptions {
   inputOverlayOptions?: InputOverlayOptions
   /** Events known up front, with explicit `atMs` on the RECORDING clock. Merges with live ones. */
   inputEvents?: Array<{ action: InputAction; atMs: number }>
+  /**
+   * Draw the pointer into the video at encode time. **On by default**; `false` turns it
+   * off, an object styles it (`PointerOverlayOptions`).
+   *
+   * Drawn from a pointer track (`pointer-track.ts`) — the positions the automation really
+   * dispatched, at the times it dispatched them — never from anything in the page. The
+   * track is `pointerTrack` when given, otherwise the one for `page` when `page` is a
+   * Playwright Page (created on first use, which hooks its `onMouseAction`). With neither,
+   * nothing is drawn and `result.pointer.note` says why.
+   *
+   * Burning it needs libass, like captions. Left at the default on an ffmpeg without
+   * libass it is skipped with a note; requested explicitly, that is an error.
+   */
+  pointer?: boolean | PointerOverlayOptions
+  /** The timeline to draw the pointer from; defaults to `page`'s track (see `pointer`). */
+  pointerTrack?: PointerTimeline
 }
 
 /** What `hold()` waited for, so a caller can assert on the pacing instead of hoping. */
@@ -1305,6 +1330,12 @@ export interface CdpScreencastResult {
   inputEvents?: ResolvedInputEvent[]
   /** Set when any chip was coalesced, retired, truncated, redacted or dropped. */
   inputOverlayNote?: string
+  /**
+   * What the pointer layer drew. Present whenever the pointer was on (the default):
+   * `drawn` is false when there was no track, no dispatched position inside the clip, or
+   * no libass, and `note` says which.
+   */
+  pointer?: { drawn: boolean; samples: number; segments: number; pulses: number; note?: string }
 }
 
 /**
@@ -1323,15 +1354,24 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     fps = 10,
     maxDurationMs = 10 * 60 * 1000,
     maxFrames = 5000,
-    mode = 'auto',
-    probeMs = 1500,
+    mode = 'screencast',
     page,
     captions: preSuppliedCaptions,
     captionOptions,
     inputOverlay = false,
     inputOverlayOptions,
     inputEvents: preSuppliedInputEvents,
+    pointer = true,
+    pointerTrack,
   } = options
+  // The sandbox hands this options object through from untyped JS, so an unknown mode —
+  // including the removed `'auto'` — must be refused rather than read as screencast.
+  if (mode !== 'screencast' && mode !== 'screenshot') {
+    throw new Error(
+      `Unknown recording mode ${JSON.stringify(mode)}; expected 'screencast' (the default; never foregrounds the tab) ` +
+        "or 'screenshot' (polls Page.captureScreenshot and calls bringToFront() on the tab first).",
+    )
+  }
 
   const frames: CapturedFrame[] = []
   const startedAt = Date.now()
@@ -1342,6 +1382,36 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
   // would throw out of `startCdpScreencast` itself.
   let usedMode: 'screencast' | 'screenshot' = 'screencast'
   let eventCaptureInFlight = false
+
+  /* ------------------------------------------------------------ pointer layer */
+
+  const pointerOptions = typeof pointer === 'object' ? pointer : undefined
+  // Refused now rather than after the recording has been made.
+  validatePointerOptions(pointerOptions)
+  const pointerTimeline: PointerTimeline | undefined =
+    pointer === false ? undefined : (pointerTrack ?? (page && isPlaywrightPage(page) ? pointerTrackFor(page) : undefined))
+  /**
+   * The device pixel ratio — the CSS-to-frame scale of every screenshot frame (screencast
+   * frames carry their own geometry). Measured once, when the first screenshot is
+   * requested, and only when there is a pointer to place.
+   */
+  let screenshotScale: number | undefined
+  let screenshotScaleError: string | undefined
+  let screenshotScaleRequested = false
+  function measureScreenshotScale(): void {
+    if (!pointerTimeline || screenshotScaleRequested) return
+    screenshotScaleRequested = true
+    withDeadline(cdp.send('Page.getLayoutMetrics'), 3000, 'measuring the device pixel ratio for the pointer layer')
+      .then((metrics) => {
+        // `layoutViewport` is in device pixels, `cssLayoutViewport` in CSS pixels.
+        const ratio = metrics.layoutViewport.clientWidth / metrics.cssLayoutViewport.clientWidth
+        if (Number.isFinite(ratio) && ratio > 0) screenshotScale = ratio
+        else screenshotScaleError = `Page.getLayoutMetrics gave no usable ratio (${ratio})`
+      })
+      .catch((error: Error) => {
+        screenshotScaleError = error.message
+      })
+  }
 
   const maxCaptions = captionOptions?.maxCaptions ?? CAPTION_DEFAULTS.maxCaptions
   const maxCharsPerLine = captionOptions?.maxCharsPerLine ?? CAPTION_DEFAULTS.maxCharsPerLine
@@ -1496,12 +1566,13 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
       return
     }
     eventCaptureInFlight = true
+    measureScreenshotScale()
     const offsetMs = Date.now() - startedAt
     void cdp
       .send('Page.captureScreenshot', { format: 'jpeg', quality })
       .then((r: any) => {
         if (!stopped && r?.data && frames.length < maxFrames) {
-          pushFrame({ data: Buffer.from(r.data, 'base64'), offsetMs })
+          pushFrame({ data: Buffer.from(r.data, 'base64'), offsetMs, screenshot: true })
           eventFramesCaptured++
         }
       })
@@ -1511,7 +1582,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
       })
   }
 
-  const onFrame = (params: { data: string; sessionId: number }) => {
+  const onFrame = (params: Protocol.Page.ScreencastFrameEvent) => {
     if (stopped) return
     if (frames.length >= maxFrames) {
       droppedForCap++
@@ -1521,7 +1592,14 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
       void cdp.send('Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {})
       return
     }
-    pushFrame({ data: Buffer.from(params.data, 'base64'), offsetMs: Date.now() - startedAt })
+    pushFrame({
+      data: Buffer.from(params.data, 'base64'),
+      offsetMs: Date.now() - startedAt,
+      // A frame without metadata keeps no geometry; the pointer layer then skips it and says so.
+      ...(params.metadata
+        ? { screencast: { deviceWidth: params.metadata.deviceWidth, offsetTop: params.metadata.offsetTop } }
+        : {}),
+    })
     // Chrome stops sending once a small number of frames are outstanding, so every frame
     // must be acked. MEASURED against Chromium 145 on an animating page, 3000ms per run:
     //
@@ -1598,6 +1676,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     } catch {
       // Best-effort; if we cannot foreground it the first capture will surface the problem.
     }
+    measureScreenshotScale()
     let inFlight = false
     pollTimer = setInterval(() => {
       if (stopped || inFlight || frames.length >= maxFrames) return
@@ -1606,7 +1685,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         .send('Page.captureScreenshot', { format: 'jpeg', quality })
         .then((r: any) => {
           if (!stopped && r?.data) {
-            pushFrame({ data: Buffer.from(r.data, 'base64'), offsetMs: Date.now() - startedAt })
+            pushFrame({ data: Buffer.from(r.data, 'base64'), offsetMs: Date.now() - startedAt, screenshot: true })
           }
         })
         .catch(() => {})
@@ -1617,9 +1696,17 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     if (typeof pollTimer.unref === 'function') pollTimer.unref()
   }
 
+  /** Why the clip has no seed frame, when it has none; folded into the result's note. */
+  let seedNote: string | undefined
   if (mode === 'screenshot') {
     await startScreenshotPolling()
   } else {
+    try {
+      seedNote = await seedFirstFrame()
+    } catch (error) {
+      cdp.off?.('Page.screencastFrame' as never, onFrame as never)
+      throw error
+    }
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
       quality,
@@ -1627,20 +1714,57 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
       ...(maxHeight ? { maxHeight } : {}),
       everyNthFrame: 1,
     })
-    if (mode === 'auto') {
-      // Nothing in the CDP session says whether an extension is in the path, so detect
-      // by observation: no frame within probeMs means screencast will never deliver.
-      //
-      // THIS IS THE LINE THAT LETS THE DEFAULT MODE FOREGROUND THE TAB. Falling back
-      // enters `startScreenshotPolling`, which calls `page.bringToFront()`; see the
-      // measurement there for why it has to. A caller for whom that is unacceptable wants
-      // `mode: 'screencast'`, which never reaches this path.
-      setTimeout(() => {
-        if (!stopped && frames.length === 0) {
-          void cdp.send('Page.stopScreencast').catch(() => {})
-          void startScreenshotPolling()
-        }
-      }, probeMs).unref?.()
+  }
+
+  /**
+   * Give the clip its first frame now, so a page that never repaints still has one.
+   *
+   * Screencast is change-driven: a static page sends its initial surface over direct CDP,
+   * but through the extension it can send nothing at all, and then there is no video. One
+   * `Page.captureScreenshot`, stamped at start, closes that gap without a poller and without
+   * foregrounding. Unclipped on purpose: a clipped capture moves Chrome's emulated viewport
+   * and corrupts concurrent captures.
+   *
+   * Only on a visible tab, read from the isolated world (no main-world code): a hidden tab's
+   * capture blocks for up to 26s (file header). Playwright's focus emulation can make a
+   * hidden tab report 'visible', so the capture also has a deadline; past it the clip starts
+   * at the first screencast frame instead and the note says so. Never `bringToFront()`.
+   */
+  async function seedFirstFrame(): Promise<string | undefined> {
+    const tree = await withDeadline(cdp.send('Page.getFrameTree'), 3000, 'reading the frame tree to check tab visibility')
+    const world = new IsolatedWorld({ cdp, getFrameId: () => tree.frameTree.frame.id })
+    let visibility: string
+    try {
+      visibility = await world.evaluate<string>('document.visibilityState', {
+        timeoutMs: 3000,
+        what: 'reading document.visibilityState before seeding the recording',
+      })
+    } finally {
+      world.dispose()
+    }
+    if (visibility !== 'visible') {
+      return (
+        `The tab was ${visibility} at start, so no first frame was captured up front (a capture on a hidden tab ` +
+        'blocks); the clip starts at the first screencast frame.'
+      )
+    }
+    measureScreenshotScale()
+    const offsetMs = Date.now() - startedAt
+    const capture = cdp.send('Page.captureScreenshot', { format: 'jpeg', quality })
+    try {
+      const shot = await withDeadline(capture, SEED_CAPTURE_DEADLINE_MS, 'capturing the first frame of the recording')
+      pushFrame({ data: Buffer.from(shot.data, 'base64'), offsetMs, screenshot: true })
+      return undefined
+    } catch (error) {
+      if (!(error instanceof PageUnresponsiveError)) {
+        throw new Error(`Capturing the recording's first frame failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      // The late capture is abandoned, and the note below is where that is reported.
+      capture.catch(() => {})
+      return (
+        `The first-frame capture did not return within ${SEED_CAPTURE_DEADLINE_MS}ms (the tab is likely hidden behind ` +
+        "Playwright's focus emulation), so the clip starts at the first screencast frame."
+      )
     }
   }
 
@@ -1800,23 +1924,18 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
           wrote: false,
           ...(stamped.length ? { captions: empty.cues, captionNote: empty.note } : {}),
           ...(stampedInputs.length ? { inputEvents: emptyInputs.events, inputOverlayNote: emptyInputs.note } : {}),
-          // Screencast is change-driven, so "nothing repainted" is the ordinary reason
-          // for an empty capture and the one worth naming first. Tab visibility is NOT
-          // a cause — a backgrounded tab records fine (31 frames vs 30 foreground,
-          // measured through the extension; 60.0 fps hidden vs 59.8 fps foreground
-          // re-measured over raw CDP, see the file header).
-          //
-          // The remedy this names does have a cost, and saying "use screenshot mode"
-          // without it would be the same kind of half-true this file has been burned by:
-          // that path foregrounds the tab.
+          ...(pointer !== false
+            ? { pointer: { drawn: false, samples: 0, segments: 0, pulses: 0, note: 'No frames were captured, so there was nothing to draw the pointer on.' } }
+            : {}),
+          // Reached only when the start-time seed was not taken (a hidden tab, or a capture
+          // past its deadline) AND the page never repainted: screencast is change-driven and
+          // records a backgrounded tab normally once something changes (file header). The
+          // remedy it names has a cost, so the note says it: that path foregrounds the tab.
           note:
-            'No frames captured. `screencast` only emits on repaint, so a page that did ' +
-            'not change during the recording sends nothing. Use mode: "screenshot" (or ' +
-            '"auto", which falls back to it) to capture a static page — note that both ' +
-            'call bringToFront() on the tab, because a hidden tab polls at ~0.1fps with ' +
-            'single captures blocking for up to 26s — or record for longer / while ' +
-            'something actually animates. Tab focus is not the reason THIS capture was ' +
-            'empty: screencast records a backgrounded tab normally.',
+            `No frames captured. ${seedNote ?? ''} No screencast frame arrived either: \`screencast\` only emits ` +
+            'on repaint, and the page did not repaint during the recording. Use mode: "screenshot" to capture ' +
+            'a static page — note that it calls bringToFront() on the tab, because a hidden tab polls at ~0.1fps ' +
+            'with single captures blocking for up to 26s — or record while something actually repaints.',
         }
       }
 
@@ -1834,6 +1953,31 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         video: { width: videoSize.width, height: videoSize.height },
       })
 
+      // The pointer, from the track: everything dispatched inside the clip, plus the last
+      // position before it so the pointer is where it was when the recording began.
+      let pointerLayer: PointerLayer | undefined
+      if (pointerTimeline) {
+        const inClip = pointerTimeline.between(startedAt, startedAt + durationMs)
+        const atStart = pointerTimeline.latest(startedAt)
+        pointerLayer = buildPointerLayer({
+          samples: atStart && atStart.t < startedAt ? [atStart, ...inClip] : inClip,
+          recordingStartedAt: startedAt,
+          frames: frames.map((f) => {
+            if (f.screencast) {
+              const size = readJpegSize(f.data)
+              return size && f.screencast.deviceWidth > 0
+                ? { offsetMs: f.offsetMs, scale: size.width / f.screencast.deviceWidth, offsetTop: f.screencast.offsetTop }
+                : { offsetMs: f.offsetMs }
+            }
+            return f.screenshot && screenshotScale !== undefined
+              ? { offsetMs: f.offsetMs, scale: screenshotScale }
+              : { offsetMs: f.offsetMs }
+          }),
+          durationMs,
+          fps,
+        })
+      }
+
       const encoded = await encodeFrames({
         frames,
         outputPath,
@@ -1844,7 +1988,19 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         inputSegments: builtInputs.segments,
         inputOverlayOptions,
         videoSize: { width: videoSize.width, height: videoSize.height },
+        ...(pointerLayer
+          ? { pointer: { layer: pointerLayer, options: pointerOptions, required: options.pointer !== undefined } }
+          : {}),
       })
+      const pointerNotes = [
+        pointer !== false && !pointerTimeline
+          ? 'No pointer track to draw from: pass `pointerTrack`, or a Playwright Page as `page`.'
+          : undefined,
+        pointerLayer && pointerLayer.samples === 0 ? 'No pointer position was dispatched before or during the recording.' : undefined,
+        pointerLayer?.note,
+        screenshotScaleError ? `The device pixel ratio could not be measured: ${screenshotScaleError}.` : undefined,
+        encoded.pointerNote,
+      ].filter(Boolean)
 
       // Escaping the burn-in text can itself change what the viewer reads (braces,
       // backslash-before-N); fold that back onto the cue so the result still accounts
@@ -1862,6 +2018,8 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
         droppedForCap > 0 ? `Hit the ${maxFrames}-frame cap; dropped ${droppedForCap} later frames.` : undefined,
         captionsRefused > 0 ? `${captionsRefused} caption(s) refused past the ${maxCaptions}-caption cap.` : undefined,
         inputsRefused > 0 ? `${inputsRefused} input event(s) refused past the ${maxInputEvents}-event cap.` : undefined,
+        // A clip that starts at its first repaint rather than at start() — say why.
+        seedNote,
         // Frames of differing size change what the overlay means; never silent.
         videoSize.note,
         // Named because it changes what was captured: these frames exist only because the
@@ -1904,6 +2062,17 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
               ...(builtInputs.note || encoded.inputNote
                 ? { inputOverlayNote: [builtInputs.note, encoded.inputNote].filter(Boolean).join(' ') }
                 : {}),
+            }
+          : {}),
+        ...(pointer !== false
+          ? {
+              pointer: {
+                drawn: encoded.pointerDrawn,
+                samples: pointerLayer?.samples ?? 0,
+                segments: pointerLayer?.segments.length ?? 0,
+                pulses: pointerLayer?.pulses.length ?? 0,
+                ...(pointerNotes.length ? { note: pointerNotes.join(' ') } : {}),
+              },
             }
           : {}),
       }
@@ -2800,6 +2969,286 @@ export function buildInputChips({
   return { events: resolved, segments, note }
 }
 
+/* ------------------------------------------------------------- pointer layer */
+
+/**
+ * How the pointer is drawn into the video.
+ *
+ * THE POINTER COMES FROM THE POINTER TRACK, NOT FROM THE PAGE. `pointer-track.ts` records
+ * every position the automation dispatched (Playwright's mouse through `onMouseAction`,
+ * raw `Input.dispatchMouseEvent` trajectories through `recordPath`), and this layer draws
+ * an arrow at those positions at encode time with libass — so the recording shows where the
+ * pointer really was while the page under test never contained a cursor element.
+ *
+ * Positions are viewport CSS px; each is scaled into frame px by the frame it is drawn on
+ * (`metadata.deviceWidth` vs the JPEG width for screencast frames, the device pixel ratio
+ * for screenshots) and clipped to the page area, so it never draws into the caption strip.
+ */
+export interface PointerOverlayOptions {
+  /** Arrow height in CSS px; scaled with the page (default 20). */
+  sizePx?: number
+  /** `#RRGGBB` arrow fill (default black). */
+  fillColor?: string
+  /** `#RRGGBB` arrow outline (default white). The pair keeps it visible on any page. */
+  outlineColor?: string
+  /** `#RRGGBB` ring drawn at each press and release (default blue). */
+  pulseColor?: string
+  /** How long a press ring takes to expand and fade, ms (default 450). */
+  pulseMs?: number
+}
+
+const POINTER_DEFAULTS = {
+  sizePx: 20,
+  fillColor: '#000000',
+  outlineColor: '#FFFFFF',
+  pulseColor: '#2563EB',
+  pulseMs: 450,
+} as const
+
+/** The arrow, tip at (0, 0) so `\an7\pos` puts the hotspot exactly on the position. */
+const ARROW_POLYGON: ReadonlyArray<readonly [number, number]> = [
+  [0, 0],
+  [0, 16],
+  [3.8, 12.4],
+  [6.4, 18.2],
+  [9, 17.1],
+  [6.5, 11.4],
+  [11.6, 11.4],
+]
+const ARROW_POLYGON_HEIGHT = 18.2
+/** The arrow shrinks to this while a button is held, the way a real cursor press reads. */
+const PRESSED_ARROW_SCALE = 0.85
+/** Press-ring radius at its start, in CSS px. */
+const PULSE_RADIUS_CSS = 9
+
+/** One drawn state of the arrow, on the VIDEO clock, in FRAME px. */
+export interface PointerSegment {
+  startMs: number
+  endMs: number
+  x: number
+  y: number
+  /** Frame px per CSS px on the frames this segment is drawn over. */
+  scale: number
+  pressed: boolean
+}
+
+/** A press or release ring, on the VIDEO clock, in FRAME px. */
+export interface PointerPulse {
+  atMs: number
+  x: number
+  y: number
+  scale: number
+  kind: 'down' | 'up'
+}
+
+export interface PointerLayer {
+  segments: PointerSegment[]
+  pulses: PointerPulse[]
+  /** Track samples that fell inside the recording (plus the position it started at). */
+  samples: number
+  note?: string
+}
+
+/**
+ * Sample the pointer track at every OUTPUT frame time and merge runs of identical state.
+ *
+ * The pointer is a step function of the track: at video time T it is at the last
+ * dispatched position at or before T, exactly what a screen capture of the real pointer
+ * would show. Each output frame's state spans the half-intervals around its frame time, so
+ * ASS's centisecond rounding cannot move an edge onto the wrong frame; the encoder
+ * resamples to `fps` BEFORE libass draws (see `buildEncodeArgs`), so libass renders at
+ * exactly these times even where the page never repainted.
+ *
+ * The scale comes from the captured frame on screen at that time; a frame whose scale is
+ * unknown gets no pointer and is counted in `note` rather than drawn at a guessed size.
+ */
+export function buildPointerLayer({
+  samples,
+  recordingStartedAt,
+  frames,
+  durationMs,
+  fps,
+}: {
+  /** Ascending by `t` (epoch ms). May include the last sample before the recording began. */
+  samples: PointerSample[]
+  /** Epoch ms the recording clock's 0 corresponds to. */
+  recordingStartedAt: number
+  frames: Array<{ offsetMs: number; scale?: number; offsetTop?: number }>
+  durationMs: number
+  fps: number
+}): PointerLayer {
+  const empty: PointerLayer = { segments: [], pulses: [], samples: samples.length }
+  if (frames.length === 0 || samples.length === 0) return empty
+  const { videoStartOffsetMs, videoDurationMs, frameTimes } = videoTimeline({
+    frameOffsetsMs: frames.map((f) => f.offsetMs),
+    durationMs,
+  })
+  const step = 1000 / fps
+  const toVideo = (t: number) => t - recordingStartedAt - videoStartOffsetMs
+  const round1 = (v: number) => Math.round(v * 10) / 10
+  // The captured frame on screen at video time t: the last one whose time is <= t. frameTimes
+  // is ascending and starts at 0, and t >= 0, so one always exists.
+  const frameAt = (t: number) => {
+    let lo = 0
+    let hi = frameTimes.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >>> 1
+      if (frameTimes[mid] <= t) lo = mid
+      else hi = mid - 1
+    }
+    return frames[lo]
+  }
+
+  const segments: PointerSegment[] = []
+  let lastSegmentFrame = -2
+  let unscaledFrames = 0
+  let si = -1
+  let pressed = false
+  const outputFrames = Math.floor(videoDurationMs / step) + 1
+  for (let k = 0; k < outputFrames; k++) {
+    const t = k * step
+    while (si + 1 < samples.length && toVideo(samples[si + 1].t) <= t) {
+      si++
+      if (samples[si].kind === 'down') pressed = true
+      else if (samples[si].kind === 'up') pressed = false
+    }
+    if (si < 0) continue
+    const frame = frameAt(t)
+    if (frame.scale === undefined) {
+      unscaledFrames++
+      continue
+    }
+    const sample = samples[si]
+    const x = round1(sample.x * frame.scale)
+    const y = round1((sample.y + (frame.offsetTop ?? 0)) * frame.scale)
+    const last = segments[segments.length - 1]
+    if (
+      last &&
+      lastSegmentFrame === k - 1 &&
+      last.x === x &&
+      last.y === y &&
+      last.pressed === pressed &&
+      last.scale === frame.scale
+    ) {
+      last.endMs = t + step / 2
+    } else {
+      segments.push({ startMs: Math.max(0, t - step / 2), endMs: t + step / 2, x, y, scale: frame.scale, pressed })
+    }
+    lastSegmentFrame = k
+  }
+
+  const pulses: PointerPulse[] = []
+  for (const sample of samples) {
+    if (sample.kind !== 'down' && sample.kind !== 'up') continue
+    const atMs = toVideo(sample.t)
+    if (atMs < 0 || atMs > videoDurationMs) continue
+    const frame = frameAt(atMs)
+    if (frame.scale === undefined) continue
+    pulses.push({
+      atMs,
+      x: round1(sample.x * frame.scale),
+      y: round1((sample.y + (frame.offsetTop ?? 0)) * frame.scale),
+      scale: frame.scale,
+      kind: sample.kind,
+    })
+  }
+
+  return {
+    segments,
+    pulses,
+    samples: samples.length,
+    ...(unscaledFrames > 0
+      ? {
+          note:
+            `The pointer is missing from ${unscaledFrames} output frame(s): the captured frame on screen there has no ` +
+            'known CSS-to-frame scale (a screenshot taken before the device pixel ratio was measured, or a screencast ' +
+            'frame without metadata), and the pointer is not placed at a guessed size.',
+        }
+      : {}),
+  }
+}
+
+/** The recorder's `page` option is any `{ bringToFront }`; only a Playwright Page has a track. */
+function isPlaywrightPage(candidate: object): candidate is Page {
+  return 'onMouseAction' in candidate && 'mouse' in candidate
+}
+
+/** Refuse pointer options that cannot be what the caller meant. */
+export function validatePointerOptions(options?: PointerOverlayOptions): void {
+  assertFiniteInRange(options?.sizePx, 'pointer.sizePx', 4, 200, 'CSS pixels')
+  assertFiniteInRange(options?.pulseMs, 'pointer.pulseMs', 0, 5000, 'ms')
+  for (const name of ['fillColor', 'outlineColor', 'pulseColor'] as const) {
+    const value = options?.[name]
+    if (value !== undefined && !/^#?[0-9a-f]{6}$/i.test(String(value).trim())) {
+      throw new Error(`pointer.${name} must be #RRGGBB, got ${JSON.stringify(value)}.`)
+    }
+  }
+  const fill = options?.fillColor ?? POINTER_DEFAULTS.fillColor
+  const outline = options?.outlineColor ?? POINTER_DEFAULTS.outlineColor
+  if (colorsCollide(fill, outline)) {
+    throw new Error(
+      `pointer.fillColor ${JSON.stringify(fill)} and outlineColor ${JSON.stringify(outline)} are the same colour, so the ` +
+        'arrow would vanish on any page of that colour. The default pair is a black arrow with a white outline.',
+    )
+  }
+}
+
+/**
+ * The pointer's ASS style and dialogues. Layer 2 holds the press rings, layer 3 the arrow
+ * — above the caption (0) and the chips (1), the way a real cursor is above everything.
+ * Every event is clipped to the page rectangle.
+ */
+function pointerAssLines(
+  layer: PointerLayer,
+  page: { width: number; height: number },
+  options?: PointerOverlayOptions,
+): { style: string; events: string[] } {
+  const sizePx = options?.sizePx ?? POINTER_DEFAULTS.sizePx
+  const pulseMs = Math.round(options?.pulseMs ?? POINTER_DEFAULTS.pulseMs)
+  const fill = assColor(options?.fillColor ?? POINTER_DEFAULTS.fillColor)
+  const outline = assColor(options?.outlineColor ?? POINTER_DEFAULTS.outlineColor)
+  const pulse = assColor(options?.pulseColor ?? POINTER_DEFAULTS.pulseColor)
+  const clip = `\\clip(0,0,${page.width},${page.height})`
+  const num = (v: number) => String(Math.round(v * 10) / 10)
+
+  const arrow = (unit: number) => {
+    const points = ARROW_POLYGON.map(([x, y]) => `${Math.round(x * unit)} ${Math.round(y * unit)}`)
+    return `m ${points[0]} l ${points.slice(1).join(' ')}`
+  }
+  // A circle of radius r centred on (r, r): four cubic arcs, kappa = 0.5523.
+  const ring = (r: number) => {
+    const k = Math.round(r * 0.5523)
+    const d = Math.round(r * 2)
+    const c = Math.round(r)
+    return `m 0 ${c} b 0 ${c - k} ${c - k} 0 ${c} 0 b ${c + k} 0 ${d} ${c - k} ${d} ${c} b ${d} ${c + k} ${c + k} ${d} ${c} ${d} b ${c - k} ${d} 0 ${c + k} 0 ${c}`
+  }
+
+  const events: string[] = []
+  for (const p of layer.pulses) {
+    const down = p.kind === 'down'
+    const from = down ? 60 : 100
+    const to = down ? 220 : 160
+    const duration = down ? pulseMs : Math.round(pulseMs * 0.7)
+    const border = num(Math.max(1, (down ? 2.5 : 1.5) * p.scale))
+    events.push(
+      `Dialogue: 2,${assTime(p.atMs)},${assTime(p.atMs + duration)},Pointer,,0,0,0,,` +
+        `{\\an5\\pos(${num(p.x)},${num(p.y)})${clip}\\bord${border}\\shad0\\1a&HFF&\\3c${pulse}\\fscx${from}\\fscy${from}` +
+        `\\t(0,${duration},\\fscx${to}\\fscy${to}\\3a&HFF&)\\p1}${ring(PULSE_RADIUS_CSS * p.scale)}{\\p0}`,
+    )
+  }
+  for (const s of layer.segments) {
+    const unit = ((sizePx * s.scale) / ARROW_POLYGON_HEIGHT) * (s.pressed ? PRESSED_ARROW_SCALE : 1)
+    events.push(
+      `Dialogue: 3,${assTime(s.startMs)},${assTime(s.endMs)},Pointer,,0,0,0,,` +
+        `{\\an7\\pos(${num(s.x)},${num(s.y)})${clip}\\bord${num(Math.max(1, 1.2 * s.scale))}\\p1}${arrow(unit)}{\\p0}`,
+    )
+  }
+  return {
+    style: `Style: Pointer,Arial,20,${fill},${fill},${outline},${outline},0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1`,
+    events,
+  }
+}
+
 /* -------------------------------------------------------- subtitle formatting */
 
 function timestamp(ms: number, msSeparator: ',' | '.'): string {
@@ -3096,6 +3545,8 @@ export function formatAss(
    * frame again for a handful of chips.
    */
   input?: { segments: InputSegment[]; options?: InputOverlayOptions },
+  /** The pointer layer (`buildPointerLayer`), in the same file for the same reason. */
+  pointer?: { layer: PointerLayer; options?: PointerOverlayOptions },
 ): {
   text: string
   /** The letterbox geometry this file was written for. `encodeFrames` pads to match. */
@@ -3105,6 +3556,7 @@ export function formatAss(
   inputNote?: string
 } {
   validateVisualOptions(video, options, input?.options)
+  validatePointerOptions(pointer?.options)
   const fontName = options?.fontName ?? CAPTION_DEFAULTS.fontName
   const burnedCues = cues.filter((c) => !c.dropped)
 
@@ -3258,6 +3710,13 @@ export function formatAss(
       const body = layout === 'row' ? pad(lines.join(ROW_SEPARATOR)) : lines.map(pad).join('\\N')
       eventLines.push(`Dialogue: 1,${assTime(segment.startMs)},${assTime(segment.endMs)},Input,,0,0,0,,${body}`)
     }
+  }
+
+  if (pointer && (pointer.layer.segments.length > 0 || pointer.layer.pulses.length > 0)) {
+    // Clipped to the PAGE rows: the pointer is part of the page picture, never the strip.
+    const drawn = pointerAssLines(pointer.layer, { width: strip.pageWidth, height: strip.pageHeight }, pointer.options)
+    styleLines.push(drawn.style)
+    eventLines.push(...drawn.events)
   }
 
   const text = [
@@ -3510,6 +3969,7 @@ export async function encodeFrames({
   inputSegments,
   inputOverlayOptions,
   videoSize,
+  pointer,
 }: {
   frames: CapturedFrame[]
   outputPath: string
@@ -3527,6 +3987,12 @@ export async function encodeFrames({
    * `resolveFrameSize` measures it here and THROWS if it cannot — it never guesses.
    */
   videoSize?: { width: number; height: number }
+  /**
+   * The pointer, already resolved onto the video timeline by `buildPointerLayer`.
+   * `required` is true when the caller asked for it explicitly: then a missing libass is an
+   * error; otherwise (the default-on case) the pointer is skipped and `pointerNote` says so.
+   */
+  pointer?: { layer: PointerLayer; options?: PointerOverlayOptions; required: boolean }
 }): Promise<{
   render: CaptionRender[]
   files: string[]
@@ -3539,6 +4005,10 @@ export async function encodeFrames({
   strip?: CaptionStripMetrics
   /** Set when the layout itself had to compromise. */
   inputNote?: string
+  /** Whether the pointer layer was burned in. */
+  pointerDrawn: boolean
+  /** Why the pointer was not drawn, when it had something to draw. */
+  pointerNote?: string
 }> {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-screencast-'))
   try {
@@ -3578,18 +4048,40 @@ export async function encodeFrames({
 
     const emitted = (captions ?? []).filter((c) => !c.dropped)
     const segments = inputSegments ?? []
-    if (emitted.length === 0 && segments.length === 0) {
-      // No captions and no overlay, no change: the args below must stay identical to
-      // what this recorder emitted before either feature existed.
+    let pointerLayer = pointer && pointer.layer.segments.length > 0 ? pointer.layer : undefined
+    let pointerNote: string | undefined
+    if (pointerLayer && !(await ffmpegCaptionCapabilities()).libass) {
+      if (pointer?.required) {
+        throw new Error(
+          'The pointer is burned into the pixels and needs an ffmpeg built with libass: the `subtitles` filter is ' +
+            'absent from `ffmpeg -filters` on this machine. Install an ffmpeg configured with --enable-libass, or ' +
+            're-run with pointer: false.',
+        )
+      }
+      pointerNote =
+        'The pointer was not drawn: this ffmpeg has no libass (the `subtitles` filter is absent from `ffmpeg ' +
+        '-filters`). Install an ffmpeg configured with --enable-libass, or pass pointer: false to opt out.'
+      pointerLayer = undefined
+    }
+    if (emitted.length === 0 && segments.length === 0 && !pointerLayer) {
+      // No captions, no overlay and no pointer, no change: the args below must stay
+      // identical to what this recorder emitted before any of them existed.
       await runFfmpeg(buildEncodeArgs({ listFile, outputPath, fps }))
-      return { render: [], files: [], extraAdjustments: new Map(), inputAdjustments: new Map() }
+      return {
+        render: [],
+        files: [],
+        extraAdjustments: new Map(),
+        inputAdjustments: new Map(),
+        pointerDrawn: false,
+        ...(pointerNote ? { pointerNote } : {}),
+      }
     }
     let inputNote: string | undefined
 
     const render = emitted.length === 0 ? [] : normalizeRender(captionOptions?.render)
     // The overlay is pixels or nothing: there is no soft or sidecar form of a key chip,
     // so it burns regardless of what captionOptions.render says about the captions.
-    const needsBurn = render.includes('burn') || segments.length > 0
+    const needsBurn = render.includes('burn') || segments.length > 0 || pointerLayer !== undefined
     const caps = await ffmpegCaptionCapabilities()
     if (needsBurn && !caps.libass) {
       throw new Error(
@@ -3628,6 +4120,7 @@ export async function encodeFrames({
         size,
         captionOptions,
         segments.length > 0 ? { segments, options: inputOverlayOptions } : undefined,
+        pointerLayer ? { layer: pointerLayer, options: pointer?.options } : undefined,
       )
       extraAdjustments = ass.adjustments
       inputAdjustments = ass.inputAdjustments
@@ -3643,7 +4136,9 @@ export async function encodeFrames({
       fs.writeFileSync(softSrtPath, formatSrt(emitted), 'utf8')
     }
 
-    await runFfmpeg(buildEncodeArgs({ listFile, outputPath, fps, burnAssPath, softSrtPath, strip }))
+    await runFfmpeg(
+      buildEncodeArgs({ listFile, outputPath, fps, burnAssPath, softSrtPath, strip, resampleBeforeBurn: pointerLayer !== undefined }),
+    )
 
     const files: string[] = []
     if (render.includes('sidecar')) {
@@ -3663,10 +4158,178 @@ export async function encodeFrames({
       inputAdjustments,
       ...(strip && strip.height > 0 ? { strip } : {}),
       ...(inputNote ? { inputNote } : {}),
+      pointerDrawn: pointerLayer !== undefined,
+      ...(pointerNote ? { pointerNote } : {}),
     }
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true })
   }
+}
+
+/** What burning the pointer into a finished recording did. Same shape as `CdpScreencastResult.pointer`. */
+export interface PointerBurnResult {
+  drawn: boolean
+  samples: number
+  segments: number
+  pulses: number
+  note?: string
+}
+
+/**
+ * Draw the pointer into an ALREADY-ENCODED recording, in place — the tabCapture recorder's
+ * counterpart of the pointer layer `startCdpScreencast` burns while encoding its frames.
+ *
+ * Same layer (`buildPointerLayer` + the `Pointer` ASS style), same source (a pointer track:
+ * what the automation dispatched, never anything read from the page), same libass rule:
+ * `required` (the caller asked for the pointer explicitly) turns a missing libass into an
+ * error; otherwise it is skipped and the result's `note` says so.
+ *
+ * The timeline: video time 0 is `recordingStartedAt` — the epoch ms the recorder stamped
+ * when it started (the extension stamps it immediately before `MediaRecorder.start()`) —
+ * and the video's own timestamps are used as they are, never shifted to its first frame.
+ * The page has one CSS-to-video scale for the whole clip, measured from the video's size
+ * against `cssViewport`; a video whose shape is not the viewport's (letterboxed, cropped,
+ * or resized mid-recording) has no exact place for the pointer and is not drawn on.
+ *
+ * The re-encode resamples to `fps` before libass draws, so the pointer moves on every
+ * output frame even where the capture held a frame, and the result is constant-rate.
+ * The container stays mp4 whatever the file is named, because the input is one: the
+ * extension's MediaRecorder writes `video/mp4`. Audio is copied untouched.
+ */
+export async function burnPointerIntoVideo({
+  videoPath,
+  timeline,
+  recordingStartedAt,
+  recordingEndedAt,
+  cssViewport,
+  fps,
+  options,
+  required,
+}: {
+  videoPath: string
+  timeline: PointerTimeline
+  /** Epoch ms that video time 0 corresponds to. */
+  recordingStartedAt: number
+  /** Epoch ms after which no dispatched position can be in the video. */
+  recordingEndedAt: number
+  /** The page's viewport in CSS px while it was recorded. */
+  cssViewport: { width: number; height: number }
+  fps: number
+  options?: PointerOverlayOptions
+  required: boolean
+}): Promise<PointerBurnResult> {
+  validatePointerOptions(options)
+  const inClip = timeline.between(recordingStartedAt, recordingEndedAt)
+  const atStart = timeline.latest(recordingStartedAt)
+  const samples = atStart && atStart.t < recordingStartedAt ? [atStart, ...inClip] : inClip
+  const skipped = (note: string, layer?: PointerLayer): PointerBurnResult => ({
+    drawn: false,
+    samples: samples.length,
+    segments: layer?.segments.length ?? 0,
+    pulses: layer?.pulses.length ?? 0,
+    note,
+  })
+  if (samples.length === 0) return skipped('No pointer position was dispatched before or during the recording.')
+
+  const video = await probeEncodedVideo(videoPath)
+  const scale = video.width / cssViewport.width
+  const scaleY = video.height / cssViewport.height
+  if (!(Math.abs(scale - scaleY) <= scale * 0.01)) {
+    const message =
+      `The recorded video is ${video.width}x${video.height} but the page viewport was ${cssViewport.width}x${cssViewport.height} ` +
+      'CSS px — not the same shape, so the capture is letterboxed, cropped or was resized mid-recording, and there is no ' +
+      'exact place to draw the pointer.'
+    if (required) throw new Error(`${message} Re-run with pointer: false, or keep the viewport fixed while recording.`)
+    return skipped(`The pointer was not drawn: ${message}`)
+  }
+
+  const layer = buildPointerLayer({
+    samples,
+    recordingStartedAt,
+    frames: [{ offsetMs: 0, scale }],
+    durationMs: video.durationMs,
+    fps,
+  })
+  if (layer.segments.length === 0) {
+    return skipped('No dispatched pointer position falls inside the recorded video.', layer)
+  }
+  if (!(await ffmpegCaptionCapabilities()).libass) {
+    if (required) {
+      throw new Error(
+        'The pointer is burned into the pixels and needs an ffmpeg built with libass: the `subtitles` filter is ' +
+          'absent from `ffmpeg -filters` on this machine. Install an ffmpeg configured with --enable-libass, or ' +
+          're-run with pointer: false.',
+      )
+    }
+    return skipped(
+      'The pointer was not drawn: this ffmpeg has no libass (the `subtitles` filter is absent from `ffmpeg ' +
+        '-filters`). Install an ffmpeg configured with --enable-libass, or pass pointer: false to opt out.',
+      layer,
+    )
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-pointer-burn-'))
+  try {
+    const ass = formatAss([], { width: video.width, height: video.height }, undefined, undefined, { layer, options })
+    const assPath = path.join(workDir, 'pointer.ass')
+    fs.writeFileSync(assPath, ass.text, 'utf8')
+    const burned = path.join(workDir, 'burned.mp4')
+    await runFfmpeg([
+      '-y',
+      '-i', path.resolve(videoPath),
+      '-map', '0:v:0',
+      '-map', '0:a?',
+      '-vf', `scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=${fps},subtitles=${escapeFilterPath(assPath)}`,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'copy',
+      '-movflags', '+faststart',
+      '-f', 'mp4',
+      burned,
+    ])
+    fs.copyFileSync(burned, path.resolve(videoPath))
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true })
+  }
+  return {
+    drawn: true,
+    samples: layer.samples,
+    segments: layer.segments.length,
+    pulses: layer.pulses.length,
+    ...(layer.note ? { note: layer.note } : {}),
+  }
+}
+
+/** Size and length of an encoded video, from ffprobe. Throws rather than guess either. */
+async function probeEncodedVideo(videoPath: string): Promise<{ width: number; height: number; durationMs: number }> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>()
+  const proc = spawn(
+    'ffprobe',
+    ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'json', path.resolve(videoPath)],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  )
+  let out = ''
+  let err = ''
+  proc.stdout.on('data', (c: Buffer) => {
+    out += c.toString()
+  })
+  proc.stderr.on('data', (c: Buffer) => {
+    err = (err + c.toString()).slice(-4000)
+  })
+  proc.on('error', (e) => reject(new Error(`ffprobe failed to spawn (is it installed?): ${e.message}`)))
+  proc.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`ffprobe exited ${code} on ${videoPath}:\n${err}`))))
+  const parsed: { streams?: Array<{ width?: number; height?: number }>; format?: { duration?: string } } = JSON.parse(await promise)
+  const width = Number(parsed.streams?.[0]?.width)
+  const height = Number(parsed.streams?.[0]?.height)
+  const durationMs = Number(parsed.format?.duration) * 1000
+  if (!(width > 0) || !(height > 0) || !(durationMs > 0)) {
+    throw new Error(
+      `ffprobe found no usable video stream in ${videoPath} (width=${width}, height=${height}, duration=${durationMs}ms), ` +
+        'so the pointer cannot be placed on it.',
+    )
+  }
+  return { width, height, durationMs }
 }
 
 /**
@@ -3723,6 +4386,12 @@ function normalizeRender(render: CaptionOptions['render']): CaptionRender[] {
  * no second `trunc` is needed after the pad. Getting this wrong is not subtle — x264 refuses
  * an odd dimension outright — but it is worth stating, because the guarantee now comes from
  * arithmetic in another file rather than from the filter that used to carry it.
+ *
+ * `resampleBeforeBurn` adds `fps=<fps>` right after `scale`, and only the pointer layer sets
+ * it. Without it libass draws once per CAPTURED frame — and the screencast captures only on
+ * repaint, so a pointer moving over a page that does not repaint would be drawn once and
+ * then jump. Resampled first, libass draws at every OUTPUT frame time, which is what
+ * `buildPointerLayer` sampled the track at. `-vsync cfr -r` after it then has nothing to do.
  */
 export function buildEncodeArgs({
   listFile,
@@ -3731,6 +4400,7 @@ export function buildEncodeArgs({
   burnAssPath,
   softSrtPath,
   strip,
+  resampleBeforeBurn = false,
 }: {
   listFile: string
   outputPath: string
@@ -3739,8 +4409,10 @@ export function buildEncodeArgs({
   softSrtPath?: string
   /** The caption strip to append below the page. Omitted or zero-height means no letterbox. */
   strip?: Pick<CaptionStripMetrics, 'height' | 'ruleHeight' | 'stripColor' | 'ruleColor'>
+  resampleBeforeBurn?: boolean
 }): string[] {
   const stages = ['scale=trunc(iw/2)*2:trunc(ih/2)*2']
+  if (resampleBeforeBurn) stages.push(`fps=${fps}`)
   if (strip && strip.height > 0) {
     if (strip.ruleHeight > 0) stages.push(`pad=iw:ih+${strip.ruleHeight}:0:0:${ffmpegColor(strip.ruleColor)}`)
     stages.push(`pad=iw:ih+${strip.height - strip.ruleHeight}:0:0:${ffmpegColor(strip.stripColor)}`)

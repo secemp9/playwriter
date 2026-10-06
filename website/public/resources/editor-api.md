@@ -50,20 +50,26 @@ export interface EditResult {
  */
 export declare class Editor {
     private cdp;
-    private enabled;
-    private scripts;
-    private stylesheets;
+    /** The session's one Debugger owner: the parsed-script map and enable-once. */
+    private debuggerDomain;
+    /** The session's one CSS owner: the stylesheet-header map and enable-once. */
+    private cssDomain;
     private sourceCache;
     constructor({ cdp }: {
         cdp: ICDPSession;
     });
-    private setupEventListeners;
     /**
-     * Enables the editor. Must be called before other methods.
-     * Scripts are collected from Debugger.scriptParsed events.
-     * Reload the page after enabling to capture all scripts.
+     * Enables the editor. Called automatically by the other methods.
+     *
+     * Scripts and stylesheets come from the session's shared Debugger and CSS owners
+     * (`cdp-domains.ts`), which enable each domain once and never disable it: the session
+     * is usually Playwright's own page session, and a `Debugger.disable`/`CSS.disable`
+     * there would drop other users' breakpoints and stylesheet bookkeeping. Page pauses
+     * stay skipped; the editor never needs one.
      */
     enable(): Promise<void>;
+    /** url → scriptId, and url → styleSheetId, of the live documents. Later entries win, as a re-parse should. */
+    private resources;
     private getIdByUrl;
     /**
      * Lists available script and stylesheet URLs. Use pattern to filter by regex.
@@ -134,7 +140,10 @@ export declare class Editor {
      * @param options.url - Script or stylesheet URL (inline scripts have `inline://{id}` URLs)
      * @param options.oldString - Exact string to find and replace
      * @param options.newString - Replacement string
-     * @param options.dryRun - If true, validate without applying (default false)
+     * @param options.dryRun - If true, validate without applying (default false). Nothing is
+     *   written to the page. A script is compiled by V8 as a check; CDP has no way to check
+     *   a stylesheet without applying it, so for CSS a dry run checks only that oldString
+     *   occurs exactly once.
      * @returns Result with success status
      *
      * @example
@@ -199,7 +208,9 @@ export declare class Editor {
      * @param options - Options
      * @param options.url - Script or stylesheet URL (inline scripts have `inline://{id}` URLs)
      * @param options.content - New content
-     * @param options.dryRun - If true, validate without applying (default false, only works for JS)
+     * @param options.dryRun - If true, write nothing (default false). A script is compiled
+     *   by V8 as a check; a stylesheet is not checked at all (CDP cannot check CSS without
+     *   applying it).
      */
     write({ url, content, dryRun, }: {
         url: string;

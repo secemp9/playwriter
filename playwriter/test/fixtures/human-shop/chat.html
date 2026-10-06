@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Assistant chat</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; }
+  #log { height: 360px; overflow-y: auto; padding: 8px; border-bottom: 1px solid #ccc; }
+  .msg { margin: 6px 0; }
+  form { padding: 8px; }
+</style>
+</head>
+<body>
+<h1>Assistant</h1>
+<!-- The standard chat markup: the transcript is an ARIA log, announced politely. -->
+<div id="log" role="log" aria-live="polite" aria-label="Conversation">
+  <p class="msg">You: Does the M185 ship tomorrow?</p>
+  <p class="msg">Assistant: Let me check the warehouse for you.</p>
+</div>
+<form id="composer">
+  <input id="message" aria-label="Message" autocomplete="off">
+  <button>Send</button>
+</form>
+<script>
+  const log = document.getElementById('log')
+  const input = document.getElementById('message')
+  const add = (text) => {
+    const p = document.createElement('p')
+    p.className = 'msg'
+    p.textContent = text
+    log.append(p)
+  }
+  document.getElementById('composer').addEventListener('submit', (event) => {
+    event.preventDefault()
+    add('You: ' + input.value)
+    input.value = ''
+    setTimeout(() => add('Assistant: Yes — the M185 ships tomorrow from the Lyon warehouse.'), 300)
+  })
+</script>
+</body>
+</html>

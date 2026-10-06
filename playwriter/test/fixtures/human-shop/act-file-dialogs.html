@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>File dialogs</title>
+<style>
+  body { font: 14px sans-serif; margin: 40px; }
+  button { display: block; margin: 12px 0; padding: 8px 16px; }
+</style>
+</head>
+<body>
+  <h1>Profile</h1>
+  <!-- A delete guarded by confirm(): answering it is all that happens. -->
+  <button id="delete" onclick="document.getElementById('out').textContent = confirm('Delete the draft?') ? 'deleted' : 'kept'">Delete draft</button>
+  <!-- confirm() first, then the file dialog from the same click: if (confirm(…)) input.click(). -->
+  <button id="replace" onclick="if (confirm('Replace your photo?')) document.getElementById('photo').click()">Replace photo</button>
+  <!-- The file dialog opens a moment after the click, from a timer: after the call that clicked has returned. -->
+  <button id="later" onclick="setTimeout(() => document.getElementById('attachment').click(), 3000)">Attach later</button>
+  <!-- A plain upload button over a hidden input, for code that answers file dialogs itself. -->
+  <button id="upload" onclick="document.getElementById('attachment').click()">Upload attachment</button>
+  <!-- Nothing to do with files: a click whose activation is all the file dialogs can come from. -->
+  <button id="hi" onclick="document.getElementById('out').textContent = 'hi'">Say hi</button>
+  <input type="file" id="photo" hidden>
+  <input type="file" id="attachment" hidden>
+  <p id="out">nothing yet</p>
+  <p id="clicks">photo input clicked 0 times</p>
+  <script>
+    let photoClicks = 0
+    const out = document.getElementById('out')
+    document.getElementById('photo').addEventListener('click', () => {
+      photoClicks += 1
+      document.getElementById('clicks').textContent = 'photo input clicked ' + photoClicks + ' times'
+    })
+    for (const id of ['photo', 'attachment']) {
+      const input = document.getElementById(id)
+      input.addEventListener('change', () => { out.textContent = id + ': ' + Array.from(input.files).map((file) => file.name).join(', ') })
+      input.addEventListener('cancel', () => { out.textContent = id + ': cancelled' })
+    }
+  </script>
+</body>
+</html>

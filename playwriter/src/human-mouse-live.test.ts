@@ -206,6 +206,46 @@ describe('the behavioural claim: a real path fires hover events a teleport does 
     expect(descriptions).toContain('#hazard')
   }, 60000)
 
+  it('records crossings without changing the page own-global list', async () => {
+    const readGlobals = (): Promise<string[]> => page.evaluate(() => Object.getOwnPropertyNames(globalThis).sort())
+    const before = await readGlobals()
+
+    const moving = humanMouse.moveTo({
+      page,
+      from: ORIGIN,
+      locator: page.locator('#target'),
+      seed: 4242,
+      reportCrossings: true,
+    })
+    // Read mid-move, while the recorder is armed. Real timer: the move runs on the real
+    // browser clock, so the read must land inside its wall-clock window.
+    await page.waitForTimeout(80)
+    const during = await readGlobals()
+    const result = await moving
+    const after = await readGlobals()
+
+    expect(during).toEqual(before)
+    expect(after).toEqual(before)
+    expect((result.crossed ?? []).map((c) => c.description).join(' | ')).toContain('#hazard')
+  }, 60000)
+
+  it('reports crossings lost to a navigation during the move instead of an empty trail', async () => {
+    const moving = humanMouse.moveTo({
+      page,
+      from: ORIGIN,
+      locator: page.locator('#target'),
+      seed: 4242,
+      reportCrossings: true,
+    })
+    // Real timer: the reload has to land inside the move's real wall-clock window.
+    await page.waitForTimeout(60)
+    await page.reload()
+    const result = await moving
+
+    expect(result.crossed).toBeUndefined()
+    expect(result.warnings.join('\n')).toContain('navigated during the move')
+  }, 60000)
+
   it('the page receives a dense, ordered trail of mousemoves, not one jump', async () => {
     await page.evaluate(() => (globalThis as unknown as { __resetProbes: () => void }).__resetProbes())
     const result = await humanMouse.moveTo({ page, from: ORIGIN, locator: page.locator('#target'), seed: 99 })
@@ -408,5 +448,52 @@ describe('ghost cursor follows the same path', () => {
       0,
     )
     expect(travelled).toBeGreaterThan(planned.distancePx * 0.9)
+  }, 60000)
+})
+
+describe('a drag holds the button through the human move', () => {
+  it('the page sees one continuous drag: every move between press and release has buttons=1', async () => {
+    const page = await context.newPage()
+    await page.setContent(`<!doctype html><html><body style="margin:0">
+      <div id="track" style="position:fixed;left:100px;top:300px;width:800px;height:40px;background:#334155"></div>
+      <script>
+        window.__pointer = []
+        for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
+          document.addEventListener(type, (e) => window.__pointer.push({ type: e.type, buttons: e.buttons, x: e.clientX }), true)
+        }
+      </script>
+    </body></html>`)
+    const humanMouse = createHumanMouseApi({
+      defaultPage: page,
+      getCdpSession: async ({ page: target }) => new PlaywrightCDPSessionAdapter(await context.newCDPSession(target)),
+    })
+    try {
+      const start = { x: 120, y: 320 }
+      await page.mouse.move(start.x, start.y)
+      await page.mouse.down()
+      const result = await humanMouse.moveTo({ page, from: start, x: 860, y: 320, heldButton: 'left', seed: 7 })
+      await page.mouse.up()
+
+      // What the fixture's own listeners recorded (plain JSON objects).
+      const events: Array<{ type: string; buttons: number; x: number }> = await page.evaluate(() => Reflect.get(window, '__pointer'))
+      const down = events.findIndex((event) => event.type === 'pointerdown')
+      const up = events.findIndex((event) => event.type === 'pointerup')
+      expect(down).toBeGreaterThanOrEqual(0)
+      // One press and one release, in that order, and no cancel: the drag was never broken.
+      expect(events.filter((event) => event.type === 'pointerdown')).toHaveLength(1)
+      expect(events.filter((event) => event.type === 'pointerup')).toHaveLength(1)
+      expect(events.some((event) => event.type === 'pointercancel')).toBe(false)
+      expect(up).toBeGreaterThan(down)
+
+      const moves = events.slice(down + 1, up)
+      expect(moves.length).toBeGreaterThan(5)
+      expect(moves.filter((event) => event.buttons !== 1)).toEqual([])
+      // It travelled with the button down and was released at the target.
+      expect(Math.max(...moves.map((event) => event.x))).toBeGreaterThan(800)
+      expect(Math.abs(events[up].x - 860)).toBeLessThanOrEqual(1)
+      expect(Number.isFinite(result.probeDispatchMs)).toBe(true)
+    } finally {
+      await page.close()
+    }
   }, 60000)
 })

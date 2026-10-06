@@ -66,6 +66,7 @@ const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'relay-workspace.test.ts': 19771,
   'relay-two-targets.test.ts': 19772,
   'relay-oopif-attach.test.ts': 19773,
+  'iframes-relay.test.ts': 19774,
   'trace-integration.test.ts': 19985,
   'aria-snapshot.test.ts': 19986,
   'relay-core.test.ts': 19987,
@@ -76,6 +77,7 @@ const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'on-mouse-action.test.ts': 19994,
   'popup-relocation.test.ts': 19995,
   'relay-state.test.ts': 19996,
+  'page-purity.test.ts': 19997,
 })
 
 // Invariants (1) and (2), enforced at module load so a bad edit cannot reach a test run.

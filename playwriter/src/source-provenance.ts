@@ -2,6 +2,8 @@ import { codeFrameColumns } from '@babel/code-frame'
 import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping'
 import type { SourceMapInput } from '@jridgewell/trace-mapping'
 import type { Loc } from './static-analysis.js'
+import type { ICDPSession } from './cdp-session.js'
+import { ModelFacingError } from './probe-types.js'
 
 export interface OriginalPosition {
   source: string | null
@@ -65,4 +67,90 @@ export function renderCodeFrame({ code, loc, message }: { code: string; loc: Loc
     },
     { highlightCode: false, message },
   )
+}
+
+/**
+ * A script or source map could not be loaded: a network failure, an HTTP error, a size bound or
+ * a stalled transfer. The browser's network stack serves these loads, not the page's main
+ * thread, so this is never evidence that the page itself is unresponsive.
+ */
+export class ResourceLoadError extends ModelFacingError {
+  readonly url: string
+  constructor(url: string, cause: string) {
+    super(`Loading ${url} failed: ${cause}`)
+    this.name = 'ResourceLoadError'
+    this.url = url
+  }
+}
+
+/** `step` of loading `url`, failing with a ResourceLoadError when it makes no progress for `timeoutMs`. */
+async function loadStep<T>(promise: Promise<T>, timeoutMs: number, url: string, step: string): Promise<T> {
+  const stalled = Promise.withResolvers<never>()
+  const timer = setTimeout(() => stalled.reject(new ResourceLoadError(url, `${step} made no progress for ${timeoutMs}ms`)), timeoutMs)
+  try {
+    return await Promise.race([promise, stalled.promise])
+  } catch (error) {
+    if (error instanceof ResourceLoadError) throw error
+    throw new ResourceLoadError(url, `${step} failed (${error instanceof Error ? error.message : String(error)})`)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Fetch a script or source map the way DevTools does: `Network.loadNetworkResource` on the
+ * frame (its cookies and origin), streamed through `IO.read`. Measured: it produces no
+ * `Network.requestWillBeSent` and no Playwright `request` event, so the page neither makes nor
+ * sees the request. `data:` URLs are decoded locally. Every failure is a `ResourceLoadError`
+ * naming the URL and the cause: a non-OK response, more than `maxBytes`, or a step (the
+ * request, one chunk read) that makes no progress for `timeoutMs` — a stall bound, so a large
+ * file that keeps streaming is never cut.
+ */
+export async function loadResourceText({
+  cdp,
+  frameId,
+  url,
+  maxBytes,
+  timeoutMs,
+}: {
+  cdp: ICDPSession
+  frameId: string
+  url: string
+  maxBytes: number
+  timeoutMs: number
+}): Promise<string> {
+  if (url.startsWith('data:')) {
+    const comma = url.indexOf(',')
+    if (comma < 0) throw new ResourceLoadError(url.slice(0, 40), 'malformed data: URL')
+    const header = url.slice(5, comma)
+    const body = url.slice(comma + 1)
+    return header.endsWith(';base64') ? Buffer.from(body, 'base64').toString('utf8') : decodeURIComponent(body)
+  }
+  const loaded = await loadStep(
+    cdp.send('Network.loadNetworkResource', { frameId, url, options: { disableCache: false, includeCredentials: true } }),
+    timeoutMs,
+    url,
+    'the request',
+  )
+  const resource = loaded.resource
+  if (!resource.success || !resource.stream) {
+    const status = resource.httpStatusCode ? `HTTP ${resource.httpStatusCode}` : 'no response'
+    throw new ResourceLoadError(url, `${status}${resource.netErrorName ? ` ${resource.netErrorName}` : ''}`)
+  }
+  const chunks: Buffer[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const chunk = await loadStep(cdp.send('IO.read', { handle: resource.stream, size: 1 << 20 }), timeoutMs, url, 'reading the body')
+      const buffer = chunk.base64Encoded ? Buffer.from(chunk.data, 'base64') : Buffer.from(chunk.data, 'utf8')
+      total += buffer.length
+      if (total > maxBytes) throw new ResourceLoadError(url, `larger than ${maxBytes} bytes (the load bound)`)
+      chunks.push(buffer)
+      if (chunk.eof) break
+    }
+  } finally {
+    cdp.send('IO.close', { handle: resource.stream }).catch(() => {})
+  }
+  if (resource.httpStatusCode && resource.httpStatusCode >= 400) throw new ResourceLoadError(url, `HTTP ${resource.httpStatusCode}`)
+  return Buffer.concat(chunks).toString('utf8')
 }

@@ -266,11 +266,18 @@ export declare function verifyNonPausingCondition(condition: string): NonPausing
  */
 export declare class Debugger {
     private cdp;
-    private debuggerEnabled;
+    /** The session's one Debugger owner: scripts, enable-once, the skip-all-pauses policy. */
+    private domain;
     private paused;
     private currentCallFrames;
     private breakpoints;
-    private scripts;
+    /**
+     * The pause leases this instance holds, keyed by what needs to pause:
+     * `bp:<breakpointId>`, `xhr:<url>`, `exceptions`. While any is held the page's
+     * `debugger;` statements and breakpoints pause; when the last is released pauses are
+     * skipped again.
+     */
+    private pauseLeases;
     private xhrBreakpoints;
     private blackboxPatterns;
     private nonPausingOnlyDepth;
@@ -292,28 +299,30 @@ export declare class Debugger {
         cdp: ICDPSession;
     });
     private setupEventListeners;
+    /** Scripts with a real URL (not Chrome/DevTools internals), in parse order. */
+    private knownScripts;
+    /** Hold a pause lease under `key` (shared if already held), so the page may pause for it. */
+    private holdPauses;
+    private releasePauses;
     /**
-     * Enables the Debugger domain. Called automatically by other methods. Also resumes
-     * execution if the target was started with --inspect-brk.
+     * Enables the Debugger domain through the session's one owner (`cdp-domains.ts`).
+     * Called automatically by other methods. Also resumes execution if the target was
+     * started with --inspect-brk.
      *
-     * It does NOT touch the Runtime domain, and that omission is load-bearing.
+     * The session is usually Playwright's OWN page session, shared with everything else
+     * in the process, so the domain is enabled once and NEVER disabled (a
+     * `Debugger.disable` would drop every other user's breakpoints), and page pauses stay
+     * skipped until this or another Debugger arms something that is meant to pause
+     * (`setBreakpoint` without a provably non-pausing condition, `setPauseOnExceptions`,
+     * `setXHRBreakpoint`, `pauseOnDebuggerStatements`). Removing the last of those skips
+     * pauses again.
      *
-     * This session is usually Playwright's OWN page session (`getExistingCDPSession`),
-     * shared with everything else in the process. Measured against real Chromium, a
-     * `Runtime.disable` followed by `Runtime.enable` makes V8 REPLAY its entire console
-     * buffer: every line the page had already logged is delivered a second time, plus
-     * Playwright's internal `--playwright--set--content--…` markers, and it happens again
-     * on every subsequent cycle. Downstream that is not cosmetic — `readLogpoints` scans
-     * the same log array, so a replayed `[[logpoint:TAG]]` line is counted as a fresh hit
-     * and "this code path ran once" reads as "it ran twice".
-     *
-     * Nothing here needed those two calls. Measured, with only `Debugger.enable` sent:
-     * `Debugger.scriptParsed` arrives for every already-parsed script (that is what
-     * repopulates `this.scripts`, and it is `Debugger.disable`/`enable` — not Runtime —
-     * that re-emits them); `Runtime.evaluate`, `Runtime.getProperties` and
-     * `Runtime.globalLexicalScopeNames` all answer without `Runtime.enable`; breakpoints
-     * bind and `Debugger.paused` fires. Playwright's own `page.evaluate` and console
-     * capture keep working throughout, with zero replayed lines.
+     * It does NOT touch the Runtime domain, and that omission is load-bearing: measured
+     * against real Chromium, a `Runtime.disable` followed by `Runtime.enable` makes V8
+     * REPLAY its entire console buffer, so a replayed `[[logpoint:TAG]]` line would be
+     * counted by `readLogpoints` as a fresh hit. `Runtime.evaluate`,
+     * `Runtime.getProperties` and `Runtime.globalLexicalScopeNames` all answer without
+     * `Runtime.enable`.
      */
     enable(): Promise<void>;
     /**
@@ -597,6 +606,26 @@ export declare class Debugger {
      */
     setPauseOnExceptions({ state }: {
         state: 'none' | 'uncaught' | 'all';
+    }): Promise<void>;
+    /**
+     * Lets the page's own `debugger;` statements pause it (`enabled: true`) or makes them
+     * harmless again (`false`, the default state).
+     *
+     * Enabling the Debugger domain alone would make every `debugger;` in the page freeze it
+     * with nobody there to resume, so pauses are skipped until a caller asks for one. This
+     * is that request for `debugger;` statements; breakpoints, `setPauseOnExceptions` and
+     * `setXHRBreakpoint` make their own.
+     *
+     * @example
+     * ```ts
+     * await dbg.pauseOnDebuggerStatements({ enabled: true })
+     * // trigger the code with the `debugger;` statement, inspect, then:
+     * await dbg.resume()
+     * await dbg.pauseOnDebuggerStatements({ enabled: false })
+     * ```
+     */
+    pauseOnDebuggerStatements({ enabled }: {
+        enabled: boolean;
     }): Promise<void>;
     /**
      * Lists available scripts where breakpoints can be set.

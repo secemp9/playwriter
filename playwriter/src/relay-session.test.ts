@@ -10,6 +10,7 @@ import {
   setupTestContext,
   cleanupTestContext,
   getExtensionServiceWorker,
+  createSimpleServer,
   createSseServer,
   safeCloseCDPBrowser,
   type TestContext,
@@ -68,7 +69,7 @@ describe('CDP Session Tests', () => {
     const cdpSession = await getCDPSessionForPage({ page })
     const dbg = new Debugger({ cdp: cdpSession })
 
-    await dbg.enable()
+    await dbg.pauseOnDebuggerStatements({ enabled: true })
 
     expect(dbg.isPaused()).toBe(false)
 
@@ -140,12 +141,15 @@ describe('CDP Session Tests', () => {
     )
     await new Promise((r) => setTimeout(r, 100))
 
+    // Debug policy: Runtime.evaluate over getCDPSession() is a write, which human mode refuses
+    // (its getCDPSession() may only read). This test is about the session cache, not the policy.
     const executor = new PlaywrightExecutor({
       cdpConfig: { port: TEST_PORT, workspace: TEST_WORKSPACE },
       logger: {
         log: () => {},
         error: () => {},
       },
+      policy: 'debug',
     })
 
     const result = await executor.execute(js`
@@ -277,7 +281,7 @@ describe('CDP Session Tests', () => {
     const cdpSession = await getCDPSessionForPage({ page })
     const dbg = new Debugger({ cdp: cdpSession })
 
-    await dbg.enable()
+    await dbg.pauseOnDebuggerStatements({ enabled: true })
 
     const pausedPromise = new Promise<void>((resolve) => {
       cdpSession.on('Debugger.paused', () => resolve())
@@ -719,7 +723,7 @@ describe('CDP Session Tests', () => {
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
     const dbg = new Debugger({ cdp: cdpSession })
 
-    await dbg.enable()
+    await dbg.pauseOnDebuggerStatements({ enabled: true })
 
     const globalVars = await dbg.inspectGlobalVariables()
     expect(globalVars).toMatchInlineSnapshot(`
@@ -770,47 +774,65 @@ describe('CDP Session Tests', () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
-    const page = await browserContext.newPage()
-    await page.goto('https://example.com/')
-    await page.bringToFront()
-
-    await serviceWorker.evaluate(
-      async ([k, l]) => {
-        await globalThis.toggleExtensionForActiveTab(k, l)
+    // The page is served locally: https://example.com/ dropped its <h1> (it now serves only <p>
+    // text plus a script-inserted <svg>), so a live third-party page cannot carry this test.
+    const server = await createSimpleServer({
+      routes: {
+        '/': `<!doctype html>
+<html>
+  <head><title>Click coordinates</title></head>
+  <body>
+    <h1>Example Domain</h1>
+    <p>Click target fixture.</p>
+  </body>
+</html>`,
       },
-      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
-    )
-    await new Promise((r) => setTimeout(r, 100))
-
-    const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
-    const cdpPage = browser
-      .contexts()[0]
-      .pages()
-      .find((p) => p.url().includes('example.com'))
-    expect(cdpPage).toBeDefined()
-
-    const h1Bounds = await cdpPage!.locator('h1').boundingBox()
-    expect(h1Bounds).toBeDefined()
-    console.log('H1 bounding box:', h1Bounds)
-
-    await cdpPage!.evaluate(() => {
-      ;(window as any).clickedAt = null
-      document.addEventListener('click', (e) => {
-        ;(window as any).clickedAt = { x: e.clientX, y: e.clientY }
-      })
     })
+    const page = await browserContext.newPage()
+    try {
+      await page.goto(server.baseUrl)
+      await page.bringToFront()
 
-    await cdpPage!.locator('h1').click()
+      await serviceWorker.evaluate(
+        async ([k, l]) => {
+          await globalThis.toggleExtensionForActiveTab(k, l)
+        },
+        [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+      )
+      await new Promise((r) => setTimeout(r, 100))
 
-    const clickedAt = await cdpPage!.evaluate(() => (window as any).clickedAt)
-    console.log('Clicked at:', clickedAt)
+      const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
+      const cdpPage = browser
+        .contexts()[0]
+        .pages()
+        .find((p) => p.url() === server.baseUrl + '/')
+      expect(cdpPage).toBeDefined()
 
-    expect(clickedAt).toBeDefined()
-    expect(clickedAt.x).toBeGreaterThan(0)
-    expect(clickedAt.y).toBeGreaterThan(0)
+      const h1Bounds = await cdpPage!.locator('h1').boundingBox()
+      expect(h1Bounds).toBeDefined()
+      console.log('H1 bounding box:', h1Bounds)
 
-    await browser.close()
-    await page.close()
+      await cdpPage!.evaluate(() => {
+        window.clickedAt = null
+        document.addEventListener('click', (e) => {
+          window.clickedAt = { x: e.clientX, y: e.clientY }
+        })
+      })
+
+      await cdpPage!.locator('h1').click()
+
+      const clickedAt = await cdpPage!.evaluate(() => window.clickedAt)
+      console.log('Clicked at:', clickedAt)
+
+      expect(clickedAt).toBeDefined()
+      expect(clickedAt.x).toBeGreaterThan(0)
+      expect(clickedAt.y).toBeGreaterThan(0)
+
+      await browser.close()
+    } finally {
+      await page.close()
+      await server.close()
+    }
   }, 60000)
 
   it('should use Editor class to list, read, and edit scripts', async () => {
@@ -967,7 +989,7 @@ describe('CDP Session Tests', () => {
     await page.close()
   }, 60000)
 
-  it('should inject bippy and find React fiber with getReactSource', async () => {
+  it('reads the React fiber with getReactSource / getReactComponentInfo without touching the page', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
@@ -1022,8 +1044,7 @@ describe('CDP Session Tests', () => {
     const btnCount = await btn.count()
     expect(btnCount).toBe(1)
 
-    const hasBippyBefore = await cdpPage!.evaluate(() => !!globalThis.__bippy)
-    expect(hasBippyBefore).toBe(false)
+    const globalsBefore = await cdpPage!.evaluate(() => Object.getOwnPropertyNames(globalThis).sort())
 
     const wsUrl = getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE })
     const cdpSession = await getCDPSessionForPage({ page: cdpPage! })
@@ -1033,31 +1054,9 @@ describe('CDP Session Tests', () => {
     const info = await getReactComponentInfo({ locator: btn, cdp: cdpSession })
     const plainInfo = await getReactComponentInfo({ locator: cdpPage!.locator('#plain-btn'), cdp: cdpSession })
 
-    const hasBippyAfter = await cdpPage!.evaluate(() => !!globalThis.__bippy)
-    expect(hasBippyAfter).toBe(true)
-
-    const hasFiber = await btn.evaluate((el) => {
-      const bippy = globalThis.__bippy
-      if (!bippy) return false
-      const fiber = bippy.getFiberFromHostInstance(el)
-      return !!fiber
-    })
-    expect(hasFiber).toBe(true)
-
-    const componentName = await btn.evaluate((el) => {
-      const bippy = globalThis.__bippy
-      if (!bippy) return null
-      const fiber = bippy.getFiberFromHostInstance(el)
-      let current = fiber
-      while (current) {
-        if (bippy.isCompositeFiber(current)) {
-          return bippy.getDisplayName(current.type)
-        }
-        current = current.return ?? null
-      }
-      return null
-    })
-    expect(componentName).toBe('SaveButton')
+    // Nothing was injected: no bippy, no hook, no new global of any kind.
+    expect(await cdpPage!.evaluate(() => Object.getOwnPropertyNames(globalThis).sort())).toEqual(globalsBefore)
+    expect(globalsBefore).not.toContain('__bippy')
     expect(plainInfo).toBe(null)
     expect(info?.componentName).toBe('SaveButton')
     expect(info?.hierarchy.map((item) => item.componentName)).toEqual(['SaveButton', 'Panel', 'App'])
@@ -1068,7 +1067,6 @@ describe('CDP Session Tests', () => {
       onClick: '[function]',
     })
 
-    console.log('Component name from fiber:', componentName)
     console.log('React component info:', info)
     console.log('Source location (null for UMD React, works on local dev servers with JSX transform):', source)
 
@@ -1310,7 +1308,8 @@ describe('Auto-enable Tests', () => {
   beforeAll(async () => {
     testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-auto-test-' })
 
-    const result = await createMCPClient({ port: TEST_PORT })
+    // Relay mechanics, not the human-mode policy.
+    const result = await createMCPClient({ port: TEST_PORT, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
 

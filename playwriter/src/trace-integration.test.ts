@@ -250,7 +250,8 @@ describe('PageModel & traceValue integration (MCP execute pipeline)', () => {
       toggleExtension: true,
     })
 
-    const result = await createMCPClient({ port: testCtx.port })
+    // The trace/page-model pipeline through MCP, not the human-mode policy.
+    const result = await createMCPClient({ port: testCtx.port, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
   }, 600000)

@@ -24,6 +24,18 @@ import './test-declarations.js'
 
 const TEST_PORT = testRelayPort(import.meta.url)
 
+/**
+ * The action report in front of a raw call's output carries what changes from run to run: the
+ * fixture server's port, the settle time, and the tab index (it depends on which earlier tests of
+ * the file ran and left tabs open). Everything else in it is snapshotted as the model reads it.
+ */
+function stableReport(text: string): string {
+  return text
+    .replace(/http:\/\/127\.0\.0\.1:\d+/g, 'http://127.0.0.1:<port>')
+    .replace(/SETTLED \d+ms/g, 'SETTLED <ms>ms')
+    .replace(/ on tab \d+ "/g, ' on tab <n> "')
+}
+
 describe('Relay Core Tests', () => {
   let client: Awaited<ReturnType<typeof createMCPClient>>['client']
   let cleanup: (() => Promise<void>) | null = null
@@ -32,7 +44,9 @@ describe('Relay Core Tests', () => {
   beforeAll(async () => {
     testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-test-', toggleExtension: true })
 
-    const result = await createMCPClient({ port: TEST_PORT })
+    // These tests drive the relay and the extension with multi-step Playwright code; the human-mode
+    // policy (one action per call) is not what they test.
+    const result = await createMCPClient({ port: TEST_PORT, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
   }, 600000)
@@ -465,17 +479,24 @@ describe('Relay Core Tests', () => {
         `,
       },
     })
-    expect(result.content).toMatchInlineSnapshot(`
-          [
-            {
-              "text": "Console output:
-          [log] Page title: Example Domain
+    const content = Array.isArray(result.content)
+      ? result.content.map((part) => (typeof part.text === 'string' ? { ...part, text: stableReport(part.text) } : part))
+      : result.content
+    expect(content).toMatchInlineSnapshot(`
+      [
+        {
+          "text": "ACTION  (raw Playwright) goto https://example.com on tab <n> "Example Domain" — no human pointer path, busy check or cover check; prefer act.* with refs from observe()
+      SETTLED <ms>ms — page content and network went quiet
+      NAV     NEW DOCUMENT → https://example.com/ (full load: client-side caches and in-memory app state were reset)
 
-          [return value] { url: 'https://example.com/', title: 'Example Domain' }",
-              "type": "text",
-            },
-          ]
-        `)
+      Console output:
+      [log] Page title: Example Domain
+
+      [return value] { url: 'https://example.com/', title: 'Example Domain' }",
+          "type": "text",
+        },
+      ]
+    `)
     expect(result.content).toBeDefined()
   }, 30000)
 
@@ -727,7 +748,9 @@ describe('Relay Core Tests', () => {
           typeof interactiveResult === 'object' && interactiveResult.content?.[0]?.text
             ? tryJsonParse(interactiveResult.content[0].text)
             : interactiveResult
-        await expect(interactiveData).toMatchFileSnapshot(`snapshots/${testCase.name}-accessibility-interactive.md`)
+        await expect(typeof interactiveData === 'string' ? stableReport(interactiveData) : interactiveData).toMatchFileSnapshot(
+          `snapshots/${testCase.name}-accessibility-interactive.md`,
+        )
         expect(interactiveResult.content).toBeDefined()
         for (const expected of testCase.expectedContent) {
           expect(interactiveData).toContain(expected)

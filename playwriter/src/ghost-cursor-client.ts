@@ -1,6 +1,10 @@
 /**
- * Browser-side ghost cursor renderer, injected into every Playwriter-attached tab.
- * Auto-enables on load (top frame only). Idles out after 5s of no activity.
+ * Browser-side ghost cursor renderer — the LIVE in-page cursor, an explicit opt-in that
+ * modifies the page (a DOM element plus `globalThis.__playwriterGhostCursor`).
+ *
+ * Injected only by `enableGhostCursor` (the sandbox's `ghostCursor.show()`), never on
+ * attach. Loading the bundle only installs the API in the top frame; nothing is drawn until
+ * `enable()` is called. Idles out after 5s of no activity.
  *
  * Two-element DOM structure so move and press have independent CSS transitions:
  *   outer (#__playwriter_ghost_cursor__) → translate3d, move easing/duration
@@ -78,12 +82,6 @@ interface GhostCursorApi {
   playPath: (options: { samples: GhostCursorPathSample[] }) => { playing: boolean; durationMs: number }
   cancelPath: () => void
   isPlayingPath: () => boolean
-  /**
-   * Last position the cursor was told about, by ANY route — `applyMouseAction` (so it
-   * tracks every Playwright mouse action, including ones the human-mouse driver never
-   * saw) or path playback. Null before the first position is known.
-   */
-  getPosition: () => { x: number; y: number } | null
 }
 
 declare global {
@@ -556,6 +554,11 @@ function disable(): void {
     runtime.outerElement = null
     runtime.innerElement = null
   }
+
+  // `hide()` gives the page back: no element and no global. A later `show()` re-injects.
+  if (globalThis.__playwriterGhostCursor === api) {
+    delete globalThis.__playwriterGhostCursor
+  }
 }
 
 function applyMouseAction(action: GhostCursorAction): void {
@@ -593,36 +596,10 @@ const api: GhostCursorApi = {
   isPlayingPath: () => {
     return pathPlaybackActive
   },
-  getPosition: () => {
-    return runtime.hasPosition ? { x: runtime.x, y: runtime.y } : null
-  },
 }
 
 if (isTopFrame) {
   globalThis.__playwriterGhostCursor = api
-
-  // Auto-enable. Defer for early injection (addScriptToEvaluateOnNewDocument)
-  // when DOM isn't ready yet. After hard navigations the cursor re-centers
-  // until the next mouse action arrives.
-  try {
-    if (document.readyState === 'loading') {
-      document.addEventListener(
-        'DOMContentLoaded',
-        () => {
-          try {
-            api.enable()
-          } catch {
-            // Non-fatal — DOM may be in an unexpected state.
-          }
-        },
-        { once: true },
-      )
-    } else {
-      api.enable()
-    }
-  } catch {
-    // Restricted contexts (chrome://, devtools://) — silently skip.
-  }
 }
 
 export {}

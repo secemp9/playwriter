@@ -33,7 +33,8 @@ describe('Popup window relocation', () => {
       toggleExtension: true,
     })
 
-    const result = await createMCPClient({ port: TEST_PORT })
+    // Popup relocation by the extension, not the human-mode policy.
+    const result = await createMCPClient({ port: TEST_PORT, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
 

@@ -1,4 +1,5 @@
 import type { ICDPSession } from './cdp-session.js'
+import { cssDomainFor, debuggerDomainFor, type CssDomain, type DebuggerDomain } from './cdp-domains.js'
 
 export interface ReadResult {
   content: string
@@ -47,85 +48,58 @@ export interface EditResult {
  */
 export class Editor {
   private cdp: ICDPSession
-  private enabled = false
-  private scripts = new Map<string, string>()
-  private stylesheets = new Map<string, string>()
+  /** The session's one Debugger owner: the parsed-script map and enable-once. */
+  private debuggerDomain: DebuggerDomain
+  /** The session's one CSS owner: the stylesheet-header map and enable-once. */
+  private cssDomain: CssDomain
   private sourceCache = new Map<string, string>()
 
   constructor({ cdp }: { cdp: ICDPSession }) {
     this.cdp = cdp
-    this.setupEventListeners()
-  }
-
-  private setupEventListeners() {
-    this.cdp.on('Debugger.scriptParsed', (params) => {
-      if (!params.url.startsWith('chrome') && !params.url.startsWith('devtools')) {
-        const url = params.url || `inline://${params.scriptId}`
-        this.scripts.set(url, params.scriptId)
-        this.sourceCache.delete(params.scriptId)
-      }
-    })
-
-    this.cdp.on('CSS.styleSheetAdded', (params) => {
-      const header = params.header
-      if (header.sourceURL?.startsWith('chrome') || header.sourceURL?.startsWith('devtools')) {
-        return
-      }
-      const url = header.sourceURL || `inline-css://${header.styleSheetId}`
-      this.stylesheets.set(url, header.styleSheetId)
-      this.sourceCache.delete(header.styleSheetId)
-    })
+    this.debuggerDomain = debuggerDomainFor(cdp)
+    this.cssDomain = cssDomainFor(cdp)
   }
 
   /**
-   * Enables the editor. Must be called before other methods.
-   * Scripts are collected from Debugger.scriptParsed events.
-   * Reload the page after enabling to capture all scripts.
+   * Enables the editor. Called automatically by the other methods.
+   *
+   * Scripts and stylesheets come from the session's shared Debugger and CSS owners
+   * (`cdp-domains.ts`), which enable each domain once and never disable it: the session
+   * is usually Playwright's own page session, and a `Debugger.disable`/`CSS.disable`
+   * there would drop other users' breakpoints and stylesheet bookkeeping. Page pauses
+   * stay skipped; the editor never needs one.
    */
   async enable(): Promise<void> {
-    if (this.enabled) {
-      return
+    await this.debuggerDomain.enable()
+    await this.cssDomain.enable()
+  }
+
+  /** url → scriptId, and url → styleSheetId, of the live documents. Later entries win, as a re-parse should. */
+  private resources(): { scripts: Map<string, string>; stylesheets: Map<string, string> } {
+    const scripts = new Map<string, string>()
+    for (const script of this.debuggerDomain.scripts.values()) {
+      if (script.url.startsWith('chrome') || script.url.startsWith('devtools')) continue
+      scripts.set(script.url || `inline://${script.scriptId}`, script.scriptId)
     }
-    await this.cdp.send('Debugger.disable')
-    await this.cdp.send('CSS.disable')
-    this.scripts.clear()
-    this.stylesheets.clear()
-    this.sourceCache.clear()
-    const resourcesReady = new Promise<void>((resolve) => {
-      let timeout: ReturnType<typeof setTimeout>
-      const listener = () => {
-        clearTimeout(timeout)
-        timeout = setTimeout(() => {
-          this.cdp.off('Debugger.scriptParsed', listener)
-          this.cdp.off('CSS.styleSheetAdded', listener)
-          resolve()
-        }, 100)
-      }
-      this.cdp.on('Debugger.scriptParsed', listener)
-      this.cdp.on('CSS.styleSheetAdded', listener)
-      timeout = setTimeout(() => {
-        this.cdp.off('Debugger.scriptParsed', listener)
-        this.cdp.off('CSS.styleSheetAdded', listener)
-        resolve()
-      }, 100)
-    })
-    await this.cdp.send('Debugger.enable')
-    await this.cdp.send('DOM.enable')
-    await this.cdp.send('CSS.enable')
-    await resourcesReady
-    this.enabled = true
+    const stylesheets = new Map<string, string>()
+    for (const header of this.cssDomain.styleSheets.values()) {
+      if (header.sourceURL.startsWith('chrome') || header.sourceURL.startsWith('devtools')) continue
+      stylesheets.set(header.sourceURL || `inline-css://${header.styleSheetId}`, header.styleSheetId)
+    }
+    return { scripts, stylesheets }
   }
 
   private getIdByUrl(url: string): { scriptId: string } | { styleSheetId: string } {
-    const scriptId = this.scripts.get(url)
+    const { scripts, stylesheets } = this.resources()
+    const scriptId = scripts.get(url)
     if (scriptId) {
       return { scriptId }
     }
-    const styleSheetId = this.stylesheets.get(url)
+    const styleSheetId = stylesheets.get(url)
     if (styleSheetId) {
       return { styleSheetId }
     }
-    const allUrls = [...Array.from(this.scripts.keys()), ...Array.from(this.stylesheets.keys())]
+    const allUrls = [...scripts.keys(), ...stylesheets.keys()]
     const available = allUrls.slice(0, 5)
     throw new Error(`Resource not found: ${url}\nAvailable: ${available.join(', ')}${allUrls.length > 5 ? '...' : ''}`)
   }
@@ -155,7 +129,8 @@ export class Editor {
    */
   async list({ pattern }: { pattern?: RegExp } = {}): Promise<string[]> {
     await this.enable()
-    const urls = [...Array.from(this.scripts.keys()), ...Array.from(this.stylesheets.keys())]
+    const { scripts, stylesheets } = this.resources()
+    const urls = [...scripts.keys(), ...stylesheets.keys()]
 
     if (!pattern) {
       return urls
@@ -244,7 +219,10 @@ export class Editor {
    * @param options.url - Script or stylesheet URL (inline scripts have `inline://{id}` URLs)
    * @param options.oldString - Exact string to find and replace
    * @param options.newString - Replacement string
-   * @param options.dryRun - If true, validate without applying (default false)
+   * @param options.dryRun - If true, validate without applying (default false). Nothing is
+   *   written to the page. A script is compiled by V8 as a check; CDP has no way to check
+   *   a stylesheet without applying it, so for CSS a dry run checks only that oldString
+   *   occurs exactly once.
    * @returns Result with success status
    *
    * @example
@@ -297,10 +275,11 @@ export class Editor {
     dryRun = false,
   ): Promise<EditResult> {
     if ('styleSheetId' in id) {
-      await this.cdp.send('CSS.setStyleSheetText', { styleSheetId: id.styleSheetId, text: content })
-      if (!dryRun) {
-        this.sourceCache.set(id.styleSheetId, content)
+      if (dryRun) {
+        return { success: true }
       }
+      await this.cdp.send('CSS.setStyleSheetText', { styleSheetId: id.styleSheetId, text: content })
+      this.sourceCache.set(id.styleSheetId, content)
       return { success: true }
     }
 
@@ -408,7 +387,9 @@ export class Editor {
    * @param options - Options
    * @param options.url - Script or stylesheet URL (inline scripts have `inline://{id}` URLs)
    * @param options.content - New content
-   * @param options.dryRun - If true, validate without applying (default false, only works for JS)
+   * @param options.dryRun - If true, write nothing (default false). A script is compiled
+   *   by V8 as a check; a stylesheet is not checked at all (CDP cannot check CSS without
+   *   applying it).
    */
   async write({
     url,

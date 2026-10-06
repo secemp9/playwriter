@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>People — binding fixture</title>
+<style>
+  body { font: 14px sans-serif; margin: 16px; }
+  li { display: flex; gap: 12px; align-items: center; height: 36px; }
+</style>
+</head>
+<body>
+<h1>People</h1>
+<p>Profile of Dana <button id="follow">Follow</button></p>
+<p id="follows">Follow clicks: 0</p>
+<ul id="people"></ul>
+<p id="deleted">Deleted: nobody</p>
+<script>
+  // An index-keyed list, the way many apps render one: row i shows people[i], and updating the
+  // data re-binds the same row elements to other people instead of re-creating them.
+  let people = ['Alice', 'Bob']
+  const list = document.getElementById('people')
+  const rows = people.map((_, index) => {
+    const row = document.createElement('li')
+    const name = document.createElement('span')
+    const remove = document.createElement('button')
+    remove.textContent = 'Delete'
+    remove.addEventListener('click', () => {
+      document.getElementById('deleted').textContent = 'Deleted: ' + people[index]
+    })
+    row.append(name, remove)
+    list.append(row)
+    return name
+  })
+  const render = () => rows.forEach((name, index) => { name.textContent = people[index] })
+  render()
+
+  let follows = 0
+  document.getElementById('follow').addEventListener('click', () => {
+    follows += 1
+    document.getElementById('follows').textContent = 'Follow clicks: ' + follows
+  })
+
+  // The app changes on its own (a push from its server): the test drives it through this long
+  // poll, so no observation the model sees happens in between.
+  const commands = {
+    relabel: () => { document.getElementById('follow').textContent = 'Unfollow' },
+    recycle: () => { people = ['Bob', 'Carol']; render() },
+  }
+  async function poll() {
+    const response = await fetch('/api/command')
+    const command = await response.text()
+    commands[command]()
+    await fetch('/api/ack?command=' + command)
+    poll()
+  }
+  poll()
+</script>
+</body>
+</html>

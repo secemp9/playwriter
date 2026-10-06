@@ -31,7 +31,6 @@
   },
   "dependencies": {
     "playwriter": "workspace:^",
-    "string-dedent": "^3.0.2",
     "zustand": "^5.0.8"
   }
 }

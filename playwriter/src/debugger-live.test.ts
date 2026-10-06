@@ -74,13 +74,18 @@ afterAll(async () => {
   await new Promise<void>((r) => server?.close(() => r()))
 })
 
-/** Pause on the fixture's `debugger` statement and hand back a live Debugger. */
+/**
+ * Pause on the fixture's `debugger` statement and hand back a live Debugger.
+ *
+ * The page's own `debugger;` does not pause by default (the Debugger owner skips pauses
+ * nobody asked for), so the test asks for it.
+ */
 async function pausedAtFixture(): Promise<{ page: Page; dbg: Debugger; resume: () => Promise<void> }> {
   const page = await context.newPage()
   await page.goto(baseUrl)
   const cdp = new PlaywrightCDPSessionAdapter(await context.newCDPSession(page))
   const dbg = new Debugger({ cdp })
-  await dbg.enable()
+  await dbg.pauseOnDebuggerStatements({ enabled: true })
 
   const paused = new Promise<void>((resolve) => {
     const onPaused = () => {

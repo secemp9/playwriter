@@ -445,16 +445,40 @@ function buildPerformanceProfiling() {
   writeToDestinations('performance-profiling.md', content)
 }
 
+/** The section the MCP `execute` description is built from; skill.md must open with it. */
+const GUIDE_HEADING = '## Browse like a human (start here)'
+
+/**
+ * The MCP description used to be the whole of skill.md (~108 KB, ~27k tokens on every turn).
+ * Measured on WorkArena/BrowserGym, weak models do WORSE as the instructions grow, so the
+ * description is now only the start-here guide; the full reference is one `docs()` call away
+ * inside execute (not every MCP client lets a model read resources).
+ */
 function buildPromptFromSkill() {
   // Read skill.md as source of truth
   const skillPath = path.join(playwriterDir, 'src', 'skill.md')
   const skillContent = fs.readFileSync(skillPath, 'utf-8')
 
-  // Generate prompt.md for MCP (without CLI sections)
-  const promptContent = stripCliSectionsFromSkill(skillContent)
+  if (!skillContent.startsWith(GUIDE_HEADING)) {
+    throw new Error(`skill.md must open with "${GUIDE_HEADING}": that section is the MCP execute description.`)
+  }
+  const guideEnd = skillContent.indexOf('\n---\n')
+  if (guideEnd === -1) {
+    throw new Error(`skill.md: the "${GUIDE_HEADING}" section must end with a "---" line.`)
+  }
+  const guide = skillContent.slice(0, guideEnd).trim()
+  const promptContent =
+    `${guide}\n\n` +
+    '### Reference\n\n' +
+    "Everything not in this guide is in the full reference, readable from inside a call: `await docs()` lists its headings, `await docs('recording')` prints the matching sections. " +
+    'Read the matching section before using an API you have not used in this session.\n'
   const distPromptPath = path.join(distDir, 'prompt.md')
   fs.writeFileSync(distPromptPath, promptContent, 'utf-8')
-  console.log('Generated playwriter/dist/prompt.md (from skill.md)')
+  console.log(`Generated playwriter/dist/prompt.md (start-here guide, ${promptContent.length} chars)`)
+
+  // The full reference without the CLI-only sections, also served as an MCP resource.
+  fs.writeFileSync(path.join(distDir, 'skill-reference.md'), stripCliSectionsFromSkill(skillContent), 'utf-8')
+  console.log('Generated playwriter/dist/skill-reference.md (from skill.md)')
 
   // Copy full skill.md to website/public/ for hosting at playwriter.dev/SKILL.md
   const websitePublicRoot = path.join(playwriterDir, '..', 'website', 'public')

@@ -48,11 +48,19 @@ export interface OffscreenCancelRecordingMessage {
   tabId: number
 }
 
+export interface OffscreenCopyToClipboardMessage {
+  action: 'copyToClipboard'
+  text: string
+}
+
 export type OffscreenMessage =
   | OffscreenStartRecordingMessage
   | OffscreenStopRecordingMessage
   | OffscreenIsRecordingMessage
   | OffscreenCancelRecordingMessage
+  | OffscreenCopyToClipboardMessage
+
+export type OffscreenCopyToClipboardResult = { success: true } | { success: false; error: string }
 
 // Offscreen document response types
 export type OffscreenStartRecordingResult =

@@ -36,15 +36,21 @@ The build process (vite.config.mts) automatically removes this permission when T
 
 Required to detect when one tab opens a new tab/window via `window.open`, `target="_blank"`, or similar navigation-triggered tab creation. The extension listens for `chrome.webNavigation.onCreatedNavigationTarget` to build a `new tab id → source tab id` mapping. When a Chrome popup window is created by a Playwriter-connected tab, the extension uses this mapping to know whether to relocate the popup into the source tab's main window so Playwright automation can control it. No URL or page content is collected — only tab-ID correlations.
 
-### scripting (updated use)
+### scripting
 
-The `scripting` permission was originally added for iframe cleanup before debugger attachment. It is now also used to:
+Used only to remove restricted iframes injected by other extensions that would otherwise block the debugger from attaching to a tab the user connected. That cleanup runs in an isolated extension world, only on connected tabs. Nothing is injected into pages for any other purpose: there is no in-page toolbar, cursor or helper script.
 
-1. **Inject the in-page toolbar** (`initPlaywriterToolbar`) into the MAIN world of every tab the user connects Playwriter to. The toolbar is a closed Shadow DOM element that floats in the top-right corner and provides quick AI-integration tools (e.g. pin-element copy mode).
-2. **Re-inject the toolbar** after page navigations via `chrome.webNavigation.onDOMContentLoaded`.
-3. **Destroy the toolbar** when the user disconnects Playwriter from a tab, so no extension UI is left behind on pages the user is actively browsing.
+### contextMenus
 
-All injections target only tabs that the user has explicitly connected (clicked the extension icon), and only the top-level frame (`allFrames: false`). No code is injected into tabs the user has not opted in to.
+Adds two items to the page and extension-icon context menus of connected tabs: "Pin an element for Playwriter" and "Copy React component source". Both turn on Chrome's own element picker (DevTools `Overlay.setInspectMode`) through the debugger connection; the user then clicks the element they mean. No code is injected into the page.
+
+### clipboardWrite
+
+After the user picks an element with one of the context-menu items, the extension copies the result to the clipboard: a `playwriter -e 'inspectPinnedElement({...})'` command, or the `file:line` of the component's source. The copy is done from the extension's offscreen document (`document.execCommand('copy')` needs this permission there); measured, it fails without it.
+
+### offscreen
+
+The offscreen document hosts tab recording (`MediaRecorder` for `chrome.tabCapture`) and the clipboard copy described above.
 
 ### host_permissions (<all_urls>)
 

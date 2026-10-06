@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shop — Assistant</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  header { display: flex; gap: 16px; padding: 12px 20px; background: #f3f3f3; }
+  main { padding: 20px; max-width: 900px; }
+  .thread { border: 1px solid #ccc; min-height: 120px; padding: 8px; margin-bottom: 8px; }
+  .msg { margin: 4px 0; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #999; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .products { display: flex; gap: 12px; }
+  .product { border: 1px solid #ddd; padding: 8px; width: 200px; list-style: none; }
+  .card { border: 1px dashed #888; padding: 10px; margin: 10px 0; cursor: pointer; width: 260px; }
+  .reviews { margin-top: 1400px; }
+  #cookie-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; }
+  #cookie { background: white; padding: 24px; width: 420px; }
+  .hidden-box { display: none; }
+  .chip { display: inline-block; padding: 4px 12px; border: 2px solid #333; border-radius: 12px; cursor: pointer; }
+  .hidden-box:checked + .chip { background: #333; color: white; }
+</style>
+</head>
+<body>
+<header>
+  <nav aria-label="Main">
+    <a href="/" data-route="/">Home</a>
+    <a href="/chat" data-route="/chat">Assistant</a>
+    <a href="/account" data-route="/account">Account</a>
+  </nav>
+</header>
+<main id="app"></main>
+
+<div id="cookie-backdrop">
+  <div id="cookie" role="dialog" aria-modal="true" aria-label="Cookie consent">
+    <p>We use cookies to keep you signed in.</p>
+    <button id="accept">Accept all</button>
+    <button id="reject">Reject</button>
+  </div>
+</div>
+
+<script>
+  // In-memory state that a full reload wipes: the point of the "no goto" rule.
+  const memory = { messages: [], cart: 0, renders: 0 }
+  const app = document.getElementById('app')
+
+  function closeCookies() { document.getElementById('cookie-backdrop').remove() }
+  document.getElementById('accept').addEventListener('click', closeCookies)
+  document.getElementById('reject').addEventListener('click', closeCookies)
+
+  function navigate(path) {
+    history.pushState({}, '', path)
+    render()
+  }
+  document.querySelectorAll('a[data-route]').forEach((a) => {
+    a.addEventListener('click', (event) => { event.preventDefault(); navigate(a.dataset.route) })
+  })
+  window.addEventListener('popstate', render)
+
+  function renderHome() {
+    app.innerHTML = `
+      <h1>Wireless mice</h1>
+      <label><input type="checkbox" id="stock"> In stock only</label>
+      <label>Sort by <select id="sort"><option>Relevance</option><option disabled>Price: high to low</option><option>Newest</option></select></label>
+      <input type="checkbox" id="gift" class="hidden-box"><label for="gift" class="chip">Gift wrap</label>
+      <p id="choices" role="status"></p>
+      <ul class="products">
+        <li class="product" aria-label="Logitech M185"><img alt="Logitech M185 photo" width="120" height="80" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='160'><rect width='240' height='160' fill='%23ccc'/></svg>"><p>Logitech M185 — $14</p><button class="add">Add to cart</button></li>
+        <li class="product" aria-label="Razer Basilisk"><img alt="Razer Basilisk photo" width="120" height="80" src="/missing-image.png"><p>Razer Basilisk — $29</p><button class="add">Add to cart</button></li>
+      </ul>
+      <div class="card" id="promo">Free shipping over $50</div>
+      <p id="cart-status" role="status">Cart: ${memory.cart} items</p>
+      <section class="reviews" aria-label="Reviews"><h2>Reviews</h2><p>Great mouse, battery lasts forever.</p></section>`
+    app.querySelectorAll('button.add').forEach((button) => {
+      button.addEventListener('click', () => {
+        memory.cart += 1
+        document.getElementById('cart-status').textContent = `Cart: ${memory.cart} items`
+      })
+    })
+    document.getElementById('promo').addEventListener('click', () => {
+      document.getElementById('promo').textContent = 'Free shipping applied'
+    })
+    // Only trusted input counts, as on a real shop that ignores scripted events.
+    const showChoices = (event) => {
+      if (!event.isTrusted) return
+      document.getElementById('choices').textContent = `Sorted by ${document.getElementById('sort').value}${document.getElementById('gift').checked ? ', gift wrapped' : ''}`
+    }
+    document.getElementById('sort').addEventListener('change', showChoices)
+    document.getElementById('gift').addEventListener('change', showChoices)
+  }
+
+  function renderChat() {
+    app.innerHTML = `
+      <h1>Shopping assistant</h1>
+      <div class="thread" role="log" aria-label="Conversation"></div>
+      <div id="busy-slot"></div>
+      <label for="message">Message</label>
+      <textarea id="message" rows="2"></textarea>
+      <button id="send">Send</button>
+      <button id="delete">Delete conversation</button>`
+    const thread = app.querySelector('.thread')
+    for (const m of memory.messages) {
+      const p = document.createElement('p'); p.className = 'msg'; p.textContent = m; thread.appendChild(p)
+    }
+    document.getElementById('send').addEventListener('click', send)
+    document.getElementById('delete').addEventListener('click', () => {
+      if (confirm('Delete this conversation?')) {
+        memory.messages = []
+        thread.innerHTML = ''
+      }
+    })
+  }
+
+  function send() {
+    const box = document.getElementById('message')
+    const text = box.value.trim()
+    if (!text) return
+    const thread = document.querySelector('.thread')
+    const mine = document.createElement('p'); mine.className = 'msg'; mine.textContent = `You: ${text}`
+    thread.appendChild(mine); memory.messages.push(mine.textContent)
+    box.value = ''
+    const slot = document.getElementById('busy-slot')
+    slot.innerHTML = '<div role="status" aria-busy="true"><span class="spinner"></span> Processing: Fetching reviews</div>'
+    // The "AI" answers through a real POST, like a real chat, then streams its reply in chunks.
+    fetch('/api/reply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: text }) }).then((r) => r.json()).then(({ chunks }) => {
+      slot.innerHTML = ''
+      const reply = document.createElement('p'); reply.className = 'msg'; reply.textContent = 'Assistant: '
+      thread.appendChild(reply)
+      let i = 0
+      const timer = setInterval(() => {
+        if (i >= chunks.length) { clearInterval(timer); memory.messages.push(reply.textContent); return }
+        reply.textContent += chunks[i++]
+      }, 120)
+    })
+  }
+
+  function renderAccount() {
+    app.innerHTML = `<h1>Account</h1><p>Signed in as nourdine</p>`
+  }
+
+  function render() {
+    memory.renders += 1
+    if (location.pathname === '/chat') renderChat()
+    else if (location.pathname === '/account') renderAccount()
+    else renderHome()
+  }
+  render()
+</script>
+</body>
+</html>

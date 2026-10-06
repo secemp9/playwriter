@@ -1,5 +1,5 @@
 /**
- * Offscreen document for Playwriter screen recording.
+ * Offscreen document for Playwriter screen recording and clipboard writes.
  *
  * WHY OFFSCREEN DOCUMENT?
  * Manifest V3 service workers cannot use MediaRecorder or getUserMedia directly.
@@ -47,6 +47,8 @@ import type {
   OffscreenStopRecordingResult,
   OffscreenIsRecordingResult,
   OffscreenCancelRecordingResult,
+  OffscreenCopyToClipboardMessage,
+  OffscreenCopyToClipboardResult,
   ChromeTabCaptureAudioConstraints,
   ChromeTabCaptureVideoConstraints,
 } from './offscreen-types'
@@ -66,6 +68,7 @@ type OffscreenResult =
   | OffscreenStopRecordingResult
   | OffscreenIsRecordingResult
   | OffscreenCancelRecordingResult
+  | OffscreenCopyToClipboardResult
 
 chrome.runtime.onMessage.addListener((message: OffscreenMessage, _sender, sendResponse) => {
   handleMessage(message).then(sendResponse)
@@ -82,9 +85,26 @@ async function handleMessage(message: OffscreenMessage): Promise<OffscreenResult
       return handleIsRecording(message)
     case 'cancelRecording':
       return handleCancelRecording(message)
+    case 'copyToClipboard':
+      return handleCopyToClipboard(message)
     default:
       return { success: false, error: 'Unknown action' }
   }
+}
+
+/**
+ * The element picker's clipboard write. `navigator.clipboard` needs a focused document,
+ * which an offscreen document never is; `execCommand('copy')` on a selected textarea is
+ * the documented way for one (offscreen reason CLIPBOARD).
+ */
+function handleCopyToClipboard(message: OffscreenCopyToClipboardMessage): OffscreenCopyToClipboardResult {
+  const textarea = document.createElement('textarea')
+  textarea.value = message.text
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  return copied ? { success: true } : { success: false, error: 'document.execCommand("copy") returned false' }
 }
 
 async function handleStartRecording(params: OffscreenStartRecordingMessage): Promise<OffscreenStartRecordingResult> {

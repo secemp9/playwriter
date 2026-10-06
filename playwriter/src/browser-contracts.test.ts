@@ -944,9 +944,9 @@ describe('D-A2: net.delay and net.timeline agree on what urlPattern means', () =
   })
 
   it('net.delay accepts the substring form and actually holds the request', async () => {
-    await withPage(async ({ page, cdp }) => {
+    await withPage(async ({ page }) => {
       await page.goto(baseUrl)
-      const probe = await netDelay({ cdp, urlPattern: '/api/cart', ms: 300, ttlMs: 10_000 })
+      const probe = await netDelay({ page, urlPattern: '/api/cart', ms: 300, ttlMs: 10_000 })
       try {
         const elapsed = await page.evaluate(async (base) => {
           const start = Date.now()
@@ -967,10 +967,10 @@ describe('D-A2: net.delay and net.timeline agree on what urlPattern means', () =
   })
 
   it('a RegExp works too, and matches exactly what netTimeline would match', async () => {
-    await withPage(async ({ page, cdp }) => {
+    await withPage(async ({ page }) => {
       await page.goto(baseUrl)
       const timeline = netTimeline({ page, urlPattern: /\/api\/ca.t$/ })
-      const probe = await netDelay({ cdp, urlPattern: /\/api\/ca.t$/, ms: 50, ttlMs: 10_000 })
+      const probe = await netDelay({ page, urlPattern: /\/api\/ca.t$/, ms: 50, ttlMs: 10_000 })
       try {
         await page.evaluate((base) => fetch(base + '/api/cart').then((r) => r.json()), baseUrl)
         await page.waitForTimeout(300)
@@ -986,59 +986,77 @@ describe('D-A2: net.delay and net.timeline agree on what urlPattern means', () =
     })
   })
 
-  it('a SUBSTRING that matches nothing is reported as having intercepted nothing', async () => {
-    await withPage(async ({ page, cdp }) => {
+  for (const urlPattern of ['/definitely-not-requested/', /\/definitely-not-requested\//]) {
+    it(`a ${typeof urlPattern === 'string' ? 'SUBSTRING' : 'REGEXP'} that matches nothing is reported as having intercepted nothing`, async () => {
+      await withPage(async ({ page }) => {
+        await page.goto(baseUrl)
+        const probe = await netDelay({ page, urlPattern, ms: 50, ttlMs: 10_000 })
+        try {
+          await page.evaluate((base) => fetch(base + '/api/cart').then((r) => r.json()), baseUrl)
+          const stats = probe.stats()
+          expect(stats.paused, 'nothing matched, so nothing was held').toBe(0)
+          expect(
+            stats.interceptedNothing,
+            'stats() showing zeros must not be indistinguishable from a probe that ran and had nothing to do',
+          ).toBe(true)
+          // Every request of the page reaches the route handler; the narrowing is the same
+          // predicate netTimeline uses.
+          expect(stats.seen).toBeGreaterThan(0)
+          expect(
+            stats.notMatched,
+            'a request that reached the interceptor but did not match must be counted and passed on at once',
+          ).toBe(stats.seen)
+          expect(probe.info()!.spec.via).toBe('page.route')
+          const warnings = tracePerturbationWarnings().join('\n')
+          expect(
+            warnings,
+            'a live PERTURBING probe that perturbed nothing must say so, or a race-class measurement reads as clean',
+          ).toMatch(/INTERCEPTED NOTHING/)
+          expect(warnings).toMatch(/the pattern is a SUBSTRING of the url \(or a RegExp\)/)
+          expect(listTraceProbes({ live: true, kind: 'net.delay' })[0].describe).toMatch(/INTERCEPTED NOTHING/)
+        } finally {
+          await probe.stop()
+        }
+      })
+    })
+  }
+
+  it("delays through the caller's own page.route and leaves it working after stop", async () => {
+    await withPage(async ({ page }) => {
       await page.goto(baseUrl)
-      const probe = await netDelay({ cdp, urlPattern: '/definitely-not-requested/', ms: 50, ttlMs: 10_000 })
-      try {
-        await page.evaluate((base) => fetch(base + '/api/cart').then((r) => r.json()), baseUrl)
-        await page.waitForTimeout(300)
-        const stats = probe.stats()
-        expect(stats.paused).toBe(0)
-        expect(
-          stats.interceptedNothing,
-          'stats() showing zeros must not be indistinguishable from a probe that ran and had nothing to do',
-        ).toBe(true)
-        // A substring becomes the glob `*<substring>*`, which Chrome evaluates itself, so a
-        // non-matching request is never paused at all. That is the desirable half of the
-        // translation: the probe does not touch requests it does not care about.
-        expect(stats.seen, 'Chrome pre-filters the derived glob, so nothing should reach the interceptor').toBe(0)
-        expect(stats.notMatched).toBe(0)
-        const warnings = tracePerturbationWarnings()
-        expect(
-          warnings.join('\n'),
-          'a live PERTURBING probe that perturbed nothing must say so, or a race-class measurement reads as clean',
-        ).toMatch(/INTERCEPTED NOTHING/)
-        expect(warnings.join('\n')).toMatch(/none reached it at all/)
-        expect(listTraceProbes({ live: true, kind: 'net.delay' })[0].describe).toMatch(/INTERCEPTED NOTHING/)
-      } finally {
-        await probe.stop()
-      }
+      // A route the caller registered first. The old implementation sent Fetch.enable and
+      // Fetch.disable on Playwright's own session; the disable tore down the interception
+      // this route depends on, so after net.stop the real server answered again.
+      await page.route('**/api/cart', (route) => route.fulfill({ contentType: 'application/json', body: '{"items":99}' }))
+      const fetchCart = () =>
+        page.evaluate(async (base) => {
+          const start = Date.now()
+          const body = await fetch(base + '/api/cart').then((r) => r.json())
+          return { body, elapsed: Date.now() - start }
+        }, baseUrl)
+
+      const probe = await netDelay({ page, urlPattern: '/api/cart', ms: 300, ttlMs: 10_000 })
+      const delayed = await fetchCart()
+      await probe.stop()
+      expect(delayed.body, 'after the delay the request must go on to the caller route').toEqual({ items: 99 })
+      expect(delayed.elapsed).toBeGreaterThanOrEqual(250)
+      expect(probe.stats()).toMatchObject({ paused: 1, continued: 1, failed: 0, pending: 0 })
+
+      const after = await fetchCart()
+      expect(after.body, "net.stop must leave the caller's interception intact").toEqual({ items: 99 })
+      expect(after.elapsed, 'and must not delay anything any more').toBeLessThan(250)
     })
   })
 
-  it('a REGEXP that matches nothing still filters handler-side, and says so', async () => {
-    await withPage(async ({ page, cdp }) => {
+  it('stop releases a request that is being held at once', async () => {
+    await withPage(async ({ page }) => {
       await page.goto(baseUrl)
-      // A RegExp cannot be expressed as a glob, so interception is `*` and the narrowing
-      // happens in the handler with the same predicate netTimeline uses.
-      const probe = await netDelay({ cdp, urlPattern: /\/definitely-not-requested\//, ms: 50, ttlMs: 10_000 })
-      try {
-        await page.evaluate((base) => fetch(base + '/api/cart').then((r) => r.json()), baseUrl)
-        await page.waitForTimeout(300)
-        const stats = probe.stats()
-        expect(stats.paused, 'nothing matched, so nothing was held').toBe(0)
-        expect(stats.interceptedNothing).toBe(true)
-        expect(stats.seen, 'with the `*` glob every request reaches the interceptor').toBeGreaterThan(0)
-        expect(
-          stats.notMatched,
-          'a request that reached the interceptor but did not match must be counted and released at once',
-        ).toBeGreaterThan(0)
-        expect(probe.info()!.spec.fetchGlob).toBe('*')
-        expect(tracePerturbationWarnings().join('\n')).toMatch(/INTERCEPTED NOTHING/)
-      } finally {
-        await probe.stop()
-      }
+      const probe = await netDelay({ page, urlPattern: '/api/cart', ms: 60_000, ttlMs: 0 })
+      const pending = page.evaluate((base) => fetch(base + '/api/cart').then((r) => r.json()), baseUrl)
+      await expect.poll(() => probe.stats().paused).toBe(1)
+      await probe.stop()
+      expect(await pending).toEqual({ items: 1 })
+      expect(probe.stats()).toMatchObject({ continued: 1, pending: 0 })
     })
   })
 })

@@ -16,7 +16,7 @@ Buffer.prototype[util.inspect.custom] = function () {
 import dedent from 'string-dedent'
 import { LOG_FILE_PATH, VERSION, parseRelayHost } from './utils.js'
 import { ensureRelayServer, RELAY_PORT } from './relay-client.js'
-import { PlaywrightExecutor, CodeExecutionTimeoutError } from './executor.js'
+import { PlaywrightExecutor, CodeExecutionTimeoutError, capOutput } from './executor.js'
 import { deriveWorkspace } from './workspace-key.js'
 import { discoverChromeInstances, resolveDirectInput, appendSessionToWsUrl } from './chrome-discovery.js'
 import crypto from 'node:crypto'
@@ -273,6 +273,20 @@ server.resource(
   },
 )
 
+server.resource(
+  'skill-reference',
+  'https://playwriter.dev/resources/skill-reference.md',
+  { mimeType: 'text/plain' },
+  async () => {
+    const packageJsonPath = require.resolve('playwriter/package.json')
+    const packageDir = path.dirname(packageJsonPath)
+    const content = fs.readFileSync(path.join(packageDir, 'dist', 'skill-reference.md'), 'utf-8')
+    return {
+      contents: [{ uri: 'https://playwriter.dev/resources/skill-reference.md', text: content, mimeType: 'text/plain' }],
+    }
+  },
+)
+
 server.tool(
   'execute',
   promptContent,
@@ -280,9 +294,12 @@ server.tool(
     code: z
       .string()
       .describe(
-        'js playwright code, has {page, state, context} in scope. Should be one line, using ; to execute multiple statements. you MUST call execute multiple times instead of writing complex scripts in a single tool call.',
+        'JavaScript run against the controlled browser tab. In scope: observe, act, find, explain, docs, page, state, context, snapshot, getLatestLogs, net. Usually one line; in human mode one input action per call (waits and reads are free).',
       ),
-    timeout: z.number().default(10000).describe('Timeout in milliseconds for code execution (default: 10000ms)'),
+    timeout: z
+      .number()
+      .default(30000)
+      .describe('Timeout in milliseconds for this call (default 30000). act.waitForIdle on a slow AI reply needs more: pass e.g. 120000.'),
   },
   async ({ code, timeout }) => {
     try {
@@ -300,15 +317,12 @@ server.tool(
 
       // Transform executor result to MCP format
       // Append screenshot metadata to text for MCP (image is included inline as content)
-      const MAX_TEXT = 10000
       let text = result.text
       for (const s of result.screenshots) {
         text += `\nScreenshot saved to: ${s.path} (image included below, ${s.labelCount} labels)\n`
         text += `Accessibility snapshot:\n${s.snapshot}\n`
       }
-      if (text.length > MAX_TEXT) {
-        text = text.slice(0, MAX_TEXT) + '\n\n[Truncated]'
-      }
+      text = capOutput(text)
 
       const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [
         { type: 'text', text },

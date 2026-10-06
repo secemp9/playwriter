@@ -11,8 +11,6 @@ declare const __PLAYWRITER_OPEN_WELCOME_PAGE__: boolean
 // production/store builds, so none of it ships to users.
 declare const __PLAYWRITER_DEV_RELOAD__: boolean
 
-import dedent from 'string-dedent'
-const js = dedent
 import { createStore } from 'zustand/vanilla'
 import type { ExtensionState, ConnectionState, TabState, TabInfo } from './types'
 import {
@@ -24,16 +22,12 @@ import {
   deleteGroupId,
   FREESTYLE_GROUP_KEY,
 } from './workspace-groups'
-import { initPlaywriterToolbar } from './toolbar/toolbar'
+import { createElementPicker, type PickPurpose } from './element-pick'
+import { copyTextViaOffscreen } from './offscreen-document'
 import { SelfGroupChangeLedger, UNGROUPED_TAB_GROUP_ID } from 'playwriter/src/tab-group-events'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
 import { handleGhostBrowserCommand, type GhostBrowserCommandParams } from 'playwriter/src/ghost-browser'
-// Inlined at build time via vite ?raw. Source: playwriter/src/ghost-cursor-client.ts
-import ghostCursorBundleCode from '../../playwriter/dist/ghost-cursor-client.js?raw'
-// Bippy: React fiber introspection library, used for "Copy React Source Path" context menu.
-// Built by playwriter/scripts/build-client-bundles.ts, exposes globalThis.__bippy
-import bippyBundleCode from '../../playwriter/dist/bippy.js?raw'
 import {
   getActiveRecordings,
   handleStartRecording,
@@ -56,8 +50,9 @@ const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
 // blocking the entire Playwright connection setup for 30s per command.
 // Note: Page.addScriptToEvaluateOnNewDocument is NOT included because user-provided
 // scripts with runImmediately:true can legitimately take longer than 10s.
-// Timeout for attachTab's own post-attach setup commands (Page.enable, our injected
-// scripts, Target.getTargetInfo). All should be near-instant on a healthy renderer.
+// Timeout for attachTab's own post-attach setup commands (Page.enable, Target.getTargetInfo)
+// and for the element picker's Overlay/DOM commands. All should be near-instant on a
+// healthy renderer.
 const ATTACH_SETUP_TIMEOUT_MS = 10000
 
 const FAST_CDP_COMMAND_TIMEOUT_MS = new Map<string, number>([
@@ -906,6 +901,8 @@ declare global {
   ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
+  /** Start Chrome's element picker on a connected tab, as the context menu does. */
+  var startElementPick: (tabId: number, purpose: PickPurpose) => Promise<void>
 }
 
 const MAX_LOG_STRING_LENGTH = 2000
@@ -1504,6 +1501,17 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
   const tab = source.tabId ? store.getState().tabs.get(source.tabId) : undefined
   if (!tab) return
 
+  // Chrome's element picker (started from the context menu) answers on the tab's root
+  // session. The event is still forwarded below: a Playwriter session's PinTracker records
+  // the pin from it.
+  if (!source.sessionId && source.tabId !== undefined) {
+    if (method === 'Overlay.inspectNodeRequested' && typeof params?.backendNodeId === 'number') {
+      void elementPicker.onNodePicked(source.tabId, params.backendNodeId)
+    } else if (method === 'Overlay.inspectModeCanceled') {
+      elementPicker.onCancelled(source.tabId)
+    }
+  }
+
   logger.debug('Forwarding CDP event:', method, 'from tab:', source.tabId)
 
   if (method === 'Target.attachedToTarget' && params?.sessionId) {
@@ -1763,24 +1771,6 @@ async function attachTab(
     // undefined, so they reach the relay unroutable. The measurement is at that block; this
     // signpost exists only because that is where a reader looks for it.
 
-    const contextMenuScript = js`
-      document.addEventListener('contextmenu', (e) => {
-        window.__playwriter_lastRightClicked = e.target;
-      }, true);
-    `
-    await setupCommand('Page.addScriptToEvaluateOnNewDocument', { source: contextMenuScript })
-    await setupCommand('Runtime.evaluate', { expression: contextMenuScript })
-
-    // Ghost cursor — survives navigations via addScriptToEvaluateOnNewDocument.
-    try {
-      await setupCommand('Page.addScriptToEvaluateOnNewDocument', {
-        source: ghostCursorBundleCode,
-      })
-      await setupCommand('Runtime.evaluate', { expression: ghostCursorBundleCode })
-    } catch (err) {
-      logger.debug('Could not inject ghost cursor (restricted page):', (err as Error).message)
-    }
-
     const result = (await setupCommand('Target.getTargetInfo')) as Protocol.Target.GetTargetInfoResponse
 
     const targetInfo = result.targetInfo
@@ -1917,18 +1907,6 @@ async function attachTab(
       skipAttachedEvent,
     )
 
-    // Inject the in-page toolbar into the MAIN world (best-effort: silently
-    // fails on restricted pages like chrome:// or about:blank)
-    chrome.scripting
-      .executeScript({
-        target: { tabId, allFrames: false },
-        world: 'MAIN',
-        func: initPlaywriterToolbar,
-      })
-      .catch((err: Error) => {
-        logger.debug('Could not inject toolbar (restricted page):', err.message)
-      })
-
     return { targetInfo, sessionId }
   } catch (error) {
     // Clean up debugger if we attached but failed later
@@ -1952,26 +1930,8 @@ function detachTab(tabId: number, shouldDetachDebugger: boolean): void {
   // Clean up any active recording for this tab
   cleanupRecordingForTab(tabId)
 
-  // Destroy the in-page toolbar (best-effort: tab may already be closing or navigating)
-  void chrome.scripting
-    .executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: () => {
-        ;(window as any).__playwriterToolbarDestroy?.()
-      },
-    })
-    .catch(() => {})
-
-  void chrome.scripting
-    .executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      func: () => {
-        ;(globalThis as any).__playwriterGhostCursor?.disable?.()
-      },
-    })
-    .catch(() => {})
+  // A pick in progress dies with the debugger session; drop its timer and badge.
+  elementPicker.forget(tabId)
 
   logger.warn(`DISCONNECT: detachTab tabId=${tabId} shouldDetach=${shouldDetachDebugger} stack=${getCallStack()}`)
 
@@ -2274,6 +2234,17 @@ const icons = {
     badgeText: '!',
     badgeColor: [220, 38, 38, 255] as [number, number, number, number],
   },
+  picking: {
+    path: {
+      '16': '/icons/icon-green-16.png',
+      '32': '/icons/icon-green-32.png',
+      '48': '/icons/icon-green-48.png',
+      '128': '/icons/icon-green-128.png',
+    },
+    title: 'Picking an element - click it in the page (Esc cancels)',
+    badgeText: 'PICK',
+    badgeColor: [37, 99, 235, 255] as [number, number, number, number],
+  },
 } as const
 
 async function updateIcons(): Promise<void> {
@@ -2295,7 +2266,9 @@ async function updateIcons(): Promise<void> {
       if (tabId !== undefined && isRestrictedUrl(tabUrl)) return icons.restricted
       if (tabInfo?.state === 'error') return icons.tabError
       if (tabInfo?.state === 'connecting') return icons.connecting
-      if (tabInfo?.state === 'connected') return icons.connected
+      if (tabInfo?.state === 'connected') {
+        return tabId !== undefined && elementPicker.isPicking(tabId) ? icons.picking : icons.connected
+      }
       return icons.idle
     })()
 
@@ -2525,41 +2498,50 @@ void (async () => {
   }
 })()
 
-chrome.contextMenus
-  .remove('playwriter-pin-element')
-  .catch(() => {})
-  .finally(() => {
-    chrome.contextMenus?.create({
-      id: 'playwriter-pin-element',
-      title: 'Copy Playwriter Element Reference',
-      contexts: ['all'],
-      visible: false,
-    })
-  })
+// Element picking lives in browser UI, never in the page: these items appear in the page's
+// context menu and in the extension icon's menu ('all' includes 'action'), and start
+// Chrome's own element picker on the tab's debugger session (see element-pick.ts).
+const PICK_MENU_ITEMS: Record<string, { purpose: PickPurpose; title: string }> = {
+  'playwriter-pin-element': { purpose: 'pin', title: 'Pin an element for Playwriter (click it next)' },
+  'playwriter-copy-react-source': { purpose: 'react-source', title: 'Copy React component source (click an element next)' },
+}
 
-chrome.contextMenus
-  .remove('playwriter-copy-react-source')
-  .catch(() => {})
-  .finally(() => {
-    chrome.contextMenus?.create({
-      id: 'playwriter-copy-react-source',
-      title: 'Copy React Component Source Path',
-      contexts: ['all'],
-      visible: false,
+for (const [id, item] of Object.entries(PICK_MENU_ITEMS)) {
+  chrome.contextMenus
+    .remove(id)
+    .catch(() => {})
+    .finally(() => {
+      chrome.contextMenus?.create({ id, title: item.title, contexts: ['all'], visible: false })
     })
-  })
+}
 
 function updateContextMenuVisibility(): void {
   const { currentTabId, tabs } = store.getState()
   const isConnected = currentTabId !== undefined && tabs.get(currentTabId)?.state === 'connected'
-  chrome.contextMenus?.update('playwriter-pin-element', { visible: isConnected })
-  chrome.contextMenus?.update('playwriter-copy-react-source', { visible: isConnected })
+  for (const id of Object.keys(PICK_MENU_ITEMS)) {
+    chrome.contextMenus?.update(id, { visible: isConnected })
+  }
 }
 
-function buildPinnedElementInspectionCode(options: { pinName: string; url: string }): string {
-  const URL_LIT = JSON.stringify(options.url).replace(/'/g, '\\u0027')
-  return `inspectPinnedElement(${URL_LIT},"globalThis.${options.pinName}")`
+const elementPicker = createElementPicker({
+  send: (tabId, method, params) => sendCommandWithTimeout({ tabId }, method, params, ATTACH_SETUP_TIMEOUT_MS),
+  copyText: copyTextViaOffscreen,
+  getTabUrl: async (tabId) => (await chrome.tabs.get(tabId)).url,
+  logger,
+  onStateChange: () => {
+    void updateIcons()
+  },
+})
+
+async function startElementPick(tabId: number, purpose: PickPurpose): Promise<void> {
+  const tabInfo = store.getState().tabs.get(tabId)
+  if (tabInfo?.state !== 'connected') {
+    throw new Error(`Tab ${tabId} is not connected to Playwriter; connect it before picking an element.`)
+  }
+  await elementPicker.start(tabId, purpose)
 }
+
+globalThis.startElementPick = startElementPick
 
 chrome.runtime.onInstalled.addListener((details) => {
   if (import.meta.env.TESTING) return
@@ -2826,221 +2808,12 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
   }
 })
 
-chrome.contextMenus?.onClicked.addListener(async (info, tab) => {
-  if (!tab?.id) return
-
-  const tabInfo = store.getState().tabs.get(tab.id)
-  if (!tabInfo || tabInfo.state !== 'connected') {
-    logger.debug('Tab not connected, ignoring')
-    return
-  }
-
-  const debuggee = { tabId: tab.id }
-
-  if (info.menuItemId === 'playwriter-pin-element') {
-    try {
-      // Allocate the next pin name by reading and incrementing the shared MAIN-world
-      // counter (window.__playwriterPinCount). This ensures right-click and toolbar
-      // pins never produce conflicting globalThis.playwriterPinnedElemN names.
-      const jsAllocatePin = js`
-        (function() {
-          window.__playwriterPinCount = (window.__playwriterPinCount || 0) + 1;
-          return window.__playwriterPinCount;
-        })()
-      `
-      const counterResult = (await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: jsAllocatePin,
-        returnByValue: true,
-      })) as { result?: { value?: number }; exceptionDetails?: { text: string } }
-
-      const count = counterResult.result?.value ?? 1
-      const name = `playwriterPinnedElem${count}`
-
-      const jsAssignPin = js`
-        if (window.__playwriter_lastRightClicked) {
-          window.${name} = window.__playwriter_lastRightClicked;
-          '${name}';
-        } else {
-          throw new Error('No element was right-clicked');
-        }
-      `
-      const result = (await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: jsAssignPin,
-        returnByValue: true,
-      })) as { result?: { value?: string }; exceptionDetails?: { text: string } }
-
-      if (result.exceptionDetails) {
-        logger.error('Failed to pin element:', result.exceptionDetails.text)
-        return
-      }
-
-      const code = buildPinnedElementInspectionCode({ pinName: name, url: tab.url || '' })
-      const clipboardText = "playwriter -e '" + code + "'"
-
-      const jsPinFlashAndCopy = js`
-        (() => {
-          const el = window.${name};
-          if (!el) return;
-          const orig = el.getAttribute('style') || '';
-          el.setAttribute('style', orig + '; outline: 3px solid #22c55e !important; outline-offset: 2px !important; box-shadow: 0 0 0 3px #22c55e !important;');
-          setTimeout(() => el.setAttribute('style', orig), 300);
-          return navigator.clipboard.writeText(${JSON.stringify(clipboardText)});
-        })()
-      `
-      await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: jsPinFlashAndCopy,
-        awaitPromise: true,
-        userGesture: true,
-      })
-
-      logger.debug('Pinned element as:', name)
-    } catch (error: any) {
-      logger.error('Failed to pin element:', error.message)
-    }
-  }
-
-  if (info.menuItemId === 'playwriter-copy-react-source') {
-    try {
-      // Inject bippy (React fiber introspection) if not already present.
-      // bippy exposes globalThis.__bippy with methods to walk the React fiber tree
-      // and resolve source file locations from React DevTools metadata.
-      const hasBippy = (await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: '!!globalThis.__bippy',
-        returnByValue: true,
-      })) as { result?: { value?: boolean } }
-
-      if (!hasBippy.result?.value) {
-        await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-          expression: bippyBundleCode,
-        })
-      }
-
-      // Walk from the right-clicked DOM element up through React fiber tree to find
-      // the nearest composite component with source location info. Uses bippy's
-      // getSource() first (direct __source prop from JSX transform), then falls back
-      // to getOwnerStack() for production builds with source maps.
-      const jsResolveSource = js`
-        (async () => {
-          const el = window.__playwriter_lastRightClicked;
-          if (!el) return JSON.stringify({ error: 'No element was right-clicked' });
-
-          const bippy = globalThis.__bippy;
-          if (!bippy) return JSON.stringify({ error: 'bippy not loaded' });
-
-          // bippy.normalizeFileName strips "/app-pages-browser/" but not the parenthesized
-          // form "/(app-pages-browser)/" that Next.js webpack actually uses. This regex
-          // strips all Next.js webpack layer prefixes: (app-pages-browser), (ssr), (rsc),
-          // (action-browser), (pages-dir-browser), (pages-dir-edge), (pages-dir-node).
-          // Also strips leading "./" that often follows the layer prefix.
-          const cleanFileName = (name) => {
-            let f = bippy.normalizeFileName(name);
-            f = f.replace(/^\/?\\([-\\w]+\\)\\//, '');
-            f = f.replace(/^\\.[\\/]/, '');
-            return f;
-          };
-
-          let fiber;
-          try { fiber = bippy.getFiberFromHostInstance(el); } catch {}
-          if (!fiber) return JSON.stringify({ error: 'No React fiber found. Is this a React app?' });
-
-          // Walk up to find nearest composite fiber with source info
-          let current = fiber;
-          for (let i = 0; i < 50 && current; i++) {
-            try {
-              if (bippy.isCompositeFiber(current)) {
-                const source = await bippy.getSource(current);
-                if (source && source.fileName && bippy.isSourceFile(source.fileName)) {
-                  return JSON.stringify({
-                    fileName: cleanFileName(source.fileName),
-                    lineNumber: source.lineNumber || null,
-                    columnNumber: source.columnNumber || null,
-                    componentName: source.functionName || bippy.getDisplayName(current.type) || null,
-                  });
-                }
-                // Try owner stack as fallback for this fiber
-                const ownerStack = await bippy.getOwnerStack(current);
-                for (const frame of ownerStack) {
-                  if (frame.fileName && bippy.isSourceFile(frame.fileName)) {
-                    return JSON.stringify({
-                      fileName: cleanFileName(frame.fileName),
-                      lineNumber: frame.lineNumber || null,
-                      columnNumber: frame.columnNumber || null,
-                      componentName: frame.functionName || bippy.getDisplayName(current.type) || null,
-                    });
-                  }
-                }
-              }
-            } catch {}
-            current = current.return;
-          }
-          return JSON.stringify({ error: 'No React source location found. Is this a dev build with source maps?' });
-        })()
-      `
-      const sourceResult = (await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: jsResolveSource,
-        returnByValue: true,
-        awaitPromise: true,
-      })) as { result?: { value?: string }; exceptionDetails?: { text: string } }
-
-      if (sourceResult.exceptionDetails) {
-        logger.error('Failed to get React source:', sourceResult.exceptionDetails.text)
-        return
-      }
-
-      const parsed = JSON.parse(sourceResult.result?.value || '{}')
-
-      if (!parsed.fileName && !parsed.error) {
-        parsed.error = 'React source result missing fileName'
-      }
-
-      if (parsed.error) {
-        // Flash red outline on the element to indicate no React source found
-        const jsFlashRed = js`
-          (() => {
-            const el = window.__playwriter_lastRightClicked;
-            if (!el) return;
-            const orig = el.getAttribute('style') || '';
-            el.setAttribute('style', orig + '; outline: 3px solid #ef4444 !important; outline-offset: 2px !important;');
-            setTimeout(() => el.setAttribute('style', orig), 600);
-          })()
-        `
-        await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-          expression: jsFlashRed,
-        })
-        logger.debug('React source not found:', parsed.error)
-        return
-      }
-
-      // Build clipboard text: "path/to/file.tsx:42" or "path/to/file.tsx" if no line
-      const clipboardText: string = (() => {
-        if (parsed.lineNumber) {
-          return `${parsed.fileName}:${parsed.lineNumber}`
-        }
-        return parsed.fileName
-      })()
-
-      // Flash green outline and copy to clipboard
-      const jsFlashGreenAndCopy = js`
-        (() => {
-          const el = window.__playwriter_lastRightClicked;
-          if (!el) return;
-          const orig = el.getAttribute('style') || '';
-          el.setAttribute('style', orig + '; outline: 3px solid #22c55e !important; outline-offset: 2px !important; box-shadow: 0 0 0 3px #22c55e !important;');
-          setTimeout(() => el.setAttribute('style', orig), 300);
-          return navigator.clipboard.writeText(${JSON.stringify(clipboardText)});
-        })()
-      `
-      await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
-        expression: jsFlashGreenAndCopy,
-        awaitPromise: true,
-        userGesture: true,
-      })
-
-      logger.debug('Copied React source path:', clipboardText, 'component:', parsed.componentName)
-    } catch (error: any) {
-      logger.error('Failed to copy React source:', error.message)
-    }
-  }
+chrome.contextMenus?.onClicked.addListener((info, tab) => {
+  const item = PICK_MENU_ITEMS[String(info.menuItemId)]
+  if (!item || !tab?.id) return
+  startElementPick(tab.id, item.purpose).catch((error: Error) => {
+    logger.error('Could not start the element picker:', error.message)
+  })
 })
 
 // Sync icons on first load
@@ -3097,28 +2870,4 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   }
 
   return false
-})
-
-// Re-inject the toolbar after hard navigations in connected tabs.
-// The MAIN-world script is destroyed on every full page load, so we re-run
-// initPlaywriterToolbar once the new document's DOM is ready.
-// onDOMContentLoaded is used instead of onCommitted because executeScript
-// with world:'MAIN' needs the document to exist before injecting.
-// Note: SPA route changes (pushState/replaceState) don't trigger this because
-// the document is not reset — the toolbar DOM persists across SPA navigations.
-chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
-  if (details.frameId !== 0) return // top frame only
-  const { tabs } = store.getState()
-  const tabInfo = tabs.get(details.tabId)
-  if (!tabInfo || tabInfo.state !== 'connected') return
-
-  chrome.scripting
-    .executeScript({
-      target: { tabId: details.tabId, allFrames: false },
-      world: 'MAIN',
-      func: initPlaywriterToolbar,
-    })
-    .catch((err: Error) => {
-      logger.debug('Could not re-inject toolbar after navigation:', err.message)
-    })
 })

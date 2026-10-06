@@ -1,6 +1,10 @@
 import { Page, Locator } from '@xmorse/playwright-core'
 import { formatHtmlForPrompt } from './htmlrewrite.js'
 import { createSmartDiff } from './diff-utils.js'
+import { getCDPSessionForPage } from './cdp-session.js'
+import { withDeadline } from './isolated-world.js'
+
+const CDP_TIMEOUT_MS = 5000
 
 /** Page -> (snapshot key -> last HTML). The diff baseline for `showDiffSinceLastCall`. */
 export type HtmlDiffStore = WeakMap<Page, Map<string, string>>
@@ -48,7 +52,8 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
   const {
     locator,
     search,
-    showDiffSinceLastCall = !search,
+    // Opt-in, like snapshot(): a second call returning a diff gets read as the whole page.
+    showDiffSinceLastCall = false,
     includeStyles = false,
     maxAttrLen = 200,
     maxContentLen = 500,
@@ -61,7 +66,11 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
 
   if (isPage(locator)) {
     page = locator
-    rawHtml = await locator.content()
+    // The same text as page.content() (measured), read without evaluating in the page: Playwright's
+    // evaluation runs as a user gesture and would give the page user activation.
+    const cdp = await getCDPSessionForPage({ page })
+    const { root } = await withDeadline(cdp.send('DOM.getDocument', { depth: 0 }), CDP_TIMEOUT_MS, 'reading the document (DOM.getDocument)')
+    ;({ outerHTML: rawHtml } = await withDeadline(cdp.send('DOM.getOuterHTML', { nodeId: root.nodeId }), CDP_TIMEOUT_MS, "reading the page's HTML (DOM.getOuterHTML)"))
   } else {
     page = locator.page()
     rawHtml = await locator.innerHTML()

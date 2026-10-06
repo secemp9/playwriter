@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Protocol } from 'devtools-protocol'
 import {
   buildRawSnapshotTree,
+  controlNameSources,
   buildSnapshotLines,
   filterFullSnapshotTree,
   filterInteractiveSnapshotTree,
@@ -115,7 +116,7 @@ describe('aria-snapshot tree filters', () => {
       return Boolean(node.backendDOMNodeId && allowed.has(node.backendDOMNodeId))
     }
 
-    const rawTree = buildRawSnapshotTree({ nodeId: rootId, axById, isNodeInScope })
+    const rawTree = buildRawSnapshotTree({ nodeId: rootId, axById, isNodeInScope, nameSources: controlNameSources(axById) })
     expect(rawTree).toMatchInlineSnapshot(`
       {
         "backendNodeId": undefined,

@@ -42,7 +42,10 @@ import { splitSkillOnCliSection } from './strip-cli-sections.js'
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const EXECUTOR_FILE = path.join(PACKAGE_ROOT, 'src', 'executor.ts')
+/** The MCP `execute` description: the start-here guide of skill.md. */
 const PROMPT_MD = path.join(PACKAGE_ROOT, 'dist', 'prompt.md')
+/** The full reference the MCP serves (resource, and `docs()` inside execute): skill.md without its CLI sections. */
+const REFERENCE_MD = path.join(PACKAGE_ROOT, 'dist', 'skill-reference.md')
 
 /** A Page stand-in. Only the members the sandbox constructor itself touches are real. */
 function stubPage(): any {
@@ -219,21 +222,20 @@ describe('the doc parser itself works', () => {
     }
   })
 
-  it('the built MCP prompt really is the stripped skill.md', () => {
+  it('the built MCP files really come from the stripped skill.md', () => {
     // Weaker than the check above ON PURPOSE: dist/ is a build artifact and may lag an
     // uncommitted skill.md edit. What cannot lag is the SHAPE — the strip either ran or
     // it did not, and a stale artifact can only ever be a subset, never a superset.
-    if (!fs.existsSync(PROMPT_MD)) {
-      throw new Error('dist/prompt.md is missing — run `pnpm build`. The MCP serves that file.')
-    }
-    const prompt = fs.readFileSync(PROMPT_MD, 'utf8')
-    expect(prompt, 'the CLI section is still in the MCP prompt; build-resources.ts stopped stripping it').not.toContain(
-      '\n## CLI Usage\n',
-    )
-    const fromPrompt = extractDocumentedApi({ root: PACKAGE_ROOT, markdownFiles: ['dist/prompt.md'], sourceFiles: [] })
     const skillOnly = extractDocumentedApi({ root: PACKAGE_ROOT, markdownFiles: DOC_MARKDOWN, sourceFiles: [] })
-    const invented = [...fromPrompt.globals.keys()].filter((g) => !skillOnly.globals.has(g))
-    expect(invented, 'the MCP prompt documents something skill.md does not — it is no longer generated from it').toEqual([])
+    for (const file of [PROMPT_MD, REFERENCE_MD]) {
+      const name = path.relative(PACKAGE_ROOT, file)
+      if (!fs.existsSync(file)) throw new Error(`${name} is missing — run \`pnpm build\`. The MCP serves that file.`)
+      const text = fs.readFileSync(file, 'utf8')
+      expect(text, `the CLI section is still in ${name}; build-resources.ts stopped stripping it`).not.toContain('\n## CLI Usage\n')
+      const built = extractDocumentedApi({ root: PACKAGE_ROOT, markdownFiles: [name], sourceFiles: [] })
+      const invented = [...built.globals.keys()].filter((g) => !skillOnly.globals.has(g))
+      expect(invented, `${name} documents something skill.md does not — it is no longer generated from it`).toEqual([])
+    }
   })
 })
 
@@ -319,7 +321,6 @@ const CLI_ONLY_BY_DESIGN: Record<string, string> = {
   'navigator.webdriver': 'names a stealth patch cloud Chromium applies; cloud is unreachable from MCP',
 
   // --- the CLI's own surface: an MCP agent drives `execute`, not argv ---
-  'playwriter session new': 'the MCP server owns session lifecycle; an agent never runs this',
   '-s <id>': 'the CLI session flag; MCP sessions are not addressed by argv',
   '--direct': 'the CLI spelling of PLAYWRITER_DIRECT, which is documented in the shipped text',
   '--token': 'the CLI spelling of PLAYWRITER_TOKEN, which is documented in the shipped text',
@@ -502,13 +503,13 @@ describe('the CLI strip does not strand MCP-relevant facts', () => {
     // This one closes the other half: that the artifact on disk really is that shipped text.
     // Weaker on purpose — dist/ may lag an uncommitted edit, so it only asserts the tokens
     // skill.md's OWN shipped half already contains.
-    if (!fs.existsSync(PROMPT_MD)) {
-      throw new Error('dist/prompt.md is missing — run `pnpm build`. The MCP serves that file.')
+    if (!fs.existsSync(REFERENCE_MD)) {
+      throw new Error('dist/skill-reference.md is missing — run `pnpm build`. The MCP serves that file.')
     }
-    const prompt = fs.readFileSync(PROMPT_MD, 'utf8')
+    const reference = fs.readFileSync(REFERENCE_MD, 'utf8')
     const mustReach = ['PLAYWRITER_HOST', '~/.playwriter/relay-server.log', 'gh issue create -R remorses/playwriter']
-    const absent = mustReach.filter((token) => shipped.includes(token) && !prompt.includes(token))
-    expect(absent, 'skill.md un-stranded these but dist/prompt.md does not have them — run `pnpm build`').toEqual([])
+    const absent = mustReach.filter((token) => shipped.includes(token) && !reference.includes(token))
+    expect(absent, 'skill.md un-stranded these but dist/skill-reference.md does not have them — run `pnpm build`').toEqual([])
   })
 })
 

@@ -2,14 +2,13 @@
 // tree (interactive-only, labels/contexts, wrapper hoisting, ignored
 // indent preservation), then render lines and locators.
 import type { Page, Locator, ElementHandle, Frame, FrameLocator } from '@xmorse/playwright-core'
-import crypto from 'node:crypto'
 import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { Protocol } from 'devtools-protocol'
-import { Sema } from 'async-sema'
 import type { ICDPSession } from './cdp-session.js'
 import { getCDPSessionForPage, getCDPSessionForFrame } from './cdp-session.js'
+import { axStatesFromNode, formatAxStates, type AxStates } from './ax-states.js'
+import { resolveElement } from './element-resolve.js'
+import { withDeadline } from './isolated-world.js'
 
 // Import sharp at module level - resolves to null if not available
 const sharpPromise = import('sharp')
@@ -28,98 +27,12 @@ export type SnapshotFormat = 'raw'
 
 export const DEFAULT_SNAPSHOT_FORMAT: SnapshotFormat = 'raw'
 
-// ============================================================================
-// A11y Client Code Loading
-// ============================================================================
-
-let a11yClientCode: string | null = null
-
-function getA11yClientCode(): string {
-  if (a11yClientCode) {
-    return a11yClientCode
-  }
-  const currentDir = path.dirname(fileURLToPath(import.meta.url))
-  const a11yClientPath = path.join(currentDir, '..', 'dist', 'a11y-client.js')
-  a11yClientCode = fs.readFileSync(a11yClientPath, 'utf-8')
-  return a11yClientCode
-}
-
 /**
- * Ceiling on a `page.evaluate` in this module.
- *
- * `page.evaluate` has NO deadline of its own, and that is not an oversight to work around
- * but a fact to defend against. Playwright's frame dispatcher runs the call under
- * `ProgressController.run(task, params?.timeout)` (dispatcher.ts:107) and the client sends
- * no `timeout` for `evaluateExpression` (client/frame.ts:205), so the controller's deadline
- * is `timeout ?? 0` — none. The very first thing `evaluateExpression` does is
- * `await this._context('main')` (frames.ts:1445), which resolves only when a
- * `Runtime.executionContextCreated` with `auxData.isDefault` has been seen for that frame.
- * If that one event was ever missed, the promise is simply never settled: no error, no
- * timeout, no log — the tool stops responding and has nothing to report. That is the exact
- * failure this module hit against a second connected target (fixed in cdp-relay.ts's
- * Runtime.enable ordering fence), and the reason a deadline belongs here regardless: the
- * cause was upstream and the next one may be too.
- *
- * 20s, not a tight bound: a genuine evaluate on a heavy page plus a relay round trip is
- * tens of milliseconds, so anything approaching this is a wedge, not slowness.
+ * Deadline for each CDP read in `getAriaSnapshot`. The whole-document reads
+ * (`DOM.getFlattenedDocument`, `Accessibility.getFullAXTree`) take seconds on a page with tens of
+ * thousands of nodes; anything approaching this is a wedged target, not a slow one.
  */
-const PAGE_EVALUATE_TIMEOUT_MS = 20000
-
-/**
- * Run a `page.evaluate` with a deadline whose message names what was being waited for and
- * on which target, so a stall reads as a legible error instead of a freeze.
- */
-async function evaluateWithDeadline<T>({
-  page,
-  what,
-  run,
-  timeoutMs = PAGE_EVALUATE_TIMEOUT_MS,
-}: {
-  page: Page
-  what: string
-  run: () => Promise<T>
-  timeoutMs?: number
-}): Promise<T> {
-  const url = page.url()
-  let timeoutId: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      run(),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(
-            new Error(
-              `page.evaluate did not return within ${timeoutMs}ms while ${what} on ${url || '<unknown url>'}. ` +
-                `page.evaluate has no deadline of its own, and it blocks on the target's main-world execution ` +
-                `context, so the usual cause is that Playwright never received this target's ` +
-                `Runtime.executionContextCreated (auxData.isDefault) — check the relay log for that session.`,
-            ),
-          )
-        }, timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId)
-    }
-  }
-}
-
-async function ensureA11yClient(page: Page): Promise<void> {
-  const hasA11y = await evaluateWithDeadline({
-    page,
-    what: 'probing for the injected a11y client (globalThis.__a11y)',
-    run: () => page.evaluate(() => !!(globalThis as any).__a11y),
-  })
-  if (!hasA11y) {
-    const code = getA11yClientCode()
-    await evaluateWithDeadline({
-      page,
-      what: 'injecting the a11y client bundle',
-      run: () => page.evaluate(code),
-    })
-  }
-}
+const SNAPSHOT_CDP_TIMEOUT_MS = 30000
 
 // ============================================================================
 // Types
@@ -142,15 +55,27 @@ export type AriaSnapshotNode = {
   ref?: string
   shortRef?: string
   backendNodeId?: Protocol.DOM.BackendNodeId
+  /** AX states (checked, disabled, expanded, focused…). Absent when Chromium reported none. */
+  states?: AxStates
+  /**
+   * The AX value of a field (textbox/searchbox/combobox/spinbutton/slider), absent when
+   * empty. An `<input type=password>` with a value reads `'••••'` — never the secret.
+   */
+  value?: string
+  /**
+   * The node's own accessible name, present only when `name` was blanked because a
+   * descendant already prints the same text (a link wrapping `<img alt="Home">` has
+   * `name: ''` and `axName: 'Home'`). Consumers that list controls without their
+   * descendants need it, or the link would be nameless.
+   */
+  axName?: string
+  /**
+   * The role of the control whose accessible name this node's text is: the node is (inside) a
+   * `<label>` or `aria-labelledby` target Chromium read that control's name from. The control's
+   * own line already says it, so a reader of the page's text can tell it apart from prose.
+   */
+  labels?: string
   children: AriaSnapshotNode[]
-}
-
-export interface ScreenshotResult {
-  path: string
-  base64: string
-  mimeType: 'image/png'
-  snapshot: string
-  labelCount: number
 }
 
 // ============================================================================
@@ -279,19 +204,6 @@ export interface AriaSnapshotResult {
   getRefStringForLocator: (locator: Locator | ElementHandle) => Promise<string | null>
 }
 
-type LabelBox = {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
-type AriaLabel = {
-  ref: string
-  role: string
-  box: LabelBox
-}
-
 export function buildShortRefMap({ refs }: { refs: Array<{ ref: string }> }): Map<string, string> {
   const map = new Map<string, string>()
   refs.forEach((entry, index) => {
@@ -324,9 +236,6 @@ const INTERACTIVE_ROLES = new Set([
 ])
 
 const LABEL_ROLES = new Set(['labeltext'])
-
-const MAX_LABEL_POSITION_CONCURRENCY = 24
-const BOX_MODEL_TIMEOUT_MS = 5000
 
 const CONTEXT_ROLES = new Set([
   'navigation',
@@ -478,6 +387,8 @@ export type SnapshotLine = {
   role?: string
   name?: string
   indent?: number
+  /** State tokens and value (` [checked] = "a@b.c"`), re-appended when the line is rebuilt around its locator. */
+  suffix?: string
 }
 
 export type SnapshotNode = {
@@ -488,7 +399,100 @@ export type SnapshotNode = {
   backendNodeId?: Protocol.DOM.BackendNodeId
   indentOffset?: number
   ignored?: boolean
+  states?: AxStates
+  value?: string
+  axName?: string
+  labels?: string
   children: SnapshotNode[]
+}
+
+/**
+ * The DOM nodes that gave a control its accessible name, mapped to the control's role: a
+ * `<label for>` or wrapping `<label>`, an `aria-labelledby` target. Chromium reports where each
+ * name came from: the winning `name.sources` entry (it holds the value and is not superseded)
+ * lists the nodes it read in `relatedNodes`.
+ */
+export function controlNameSources(axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>): Map<Protocol.DOM.BackendNodeId, string> {
+  const sources = new Map<Protocol.DOM.BackendNodeId, string>()
+  for (const node of axById.values()) {
+    if (node.ignored) continue
+    const role = getAxRole(node)
+    if (!INTERACTIVE_ROLES.has(role)) continue
+    const winner = node.name?.sources?.find((source) => source.value !== undefined && !source.superseded && !source.invalid)
+    if (winner?.type !== 'relatedElement') continue
+    for (const related of winner.nativeSourceValue?.relatedNodes ?? winner.attributeValue?.relatedNodes ?? []) {
+      sources.set(related.backendDOMNodeId, role)
+    }
+  }
+  return sources
+}
+
+/**
+ * Roles whose AX `value` is what the user typed or picked. Other roles report values
+ * too (a link's `url`, a heading's nothing), but those are not field contents. The
+ * date/time/colour roles are Chromium's for native date, datetime-local/month/week, time
+ * and colour inputs (`ax_node_object.cc`); their value is the field's ISO / `#rrggbb` value.
+ */
+const VALUE_ROLES: Record<string, true> = {
+  textbox: true,
+  searchbox: true,
+  combobox: true,
+  spinbutton: true,
+  slider: true,
+  date: true,
+  datetime: true,
+  inputtime: true,
+  colorwell: true,
+}
+
+/**
+ * `autocomplete` tokens that name a secret (HTML autofill field names): what the browser
+ * fills there is a password, a one-time code or card security data.
+ */
+const SECRET_AUTOCOMPLETE_TOKENS: Record<string, true> = {
+  'current-password': true,
+  'new-password': true,
+  'one-time-code': true,
+  'cc-csc': true,
+  'cc-number': true,
+}
+
+/**
+ * Whether a field's value is a secret by what the author declared in the DOM: `type=password`,
+ * or an `autocomplete` token naming a password, one-time code or card number/security code.
+ * Fields that draw bullets through CSS (`-webkit-text-security`) are a computed-style fact
+ * this DOM row does not carry; observe() reads that style in the isolated world.
+ */
+export function isSecretField(nodeName: string, type: string | undefined, autocomplete: string | undefined): boolean {
+  const tag = nodeName.toLowerCase()
+  if (tag !== 'input' && tag !== 'textarea') return false
+  if (tag === 'input' && type?.toLowerCase() === 'password') return true
+  return (autocomplete ?? '').toLowerCase().split(/\s+/).some((token) => SECRET_AUTOCOMPLETE_TOKENS[token] === true)
+}
+
+/**
+ * What `snapshot()` lines and the tree carry about a node's state: its AX states and
+ * its field value, with a secret field's value replaced by `'••••'`.
+ *
+ * Masked from the DOM, not from the AX value: Chromium 145 already reports a password
+ * field's AX value as bullets (measured: `"••••••"` for "secret"), but the bullet count
+ * leaks the length and nothing guarantees every Chrome build masks, whereas `type=password`
+ * and a secret `autocomplete` token are the author's own statement that the value is a
+ * secret. A value whose DOM row is missing cannot be checked, so it is masked.
+ */
+function stateFields(
+  node: SnapshotNode,
+  domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>,
+): Pick<SnapshotNode, 'states' | 'value'> {
+  let value = node.value
+  if (value !== undefined) {
+    const domInfo = node.backendNodeId !== undefined ? domByBackendId.get(node.backendNodeId) : undefined
+    if (!domInfo || isSecretField(domInfo.nodeName, domInfo.attributes.get('type'), domInfo.attributes.get('autocomplete'))) value = '••••'
+  }
+  return {
+    ...(node.states ? { states: node.states } : {}),
+    ...(value !== undefined ? { value } : {}),
+  }
 }
 
 function buildSnapshotLine({
@@ -497,12 +501,14 @@ function buildSnapshotLine({
   baseLocator,
   indent,
   hasChildren,
+  suffix,
 }: {
   role: string
   name: string
   baseLocator?: string
   indent: number
   hasChildren: boolean
+  suffix: string
 }): SnapshotLine {
   const prefix = '  '.repeat(indent)
   let text = `${prefix}- ${role}`
@@ -510,7 +516,8 @@ function buildSnapshotLine({
     const escapedName = name.replace(/"/g, '\\"')
     text += ` "${escapedName}"`
   }
-  return { text, baseLocator, hasChildren, role, name, indent }
+  text += suffix
+  return { text, baseLocator, hasChildren, role, name, indent, ...(suffix ? { suffix } : {}) }
 }
 
 function buildTextLine(text: string, indent: number): SnapshotLine {
@@ -522,6 +529,11 @@ function buildTextLine(text: string, indent: number): SnapshotLine {
 export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotLine[] {
   return nodes.flatMap((node) => {
     const nodeIndent = indent + (node.indentOffset ?? 0)
+    // A contenteditable's AX value is its whole text, newlines included (measured on a
+    // `plaintext-only` editor). One snapshot line per node is the format's contract, so
+    // the value is flattened and capped here; the tree keeps it whole.
+    const flatValue = (node.value ?? '').replace(/\s+/g, ' ').trim()
+    const shownValue = flatValue.length > 100 ? `${flatValue.slice(0, 99)}…` : flatValue
     const line =
       node.role === 'text'
         ? buildTextLine(node.name, nodeIndent)
@@ -531,6 +543,7 @@ export function buildSnapshotLines(nodes: SnapshotNode[], indent = 0): SnapshotL
             baseLocator: node.baseLocator,
             indent: nodeIndent,
             hasChildren: node.children.length > 0,
+            suffix: formatAxStates(node.states, node.role) + (shownValue ? ` = "${shownValue.replace(/"/g, '\\"')}"` : ''),
           })
     return [line, ...buildSnapshotLines(node.children, nodeIndent + 1)]
   })
@@ -546,6 +559,10 @@ export function buildRawSnapshotTree(options: {
   nodeId: Protocol.Accessibility.AXNodeId
   axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
   isNodeInScope: (node: Protocol.Accessibility.AXNode) => boolean
+  /** `controlNameSources(axById)`. */
+  nameSources: Map<Protocol.DOM.BackendNodeId, string>
+  /** The role of the control an enclosing label names (inherited down the label's subtree). */
+  labels?: string
 }): SnapshotNode | null {
   const node = options.axById.get(options.nodeId)
   if (!node) {
@@ -554,12 +571,15 @@ export function buildRawSnapshotTree(options: {
 
   const role = getAxRole(node)
   const name = getAxValueString(node.name).trim()
+  const labels = (node.backendDOMNodeId !== undefined ? options.nameSources.get(node.backendDOMNodeId) : undefined) ?? options.labels
   const children = (node.childIds ?? [])
     .map((childId) => {
       return buildRawSnapshotTree({
         nodeId: childId,
         axById: options.axById,
         isNodeInScope: options.isNodeInScope,
+        nameSources: options.nameSources,
+        ...(labels !== undefined ? { labels } : {}),
       })
     })
     .filter(isTruthy)
@@ -569,11 +589,16 @@ export function buildRawSnapshotTree(options: {
     return null
   }
 
+  const states = axStatesFromNode(node)
+  const value = VALUE_ROLES[role] ? getAxValueString(node.value) : ''
   return {
     role,
     name,
     backendNodeId: node.backendDOMNodeId,
     ignored: node.ignored,
+    ...(states ? { states } : {}),
+    ...(value !== '' ? { value } : {}),
+    ...(labels !== undefined ? { labels } : {}),
     children,
   }
 }
@@ -639,7 +664,14 @@ export function filterInteractiveSnapshotTree(options: {
     }
     const names = new Set(childNames)
     names.add(name)
-    const textNode: SnapshotNode = { role: 'text', name, children: [] }
+    // The DOM text node's id is kept so consumers (PageModel, observe) can place and
+    // track the text; without it every text line was an anonymous, unmeasurable node.
+    const textNode: SnapshotNode = {
+      role: 'text',
+      name,
+      ...(options.node.backendNodeId !== undefined ? { backendNodeId: options.node.backendNodeId } : {}),
+      children: [],
+    }
     return { nodes: [textNode], names }
   }
 
@@ -686,6 +718,8 @@ export function filterInteractiveSnapshotTree(options: {
     baseLocator,
     ref: ref ?? undefined,
     backendNodeId: options.node.backendNodeId,
+    ...stateFields(options.node, options.domByBackendId),
+    ...(nameToUse !== name ? { axName: name } : {}),
     children: childNodes,
   }
   const names = new Set(childNames)
@@ -748,7 +782,13 @@ export function filterFullSnapshotTree(options: {
     }
     const names = new Set(childNames)
     names.add(name)
-    const textNode: SnapshotNode = { role: 'text', name, children: [] }
+    const textNode: SnapshotNode = {
+      role: 'text',
+      name,
+      ...(options.node.backendNodeId !== undefined ? { backendNodeId: options.node.backendNodeId } : {}),
+      ...(options.node.labels !== undefined ? { labels: options.node.labels } : {}),
+      children: [],
+    }
     return { nodes: [textNode], names }
   }
 
@@ -787,6 +827,9 @@ export function filterFullSnapshotTree(options: {
     baseLocator,
     ref: ref ?? undefined,
     backendNodeId: options.node.backendNodeId,
+    ...stateFields(options.node, options.domByBackendId),
+    ...(nameToUse !== name ? { axName: name } : {}),
+    ...(options.node.labels !== undefined ? { labels: options.node.labels } : {}),
     children: childNodes,
   }
   const names = new Set(childNames)
@@ -814,7 +857,7 @@ function buildLocatorLineText({ line, locator }: { line: SnapshotLine; locator: 
   }
 
   const base = parts.length > 0 ? `${prefix}- ${parts.join(' ')}` : `${prefix}-`
-  return `${base} ${locator}`
+  return `${base} ${locator}${line.suffix ?? ''}`
 }
 
 export function finalizeSnapshotOutput(
@@ -871,6 +914,10 @@ export function finalizeSnapshotOutput(
         ref: item.ref,
         shortRef: item.ref ? (shortRefMap.get(item.ref) ?? item.ref) : undefined,
         backendNodeId: item.backendNodeId,
+        ...(item.states ? { states: item.states } : {}),
+        ...(item.value !== undefined ? { value: item.value } : {}),
+        ...(item.axName !== undefined ? { axName: item.axName } : {}),
+        ...(item.labels !== undefined ? { labels: item.labels } : {}),
         children,
       }
     })
@@ -879,76 +926,51 @@ export function finalizeSnapshotOutput(
   return { snapshot, tree: applyLocators(nodes) }
 }
 
-function buildDomIndex(nodes: Protocol.DOM.Node[]): {
-  domById: Map<Protocol.DOM.NodeId, DomNodeInfo>
+/**
+ * Index a pierced `DOM.getDocument` tree, walking every node with its real parent: light
+ * children, shadow roots (parent: the host), a same-process iframe's document (parent: the
+ * iframe) and pseudo-elements. The subtree below any element therefore holds everything rendered
+ * inside it. `DOM.getFlattenedDocument` cannot give that: it omits shadow-root nodes, so the
+ * parent links of every shadow tree end at a node that is not in the list (measured on
+ * Chromium 145).
+ */
+function buildDomIndex(root: Protocol.DOM.Node): {
   domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>
-  childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>
+  childrenByBackendId: Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId[]>
 } {
-  const domById = new Map<Protocol.DOM.NodeId, DomNodeInfo>()
   const domByBackendId = new Map<Protocol.DOM.BackendNodeId, DomNodeInfo>()
-  const childrenByParent = new Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>()
-
-  for (const node of nodes) {
-    const info: DomNodeInfo = {
+  const childrenByBackendId = new Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId[]>()
+  const stack: Array<{ node: Protocol.DOM.Node; parent?: Protocol.DOM.Node }> = [{ node: root }]
+  for (let entry = stack.pop(); entry; entry = stack.pop()) {
+    const { node, parent } = entry
+    domByBackendId.set(node.backendNodeId, {
       nodeId: node.nodeId,
-      parentId: node.parentId,
+      parentId: parent?.nodeId,
       backendNodeId: node.backendNodeId,
       nodeName: node.nodeName,
       attributes: toAttributeMap(node.attributes),
+    })
+    if (parent) {
+      const siblings = childrenByBackendId.get(parent.backendNodeId)
+      if (siblings) siblings.push(node.backendNodeId)
+      else childrenByBackendId.set(parent.backendNodeId, [node.backendNodeId])
     }
-    domById.set(node.nodeId, info)
-    domByBackendId.set(node.backendNodeId, info)
-    if (node.parentId) {
-      if (!childrenByParent.has(node.parentId)) {
-        childrenByParent.set(node.parentId, [])
-      }
-      childrenByParent.get(node.parentId)!.push(node.nodeId)
-    }
+    const nested = [...(node.children ?? []), ...(node.shadowRoots ?? []), ...(node.pseudoElements ?? [])]
+    if (node.contentDocument) nested.push(node.contentDocument)
+    for (const child of nested) stack.push({ node: child, parent: node })
   }
-
-  return { domById, domByBackendId, childrenByParent }
-}
-
-function findScopeRootNodeId(
-  nodes: Protocol.DOM.Node[],
-  attrName: string,
-  attrValue: string,
-): Protocol.DOM.NodeId | null {
-  for (const node of nodes) {
-    if (!node.attributes) {
-      continue
-    }
-    for (let i = 0; i < node.attributes.length; i += 2) {
-      const name = node.attributes[i]
-      const value = node.attributes[i + 1]
-      if (name === attrName && value === attrValue) {
-        return node.nodeId
-      }
-    }
-  }
-  return null
+  return { domByBackendId, childrenByBackendId }
 }
 
 function buildBackendIdSet(
-  rootNodeId: Protocol.DOM.NodeId,
-  childrenByParent: Map<Protocol.DOM.NodeId, Protocol.DOM.NodeId[]>,
-  domById: Map<Protocol.DOM.NodeId, DomNodeInfo>,
+  rootBackendId: Protocol.DOM.BackendNodeId,
+  childrenByBackendId: Map<Protocol.DOM.BackendNodeId, Protocol.DOM.BackendNodeId[]>,
 ): Set<Protocol.DOM.BackendNodeId> {
   const result = new Set<Protocol.DOM.BackendNodeId>()
-  const stack: Protocol.DOM.NodeId[] = [rootNodeId]
-  while (stack.length > 0) {
-    const current = stack.pop()
-    if (current === undefined) {
-      continue
-    }
-    const node = domById.get(current)
-    if (node) {
-      result.add(node.backendNodeId)
-    }
-    const children = childrenByParent.get(current)
-    if (children && children.length > 0) {
-      stack.push(...children)
-    }
+  const stack = [rootBackendId]
+  for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
+    result.add(current)
+    stack.push(...(childrenByBackendId.get(current) ?? []))
   }
   return result
 }
@@ -1066,726 +1088,384 @@ export async function getAriaSnapshot({
   // each. Getting it wrong returns the PARENT document's tree under the child's name.
   const frameSession = resolvedFrame ? await getCDPSessionForFrame({ frame: resolvedFrame }) : null
   const isOopif = frameSession !== null
-  // Only sessions this call created are detached in `finally`; a caller-supplied `cdp`
-  // outlives us.
-  const pageSession = cdp || (await getCDPSessionForPage({ page }))
+  const pageSession = cdp ?? (await getCDPSessionForPage({ page }))
   const session: ICDPSession = frameSession ?? pageSession
 
-  await session.send('DOM.enable')
-  await session.send('Accessibility.enable')
-  const scopeAttr = 'data-pw-scope'
-  const scopeValue = crypto.randomUUID()
-  let scopeApplied = false
-  const scopeLocator = locator
+  await withDeadline(session.send('DOM.enable'), SNAPSHOT_CDP_TIMEOUT_MS, 'enabling the DOM domain (DOM.enable)')
+  await withDeadline(
+    session.send('Accessibility.enable'),
+    SNAPSHOT_CDP_TIMEOUT_MS,
+    'enabling the Accessibility domain (Accessibility.enable)',
+  )
 
-  try {
-    if (scopeLocator) {
-      await scopeLocator.evaluate(
-        (element, data) => {
-          element.setAttribute(data.attr, data.value)
-        },
-        { attr: scopeAttr, value: scopeValue },
+  // Scope: the locator's element is identified by backendNodeId without writing to the page
+  // (element-resolve.ts), and its subtree is taken from the pierced DOM tree's parent links,
+  // which run through shadow roots and same-process iframe documents (see buildDomIndex).
+  const scopeElement = locator ? await resolveElement({ target: locator, cdp: pageSession }) : null
+  if (scopeElement) {
+    const snapshotFrame = resolvedFrame ?? page.mainFrame()
+    const owner = scopeElement.frame
+    let inside = false
+    for (let current: Frame | null = owner; current; current = current.parentFrame()) {
+      if (current === snapshotFrame) {
+        inside = true
+        break
+      }
+    }
+    if (!inside) {
+      throw new Error(
+        `getAriaSnapshot: the locator's element is in frame ${scopeElement.frameId} (${owner.url()}), ` +
+          `which is not ${resolvedFrame ? `the requested frame ${frameId} or inside it` : 'part of this page'}. ` +
+          "Pass a locator inside the snapshotted frame, or pass that element's own frame as `frame`.",
       )
-      scopeApplied = true
+    }
+    if (scopeElement.ownSession !== isOopif) {
+      throw new Error(
+        `getAriaSnapshot: the locator's element is in frame ${scopeElement.frameId} (${owner.url()}), ` +
+          `which runs in ${scopeElement.ownSession ? 'its own renderer process' : 'the page process'} while the ` +
+          `${resolvedFrame ? `requested frame ${frameId}` : 'page'} runs in ${isOopif ? 'its own' : 'the page'} process, ` +
+          "so one DOM read cannot contain both. Pass the element's own frame as `frame`.",
+      )
+    }
+  }
+
+  const { root: domRoot } = await withDeadline(
+    session.send('DOM.getDocument', { depth: -1, pierce: true }),
+    SNAPSHOT_CDP_TIMEOUT_MS,
+    'reading the DOM (DOM.getDocument)',
+  )
+  const { domByBackendId, childrenByBackendId } = buildDomIndex(domRoot)
+
+  const scopeRootBackendId = scopeElement?.backendNodeId ?? null
+  let allowedBackendIds: Set<Protocol.DOM.BackendNodeId> | null = null
+  if (scopeElement) {
+    if (!domByBackendId.has(scopeElement.backendNodeId)) {
+      throw new Error(
+        `getAriaSnapshot: the locator's element <${scopeElement.node.localName}> (backendNodeId ` +
+          `${scopeElement.backendNodeId}) is not in the document DOM.getDocument returned: it was removed ` +
+          'between resolving the locator and reading the DOM. Take the snapshot again once the page settles.',
+      )
+    }
+    allowedBackendIds = buildBackendIdSet(scopeElement.backendNodeId, childrenByBackendId)
+  }
+
+  // On the OOPIF's own session the document IS the frame, so scoping by frameId is
+  // both unnecessary and wrong (the parent's frame id is unknown there). On the page
+  // session an unscoped call would return the TOP document, so `frameId` is required
+  // whenever a frame was asked for.
+  const axParams = isOopif ? undefined : frameId ? { frameId } : undefined
+  const { nodes: axNodes } = await withDeadline(
+    session.send('Accessibility.getFullAXTree', axParams),
+    SNAPSHOT_CDP_TIMEOUT_MS,
+    'reading the accessibility tree (Accessibility.getFullAXTree)',
+  ).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    // The one failure that used to be invisible: a cross-origin frame that Playwright
+    // holds no session for (so `getCDPSessionForFrame` returned null) is unreachable
+    // from the page session. Say so instead of falling back to the parent's tree.
+    if (frameId && /Frame with the given frameId is not found/i.test(message)) {
+      throw new Error(
+        `getAriaSnapshot: frame ${frameId} (${resolvedFrame?.url() ?? 'unknown url'}) is not reachable from the ` +
+          `page's CDP session, and Playwright holds no separate session for it either. It is a cross-process ` +
+          `iframe whose target was never attached — through the relay, iframe targets are not in ` +
+          `connectedTargets, so no session exists to ask. Refusing to return the parent document's tree in its ` +
+          `place. Original protocol error: ${message}`,
+      )
+    }
+    throw error
+  })
+
+  const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
+  for (const node of axNodes) {
+    axById.set(node.nodeId, node)
+  }
+
+  // Index AX nodes by backendDOMNodeId for O(1) lookups during promotion
+  // and root finding (instead of repeated O(n) axNodes.find() calls)
+  const axByBackendId = new Map<Protocol.DOM.BackendNodeId, Protocol.Accessibility.AXNode>()
+  for (const node of axNodes) {
+    if (node.backendDOMNodeId) {
+      axByBackendId.set(node.backendDOMNodeId, node)
+    }
+  }
+
+  // Promote contenteditable elements that Chrome's AX tree doesn't classify as
+  // interactive. Rich text editors (ProseMirror, Tiptap, Slate, Lexical, etc.) use
+  // bare <div contenteditable="true"> without role="textbox", so Chrome reports
+  // them as "generic" and they become invisible in the snapshot. We detect these
+  // via the DOM tree and override the AX role to "textbox" so they appear as
+  // interactive elements the AI can target.
+  //
+  // The "generic" is MEASURED, not inferred from the frameworks' behaviour: on
+  // Chromium 145 `Accessibility.getFullAXTree` reports a bare
+  // `<div contenteditable="true">` with `role.value === 'generic'` and
+  // `ignored: false`, while the same div with an explicit `role="textbox"` reports
+  // `'textbox'`. `generic` is in SKIP_WRAPPER_ROLES, so without this promotion the node
+  // is dropped as a wrapper and the editor is simply absent from the snapshot.
+  const promotedContentEditableIds = new Set<Protocol.DOM.BackendNodeId>()
+  for (const [, domInfo] of domByBackendId) {
+    if (!isContentEditable(domInfo.attributes.get('contenteditable'))) {
+      continue
+    }
+    const axNode = axByBackendId.get(domInfo.backendNodeId)
+    if (!axNode) {
+      continue
+    }
+    const currentRole = getAxRole(axNode)
+    if (INTERACTIVE_ROLES.has(currentRole)) {
+      continue
+    }
+    axNode.role = { type: 'role', value: 'textbox' }
+    promotedContentEditableIds.add(domInfo.backendNodeId)
+  }
+
+  const findRootAxNodeId = (): Protocol.Accessibility.AXNodeId | null => {
+    if (scopeRootBackendId) {
+      const scoped = axByBackendId.get(scopeRootBackendId)
+      if (scoped) {
+        return scoped.nodeId
+      }
+    }
+    const rootWebArea = axNodes.find((node) => {
+      return getAxRole(node) === 'rootwebarea'
+    })
+    if (rootWebArea) {
+      return rootWebArea.nodeId
+    }
+    const webArea = axNodes.find((node) => {
+      return getAxRole(node) === 'webarea'
+    })
+    if (webArea) {
+      return webArea.nodeId
+    }
+    const topLevel = axNodes.find((node) => {
+      return !node.parentId
+    })
+    return topLevel ? topLevel.nodeId : null
+  }
+
+  const rootAxNodeId = findRootAxNodeId()
+
+  const refCounts = new Map<string, number>()
+  let fallbackCounter = 0
+  const refs: AriaRefDraft[] = []
+
+  const createRefForNode = (options: {
+    backendNodeId?: Protocol.DOM.BackendNodeId
+    role: string
+    name: string
+  }): string | null => {
+    if (!INTERACTIVE_ROLES.has(options.role)) {
+      return null
     }
 
-    const { nodes: domNodes } = (await session.send('DOM.getFlattenedDocument', {
-      depth: -1,
-      pierce: true,
-    })) as Protocol.DOM.GetFlattenedDocumentResponse
-    const { domById, domByBackendId, childrenByParent } = buildDomIndex(domNodes)
-
-    let scopeRootNodeId: Protocol.DOM.NodeId | null = null
-    let scopeRootBackendId: Protocol.DOM.BackendNodeId | null = null
-    if (scopeLocator) {
-      scopeRootNodeId = findScopeRootNodeId(domNodes, scopeAttr, scopeValue)
-      if (scopeRootNodeId) {
-        const scopeNode = domById.get(scopeRootNodeId)
-        if (scopeNode) {
-          scopeRootBackendId = scopeNode.backendNodeId
-        }
-      }
+    const domInfo = options.backendNodeId ? domByBackendId.get(options.backendNodeId) : undefined
+    const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
+    let baseRef = stable?.value
+    if (!baseRef) {
+      fallbackCounter += 1
+      baseRef = `e${fallbackCounter}`
     }
 
-    const allowedBackendIds = scopeRootNodeId ? buildBackendIdSet(scopeRootNodeId, childrenByParent, domById) : null
+    const count = refCounts.get(baseRef) ?? 0
+    refCounts.set(baseRef, count + 1)
+    const ref = count === 0 ? baseRef : `${baseRef}-${count + 1}`
 
-    // On the OOPIF's own session the document IS the frame, so scoping by frameId is
-    // both unnecessary and wrong (the parent's frame id is unknown there). On the page
-    // session an unscoped call would return the TOP document, so `frameId` is required
-    // whenever a frame was asked for.
-    const axParams = isOopif ? undefined : frameId ? { frameId } : undefined
-    const { nodes: axNodes } = (await session
-      .send('Accessibility.getFullAXTree', axParams)
-      .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error)
-        // The one failure that used to be invisible: a cross-origin frame that Playwright
-        // holds no session for (so `getCDPSessionForFrame` returned null) is unreachable
-        // from the page session. Say so instead of falling back to the parent's tree.
-        if (frameId && /Frame with the given frameId is not found/i.test(message)) {
-          throw new Error(
-            `getAriaSnapshot: frame ${frameId} (${resolvedFrame?.url() ?? 'unknown url'}) is not reachable from the ` +
-              `page's CDP session, and Playwright holds no separate session for it either. It is a cross-process ` +
-              `iframe whose target was never attached — through the relay, iframe targets are not in ` +
-              `connectedTargets, so no session exists to ask. Refusing to return the parent document's tree in its ` +
-              `place. Original protocol error: ${message}`,
-          )
-        }
-        throw error
-      })) as Protocol.Accessibility.GetFullAXTreeResponse
-
-    const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
-    for (const node of axNodes) {
-      axById.set(node.nodeId, node)
+    let selector: string | undefined
+    if (stable && count === 0) {
+      selector = buildLocatorFromStable(stable)
+    }
+    // For promoted contenteditable elements without a stable selector, store
+    // [contenteditable="true"] so getSelectorForRef() doesn't fall back to
+    // role=textbox which Playwright can't match on bare contenteditable divs.
+    if (!selector && options.backendNodeId != null && promotedContentEditableIds.has(options.backendNodeId)) {
+      selector = '[contenteditable="true"]'
     }
 
-    // Index AX nodes by backendDOMNodeId for O(1) lookups during promotion
-    // and root finding (instead of repeated O(n) axNodes.find() calls)
-    const axByBackendId = new Map<Protocol.DOM.BackendNodeId, Protocol.Accessibility.AXNode>()
-    for (const node of axNodes) {
-      if (node.backendDOMNodeId) {
-        axByBackendId.set(node.backendDOMNodeId, node)
-      }
+    refs.push({ ref, role: options.role, name: options.name, selector, backendNodeId: options.backendNodeId })
+    return ref
+  }
+
+  const isNodeInScope = (node: Protocol.Accessibility.AXNode): boolean => {
+    if (!allowedBackendIds) {
+      return true
     }
-
-    // Promote contenteditable elements that Chrome's AX tree doesn't classify as
-    // interactive. Rich text editors (ProseMirror, Tiptap, Slate, Lexical, etc.) use
-    // bare <div contenteditable="true"> without role="textbox", so Chrome reports
-    // them as "generic" and they become invisible in the snapshot. We detect these
-    // via the DOM tree and override the AX role to "textbox" so they appear as
-    // interactive elements the AI can target.
-    //
-    // The "generic" is MEASURED, not inferred from the frameworks' behaviour: on
-    // Chromium 145 `Accessibility.getFullAXTree` reports a bare
-    // `<div contenteditable="true">` with `role.value === 'generic'` and
-    // `ignored: false`, while the same div with an explicit `role="textbox"` reports
-    // `'textbox'`. `generic` is in SKIP_WRAPPER_ROLES, so without this promotion the node
-    // is dropped as a wrapper and the editor is simply absent from the snapshot.
-    const promotedContentEditableIds = new Set<Protocol.DOM.BackendNodeId>()
-    for (const [, domInfo] of domByBackendId) {
-      if (!isContentEditable(domInfo.attributes.get('contenteditable'))) {
-        continue
-      }
-      const axNode = axByBackendId.get(domInfo.backendNodeId)
-      if (!axNode) {
-        continue
-      }
-      const currentRole = getAxRole(axNode)
-      if (INTERACTIVE_ROLES.has(currentRole)) {
-        continue
-      }
-      axNode.role = { type: 'role', value: 'textbox' }
-      promotedContentEditableIds.add(domInfo.backendNodeId)
+    if (!node.backendDOMNodeId) {
+      return false
     }
+    return allowedBackendIds.has(node.backendDOMNodeId)
+  }
 
-    const findRootAxNodeId = (): Protocol.Accessibility.AXNodeId | null => {
-      if (scopeRootBackendId) {
-        const scoped = axByBackendId.get(scopeRootBackendId)
-        if (scoped) {
-          return scoped.nodeId
-        }
-      }
-      const rootWebArea = axNodes.find((node) => {
-        return getAxRole(node) === 'rootwebarea'
-      })
-      if (rootWebArea) {
-        return rootWebArea.nodeId
-      }
-      const webArea = axNodes.find((node) => {
-        return getAxRole(node) === 'webarea'
-      })
-      if (webArea) {
-        return webArea.nodeId
-      }
-      const topLevel = axNodes.find((node) => {
-        return !node.parentId
-      })
-      return topLevel ? topLevel.nodeId : null
-    }
+  const nameSources = controlNameSources(axById)
+  let snapshotNodes: SnapshotNode[] = []
+  if (rootAxNodeId) {
+    const rootNode = axById.get(rootAxNodeId)
+    const rootRole = rootNode ? getAxRole(rootNode) : ''
+    const rawRoots =
+      rootNode && (rootRole === 'rootwebarea' || rootRole === 'webarea') && rootNode.childIds
+        ? rootNode.childIds
+            .map((childId) => {
+              return buildRawSnapshotTree({ nodeId: childId, axById, isNodeInScope, nameSources })
+            })
+            .filter(isTruthy)
+        : [buildRawSnapshotTree({ nodeId: rootAxNodeId, axById, isNodeInScope, nameSources })].filter(isTruthy)
 
-    const rootAxNodeId = findRootAxNodeId()
-
-    const refCounts = new Map<string, number>()
-    let fallbackCounter = 0
-    const refs: AriaRefDraft[] = []
-
-    const createRefForNode = (options: {
-      backendNodeId?: Protocol.DOM.BackendNodeId
-      role: string
-      name: string
-    }): string | null => {
-      if (!INTERACTIVE_ROLES.has(options.role)) {
-        return null
-      }
-
-      const domInfo = options.backendNodeId ? domByBackendId.get(options.backendNodeId) : undefined
-      const stable = domInfo ? getStableRefFromAttributes(domInfo.attributes) : null
-      let baseRef = stable?.value
-      if (!baseRef) {
-        fallbackCounter += 1
-        baseRef = `e${fallbackCounter}`
-      }
-
-      const count = refCounts.get(baseRef) ?? 0
-      refCounts.set(baseRef, count + 1)
-      const ref = count === 0 ? baseRef : `${baseRef}-${count + 1}`
-
-      let selector: string | undefined
-      if (stable && count === 0) {
-        selector = buildLocatorFromStable(stable)
-      }
-      // For promoted contenteditable elements without a stable selector, store
-      // [contenteditable="true"] so getSelectorForRef() doesn't fall back to
-      // role=textbox which Playwright can't match on bare contenteditable divs.
-      if (!selector && options.backendNodeId != null && promotedContentEditableIds.has(options.backendNodeId)) {
-        selector = '[contenteditable="true"]'
-      }
-
-      refs.push({ ref, role: options.role, name: options.name, selector, backendNodeId: options.backendNodeId })
-      return ref
-    }
-
-    const isNodeInScope = (node: Protocol.Accessibility.AXNode): boolean => {
-      if (!allowedBackendIds) {
-        return true
-      }
-      if (!node.backendDOMNodeId) {
-        return false
-      }
-      return allowedBackendIds.has(node.backendDOMNodeId)
-    }
-
-    let snapshotNodes: SnapshotNode[] = []
-    if (rootAxNodeId) {
-      const rootNode = axById.get(rootAxNodeId)
-      const rootRole = rootNode ? getAxRole(rootNode) : ''
-      const rawRoots =
-        rootNode && (rootRole === 'rootwebarea' || rootRole === 'webarea') && rootNode.childIds
-          ? rootNode.childIds
-              .map((childId) => {
-                return buildRawSnapshotTree({ nodeId: childId, axById, isNodeInScope })
-              })
-              .filter(isTruthy)
-          : [buildRawSnapshotTree({ nodeId: rootAxNodeId, axById, isNodeInScope })].filter(isTruthy)
-
-      const filtered = rawRoots.flatMap((rawNode) => {
-        if (interactiveOnly) {
-          return filterInteractiveSnapshotTree({
-            node: rawNode,
-            ancestorNames: [],
-            labelContext: false,
-            refFilter,
-            domByBackendId,
-            promotedContentEditableIds,
-            createRefForNode,
-          }).nodes
-        }
-        return filterFullSnapshotTree({
+    const filtered = rawRoots.flatMap((rawNode) => {
+      if (interactiveOnly) {
+        return filterInteractiveSnapshotTree({
           node: rawNode,
           ancestorNames: [],
+          labelContext: false,
           refFilter,
           domByBackendId,
           promotedContentEditableIds,
           createRefForNode,
         }).nodes
-      })
-      snapshotNodes = filtered
-    }
-
-    const snapshotLines = buildSnapshotLines(snapshotNodes)
-
-    const shortRefMap = buildShortRefMap({ refs })
-    const finalized = finalizeSnapshotOutput(snapshotLines, snapshotNodes, shortRefMap)
-    const refsWithShortRef: Array<AriaRef & { selector?: string }> = refs.map((entry) => {
-      return {
-        ...entry,
-        shortRef: shortRefMap.get(entry.ref) ?? entry.ref,
       }
+      return filterFullSnapshotTree({
+        node: rawNode,
+        ancestorNames: [],
+        refFilter,
+        domByBackendId,
+        promotedContentEditableIds,
+        createRefForNode,
+      }).nodes
     })
-    const result = { snapshot: finalized.snapshot, tree: finalized.tree, refs: refsWithShortRef }
+    snapshotNodes = filtered
+  }
 
-    // Build refToElement map
-    const refToElement = new Map<string, { role: string; name: string; shortRef: string }>()
-    const refToSelector = new Map<string, string>()
-    for (const { ref, role, name, shortRef } of result.refs) {
-      if (!refFilter || refFilter({ role, name })) {
-        refToElement.set(ref, { role, name, shortRef })
-      }
+  const snapshotLines = buildSnapshotLines(snapshotNodes)
+
+  const shortRefMap = buildShortRefMap({ refs })
+  const finalized = finalizeSnapshotOutput(snapshotLines, snapshotNodes, shortRefMap)
+  const refsWithShortRef: Array<AriaRef & { selector?: string }> = refs.map((entry) => {
+    return {
+      ...entry,
+      shortRef: shortRefMap.get(entry.ref) ?? entry.ref,
+    }
+  })
+  const result = { snapshot: finalized.snapshot, tree: finalized.tree, refs: refsWithShortRef }
+
+  // Build refToElement map
+  const refToElement = new Map<string, { role: string; name: string; shortRef: string }>()
+  const refToSelector = new Map<string, string>()
+  for (const { ref, role, name, shortRef } of result.refs) {
+    if (!refFilter || refFilter({ role, name })) {
+      refToElement.set(ref, { role, name, shortRef })
+    }
+  }
+
+  for (const { ref, selector } of result.refs) {
+    if (!selector) {
+      continue
+    }
+    refToSelector.set(ref, selector)
+  }
+
+  const snapshot = result.snapshot
+
+  const getSelectorForRef = (ref: string): string | null => {
+    const mapped = refToSelector.get(ref)
+    if (mapped) {
+      return mapped
+    }
+    const info = refToElement.get(ref)
+    if (!info) {
+      return null
+    }
+    const escapedName = info.name.replace(/"/g, '\\"')
+    return `role=${info.role}[name="${escapedName}"]`
+  }
+
+  const getRefsForLocators = async (locators: Array<Locator | ElementHandle>): Promise<Array<AriaRef | null>> => {
+    if (locators.length === 0) {
+      return []
     }
 
-    for (const { ref, selector } of result.refs) {
-      if (!selector) {
-        continue
-      }
-      refToSelector.set(ref, selector)
-    }
+    const targetHandles = await Promise.all(
+      locators.map(async (loc) => {
+        try {
+          return 'elementHandle' in loc
+            ? await (loc as Locator).elementHandle({ timeout: 1000 })
+            : (loc as ElementHandle)
+        } catch {
+          return null
+        }
+      }),
+    )
 
-    const snapshot = result.snapshot
-
-    const getSelectorForRef = (ref: string): string | null => {
-      const mapped = refToSelector.get(ref)
-      if (mapped) {
-        return mapped
-      }
-      const info = refToElement.get(ref)
-      if (!info) {
-        return null
-      }
-      const escapedName = info.name.replace(/"/g, '\\"')
-      return `role=${info.role}[name="${escapedName}"]`
-    }
-
-    const getRefsForLocators = async (locators: Array<Locator | ElementHandle>): Promise<Array<AriaRef | null>> => {
-      if (locators.length === 0) {
-        return []
-      }
-
-      const targetHandles = await Promise.all(
-        locators.map(async (loc) => {
-          try {
-            return 'elementHandle' in loc
-              ? await (loc as Locator).elementHandle({ timeout: 1000 })
-              : (loc as ElementHandle)
-          } catch {
+    const matchingRefs = await page.evaluate(
+      ({ targets, refData }) => {
+        return targets.map((target) => {
+          if (!target) {
             return null
           }
-        }),
-      )
 
-      const matchingRefs = await page.evaluate(
-        ({ targets, refData }) => {
-          return targets.map((target) => {
-            if (!target) {
-              return null
-            }
-
-            const testIdAttrs = [
-              'data-testid',
-              'data-test-id',
-              'data-test',
-              'data-cy',
-              'data-pw',
-              'data-qa',
-              'data-e2e',
-              'data-automation-id',
-            ]
-            for (const attr of testIdAttrs) {
-              const value = target.getAttribute(attr)
-              if (value) {
-                const match = refData.find((ref) => {
-                  return ref.ref === value || ref.ref.startsWith(value)
-                })
-                if (match) {
-                  return match.ref
-                }
-              }
-            }
-
-            const id = target.getAttribute('id')
-            if (id) {
+          const testIdAttrs = [
+            'data-testid',
+            'data-test-id',
+            'data-test',
+            'data-cy',
+            'data-pw',
+            'data-qa',
+            'data-e2e',
+            'data-automation-id',
+          ]
+          for (const attr of testIdAttrs) {
+            const value = target.getAttribute(attr)
+            if (value) {
               const match = refData.find((ref) => {
-                return ref.ref === id || ref.ref.startsWith(id)
+                return ref.ref === value || ref.ref.startsWith(value)
               })
               if (match) {
                 return match.ref
               }
             }
+          }
 
-            return null
-          })
-        },
-        {
-          targets: targetHandles,
-          refData: result.refs,
-        },
-      )
+          const id = target.getAttribute('id')
+          if (id) {
+            const match = refData.find((ref) => {
+              return ref.ref === id || ref.ref.startsWith(id)
+            })
+            if (match) {
+              return match.ref
+            }
+          }
 
-      return matchingRefs.map((ref) => {
-        if (!ref) {
           return null
-        }
-        const info = refToElement.get(ref)
-        return info ? { ...info, ref } : null
-      })
-    }
+        })
+      },
+      {
+        targets: targetHandles,
+        refData: result.refs,
+      },
+    )
 
-    return {
-      snapshot,
-      tree: result.tree,
-      refs: result.refs,
-      refToElement,
-      refToSelector,
-      getSelectorForRef,
-      getRefsForLocators,
-      getRefForLocator: async (loc) => (await getRefsForLocators([loc]))[0],
-      getRefStringForLocator: async (loc) => (await getRefsForLocators([loc]))[0]?.ref ?? null,
-    }
-  } finally {
-    if (scopeApplied && scopeLocator) {
-      await scopeLocator.evaluate((element, attr) => {
-        element.removeAttribute(attr)
-      }, scopeAttr)
-    }
-    // The frame session is BORROWED from Playwright (`CDPSession.fromExistingSession`),
-    // so there is nothing to detach and nothing to tear down — Playwright's page
-    // lifecycle owns it. Detaching it here would be detaching Playwright's own session.
-    if (!cdp) {
-      await pageSession.detach()
-    }
+    return matchingRefs.map((ref) => {
+      if (!ref) {
+        return null
+      }
+      const info = refToElement.get(ref)
+      return info ? { ...info, ref } : null
+    })
   }
-}
 
-function buildBoxFromQuad(quad?: number[]): LabelBox | null {
-  if (!quad || quad.length < 8) {
-    return null
-  }
-  const xs = [quad[0], quad[2], quad[4], quad[6]]
-  const ys = [quad[1], quad[3], quad[5], quad[7]]
-  const left = Math.min(...xs)
-  const right = Math.max(...xs)
-  const top = Math.min(...ys)
-  const bottom = Math.max(...ys)
   return {
-    x: left,
-    y: top,
-    width: Math.max(0, right - left),
-    height: Math.max(0, bottom - top),
+    snapshot,
+    tree: result.tree,
+    refs: result.refs,
+    refToElement,
+    refToSelector,
+    getSelectorForRef,
+    getRefsForLocators,
+    getRefForLocator: async (loc) => (await getRefsForLocators([loc]))[0],
+    getRefStringForLocator: async (loc) => (await getRefsForLocators([loc]))[0]?.ref ?? null,
   }
 }
 
 function isTruthy<T>(value: T): value is NonNullable<T> {
   return Boolean(value)
-}
-
-async function getLabelBoxesForRefs({
-  page,
-  refs,
-  maxConcurrency = MAX_LABEL_POSITION_CONCURRENCY,
-  logger,
-  cdp,
-}: {
-  page: Page
-  refs: AriaRef[]
-  maxConcurrency?: number
-  logger?: { info?: (...args: unknown[]) => void; error?: (...args: unknown[]) => void }
-  cdp?: ICDPSession
-}): Promise<AriaLabel[]> {
-  const log = logger?.info ?? logger?.error ?? console.error
-  const session = cdp || (await getCDPSessionForPage({ page }))
-  const sema = new Sema(maxConcurrency)
-  const labelRefs = refs.filter((ref) => {
-    return Boolean(ref.backendNodeId) && INTERACTIVE_ROLES.has(ref.role)
-  })
-
-  log(`[getLabelBoxesForRefs] processing ${labelRefs.length} interactive refs (concurrency: ${maxConcurrency})`)
-  const startTime = Date.now()
-  let completed = 0
-  let timedOut = 0
-  let failed = 0
-
-  try {
-    const labels = await Promise.all(
-      labelRefs.map(async (ref) => {
-        if (!ref.backendNodeId) {
-          return null
-        }
-        await sema.acquire()
-        try {
-          const response = await Promise.race([
-            session.send('DOM.getBoxModel', {
-              backendNodeId: ref.backendNodeId,
-            }) as Promise<Protocol.DOM.GetBoxModelResponse>,
-            new Promise<null>((resolve) => {
-              setTimeout(() => {
-                resolve(null)
-              }, BOX_MODEL_TIMEOUT_MS)
-            }),
-          ])
-          completed++
-          if (completed % 50 === 0 || completed === labelRefs.length) {
-            log(
-              `[getLabelBoxesForRefs] progress: ${completed}/${labelRefs.length} (${timedOut} timeouts, ${failed} errors) - ${Date.now() - startTime}ms`,
-            )
-          }
-          if (!response) {
-            timedOut++
-            return null
-          }
-          const box = buildBoxFromQuad(response.model.border)
-          if (!box) {
-            return null
-          }
-          return { ref: ref.ref, role: ref.role, box }
-        } catch (error) {
-          completed++
-          failed++
-          return null
-        } finally {
-          sema.release()
-        }
-      }),
-    )
-    log(
-      `[getLabelBoxesForRefs] done: ${completed} completed, ${timedOut} timeouts, ${failed} errors - ${Date.now() - startTime}ms`,
-    )
-    return labels.filter(isTruthy)
-  } finally {
-    if (!cdp) {
-      await session.detach()
-    }
-  }
-}
-
-/**
- * Show Vimium-style labels on interactive elements.
- * Labels are colored badges positioned above each element showing the ref.
- * Use with screenshots so agents can see which elements are interactive.
- *
- * Labels auto-hide after 30 seconds to prevent stale labels.
- * Call this function again if the page HTML changes to get fresh labels.
- *
- * @param page - Playwright page
- * @param locator - Optional locator to scope labels to a subtree
- * @param interactiveOnly - Only show labels for interactive elements (default: true)
- *
- * @example
- * ```ts
- * const { snapshot, labelCount } = await showAriaRefLabels({ page })
- * await page.screenshot({ path: '/tmp/screenshot.png' })
- * // Agent sees [submit-btn] label on "Submit" button
- * await page.locator('[data-testid="submit-btn"]').click()
- * ```
- */
-export async function showAriaRefLabels({
-  page,
-  locator,
-  interactiveOnly = true,
-  logger,
-}: {
-  page: Page
-  locator?: Locator
-  interactiveOnly?: boolean
-  logger?: { info?: (...args: unknown[]) => void; error?: (...args: unknown[]) => void }
-}): Promise<{
-  snapshot: string
-  labelCount: number
-}> {
-  const startTime = Date.now()
-  const log = logger?.info ?? logger?.error ?? console.error
-
-  log(`[showAriaRefLabels] starting...`)
-  await ensureA11yClient(page)
-  log(`[showAriaRefLabels] ensureA11yClient: ${Date.now() - startTime}ms`)
-
-  const cdpStart = Date.now()
-  const cdp = await getCDPSessionForPage({ page })
-  log(`[showAriaRefLabels] getCDPSessionForPage: ${Date.now() - cdpStart}ms`)
-
-  try {
-    const snapshotStart = Date.now()
-    const { snapshot, refs } = await getAriaSnapshot({ page, locator, interactiveOnly, cdp })
-    const shortRefMap = new Map(
-      refs.map((entry) => {
-        return [entry.ref, entry.shortRef]
-      }),
-    )
-    const interactiveRefs = refs.filter((ref) => Boolean(ref.backendNodeId) && INTERACTIVE_ROLES.has(ref.role))
-    log(
-      `[showAriaRefLabels] getAriaSnapshot: ${Date.now() - snapshotStart}ms (${refs.length} refs, ${interactiveRefs.length} interactive)`,
-    )
-
-    const rootHandle = locator ? await locator.elementHandle() : null
-
-    const labelsStart = Date.now()
-    const labels = await getLabelBoxesForRefs({ page, refs, logger, cdp })
-    const shortLabels = labels.map((label) => {
-      return {
-        ...label,
-        ref: shortRefMap.get(label.ref) ?? label.ref,
-      }
-    })
-    log(`[showAriaRefLabels] getLabelBoxesForRefs: ${Date.now() - labelsStart}ms (${labels.length} boxes)`)
-
-    const renderStart = Date.now()
-    const labelCount = await evaluateWithDeadline({
-      page,
-      what: 'rendering the ref-label overlay',
-      run: () =>
-        page.evaluate(
-          ({ entries, root, interactiveOnly: intOnly }) => {
-            const a11y = (
-              globalThis as {
-                __a11y?: {
-                  renderA11yLabels?: (labels: typeof entries) => number
-                  computeA11ySnapshot?: (options: {
-                    root: unknown
-                    interactiveOnly: boolean
-                    renderLabels: boolean
-                  }) => {
-                    labelCount: number
-                  }
-                }
-              }
-            ).__a11y
-            if (a11y?.renderA11yLabels) {
-              return a11y.renderA11yLabels(entries)
-            }
-            if (a11y?.computeA11ySnapshot) {
-              const rootElement = root || document.body
-              return a11y.computeA11ySnapshot({ root: rootElement, interactiveOnly: intOnly, renderLabels: true })
-                .labelCount
-            }
-            throw new Error('a11y client not loaded')
-          },
-          { entries: shortLabels, root: rootHandle, interactiveOnly },
-        ),
-    })
-
-    log(`[showAriaRefLabels] renderA11yLabels: ${Date.now() - renderStart}ms (${labelCount} labels)`)
-    log(`[showAriaRefLabels] total: ${Date.now() - startTime}ms`)
-
-    return { snapshot, labelCount }
-  } finally {
-    await cdp.detach()
-  }
-}
-
-/**
- * Remove all aria ref labels from the page.
- */
-export async function hideAriaRefLabels({ page }: { page: Page }): Promise<void> {
-  await evaluateWithDeadline({
-    page,
-    what: 'removing the ref-label overlay',
-    run: () =>
-      page.evaluate(() => {
-        const a11y = (globalThis as any).__a11y
-        if (a11y) {
-          a11y.hideA11yLabels()
-        } else {
-          // Fallback if client not loaded
-          const doc = document
-          const win = window as any
-          const timerKey = '__playwriter_labels_timer__'
-          if (win[timerKey]) {
-            win.clearTimeout(win[timerKey])
-            win[timerKey] = null
-          }
-          doc.getElementById('__playwriter_labels__')?.remove()
-        }
-      }),
-  })
-}
-
-/**
- * Take a screenshot with accessibility labels overlaid on interactive elements.
- * Shows Vimium-style labels, captures the screenshot, then removes the labels.
- * The screenshot is automatically included in the MCP response.
- *
- * @param page - Playwright page
- * @param locator - Optional locator to scope labels to a subtree
- * @param collector - Array to collect screenshots (passed by MCP execute tool)
- *
- * @example
- * ```ts
- * await screenshotWithAccessibilityLabels({ page })
- * // Screenshot is automatically included in the MCP response
- * // Use ref from the snapshot to interact with elements
- * await page.locator('[data-testid="submit-btn"]').click()
- * ```
- */
-export async function screenshotWithAccessibilityLabels({
-  page,
-  locator,
-  interactiveOnly = true,
-  collector,
-  logger,
-}: {
-  page: Page
-  locator?: Locator
-  interactiveOnly?: boolean
-  collector: ScreenshotResult[]
-  logger?: { info?: (...args: unknown[]) => void; error?: (...args: unknown[]) => void }
-}): Promise<void> {
-  const log = logger?.info ?? logger?.error
-  const showLabelsStart = Date.now()
-  const { snapshot, labelCount } = await showAriaRefLabels({ page, locator, interactiveOnly, logger })
-  if (log) {
-    log(`showAriaRefLabels: ${Date.now() - showLabelsStart}ms`)
-  }
-
-  // Generate unique filename with timestamp
-  const timestamp = Date.now()
-  const random = Math.random().toString(36).slice(2, 6)
-  const filename = `playwriter-screenshot-${timestamp}-${random}.png`
-
-  // Use ./tmp folder (gitignored) instead of system temp
-  const tmpDir = path.join(process.cwd(), 'tmp')
-  if (!fs.existsSync(tmpDir)) {
-    fs.mkdirSync(tmpDir, { recursive: true })
-  }
-  const screenshotPath = path.join(tmpDir, filename)
-
-  // Get viewport size to clip screenshot to visible area
-  const viewport = (await page.evaluate('({ width: window.innerWidth, height: window.innerHeight })')) as {
-    width: number
-    height: number
-  }
-
-  // Check if sharp is available for resizing
-  const sharp = await sharpPromise
-
-  // Clip dimensions: if sharp unavailable, limit capture area to LLM_MAX_DIMENSION
-  const clipWidth = sharp ? viewport.width : Math.min(viewport.width, LLM_MAX_DIMENSION)
-  const clipHeight = sharp ? viewport.height : Math.min(viewport.height, LLM_MAX_DIMENSION)
-
-  // Take viewport screenshot as PNG for Kitty Graphics Protocol compatibility.
-  // PNG is lossless and the only format extracted by kitty-graphics-agent (f=100).
-  const screenshotStart = Date.now()
-  const rawBuffer = await page.screenshot({
-    type: 'png',
-    scale: 'css',
-    clip: { x: 0, y: 0, width: clipWidth, height: clipHeight },
-  })
-  if (log) {
-    log(`page.screenshot: ${Date.now() - screenshotStart}ms`)
-  }
-
-  // Resize with resizeImage if sharp available, otherwise use clipped raw buffer
-  const resizeStart = Date.now()
-  const buffer = await (async () => {
-    if (!sharp) {
-      logger?.error?.('[playwriter] sharp not available, using clipped screenshot (max', LLM_MAX_DIMENSION, 'px)')
-      return rawBuffer
-    }
-    try {
-      const result = await resizeImageForAgent({ input: rawBuffer, format: 'png' })
-      return result.buffer
-    } catch (err) {
-      logger?.error?.('[playwriter] sharp resize failed, using raw buffer:', err)
-      return rawBuffer
-    }
-  })()
-  if (log) {
-    log(`screenshot resize: ${Date.now() - resizeStart}ms`)
-  }
-
-  // Save to file
-  fs.writeFileSync(screenshotPath, buffer)
-
-  // Convert to base64
-  const base64 = buffer.toString('base64')
-
-  // Hide labels
-  await hideAriaRefLabels({ page })
-
-  // Add to collector array
-  collector.push({
-    path: screenshotPath,
-    base64,
-    mimeType: 'image/png',
-    snapshot,
-    labelCount,
-  })
 }
 
 // Re-export for backward compatibility

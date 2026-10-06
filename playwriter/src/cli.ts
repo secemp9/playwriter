@@ -119,7 +119,7 @@ cli
   .option('-e, --eval <code>', 'Execute JavaScript code and exit, read https://playwriter.dev/SKILL.md for usage')
   .option('-f, --file <path>', 'Execute JavaScript from a file and exit')
   .option('--patchright', 'Use @playwriter/patchright-core for stealth mode (bypasses bot detection)')
-  .option('--timeout [ms]', z.number().default(10000).describe('Execution timeout in milliseconds'))
+  .option('--timeout [ms]', z.number().default(30000).describe('Execution timeout in milliseconds'))
   .action(async (options) => {
     if (options.patchright) {
       process.env.PLAYWRITER_PATCHRIGHT = '1'
@@ -375,6 +375,16 @@ interface BrowserOption {
   activeCloudSessionId?: string
 }
 
+/**
+ * The session's human/debug policy as the CLI user chose it: `--policy`, else PLAYWRITER_POLICY.
+ * Absent means the relay's default (human). It travels in the session-creation request because the
+ * relay is a separate, long-lived process whose own environment belongs to whoever started it.
+ */
+function sessionPolicyField(): { policy?: string } {
+  const policy = process.env.PLAYWRITER_POLICY
+  return policy ? { policy } : {}
+}
+
 cli
   .command('session new', 'Create a new session and print the session ID')
   .option('--host <host>', 'Remote relay server host')
@@ -386,7 +396,18 @@ cli
   .option('--custom-proxy <url>', 'Custom proxy for cloud browser (host:port or user:pass@host:port)')
   .option('--timeout <minutes>', 'Cloud browser timeout in minutes (1-240, default 60)')
   .option('--disable-proxy-bandwidth-acceleration', 'Allow loading images, video, and fonts when proxy is enabled (they are blocked by default to save proxy bandwidth)')
+  .option(
+    '--policy <policy>',
+    'human (default): one input action per call, no page.goto after the first load, no faked conditions, a settle + "what changed" report after every action. debug: everything allowed',
+  )
   .action(async (options) => {
+    if (options.policy !== undefined) {
+      if (options.policy !== 'human' && options.policy !== 'debug') {
+        console.error(`--policy must be "human" or "debug" (got ${JSON.stringify(options.policy)})`)
+        process.exit(1)
+      }
+      process.env.PLAYWRITER_POLICY = options.policy
+    }
     if (options.patchright) {
       process.env.PLAYWRITER_PATCHRIGHT = '1'
     }
@@ -401,7 +422,7 @@ cli
         const response = await fetch(`${serverUrl}/cli/session/new`, {
           method: 'POST',
           headers: buildAuthHeaders({ token: options.token, json: true }),
-          body: JSON.stringify({ headless: true, cwd: process.cwd() }),
+          body: JSON.stringify({ headless: true, cwd: process.cwd(), ...sessionPolicyField() }),
         })
         if (!response.ok) {
           const text = await response.text()
@@ -616,7 +637,7 @@ cli
         const response = await fetch(`${serverUrl}/cli/session/new`, {
           method: 'POST',
           headers: buildAuthHeaders({ token: options.token, json: true }),
-          body: JSON.stringify({ extensionId, cwd }),
+          body: JSON.stringify({ extensionId, cwd, ...sessionPolicyField() }),
         })
         if (!response.ok) {
           const text = await response.text()
@@ -702,7 +723,7 @@ cli
           const response = await fetch(`${serverUrl}/cli/session/new`, {
             method: 'POST',
             headers: buildAuthHeaders({ token: options.token, json: true }),
-            body: JSON.stringify({ extensionId: selected.extensionId, cwd }),
+            body: JSON.stringify({ extensionId: selected.extensionId, cwd, ...sessionPolicyField() }),
           })
           if (!response.ok) {
             const text = await response.text()
@@ -750,7 +771,7 @@ async function createDirectSession({
   const response = await fetch(`${serverUrl}/cli/session/new`, {
     method: 'POST',
     headers: buildAuthHeaders({ token, json: true }),
-    body: JSON.stringify({ cdpEndpoint, cwd, browser, profiles }),
+    body: JSON.stringify({ cdpEndpoint, cwd, browser, profiles, ...sessionPolicyField() }),
   })
   if (!response.ok) {
     const text = await response.text()
@@ -982,6 +1003,7 @@ async function createCloudSession({
           timeoutAt: connectResult.timeoutAt,
           blockProxyResources,
         },
+        ...sessionPolicyField(),
       }),
     })
   } catch (cause) {
@@ -1044,6 +1066,7 @@ async function attachExistingCloudSession({
         timeoutAt: session.timeoutAt,
         blockProxyResources,
       },
+      ...sessionPolicyField(),
     }),
   })
 

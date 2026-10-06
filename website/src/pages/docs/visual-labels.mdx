@@ -1,37 +1,29 @@
 ---
 title: Screenshot with Element Labels for AI Agents
 sidebarTitle: Visual Labels
-description: Overlay Vimium-style numbered labels on every interactive element in a screenshot so AI agents can see and click by reference.
+description: Draw numbered observe() refs on every visible control in a screenshot so AI agents can see and act by reference.
 icon: lucide:tags
 ---
 
-When the agent needs to understand **where things are on screen**, `screenshotWithAccessibilityLabels` overlays color-coded labels on every interactive element. The agent sees the screenshot, reads the labels, and interacts by reference.
+When the agent needs to understand **where things are on screen**, `screenshotWithAccessibilityLabels` returns a screenshot with a color-coded `[N]` label at the top-left corner of every visible element `observe()` lists. The agent looks at the screenshot, reads the labels, and acts on those refs.
 
 ## Basic usage
 
 ```js
 await screenshotWithAccessibilityLabels({ page: state.page })
-// Image and accessibility snapshot are automatically included in the response
+// The image and the observation text are included in the response automatically
 ```
 
-The function takes a screenshot, overlays numbered labels (`e1`, `e2`, `e3`...), captures the annotated image, then removes the labels. Both the **image** and an **accessibility snapshot** are returned automatically.
+The function observes the page, captures the viewport once with CDP, and draws the labels onto the image in Node. Nothing is added to the page: no overlay DOM and no injected script. The image is in CSS pixels, so image coordinates match page coordinates; it is downscaled to fit 1568 px when the viewport is larger. Both the **image** and the **observation text** are returned.
 
 ## Interacting with refs
 
-Use `refToLocator` to convert a visual label to a Playwright locator:
-
-```js
-// From the screenshot, the agent sees label "e5" on a button
-const locator = refToLocator({ ref: 'e5' })
-await state.page.locator(locator).click()
-```
-
-Or use locators from the accompanying snapshot directly:
+The labels are the same numeric refs `observe()` prints, so `act.*` takes them directly:
 
 ```js
 await screenshotWithAccessibilityLabels({ page: state.page })
-// Snapshot shows: role=button[name="Submit"] with ref e3
-await state.page.locator('role=button[name="Submit"]').click()
+// The screenshot shows [5] on the "Submit" button
+await act.click(5)
 ```
 
 ## Color coding
@@ -64,15 +56,17 @@ await screenshotWithAccessibilityLabels({ page: state.page })
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `page` | Page | required | Playwright page to screenshot |
-| `interactiveOnly` | boolean | `true` | Only label interactive elements |
+| `scope` | number | none | Only label this ref and the elements inside it, like `observe({ scope })` |
+
+The call refuses a background tab, because Chrome paints nothing for it, so there is no picture to take. `observe()` needs no pixels and still works. If you need a picture, ask the user to switch to the tab. The call also refuses a pinch-zoomed page, and an observation the page has navigated or scrolled away from. In that case, observe again.
 
 ## When to use
 
 Use `screenshotWithAccessibilityLabels` for **complex visual layouts** where spatial position matters: grids, image galleries, maps, dashboards, canvas-based UIs.
 
-For **text-heavy pages** (forms, articles, lists), prefer `snapshot()` with search. It's faster, cheaper, and uses fewer tokens.
+For **text-heavy pages** (forms, articles, lists), prefer `observe()` or `find()`. They are faster, cheaper, and use fewer tokens.
 
-Both methods share the same **ref system**, so you can switch between text and visual modes freely. A ref from `snapshot()` works the same as a ref from `screenshotWithAccessibilityLabels()`.
+Both use the **same refs**, so you can switch between text and visual modes freely.
 
 ## Resizing images
 

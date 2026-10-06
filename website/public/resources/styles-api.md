@@ -38,57 +38,21 @@ export interface StylesResult {
     rules: StyleRule[];
 }
 /**
- * One tree the element path passes through. `enter` says how the tree is entered from
- * the previous hop: `document` = the top-level document, `frame` = the content document
- * of the iframe element the previous hop resolved, `shadow` = the shadow root of the
- * host element the previous hop resolved. `path` is the chain of 0-based *element*
- * child indexes to follow inside that tree.
- */
-export interface ElementPathHop {
-    enter: 'document' | 'shadow' | 'frame';
-    path: number[];
-}
-export interface ElementPathResult {
-    hops: ElementPathHop[];
-    /** Lowercased tag name of the target, used to verify the walk landed on it. */
-    tagName: string;
-    /** Set when the path cannot be expressed, e.g. a detached or cross-origin element. */
-    error?: string;
-}
-/**
- * Compute an element's exact position in its tree, as index paths split at shadow-root
- * and iframe boundaries.
+ * Resolve a locator to the CDP node it actually points at, as a FRONTEND node id on the page
+ * session (what `CSS.getMatchedStylesForNode` takes).
  *
- * This runs IN THE PAGE (it is stringified by `evaluate`), so it must stay entirely
- * self-contained: no imports, no closure over module scope, no TypeScript-only syntax
- * that would not survive `String(fn)`.
+ * Identity comes from `resolveElement` (element-resolve.ts): the element's own index path,
+ * walked in an isolated world — never `DOM.getNodeForLocation`, which returns the TOPMOST node
+ * at a point, so anything covering the element (a modal, a sticky header, a child span holding
+ * the label) would silently answer about a different node. MEASURED against Chromium 145: over
+ * two absolutely-positioned 200x200 divs stacked at the same origin,
+ * `getNodeForLocation({x:50,y:50})` returns the LATER-painted one (`#over`), never the one
+ * underneath — the exact failure `debugStyle` exists to diagnose.
  *
- * This is identity, not geometry: the walk starts at the element itself, so nothing that
- * happens to be painted on top of it can change the answer.
- */
-export declare function computeElementPath(element: any): ElementPathResult;
-/**
- * Resolve a locator to the CDP node it actually points at.
- *
- * Why not `DOM.getNodeForLocation`: that returns the TOPMOST node at a screen point, so
- * anything covering the element — a modal, a sticky header, or just a child span holding
- * the label — silently resolves to a *different* node, and every rule, cascade winner
- * and source location reported afterwards then belongs to the wrong element. MEASURED
- * against Chromium 145: over two absolutely-positioned 200x200 divs stacked at the same
- * origin, `getNodeForLocation({x:50,y:50})` returns the LATER-painted one (`#over`), never
- * the one underneath. That is the exact failure `debugStyle` exists to diagnose, so
- * identity is resolved through the element's own node instead: the page reports the
- * element's index path, and the path is walked over one pierced `DOM.getDocument` tree.
- * The final node's tag name is verified against the page's, so a DOM mutation racing the
- * walk fails loudly instead of answering about a neighbour.
- *
- * `DOM.getDocument` doubles as the priming call CDP requires before FRONTEND node ids can
- * be handed out on a fresh session — measured: `DOM.pushNodesByBackendIdsToFrontend` on a
- * session with `DOM.enable` but no `DOM.getDocument` is rejected with "Document needs to
- * be requested first" — which is why both style entry points share this helper rather than
- * each remembering to prime. (`DOM.getNodeForLocation` is NOT subject to that rule: the
- * same measurement had it answer with no `DOM.getDocument` and indeed with no `DOM.enable`
- * at all. It returns a backendNodeId, not a frontend one.)
+ * `DOM.getDocument` is the priming call CDP requires before FRONTEND node ids can be handed out
+ * on a fresh session — measured: `DOM.pushNodesByBackendIdsToFrontend` on a session with
+ * `DOM.enable` but no `DOM.getDocument` is rejected with "Document needs to be requested first" —
+ * which is why both style entry points share this helper rather than each remembering to prime.
  */
 export declare function resolveElementNode({ locator, cdp, }: {
     locator: Locator;

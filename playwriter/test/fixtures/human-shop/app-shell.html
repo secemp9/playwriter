@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Inbox — app shell</title>
+<style>
+  /* The app-shell layout of mail, chat and dashboard apps: the document never scrolls; the
+     message list does, inside its own overflow box. */
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px sans-serif; }
+  .shell { display: flex; height: 100vh; }
+  nav { width: 180px; padding: 8px; border-right: 1px solid #ccc; }
+  main#inbox { flex: 1; overflow-y: auto; }
+  h1 { margin: 8px; font-size: 18px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { height: 48px; display: flex; align-items: center; padding: 0 8px; border-bottom: 1px solid #eee; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav aria-label="Folders"><a href="#inbox">Inbox</a><br><a href="#sent">Sent</a></nav>
+  <main id="inbox" aria-label="Messages">
+    <h1>Inbox</h1>
+    <ul id="mails"></ul>
+  </main>
+</div>
+<script>
+  const list = document.getElementById('mails')
+  for (let i = 1; i <= 60; i++) {
+    const item = document.createElement('li')
+    const link = document.createElement('a')
+    link.href = '#mail-' + i
+    link.textContent = 'Mail ' + i + ' — weekly report'
+    item.append(link)
+    list.append(item)
+  }
+</script>
+</body>
+</html>

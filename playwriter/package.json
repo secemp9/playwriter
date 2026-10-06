@@ -35,7 +35,6 @@
     "@types/node": "^24.10.1",
     "@types/ws": "^8.18.1",
     "@vitest/ui": "^4.0.8",
-    "bippy": "^0.5.27",
     "devtools-protocol": "^0.0.1568893",
     "image-size": "^2.0.2",
     "kitty-graphics-agent": "^0.0.5",

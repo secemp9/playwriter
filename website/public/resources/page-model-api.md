@@ -39,6 +39,7 @@ import type { Page } from '@xmorse/playwright-core';
 import type { Protocol } from 'devtools-protocol';
 import type { ICDPSession } from './cdp-session.js';
 import type { AriaSnapshotNode } from './aria-snapshot.js';
+import type { AxStates } from './ax-states.js';
 import { type NormalizedRule, type DeclRef } from './css-cascade.js';
 export type NodeKey = `${string}:${number}`;
 /**
@@ -114,6 +115,14 @@ export interface PageModelNode {
     name?: string;
     attributes: Record<string, string>;
     locator?: string;
+    /** AX states copied from the aria node (checked, disabled, expanded, focused…). */
+    states?: AxStates;
+    /** Field value copied from the aria node; a password field reads `'••••'`. */
+    value?: string;
+    /** The node's own accessible name when the aria tree blanked `name` (see `AriaSnapshotNode.axName`). */
+    axName?: string;
+    /** The role of the control this node's text names (see `AriaSnapshotNode.labels`). */
+    labels?: string;
     runtime: {
         /**
          * INFERENCE. True when the node is laid out, has a non-degenerate box and is not
@@ -314,6 +323,20 @@ export interface SnapshotNodeGeometry {
     paintOrder?: number;
     styles: Record<string, string>;
     stackingContext: boolean;
+    /**
+     * GROUND TRUTH. DOMSnapshot `nodes.isClickable`: Chromium's "this node has a click
+     * listener or is a link". MEASURED on Chromium 145: a `<div>` given
+     * `addEventListener('click')` is listed, and so is a React 19 `onClick` div (React sets
+     * a no-op `onclick` property on it) — but so is the React root container, because React
+     * delegates every listener there, and plain `<button>`s are NOT listed. So it finds
+     * non-semantic click targets, and says nothing about native controls. Optional only so
+     * hand-built geometry in tests may omit it; the decoder always sets it.
+     */
+    isClickable?: boolean;
+    /** Rendered text of a text node (`layout.text`: after whitespace collapsing and `text-transform`). */
+    text?: string;
+    /** Decoded DOM attributes of the node, as captured. */
+    attributes?: Record<string, string>;
 }
 /** Everything decoded for one document (= one frame) of a `captureSnapshot`. */
 export interface FrameGeometry {
@@ -326,6 +349,11 @@ export interface FrameGeometry {
     documentBackendIds: Set<number>;
     /** `NodeTreeSnapshot.parentIndex` — the ancestry table (-1 at the root). */
     parentIndex: number[];
+    /**
+     * `NodeTreeSnapshot.backendNodeId`, in node-table (document pre-)order: the position of
+     * a node, laid out or not, in DOM order. Optional only for hand-built test geometry.
+     */
+    nodeBackendIds?: number[];
     /**
      * The document's scroll offset, as Chromium reported it.
      *
@@ -371,7 +399,7 @@ export interface FrameGeometry {
  * across documents. `paintOrders`, by contrast, ARE global across the documents of one
  * response.
  */
-export declare function decodeCaptureSnapshot({ snapshot, computedStyles, viewports, into, }: {
+export declare function decodeCaptureSnapshot({ snapshot, computedStyles, viewports, into, cssPerSnapshotPx, }: {
     snapshot: Protocol.DOMSnapshot.CaptureSnapshotResponse;
     /** The property names passed as `computedStyles` to captureSnapshot, in order. */
     computedStyles?: readonly string[];
@@ -379,7 +407,56 @@ export declare function decodeCaptureSnapshot({ snapshot, computedStyles, viewpo
     viewports?: Record<string, Box>;
     /** Merge into an existing map (for OOPIF documents captured separately). */
     into?: Map<string, FrameGeometry>;
+    /**
+     * CSS px per unit of the snapshot's bounds and scroll offsets. captureSnapshot reports them in
+     * the units of `Page.getLayoutMetrics().layoutViewport`, which are device pixels when the scale
+     * factor is real rather than emulated. Measured with `--force-device-scale-factor=1.25`: a
+     * button at CSS (40, 260) reported bounds (50, 325), layoutViewport 1000×750 against
+     * cssLayoutViewport 800×600. Under Playwright's emulated deviceScaleFactor the two agree and
+     * this is 1.
+     */
+    cssPerSnapshotPx?: number;
 }): Map<string, FrameGeometry>;
+/**
+ * INFERENCE. The rect this node can actually be seen through: the layout viewport,
+ * intersected with the boxes of the ancestors that clip it.
+ *
+ * Which ancestors clip is decided the way CSS decides it, approximately:
+ *   - a `position: fixed` node's containing block is the viewport, so no ancestor
+ *     scroll container clips it;
+ *   - an `overflow != visible` ancestor clips in-flow and relatively-positioned
+ *     descendants;
+ *   - for an absolutely-positioned node, only ancestors that are themselves in its
+ *     containing-block chain (positioned, or transformed/contained) clip it.
+ * Not modelled: `clip-path`, per-axis clipping (an `overflow-x: hidden` /
+ * `overflow-y: visible` pair clips both axes here), clipping by a transformed ancestor's
+ * *rotated* box, and the border-box/padding-box difference (the clip is taken as the
+ * ancestor's border box, so it is up to a border width too generous). Returns undefined
+ * when the frame's viewport is unknown — that is "unknown", not "not in the viewport".
+ */
+export declare function visibleClipRect(record: SnapshotNodeGeometry, frame: FrameGeometry): Box | null | undefined;
+/**
+ * `visible` and `inViewport` for one laid-out record, computed exactly as they are for
+ * model nodes (the model's `runtime` is built from this). Exported so a caller can
+ * measure a node the a11y tree does not contain — a `<div>` with a click listener —
+ * with the same predicates instead of a second, drifting copy of them.
+ * `inViewport` is absent when the frame's viewport is unknown.
+ */
+export declare function measureLaidOutRecord(record: SnapshotNodeGeometry, frame: FrameGeometry, visibilityCache: Map<number, boolean>): {
+    visible: boolean;
+    inViewport?: boolean;
+};
+/**
+ * The text a person sees inside a node: the rendered text of the laid-out text nodes in
+ * its subtree, in document order, whitespace-collapsed, cut at `maxChars`. Text whose
+ * own element is not visible (`visibility: hidden`, `opacity: 0`) is skipped, and text
+ * that is not laid out (`display: none`) has no layout record, so it never appears.
+ *
+ * Text runs are joined with a space unless one side already has whitespace — so
+ * `<div>Alice</div><div>Edit</div>` reads "Alice Edit" (and `<b>A</b><i>B</i>`, which
+ * renders "AB", reads "A B": a cheaper error than gluing separate blocks together).
+ */
+export declare function nodeVisibleText(frame: FrameGeometry, nodeIndex: number, maxChars?: number): string;
 /** Topmost-first occluders and how much of the target they cover. */
 export interface OcclusionResult {
     state: 'partial' | 'full';
@@ -388,6 +465,8 @@ export interface OcclusionResult {
     by: NodeKey[];
     labels: string[];
 }
+/** Fraction of `target` covered by `cuts`, computed by rectangle subtraction (exact union). */
+export declare function coveredFraction(target: Box, cuts: Box[]): number;
 /**
  * INFERENCE. Compute occlusion for `targets` within one frame, from paint order and
  * bounds containment.

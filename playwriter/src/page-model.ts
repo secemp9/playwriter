@@ -29,6 +29,7 @@ import type { Page } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import type { AriaSnapshotNode } from './aria-snapshot.js'
+import type { AxStates } from './ax-states.js'
 import { getAriaSnapshot } from './aria-snapshot.js'
 import { getReactComponentInfo } from './react-source.js'
 import { fetchNormalizedStyles } from './styles.js'
@@ -119,6 +120,14 @@ export interface PageModelNode {
   name?: string
   attributes: Record<string, string>
   locator?: string
+  /** AX states copied from the aria node (checked, disabled, expanded, focused…). */
+  states?: AxStates
+  /** Field value copied from the aria node; a password field reads `'••••'`. */
+  value?: string
+  /** The node's own accessible name when the aria tree blanked `name` (see `AriaSnapshotNode.axName`). */
+  axName?: string
+  /** The role of the control this node's text names (see `AriaSnapshotNode.labels`). */
+  labels?: string
   runtime: {
     /**
      * INFERENCE. True when the node is laid out, has a non-degenerate box and is not
@@ -344,6 +353,20 @@ export interface SnapshotNodeGeometry {
   paintOrder?: number
   styles: Record<string, string>
   stackingContext: boolean
+  /**
+   * GROUND TRUTH. DOMSnapshot `nodes.isClickable`: Chromium's "this node has a click
+   * listener or is a link". MEASURED on Chromium 145: a `<div>` given
+   * `addEventListener('click')` is listed, and so is a React 19 `onClick` div (React sets
+   * a no-op `onclick` property on it) — but so is the React root container, because React
+   * delegates every listener there, and plain `<button>`s are NOT listed. So it finds
+   * non-semantic click targets, and says nothing about native controls. Optional only so
+   * hand-built geometry in tests may omit it; the decoder always sets it.
+   */
+  isClickable?: boolean
+  /** Rendered text of a text node (`layout.text`: after whitespace collapsing and `text-transform`). */
+  text?: string
+  /** Decoded DOM attributes of the node, as captured. */
+  attributes?: Record<string, string>
 }
 
 /** Everything decoded for one document (= one frame) of a `captureSnapshot`. */
@@ -357,6 +380,11 @@ export interface FrameGeometry {
   documentBackendIds: Set<number>
   /** `NodeTreeSnapshot.parentIndex` — the ancestry table (-1 at the root). */
   parentIndex: number[]
+  /**
+   * `NodeTreeSnapshot.backendNodeId`, in node-table (document pre-)order: the position of
+   * a node, laid out or not, in DOM order. Optional only for hand-built test geometry.
+   */
+  nodeBackendIds?: number[]
   /**
    * The document's scroll offset, as Chromium reported it.
    *
@@ -411,6 +439,7 @@ export function decodeCaptureSnapshot({
   computedStyles = PAGE_MODEL_COMPUTED_STYLES,
   viewports,
   into,
+  cssPerSnapshotPx = 1,
 }: {
   snapshot: Protocol.DOMSnapshot.CaptureSnapshotResponse
   /** The property names passed as `computedStyles` to captureSnapshot, in order. */
@@ -419,6 +448,15 @@ export function decodeCaptureSnapshot({
   viewports?: Record<string, Box>
   /** Merge into an existing map (for OOPIF documents captured separately). */
   into?: Map<string, FrameGeometry>
+  /**
+   * CSS px per unit of the snapshot's bounds and scroll offsets. captureSnapshot reports them in
+   * the units of `Page.getLayoutMetrics().layoutViewport`, which are device pixels when the scale
+   * factor is real rather than emulated. Measured with `--force-device-scale-factor=1.25`: a
+   * button at CSS (40, 260) reported bounds (50, 325), layoutViewport 1000×750 against
+   * cssLayoutViewport 800×600. Under Playwright's emulated deviceScaleFactor the two agree and
+   * this is 1.
+   */
+  cssPerSnapshotPx?: number
 }): Map<string, FrameGeometry> {
   const strings = snapshot.strings
   if (!Array.isArray(strings)) {
@@ -514,6 +552,9 @@ export function decodeCaptureSnapshot({
       }
     }
     const stackingLayoutIndexes = new Set<number>(stackingIndex)
+    // `isClickable` is RareBooleanData: a sparse list of NODE indexes (it lives on
+    // NodeTreeSnapshot), unlike `stackingContexts` above.
+    const clickableNodeIndexes = new Set<number>(nodes.isClickable?.index ?? [])
 
     const byBackendId = new Map<number, SnapshotNodeGeometry>()
     const byNodeIndex = new Map<number, SnapshotNodeGeometry>()
@@ -557,16 +598,29 @@ export function decodeCaptureSnapshot({
 
       const nodeName = str(nodes.nodeName?.[nodeIndex])
       const attributes = decodeAttributes(nodes.attributes?.[nodeIndex], str)
+      const nodeType = nodes.nodeType?.[nodeIndex] ?? ELEMENT_NODE_TYPE
+      // `layout.text` is the RENDERED text of a text box (whitespace collapsed,
+      // `text-transform` applied) — what a person reads — rather than the raw
+      // `nodes.nodeValue`, which keeps source indentation and newlines.
+      const text = nodeType === TEXT_NODE_TYPE ? str(layout.text?.[layoutIndex]) : ''
       const record: SnapshotNodeGeometry = {
         backendNodeId,
         nodeIndex,
-        nodeType: nodes.nodeType?.[nodeIndex] ?? ELEMENT_NODE_TYPE,
+        nodeType,
         nodeName,
         label: describeSnapshotNode(nodeName, attributes),
-        box: { x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3] },
+        box: {
+          x: bounds[0] * cssPerSnapshotPx,
+          y: bounds[1] * cssPerSnapshotPx,
+          width: bounds[2] * cssPerSnapshotPx,
+          height: bounds[3] * cssPerSnapshotPx,
+        },
         paintOrder: layout.paintOrders?.[layoutIndex],
         styles,
         stackingContext: stackingLayoutIndexes.has(layoutIndex),
+        isClickable: clickableNodeIndexes.has(nodeIndex),
+        ...(text !== '' ? { text } : {}),
+        attributes,
       }
       // One backendNodeId CAN appear twice in the layout table: a `::before`/`::after`
       // pseudo-element gets its own backendNodeId (not its originator's, so a real
@@ -590,8 +644,9 @@ export function decodeCaptureSnapshot({
       byNodeIndex,
       documentBackendIds,
       parentIndex: nodes.parentIndex ?? [],
-      scrollOffsetX: doc.scrollOffsetX ?? 0,
-      scrollOffsetY: doc.scrollOffsetY ?? 0,
+      nodeBackendIds: nodes.backendNodeId,
+      scrollOffsetX: (doc.scrollOffsetX ?? 0) * cssPerSnapshotPx,
+      scrollOffsetY: (doc.scrollOffsetY ?? 0) * cssPerSnapshotPx,
       viewport: viewports?.[frameId],
     })
   })
@@ -709,7 +764,7 @@ function intersect(a: Box, b: Box): Box | null {
  * ancestor's border box, so it is up to a border width too generous). Returns undefined
  * when the frame's viewport is unknown — that is "unknown", not "not in the viewport".
  */
-function visibleClipRect(record: SnapshotNodeGeometry, frame: FrameGeometry): Box | null | undefined {
+export function visibleClipRect(record: SnapshotNodeGeometry, frame: FrameGeometry): Box | null | undefined {
   if (!frame.viewport) return undefined
   let clip: Box | null = frame.viewport
   const position = record.styles['position'] ?? 'static'
@@ -746,6 +801,69 @@ function visibleClipRect(record: SnapshotNodeGeometry, frame: FrameGeometry): Bo
     }
   }
   return clip
+}
+
+/**
+ * `visible` and `inViewport` for one laid-out record, computed exactly as they are for
+ * model nodes (the model's `runtime` is built from this). Exported so a caller can
+ * measure a node the a11y tree does not contain — a `<div>` with a click listener —
+ * with the same predicates instead of a second, drifting copy of them.
+ * `inViewport` is absent when the frame's viewport is unknown.
+ */
+export function measureLaidOutRecord(
+  record: SnapshotNodeGeometry,
+  frame: FrameGeometry,
+  visibilityCache: Map<number, boolean>,
+): { visible: boolean; inViewport?: boolean } {
+  const visible = isGeometricallyVisible(record, frame, visibilityCache)
+  const clip = visibleClipRect(record, frame)
+  if (clip === undefined) return { visible }
+  return { visible, inViewport: clip !== null && intersect(record.box, clip) !== null }
+}
+
+/** Per-frame child lists (node-table indexes, document order), built once on first use. */
+const childIndexCache = new WeakMap<FrameGeometry, number[][]>()
+
+/**
+ * The text a person sees inside a node: the rendered text of the laid-out text nodes in
+ * its subtree, in document order, whitespace-collapsed, cut at `maxChars`. Text whose
+ * own element is not visible (`visibility: hidden`, `opacity: 0`) is skipped, and text
+ * that is not laid out (`display: none`) has no layout record, so it never appears.
+ *
+ * Text runs are joined with a space unless one side already has whitespace — so
+ * `<div>Alice</div><div>Edit</div>` reads "Alice Edit" (and `<b>A</b><i>B</i>`, which
+ * renders "AB", reads "A B": a cheaper error than gluing separate blocks together).
+ */
+export function nodeVisibleText(frame: FrameGeometry, nodeIndex: number, maxChars = 160): string {
+  let children = childIndexCache.get(frame)
+  if (!children) {
+    children = []
+    frame.parentIndex.forEach((parent, index) => {
+      if (parent < 0) return
+      ;(children![parent] ??= []).push(index)
+    })
+    childIndexCache.set(frame, children)
+  }
+  const cache = new Map<number, boolean>()
+  let text = ''
+  const stack = [nodeIndex]
+  while (stack.length > 0 && text.length < maxChars) {
+    const current = stack.pop()!
+    const record = frame.byNodeIndex.get(current)
+    if (record?.text !== undefined && record.nodeType === TEXT_NODE_TYPE) {
+      const parent = frame.byNodeIndex.get(frame.parentIndex[current] ?? -1)
+      if (!parent || isGeometricallyVisible(parent, frame, cache)) {
+        const piece = record.text.replace(/\s+/g, ' ')
+        if (piece.trim() !== '') {
+          text += text !== '' && !text.endsWith(' ') && !piece.startsWith(' ') ? ` ${piece}` : piece
+        }
+      }
+    }
+    const kids = children[current]
+    if (kids) for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k])
+  }
+  text = text.trim()
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
 }
 
 // --- occlusion --------------------------------------------------------------
@@ -803,7 +921,7 @@ function areaOf(box: Box): number {
 }
 
 /** Fraction of `target` covered by `cuts`, computed by rectangle subtraction (exact union). */
-function coveredFraction(target: Box, cuts: Box[]): number {
+export function coveredFraction(target: Box, cuts: Box[]): number {
   const total = areaOf(target)
   if (total <= 0) return 0
   let remainder: Box[] = [target]
@@ -1230,8 +1348,9 @@ export class PageModel {
       runtime: { ...node.runtime, computedStyles: { ...node.runtime.computedStyles } },
       async reactFiber() {
         if (node.edges.reactFiber) return node.edges.reactFiber
-        if (!deps.page || !deps.cdp || !node.locator) return null
-        const info = await getReactComponentInfo({ locator: deps.page.locator(node.locator), cdp: deps.cdp })
+        if (!deps.cdp) return null
+        // The model already knows the node: read it by id, no locator round trip through the page.
+        const info = await getReactComponentInfo({ backendNodeId: node.backendNodeId, frameId: node.frameId, cdp: deps.cdp })
         const fiber = info ? { componentName: info.componentName, source: info.source, props: info.props } : null
         if (fiber) node.edges.reactFiber = fiber
         return fiber
@@ -1668,6 +1787,10 @@ export function buildPageModelFromRaw({
       name: ariaNode.name || undefined,
       attributes,
       locator: ariaNode.locator,
+      ...(ariaNode.states ? { states: ariaNode.states } : {}),
+      ...(ariaNode.value !== undefined ? { value: ariaNode.value } : {}),
+      ...(ariaNode.axName !== undefined ? { axName: ariaNode.axName } : {}),
+      ...(ariaNode.labels !== undefined ? { labels: ariaNode.labels } : {}),
       runtime,
       edges: {},
       children: [],
@@ -1696,14 +1819,12 @@ export function buildPageModelFromRaw({
       return { visible: false, rendered: false, inViewport: false, computedStyles: {} }
     }
     const { frame, record } = located
-    const cache = visibilityCacheFor(frame)
-    const visible = isGeometricallyVisible(record, frame, cache)
-    const clip = visibleClipRect(record, frame)
+    const { visible, inViewport } = measureLaidOutRecord(record, frame, visibilityCacheFor(frame))
     const reasons = record.stackingContext ? stackingContextReasons(record.styles) : undefined
     return {
       visible,
       rendered: true,
-      ...(clip === undefined ? {} : { inViewport: clip !== null && intersect(record.box, clip) !== null }),
+      ...(inViewport === undefined ? {} : { inViewport }),
       box: { ...record.box },
       ...(record.paintOrder != null ? { paintOrder: record.paintOrder } : {}),
       stackingContext: record.stackingContext,
@@ -1812,7 +1933,9 @@ export async function fetchPageGeometry({ cdp }: { cdp: ICDPSession }): Promise<
     }
   }
 
-  return decodeCaptureSnapshot({ snapshot, viewports })
+  // Snapshot bounds are in `layoutViewport` units; see `cssPerSnapshotPx`.
+  const cssPerSnapshotPx = layoutViewport.clientWidth / metrics.layoutViewport.clientWidth
+  return decodeCaptureSnapshot({ snapshot, viewports, cssPerSnapshotPx })
 }
 
 /**

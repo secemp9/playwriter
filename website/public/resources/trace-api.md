@@ -108,8 +108,6 @@ export interface StoreDiscovery {
     /** Where in the fiber tree the store came from, when `via === 'react-fiber'`. */
     path?: string;
     componentName?: string | null;
-    /** Set when the probe pinned the store on the page so it can be re-read. */
-    pinnedAs?: string;
 }
 /**
  * The measured half. `sameReference` EXISTS ONLY HERE: reading it requires having
@@ -149,12 +147,15 @@ export type StoreIdentityResult = StoreIdentityMeasured | StoreIdentityUnmeasure
  * true` is the fingerprint of a mutating reducer (React bails out of the
  * re-render because the reference did not change).
  *
- * Discovery order: a caller `storeExpr` (eval'd in the page), then a list of
- * conventional globals probed structurally, then the React fiber tree — a
- * `<Provider store={…}>` prop or a context provider whose value exposes
- * `getState`. A fiber-discovered store is pinned as
- * `globalThis.__playwriter_trace_store` so it can be re-read after the action and
- * reused as a `storeExpr` later; that pin is reported in `discovery.pinnedAs`.
+ * Discovery order: a caller `storeExpr` (evaluated in the page through CDP), then a
+ * list of conventional globals probed structurally, then the React fiber tree — a
+ * `<Provider store={…}>` prop or a context provider whose value exposes `getState`.
+ * For a fiber-discovered store, `discovery.expr` is a self-contained expression that
+ * re-finds the same provider, reusable as a `storeExpr`.
+ *
+ * Nothing is written to the page: the captured state, its shallow copy and the store are
+ * held by reference in a CDP object group (released at the end), never in a page global.
+ * A navigation destroys them with the document, which is reported, not compared.
  *
  * When nothing is found the result is `{ measured: false }` and carries no
  * verdict field at all — there is no shape in which a failed probe reads as a
@@ -213,19 +214,6 @@ export interface NetEntry {
     ts: number;
 }
 export declare function matchesUrlPattern(url: string, urlPattern: string | RegExp | undefined): boolean;
-/**
- * The `Fetch.enable` glob that intercepts a SUPERSET of what `urlPattern` matches.
- *
- * A substring becomes `*<escaped>*`, with the glob metacharacters (`\`, `*`, `?`)
- * escaped so a literal `?` in a query string is matched as itself rather than as the
- * one-character wildcard. A RegExp cannot be expressed as a glob at all, so it
- * intercepts `*` and is narrowed by `matchesUrlPattern` in the handler.
- *
- * The handler re-checks EVERY paused request with `matchesUrlPattern` regardless, so
- * the glob is only a cheap pre-filter and the two functions' semantics stay identical
- * by construction rather than by two implementations agreeing.
- */
-export declare function urlPatternToFetchGlob(urlPattern: string | RegExp | undefined): string;
 export interface NetTimelineController {
     /** Registry id. Survives this `execute()` call: `net.read(id)` drains it later. */
     id: string;
@@ -261,9 +249,9 @@ export type NetDelayStats = {
     continued: number;
     failed: number;
     pending: number;
-    /** Every `Fetch.requestPaused` the probe saw, matching or not. */
+    /** Every request of the page that reached the probe while it was live, matching or not. */
     seen: number;
-    /** Seen but not matching `urlPattern` — continued immediately, never delayed. */
+    /** Seen but not matching `urlPattern` — passed on at once, never delayed. */
     notMatched: number;
     /**
      * TRUE while the probe has held nothing. A `net.delay` that intercepts nothing is
@@ -279,31 +267,40 @@ export interface NetDelayController {
     info(): TraceProbeInfo | null;
 }
 /**
- * Deterministic race-forcing: hold matching requests for `ms` before continuing, so
- * an async ordering bug reproduces every time. Uses the CDP Fetch domain.
- * PERTURBING — never auto-run.
+ * Deterministic race-forcing: hold matching requests for `ms` before letting them go,
+ * so an async ordering bug reproduces every time. PERTURBING — never auto-run.
+ *
+ * Built on Playwright's own `page.route`, never on CDP `Fetch` directly: Playwright
+ * owns request interception on its page session, and a `Fetch.enable`/`Fetch.disable`
+ * sent behind its back would replace or tear down the interception `page.route` and
+ * `context.route` depend on. A held request is released with `route.fallback()`, so any
+ * route the caller registered earlier still gets to fulfil, abort or modify it after the
+ * delay. While the probe is live Playwright disables the HTTP cache and passes every
+ * request of the page through its route machinery (what it does for any `page.route`);
+ * stopping unroutes, and Playwright restores both when no route is left.
  *
  * Three guarantees replace the old "remember to call stop()" doctrine:
- *   - a second overlapping `net.delay` on the same CDP session is REFUSED (naming
- *     the live one), because `Fetch.enable` replaces the previous patterns and the
- *     two probes would silently fight;
+ *   - a second overlapping `net.delay` on the same page is REFUSED (naming the live
+ *     one), because both would hold the same requests and the delays would compound;
+ *     `force: true` stops the live one and takes over;
  *   - the interception auto-expires after `ttlMs` (default 120s; `0` disables the
- *     expiry and is recorded as `unbounded`);
+ *     expiry and is recorded as `unbounded`); stopping releases every held request at
+ *     once;
  *   - the probe is registered, so `net.active()` lists it and every later
  *     `traceValue` warns while it is live.
  */
-export declare function netDelay({ cdp, urlPattern, ms, ttlMs, force, }: {
-    cdp: ICDPSession;
-    /** A SUBSTRING of the URL, or a RegExp — the same language `netTimeline` uses. NOT a
-     *  `Fetch.enable` glob; see `matchesUrlPattern`. */
+export declare function netDelay({ page, urlPattern, ms, ttlMs, force, }: {
+    page: Page;
+    /** A SUBSTRING of the URL, or a RegExp — the same language `netTimeline` uses; see `matchesUrlPattern`. */
     urlPattern: string | RegExp;
     ms: number;
     ttlMs?: number;
     force?: boolean;
 }): Promise<NetDelayController>;
-/** One prop of an identity-capturing snapshot. `ref` is a page-side identity token. */
+/** One prop of an identity-capturing snapshot. `ref` is an identity token from the frame's registry (held by playwriter, not the page). */
 export interface IdentifiedProp {
-    /** Stable while the reference is unchanged; 0 for primitives. */
+    /** Stable while the reference is unchanged; 0 for primitives, and for a value whose identity
+     *  was not captured because the frame's identity registry is full (see `caps.identitiesOmitted`). */
     ref: number;
     type: 'primitive' | 'function' | 'object' | 'array';
     /** Structural projection; functions render as `[fn name/arity]` (paired with `ref`). */
@@ -325,11 +322,14 @@ export interface FiberIdentitySnapshot {
         name: string | null;
         arity: number;
     }>;
+    /** `identitiesOmitted`: objects/functions left without a token because the frame's identity
+     *  registry reached its cap; `fiberDiff` reports them as unobservable, never as changed. */
     caps: {
         maxKeys: number;
         maxDepth: number;
         keysOmitted: number;
         fnRefsOmitted: number;
+        identitiesOmitted: number;
     };
     note: string;
 }
@@ -350,11 +350,12 @@ export interface FiberDiffInput {
 /**
  * Capture a React component's props/hierarchy for later diffing.
  *
- * With `identity: true` the snapshot additionally carries page-side identity
- * tokens for every object/function prop (and for nested functions, by path). That
- * is the ONLY way handler-identity churn is observable across the process
- * boundary: the default serialisation renders every function as the string
- * `[function]`, so two different arrows look identical to any comparison.
+ * With `identity: true` the snapshot additionally carries identity tokens for every
+ * object/function prop (and for nested functions, by path). That is the ONLY way
+ * handler-identity churn is observable across the process boundary: the default
+ * serialisation renders every function as the string `[function]`, so two different
+ * arrows look identical to any comparison. The tokens come from a per-frame registry
+ * playwriter holds through CDP (see `walkFiberIdentity`); nothing is stored on the page.
  */
 export declare function fiberSnapshot(opts: {
     locator: Locator | ElementHandle;

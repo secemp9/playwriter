@@ -2,6 +2,11 @@ import type { ICDPSession } from './cdp-session.js'
 import type { Locator } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import { computeSpecificity, compareSpecificity, type NormalizedRule, type Specificity } from './css-cascade.js'
+import { resolveElement } from './element-resolve.js'
+import { cssDomainFor } from './cdp-domains.js'
+import { withDeadline } from './isolated-world.js'
+
+const CDP_TIMEOUT_MS = 5000
 
 export interface StyleSource {
   url: string
@@ -124,65 +129,26 @@ function selectorRangeFor(rule: CSSRule, matchingSelectors?: number[]): SourceRa
 }
 
 /**
- * Every stylesheet header seen so far, keyed by `styleSheetId`.
- *
- * Module-level rather than per-session on purpose, and it is not a shortcut: a
- * `styleSheetId` is unique across the browser process (Chromium 145 issues them as
- * `style-sheet-<pid-ish counter>-<n>`, e.g. `style-sheet-1024378-1`), so two sessions
- * cannot collide in this map. Per-session was not an option: `getCDPSessionForPage`
- * mints a NEW `PlaywrightCDPSessionAdapter` on every call — executor.ts documents this
- * and keeps its own per-page cache for exactly that reason — so a `WeakMap` keyed on the
- * `ICDPSession` handed to us would miss on literally every call after the first.
- */
-const styleSheetHeadersById = new Map<string, CSSStyleSheetHeader>()
-
-/** Bound on the above, so a long-lived SPA that keeps injecting `<style>` cannot grow it forever. */
-const MAX_TRACKED_STYLESHEETS = 5000
-
-/**
- * Enable the CSS domain and collect the stylesheet headers, which is the only way to
- * learn a rule's real source URL.
+ * Enable DOM + CSS through the session's ONE CSS owner (`cssDomainFor`, cdp-domains.ts) and
+ * return the stylesheet headers it collected, which is the only way to learn a rule's real
+ * source URL.
  *
  * MEASURED against Chromium 145.0.7632.18: `CSS.getMatchedStylesForNode` does NOT carry a
  * `cssStyleSheetHeaders` field. The response keys are exactly `inlineStyle`,
  * `matchedCSSRules`, `pseudoElements`, `inherited`, `inheritedPseudoElements`,
  * `cssKeyframesRules`, `cssPropertyRules`, `cssPropertyRegistrations`, `cssAtRules`,
- * `parentLayoutNodeId` — with an external `<link>`, an inline `<style>`, or both. The
- * comment this replaces said Chrome "has sent it for years" and treated its absence as a
- * hypothetical; absent is what it actually is, so EVERY rule was falling back to
- * `stylesheet:<id>` and no real URL was ever reported.
+ * `parentLayoutNodeId` — with an external `<link>`, an inline `<style>`, or both.
  *
- * The headers do arrive, as events: `CSS.enable` REPLAYS `CSS.styleSheetAdded` for every
- * already-parsed sheet. Measured on a page loaded BEFORE either domain was enabled, two
- * events arrive carrying `sourceURL: 'http://.../s.css'` (isInline false) and
- * `sourceURL: 'http://.../'` (isInline true, the `<style>` block), and their
- * `styleSheetId`s are the same ids the matched rules reference.
- *
- * KNOWN LIMIT, stated rather than papered over: the replay only happens on the enable
- * that actually turns the domain on. A second call on a session where CSS is already
- * enabled receives nothing new, which is why the headers are accumulated in a map that
- * outlives the call instead of being collected fresh each time. A stylesheet added while
- * the domain was enabled but no style call was in flight is therefore not in the map, and
- * its rules report `stylesheet:<id>`. That degrades to the old behaviour for those rules;
- * it never reports a WRONG url. `CSS.disable`+`CSS.enable` would force a full replay and
- * is deliberately not done — this is Playwright's own shared page session, and the same
- * move on the Runtime domain is what makes V8 replay the whole console buffer (see
- * `Debugger.enable` in debugger.ts).
+ * The headers arrive as events: `CSS.enable` REPLAYS `CSS.styleSheetAdded` for every
+ * already-parsed sheet, but only on the enable that actually turns the domain on. The owner
+ * listens from before that enable for the life of the session, so every sheet — replayed or
+ * added later — is in its map; a feature that enabled CSS itself would steal the replay from
+ * everyone else on the session.
  */
 async function enableCssCollectingHeaders(cdp: ICDPSession): Promise<CSSStyleSheetHeader[]> {
-  const onAdded = (event: Protocol.CSS.StyleSheetAddedEvent): void => {
-    if (styleSheetHeadersById.size >= MAX_TRACKED_STYLESHEETS) return
-    styleSheetHeadersById.set(event.header.styleSheetId, event.header as unknown as CSSStyleSheetHeader)
-  }
-  // Registered BEFORE the enable so the replay is caught, and removed after so repeated
-  // style calls cannot pile listeners onto the shared underlying Playwright session.
-  cdp.on('CSS.styleSheetAdded', onAdded)
-  try {
-    await cdp.send('CSS.enable')
-  } finally {
-    cdp.off('CSS.styleSheetAdded', onAdded)
-  }
-  return [...styleSheetHeadersById.values()]
+  const css = cssDomainFor(cdp)
+  await css.enable()
+  return [...css.styleSheets.values()]
 }
 
 // ---------------------------------------------------------------------------
@@ -190,137 +156,21 @@ async function enableCssCollectingHeaders(cdp: ICDPSession): Promise<CSSStyleShe
 // ---------------------------------------------------------------------------
 
 /**
- * One tree the element path passes through. `enter` says how the tree is entered from
- * the previous hop: `document` = the top-level document, `frame` = the content document
- * of the iframe element the previous hop resolved, `shadow` = the shadow root of the
- * host element the previous hop resolved. `path` is the chain of 0-based *element*
- * child indexes to follow inside that tree.
- */
-export interface ElementPathHop {
-  enter: 'document' | 'shadow' | 'frame'
-  path: number[]
-}
-
-export interface ElementPathResult {
-  hops: ElementPathHop[]
-  /** Lowercased tag name of the target, used to verify the walk landed on it. */
-  tagName: string
-  /** Set when the path cannot be expressed, e.g. a detached or cross-origin element. */
-  error?: string
-}
-
-/**
- * Compute an element's exact position in its tree, as index paths split at shadow-root
- * and iframe boundaries.
+ * Resolve a locator to the CDP node it actually points at, as a FRONTEND node id on the page
+ * session (what `CSS.getMatchedStylesForNode` takes).
  *
- * This runs IN THE PAGE (it is stringified by `evaluate`), so it must stay entirely
- * self-contained: no imports, no closure over module scope, no TypeScript-only syntax
- * that would not survive `String(fn)`.
+ * Identity comes from `resolveElement` (element-resolve.ts): the element's own index path,
+ * walked in an isolated world — never `DOM.getNodeForLocation`, which returns the TOPMOST node
+ * at a point, so anything covering the element (a modal, a sticky header, a child span holding
+ * the label) would silently answer about a different node. MEASURED against Chromium 145: over
+ * two absolutely-positioned 200x200 divs stacked at the same origin,
+ * `getNodeForLocation({x:50,y:50})` returns the LATER-painted one (`#over`), never the one
+ * underneath — the exact failure `debugStyle` exists to diagnose.
  *
- * This is identity, not geometry: the walk starts at the element itself, so nothing that
- * happens to be painted on top of it can change the answer.
- */
-export function computeElementPath(element: any): ElementPathResult {
-  const hops: Array<{ enter: 'document' | 'shadow' | 'frame'; path: number[] }> = []
-  const tagName = String(element.tagName || '').toLowerCase()
-  let node: any = element
-  let path: number[] = []
-  let guard = 0
-
-  const elementIndexIn = (parent: any, child: any): number => {
-    const children = parent.children
-    for (let i = 0; i < children.length; i++) {
-      if (children[i] === child) return i
-    }
-    return -1
-  }
-
-  while (guard++ < 10000) {
-    const parentElement = node.parentElement
-    if (parentElement) {
-      const index = elementIndexIn(parentElement, node)
-      if (index < 0) return { hops: [], tagName, error: 'element is not among its parent element children' }
-      path.unshift(index)
-      node = parentElement
-      continue
-    }
-
-    const root = node.getRootNode ? node.getRootNode() : node.parentNode
-    if (root && root.nodeType === 11 && root.host) {
-      // Shadow root: index among the shadow root's own element children, then hop to the
-      // host and keep walking in the outer tree.
-      const index = elementIndexIn(root, node)
-      if (index < 0) return { hops: [], tagName, error: 'element is not among its shadow root children' }
-      path.unshift(index)
-      hops.unshift({ enter: 'shadow', path })
-      path = []
-      node = root.host
-      continue
-    }
-
-    if (root && root.nodeType === 9) {
-      // Document. `node` is the document element, whose own index is implied by starting
-      // the hop at the document element, so it contributes no index.
-      let frameElement: any = null
-      try {
-        frameElement = root.defaultView ? root.defaultView.frameElement : null
-      } catch {
-        // Cross-origin parent: the frame element is unreachable from here, and so is any
-        // node id for it on this CDP session.
-        return { hops: [], tagName, error: 'element is inside a cross-origin iframe' }
-      }
-      hops.unshift({ enter: frameElement ? 'frame' : 'document', path })
-      if (!frameElement) return { hops, tagName }
-      path = []
-      node = frameElement
-      continue
-    }
-
-    return { hops: [], tagName, error: 'element is detached from any document' }
-  }
-  return { hops: [], tagName, error: 'element ancestor chain exceeded 10000 steps' }
-}
-
-async function describeElementPath(elementHandle: any): Promise<ElementPathResult> {
-  return (await elementHandle.evaluate(computeElementPath)) as ElementPathResult
-}
-
-/** The element children of a CDP node, in document order. */
-function elementChildren(node: Protocol.DOM.Node): Protocol.DOM.Node[] {
-  return (node.children ?? []).filter((child) => child.nodeType === 1)
-}
-
-/** The document element of a CDP document node. */
-function documentElementOf(document: Protocol.DOM.Node): Protocol.DOM.Node {
-  const element = elementChildren(document)[0]
-  if (!element) {
-    throw new Error('Could not resolve element: document node has no document element in the CDP tree')
-  }
-  return element
-}
-
-/**
- * Resolve a locator to the CDP node it actually points at.
- *
- * Why not `DOM.getNodeForLocation`: that returns the TOPMOST node at a screen point, so
- * anything covering the element — a modal, a sticky header, or just a child span holding
- * the label — silently resolves to a *different* node, and every rule, cascade winner
- * and source location reported afterwards then belongs to the wrong element. MEASURED
- * against Chromium 145: over two absolutely-positioned 200x200 divs stacked at the same
- * origin, `getNodeForLocation({x:50,y:50})` returns the LATER-painted one (`#over`), never
- * the one underneath. That is the exact failure `debugStyle` exists to diagnose, so
- * identity is resolved through the element's own node instead: the page reports the
- * element's index path, and the path is walked over one pierced `DOM.getDocument` tree.
- * The final node's tag name is verified against the page's, so a DOM mutation racing the
- * walk fails loudly instead of answering about a neighbour.
- *
- * `DOM.getDocument` doubles as the priming call CDP requires before FRONTEND node ids can
- * be handed out on a fresh session — measured: `DOM.pushNodesByBackendIdsToFrontend` on a
- * session with `DOM.enable` but no `DOM.getDocument` is rejected with "Document needs to
- * be requested first" — which is why both style entry points share this helper rather than
- * each remembering to prime. (`DOM.getNodeForLocation` is NOT subject to that rule: the
- * same measurement had it answer with no `DOM.getDocument` and indeed with no `DOM.enable`
- * at all. It returns a backendNodeId, not a frontend one.)
+ * `DOM.getDocument` is the priming call CDP requires before FRONTEND node ids can be handed out
+ * on a fresh session — measured: `DOM.pushNodesByBackendIdsToFrontend` on a session with
+ * `DOM.enable` but no `DOM.getDocument` is rejected with "Document needs to be requested first" —
+ * which is why both style entry points share this helper rather than each remembering to prime.
  */
 export async function resolveElementNode({
   locator,
@@ -329,83 +179,22 @@ export async function resolveElementNode({
   locator: Locator
   cdp: ICDPSession
 }): Promise<{ nodeId: number; backendNodeId: number; node: Protocol.DOM.Node }> {
-  await cdp.send('DOM.enable')
-  const elementHandle = await locator.elementHandle()
-  if (!elementHandle) {
-    throw new Error('Could not get element handle from locator')
-  }
-  const described = await describeElementPath(elementHandle)
-  if (described.error) {
-    throw new Error(`Could not resolve element identity over CDP: ${described.error}`)
-  }
-
-  // `pierce: true` brings shadow roots and same-process iframe content documents into
-  // the one tree, which is what makes the hop walk below possible in a single round-trip.
-  // MEASURED against Chromium 145 on a page with an open shadow root and a srcdoc iframe:
-  // with `pierce: true` the returned tree contains both the shadow child and the iframe's
-  // `<p>`; with `pierce: false` it contains neither.
-  const { root } = (await cdp.send('DOM.getDocument', {
-    depth: -1,
-    pierce: true,
-  })) as Protocol.DOM.GetDocumentResponse
-
-  let current: Protocol.DOM.Node | null = null
-  for (const hop of described.hops) {
-    let treeRoot: Protocol.DOM.Node
-    if (hop.enter === 'document') {
-      treeRoot = documentElementOf(root)
-    } else if (hop.enter === 'frame') {
-      const contentDocument = current?.contentDocument
-      if (!contentDocument) {
-        throw new Error(
-          `Could not resolve element: <${current?.nodeName?.toLowerCase() ?? '?'}> has no content document on this CDP ` +
-            'session (a cross-process iframe needs its own session)',
-        )
-      }
-      treeRoot = documentElementOf(contentDocument)
-    } else {
-      // Prefer an author shadow root; a user-agent one belongs to the browser's own
-      // internals and never contains the element the page handed us. Not hypothetical:
-      // MEASURED against Chromium 145, `DOM.getDocument({ pierce: true })` reports an
-      // `<input type=range>` with `shadowRoots: [{ shadowRootType: 'user-agent' }]`, so an
-      // unfiltered `shadowRoots[0]` would walk into the slider's internals.
-      const shadowRoot = (current?.shadowRoots ?? []).find((sr) => sr.shadowRootType !== 'user-agent')
-      if (!shadowRoot) {
-        throw new Error(
-          `Could not resolve element: <${current?.nodeName?.toLowerCase() ?? '?'}> has no author shadow root in the CDP tree`,
-        )
-      }
-      treeRoot = shadowRoot
-    }
-
-    current = treeRoot
-    for (const index of hop.path) {
-      const children = elementChildren(current)
-      const next = children[index]
-      if (!next) {
-        throw new Error(
-          `Could not resolve element: child index ${index} does not exist under <${current.nodeName.toLowerCase()}> ` +
-            '(the DOM changed while resolving)',
-        )
-      }
-      current = next
-    }
-  }
-
-  if (!current) {
-    throw new Error('Could not resolve element: empty element path')
-  }
-  const resolvedTag = current.nodeName.toLowerCase()
-  if (described.tagName && resolvedTag !== described.tagName) {
+  const resolved = await resolveElement({ target: locator, cdp })
+  if (resolved.ownSession) {
     throw new Error(
-      `Could not resolve element: the path resolved to <${resolvedTag}> but the locator points at ` +
-        `<${described.tagName}> — the DOM changed while resolving`,
+      `Could not read styles: <${resolved.node.localName}> is inside an out-of-process iframe (frame ${resolved.frameId}), ` +
+        "which this page's CDP session cannot inspect; it needs that frame's own session.",
     )
   }
-  if (!current.nodeId) {
-    throw new Error(`Could not resolve element: <${resolvedTag}> has no frontend nodeId`)
-  }
-  return { nodeId: current.nodeId, backendNodeId: current.backendNodeId, node: current }
+  await withDeadline(cdp.send('DOM.getDocument', { depth: 0 }), CDP_TIMEOUT_MS, 'requesting the document node')
+  const pushed = await withDeadline(
+    cdp.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [resolved.backendNodeId] }),
+    CDP_TIMEOUT_MS,
+    `getting a frontend node id for <${resolved.node.localName}>`,
+  )
+  const nodeId = pushed.nodeIds[0]
+  if (!nodeId) throw new Error(`Could not resolve element: <${resolved.node.localName}> has no frontend nodeId`)
+  return { nodeId, backendNodeId: resolved.backendNodeId, node: resolved.node }
 }
 
 export async function getStylesForLocator({

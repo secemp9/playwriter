@@ -50,6 +50,7 @@
 
 import type { Locator, Page } from '@xmorse/playwright-core'
 import type { ICDPSession } from './cdp-session.js'
+import { IsolatedWorld, withDeadline } from './isolated-world.js'
 import {
   planHumanTrajectory,
   DEFAULT_SAMPLE_RATE_HZ,
@@ -59,7 +60,8 @@ import {
   type Point,
   type Submovement,
 } from './human-mouse.js'
-import { playGhostCursorPath, cancelGhostCursorPath } from './ghost-cursor.js'
+import { playGhostCursorPath, cancelGhostCursorPath, isGhostCursorShown } from './ghost-cursor.js'
+import { pointerTrackFor, type PointerPathSample } from './pointer-track.js'
 
 /** Above this, the renderer is not acking within a frame and the model's timing is fiction. */
 const THROTTLED_RENDERER_PROBE_MS = 100
@@ -69,6 +71,9 @@ const DURATION_DRIFT_WARN_MS = 60
 
 /** Bound on un-awaited dispatches, so a stalled relay cannot queue an unbounded backlog. */
 const MAX_IN_FLIGHT_DISPATCHES = 32
+
+/** Reading the layout metrics for the first move's start point is one CDP round trip. */
+const START_POINT_TIMEOUT_MS = 5000
 
 export interface HoverCrossing {
   /** A short human-readable description, e.g. `button#submit.primary "Save"`. */
@@ -105,7 +110,11 @@ export interface HumanMoveResult {
   probeDispatchMs: number
   /** True when the probe says the renderer cannot ack within a frame — see the header. */
   rendererThrottled: boolean
-  /** Whether the overlay actually played the same path. */
+  /**
+   * Whether the live in-page overlay played the same path. Only ever `playing: true` on a
+   * page where `ghostCursor.show()` injected it; otherwise nothing is drawn in the page (a
+   * CDP recording draws the pointer from the pointer track instead).
+   */
   ghostCursor: { playing: boolean; durationMs: number }
   /**
    * Elements the pointer actually crossed, from real `mouseover` events captured in the
@@ -137,7 +146,12 @@ export interface HumanMoveOptions extends HumanMouseDefaults {
   /** Offset within the target element, like Playwright's `position`. Defaults to the centre. */
   position?: Point
   includeTrajectory?: boolean
-  /** Mouse button held during the move, for drags. */
+  /**
+   * Mouse button held during the move, for drags: every dispatched move (the latency probe and
+   * each path sample) carries it as `button` and in the `buttons` mask. Press it with
+   * `page.mouse.down({ button })` first: the move ends with Playwright's own zero-distance pointer
+   * sync, which carries the buttons Playwright pressed, so `page.mouse.up()` releases at the target.
+   */
   heldButton?: 'left' | 'right' | 'middle'
 }
 
@@ -157,69 +171,34 @@ interface ResolvedTarget {
 // ---------------------------------------------------------------------------
 
 /**
- * Playwright's client `Mouse` does not expose its current point, so the driver keeps its
- * own — and it has to stay correct across mouse actions the driver never issued, because
- * a move that starts from the wrong origin traces the wrong path (worst case: a plain
- * `page.mouse.move` moved the pointer, the driver still believes it is at the previous
- * target, and the "move" it plans has zero length and crosses nothing).
+ * Playwright's client `Mouse` does not expose its current point, and the driver has to
+ * stay correct across mouse actions it never issued: a move that starts from the wrong
+ * origin traces the wrong path (worst case: a plain `page.mouse.move` moved the pointer,
+ * the driver still believes it is at the previous target, and the "move" it plans has zero
+ * length and crosses nothing).
  *
- * So the driver chains `page.onMouseAction` — the same hook the ghost cursor uses — and
- * records every move/down/up/wheel Playwright performs. Deliberately NOT read from the
- * ghost cursor overlay: the overlay is cosmetic and can be disabled, and correctness must
- * not depend on it. The overlay is still consulted as a last resort before falling back to
- * the viewport centre, for the case where a previous session left the pointer somewhere.
+ * So the start point comes from the page's pointer track (`pointer-track.ts`): it records
+ * every move/down/up/wheel Playwright performs through `page.onMouseAction`, and every
+ * trajectory this driver dispatches. Before the first move the pointer is taken to be at
+ * the viewport centre; with no emulated viewport (connectOverCDP) the viewport is read
+ * with `Page.getLayoutMetrics`, never from the page's own realm.
  */
-const lastKnownPointByPage = new WeakMap<Page, Point>()
-const positionTrackedPages = new WeakSet<Page>()
-
-/** Idempotent. Chains onto whatever callback is already installed (e.g. the ghost cursor). */
-function trackPointerPosition(page: Page): void {
-  if (positionTrackedPages.has(page)) {
-    return
-  }
-  positionTrackedPages.add(page)
-
-  const previous = page.onMouseAction
-  page.onMouseAction = async (event) => {
-    // Must stay trivial and never throw: this runs inline on every Playwright mouse action.
-    if (Number.isFinite(event.x) && Number.isFinite(event.y)) {
-      lastKnownPointByPage.set(page, { x: event.x, y: event.y })
-    }
-    if (previous) {
-      await previous(event)
-    }
-  }
-}
-
-async function readOverlayPointerPosition(page: Page): Promise<Point | null> {
-  try {
-    return await page.evaluate(() => {
-      const api = (globalThis as { __playwriterGhostCursor?: { getPosition?: () => { x: number; y: number } | null } })
-        .__playwriterGhostCursor
-      return api?.getPosition?.() ?? null
-    })
-  } catch {
-    return null
-  }
-}
-
-async function resolveStartPoint(options: { page: Page; explicit?: Point }): Promise<Point> {
-  // Installed before the `explicit` shortcut so that a first move with an explicit origin
+async function resolveStartPoint(options: {
+  page: Page
+  explicit?: Point
+  getCdpSession: (options: { page: Page }) => Promise<ICDPSession>
+}): Promise<Point> {
+  // Created before the `explicit` shortcut so that a first move with an explicit origin
   // still leaves tracking armed for the next one.
-  trackPointerPosition(options.page)
+  const track = pointerTrackFor(options.page)
 
   if (options.explicit) {
     return options.explicit
   }
 
-  const remembered = lastKnownPointByPage.get(options.page)
+  const remembered = track.latest()
   if (remembered) {
-    return remembered
-  }
-
-  const fromOverlay = await readOverlayPointerPosition(options.page)
-  if (fromOverlay && Number.isFinite(fromOverlay.x) && Number.isFinite(fromOverlay.y)) {
-    return fromOverlay
+    return { x: remembered.x, y: remembered.y }
   }
 
   const viewport = options.page.viewportSize()
@@ -227,10 +206,13 @@ async function resolveStartPoint(options: { page: Page; explicit?: Point }): Pro
     return { x: Math.round(viewport.width / 2), y: Math.round(viewport.height / 2) }
   }
 
-  const measured = await options.page
-    .evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
-    .catch(() => ({ width: 1280, height: 720 }))
-  return { x: Math.round(measured.width / 2), y: Math.round(measured.height / 2) }
+  const cdp = await options.getCdpSession({ page: options.page })
+  const { cssLayoutViewport } = await withDeadline(
+    cdp.send('Page.getLayoutMetrics'),
+    START_POINT_TIMEOUT_MS,
+    'reading the viewport size to place the pointer at its centre (Page.getLayoutMetrics)',
+  )
+  return { x: Math.round(cssLayoutViewport.clientWidth / 2), y: Math.round(cssLayoutViewport.clientHeight / 2) }
 }
 
 async function resolveTarget(options: {
@@ -266,95 +248,87 @@ async function resolveTarget(options: {
 // Hover crossing capture
 // ---------------------------------------------------------------------------
 
-const HOVER_TRAIL_KEY = '__playwriterHumanMouseHoverTrail'
+// The recorder lives in a CDP isolated world of its own, never in the page's realm: its
+// listener sits on the page's real `document` (the DOM is shared, so trusted `mouseover`
+// events fire it), but the listener, its closure and the global holding the trail exist
+// only in a realm page scripts cannot see. The page's globals and listener list are
+// untouched while crossings are recorded.
 
-async function armHoverRecorder(page: Page): Promise<boolean> {
-  try {
-    await page.evaluate((key) => {
-      const store = globalThis as unknown as Record<string, unknown>
-      const existing = store[key] as { teardown?: () => void } | undefined
-      existing?.teardown?.()
+const HOVER_WORLD_NAME = '__playwriter_human_mouse__'
+const HOVER_RECORDER_TIMEOUT_MS = 5000
 
-      const startedAt = performance.now()
-      const entries: Array<{ description: string; tagName: string; id: string | null; atMs: number }> = []
+/** World-global holding the live recorder. Exists only inside the isolated world. */
+const HOVER_RECORDER_KEY = '__playwriterHoverRecorder'
 
-      // The `src` tsconfig has no DOM lib (types are node + chrome only), so this
-      // page-side callback describes the shapes it uses structurally rather than
-      // reaching for `Element` / `Event`.
-      interface DomElementLike {
-        tagName: string
-        id: string
-        classList: ArrayLike<string>
-        textContent: string | null
-        getAttribute: (name: string) => string | null
-      }
-
-      const describe = (element: DomElementLike): string => {
-        const tag = element.tagName.toLowerCase()
-        const id = element.id ? `#${element.id}` : ''
-        const classes = Array.prototype.slice
-          .call(element.classList, 0, 2)
-          .map((c: string) => `.${c}`)
-          .join('')
-        const label =
-          element.getAttribute('aria-label') || (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)
-        return `${tag}${id}${classes}${label ? ` "${label}"` : ''}`
-      }
-
-      const handler = (event: { target: unknown }): void => {
-        const target = event.target as DomElementLike | null
-        if (!target || typeof target.tagName !== 'string' || entries.length >= 200) {
-          return
-        }
-        // The overlay is `pointer-events: none` and never receives these, but skip it
-        // defensively so a crossing report can never be about our own cursor.
-        if (target.id === '__playwriter_ghost_cursor__') {
-          return
-        }
-        const description = describe(target)
-        const previous = entries[entries.length - 1]
-        if (previous && previous.description === description) {
-          return
-        }
-        entries.push({
-          description,
-          tagName: target.tagName.toLowerCase(),
-          id: target.id || null,
-          atMs: Math.round(performance.now() - startedAt),
-        })
-      }
-
-      document.addEventListener('mouseover', handler as (event: unknown) => void, true)
-      store[key] = {
-        entries,
-        teardown: () => {
-          document.removeEventListener('mouseover', handler as (event: unknown) => void, true)
-        },
-      }
-    }, HOVER_TRAIL_KEY)
-    return true
-  } catch {
-    return false
+const ARM_HOVER_RECORDER_SOURCE = `(() => {
+  const key = ${JSON.stringify(HOVER_RECORDER_KEY)}
+  const existing = globalThis[key]
+  if (existing) existing.teardown()
+  const startedAt = performance.now()
+  const entries = []
+  const describe = (element) => {
+    const tag = element.tagName.toLowerCase()
+    const id = element.id ? '#' + element.id : ''
+    const classes = Array.prototype.slice.call(element.classList, 0, 2).map((c) => '.' + c).join('')
+    const label = element.getAttribute('aria-label') || (element.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40)
+    return tag + id + classes + (label ? ' "' + label + '"' : '')
   }
+  const handler = (event) => {
+    const target = event.target
+    if (!target || typeof target.tagName !== 'string' || entries.length >= 200) return
+    // The ghost cursor overlay is pointer-events: none and never receives these; skip it
+    // so a crossing report can never be about our own cursor.
+    if (target.id === '__playwriter_ghost_cursor__') return
+    const description = describe(target)
+    const previous = entries[entries.length - 1]
+    if (previous && previous.description === description) return
+    entries.push({
+      description,
+      tagName: target.tagName.toLowerCase(),
+      id: target.id || null,
+      atMs: Math.round(performance.now() - startedAt),
+    })
+  }
+  document.addEventListener('mouseover', handler, true)
+  globalThis[key] = {
+    entries,
+    teardown: () => document.removeEventListener('mouseover', handler, true),
+  }
+  return true
+})()`
+
+/** Returns the trail and removes the recorder, or null when this world copy never had one. */
+const COLLECT_HOVER_RECORDER_SOURCE = `(() => {
+  const key = ${JSON.stringify(HOVER_RECORDER_KEY)}
+  const record = globalThis[key]
+  if (!record) return null
+  record.teardown()
+  delete globalThis[key]
+  return record.entries
+})()`
+
+async function armHoverRecorder(world: IsolatedWorld): Promise<number> {
+  await world.evaluate<boolean>(ARM_HOVER_RECORDER_SOURCE, {
+    timeoutMs: HOVER_RECORDER_TIMEOUT_MS,
+    what: 'arming the hover-crossing recorder in the isolated world',
+  })
+  return await world.getContextId(HOVER_RECORDER_TIMEOUT_MS)
 }
 
-async function collectHoverRecorder(page: Page): Promise<HoverCrossing[]> {
-  try {
-    return await page.evaluate((key) => {
-      const store = globalThis as unknown as Record<string, unknown>
-      const record = store[key] as
-        | { entries: Array<{ description: string; tagName: string; id: string | null; atMs: number }>; teardown: () => void }
-        | undefined
-      if (!record) {
-        return []
-      }
-      record.teardown()
-      delete store[key]
-      return record.entries
-    }, HOVER_TRAIL_KEY)
-  } catch {
-    return []
+type HoverCollection = { kind: 'collected'; crossed: HoverCrossing[] } | { kind: 'lost' }
+
+async function collectHoverRecorder(world: IsolatedWorld, armedContextId: number): Promise<HoverCollection> {
+  const contextId = await world.getContextId(HOVER_RECORDER_TIMEOUT_MS)
+  const entries = await world.evaluate<HoverCrossing[] | null>(COLLECT_HOVER_RECORDER_SOURCE, {
+    timeoutMs: HOVER_RECORDER_TIMEOUT_MS,
+    what: 'reading the hover-crossing trail from the isolated world',
+  })
+  // A navigation during the move destroys the document the recorder listened on; the world
+  // is recreated empty for the new document, so the trail recorded before it is gone.
+  if (contextId !== armedContextId || entries === null) {
+    return { kind: 'lost' }
   }
+  return { kind: 'collected', crossed: entries }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,23 +352,29 @@ function sleepUntil(deadlineMs: number): Promise<void> {
  * a late timer callback does not push every later sample back — the schedule self-corrects
  * instead of drifting. Events are issued without awaiting (see the header); the batch is
  * awaited once at the end so the caller's `await` still means "the browser has them".
+ *
+ * Returns the samples as they were really ISSUED — `tMs` is the offset from `startedAt` at
+ * which each one was sent, not the planned one — so the pointer track (and any recording
+ * drawn from it) follows what the page received, including a late timer.
  */
 async function dispatchTrajectory(options: {
   cdp: ICDPSession
   trajectory: HumanTrajectory
   heldButton?: 'left' | 'right' | 'middle'
-}): Promise<{ dispatched: number; achievedDurationMs: number }> {
+}): Promise<{ dispatched: number; achievedDurationMs: number; startedAt: number; issued: PointerPathSample[] }> {
   const { cdp, trajectory, heldButton } = options
   const button = heldButton ?? 'none'
   const buttons = heldButton ? BUTTON_MASK[heldButton] : 0
 
   const pending: Array<Promise<unknown>> = []
   let dispatched = 0
+  const issued: PointerPathSample[] = []
 
   const startedAt = Date.now()
 
   for (const sample of trajectory.samples) {
     await sleepUntil(startedAt + sample.tMs)
+    issued.push({ tMs: Date.now() - startedAt, x: sample.x, y: sample.y })
 
     const promise = cdp
       .send('Input.dispatchMouseEvent', {
@@ -418,18 +398,23 @@ async function dispatchTrajectory(options: {
   }
 
   await Promise.all(pending)
-  return { dispatched, achievedDurationMs: Date.now() - startedAt }
+  return { dispatched, achievedDurationMs: Date.now() - startedAt, startedAt, issued }
 }
 
-async function probeDispatchLatency(options: { cdp: ICDPSession; at: Point }): Promise<number> {
+/**
+ * One awaited mouseMoved at `at`, timed. With a held button it carries that button, like every
+ * other move of a drag: a move with `buttons: 0` in the middle of a drag tells Chrome the button
+ * is up, and the page sees the drag end.
+ */
+async function probeDispatchLatency(options: { cdp: ICDPSession; at: Point; heldButton?: 'left' | 'right' | 'middle' }): Promise<number> {
   const startedAt = Date.now()
   try {
     await options.cdp.send('Input.dispatchMouseEvent', {
       type: 'mouseMoved',
       x: options.at.x,
       y: options.at.y,
-      button: 'none',
-      buttons: 0,
+      button: options.heldButton ?? 'none',
+      buttons: options.heldButton ? BUTTON_MASK[options.heldButton] : 0,
     })
   } catch {
     return Number.NaN
@@ -482,6 +467,30 @@ export function createHumanMouseApi(options: {
 
   const resolvePage = (page?: Page): Page => page ?? defaultPage
 
+  // One recorder world per page, created on first use and disposed with the page.
+  const hoverWorlds = new WeakMap<Page, Promise<IsolatedWorld>>()
+  const hoverWorldFor = (page: Page): Promise<IsolatedWorld> => {
+    const existing = hoverWorlds.get(page)
+    if (existing) {
+      return existing
+    }
+    const creating = (async () => {
+      const cdp = await withDeadline(
+        getCdpSession({ page }),
+        HOVER_RECORDER_TIMEOUT_MS,
+        'opening the CDP session for the hover-crossing recorder',
+      )
+      const world = new IsolatedWorld({ cdp, getFrameId: () => page.mainFrame().frameId(), worldName: HOVER_WORLD_NAME })
+      page.once('close', () => world.dispose())
+      return world
+    })()
+    hoverWorlds.set(page, creating)
+    creating.catch(() => {
+      if (hoverWorlds.get(page) === creating) hoverWorlds.delete(page)
+    })
+    return creating
+  }
+
   async function buildPlan(moveOptions: HumanMoveOptions): Promise<{
     trajectory: HumanTrajectory
     page: Page
@@ -495,7 +504,7 @@ export function createHumanMouseApi(options: {
       y: moveOptions.y,
       position: moveOptions.position,
     })
-    const from = await resolveStartPoint({ page, explicit: moveOptions.from })
+    const from = await resolveStartPoint({ page, explicit: moveOptions.from, getCdpSession })
 
     const trajectory = planHumanTrajectory({
       from,
@@ -516,14 +525,19 @@ export function createHumanMouseApi(options: {
     const warnings: string[] = []
 
     const reportCrossings = moveOptions.reportCrossings ?? defaults.reportCrossings ?? false
-    const armed = reportCrossings ? await armHoverRecorder(page) : false
-    if (reportCrossings && !armed) {
-      warnings.push('Could not arm the hover recorder — `crossed` is unavailable for this move.')
+    let hover: { world: IsolatedWorld; armedContextId: number } | undefined
+    if (reportCrossings) {
+      const world = await hoverWorldFor(page)
+      hover = { world, armedContextId: await armHoverRecorder(world) }
     }
 
     // Probe BEFORE the move: one awaited dispatch at the starting point (a no-op position
     // change) tells us whether this renderer acks within a frame or is throttled to 1Hz.
-    const probeDispatchMs = await probeDispatchLatency({ cdp, at: from })
+    // It is a real dispatch — with an explicit `from` it is what puts the pointer there —
+    // so it goes on the track like every other one.
+    const track = pointerTrackFor(page)
+    track.record({ x: from.x, y: from.y, kind: 'move' })
+    const probeDispatchMs = await probeDispatchLatency({ cdp, at: from, heldButton: moveOptions.heldButton })
     const rendererThrottled = Number.isFinite(probeDispatchMs) && probeDispatchMs > THROTTLED_RENDERER_PROBE_MS
     if (rendererThrottled) {
       warnings.push(
@@ -534,25 +548,26 @@ export function createHumanMouseApi(options: {
       )
     }
 
-    // Hand the whole path to the overlay first, so it starts within one round trip of the
-    // real pointer instead of chasing it a transition behind.
+    // Hand the whole path to the live overlay first — only on a page where
+    // `ghostCursor.show()` put one — so it starts within one round trip of the real pointer
+    // instead of chasing it a transition behind. Never injects anything.
     const ghostCursor = await playGhostCursorPath({ page, samples: trajectory.samples })
-    if (!ghostCursor.playing) {
-      warnings.push('Ghost cursor did not play the path (overlay disabled or page not ready).')
+    if (isGhostCursorShown(page) && !ghostCursor.playing) {
+      warnings.push('The ghost cursor overlay is shown on this page but did not play the path (page navigating or not ready).')
     }
 
-    const { dispatched, achievedDurationMs } = await dispatchTrajectory({
+    const { dispatched, achievedDurationMs, startedAt, issued } = await dispatchTrajectory({
       cdp,
       trajectory,
       heldButton: moveOptions.heldButton,
     })
+    track.recordPath(issued, startedAt)
 
     // Sync Playwright's own pointer bookkeeping. The raw CDP dispatches above are
     // invisible to `Mouse._x/_y`, so without this a later `page.mouse.down()` would press
     // at wherever Playwright last thought the pointer was. This is a single zero-distance
-    // move: the overlay is already there, so nothing jumps.
+    // move (recorded on the track through the onMouseAction hook), so nothing jumps.
     await page.mouse.move(to.x, to.y).catch(() => {})
-    lastKnownPointByPage.set(page, to)
 
     const durationDriftMs = achievedDurationMs - trajectory.plannedDurationMs
     if (Math.abs(durationDriftMs) > DURATION_DRIFT_WARN_MS) {
@@ -568,7 +583,18 @@ export function createHumanMouseApi(options: {
       )
     }
 
-    const crossed = armed ? await collectHoverRecorder(page) : undefined
+    let crossed: HoverCrossing[] | undefined
+    if (hover) {
+      const collection = await collectHoverRecorder(hover.world, hover.armedContextId)
+      if (collection.kind === 'collected') {
+        crossed = collection.crossed
+      } else {
+        warnings.push(
+          'The page navigated during the move: the hover crossings recorded on the previous document were lost ' +
+            'with it, so `crossed` is unavailable for this move. Repeat the move after the navigation settles.',
+        )
+      }
+    }
 
     return {
       from,
@@ -704,7 +730,7 @@ export function createHumanMouseApi(options: {
       return { enabled: false }
     },
     isEnabled: (isEnabledOptions) => enabledPages.has(resolvePage(isEnabledOptions?.page)),
-    position: async (positionOptions) => resolveStartPoint({ page: resolvePage(positionOptions?.page) }),
+    position: async (positionOptions) => resolveStartPoint({ page: resolvePage(positionOptions?.page), getCdpSession }),
     defaults,
   }
 }

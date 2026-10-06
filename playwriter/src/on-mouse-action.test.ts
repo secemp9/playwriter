@@ -199,36 +199,30 @@ describe('onMouseAction callback', () => {
     await safeCloseCDPBrowser(directBrowser)
   }, 30000)
 
-  // Always-on ghost cursor: the Chrome extension injects the ghost-cursor-client.js
-  // bundle into MAIN world the moment it attaches a tab (see attachTab in
-  // extension/src/background.ts). This test verifies the cursor element exists on
-  // a freshly-attached tab WITHOUT any explicit enableGhostCursor call.
-  it('should inject ghost cursor into attached tabs without explicit enable', async () => {
+  // The ghost cursor is an explicit opt-in (`ghostCursor.show()`): attaching a tab must not
+  // put it in the page. It used to be injected into every attached tab's main world; the
+  // full purity proof (elements, globals, reload) is in page-purity.test.ts.
+  it('does not inject the ghost cursor into attached tabs', async () => {
     const browserContext = testCtx!.browserContext
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
     const page = await browserContext.newPage()
-    await page.goto('data:text/html,<html><body><h1>always-on-cursor</h1></body></html>')
+    await page.goto('data:text/html,<html><body><h1>no-cursor</h1></body></html>')
     await page.bringToFront()
 
-    await serviceWorker.evaluate(
-      async ([k, l]) => {
-        await (globalThis as any).toggleExtensionForActiveTab(k, l)
-      },
+    const connected = await serviceWorker.evaluate(
+      async ([k, l]) => (await globalThis.toggleExtensionForActiveTab(k, l)).isConnected,
       [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
-    await new Promise((r) => {
-      setTimeout(r, 300)
-    })
+    expect(connected).toBe(true)
 
     const cursorPresent = await page.evaluate(() => {
       return {
-        apiPresent: Boolean((globalThis as any).__playwriterGhostCursor),
+        apiPresent: '__playwriterGhostCursor' in globalThis,
         elementPresent: Boolean(document.getElementById('__playwriter_ghost_cursor__')),
       }
     })
 
-    expect(cursorPresent.apiPresent).toBe(true)
-    expect(cursorPresent.elementPresent).toBe(true)
+    expect(cursorPresent).toEqual({ apiPresent: false, elementPresent: false })
   }, 30000)
 })

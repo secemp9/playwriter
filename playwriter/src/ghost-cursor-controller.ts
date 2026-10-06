@@ -1,9 +1,14 @@
 /**
- * Always-on ghost cursor controller (Node side).
+ * Per-page pointer bookkeeping (Node side), plus the opt-in live overlay.
  *
- * Wires page.onMouseAction → applyGhostCursorMouseAction for every page.
- * Chains with any pre-existing onMouseAction callback. Cursor-apply is
- * fire-and-forget via a per-page queue so it does not block action completion.
+ * `attachToPage` gives every page a pointer track (`pointer-track.ts`): the fork's
+ * `page.onMouseAction` hook records each Playwright move/down/up/wheel with its
+ * coordinates. Recording reads nothing from the page and writes nothing to it — the CDP
+ * recorder draws the pointer from this track at encode time.
+ *
+ * The in-page ghost cursor is a separate, explicit opt-in: only after `show()` are mouse
+ * actions also forwarded to the overlay (which `show()` injects into the page). `hide()`
+ * stops forwarding and removes it.
  */
 
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
@@ -13,6 +18,7 @@ import {
   enableGhostCursor,
   type GhostCursorClientOptions,
 } from './ghost-cursor.js'
+import { pointerTrackFor, releasePointerTrack, type PointerTrack } from './pointer-track.js'
 
 interface GhostCursorLogger {
   error: (...args: unknown[]) => void
@@ -24,9 +30,8 @@ interface RecordingTargetOptions {
 }
 
 export class GhostCursorController {
-  private readonly previousMouseActionByPage = new WeakMap<Page, Page['onMouseAction']>()
-  private readonly cursorApplyQueueByPage = new WeakMap<Page, Promise<void>>()
-  private readonly attachedPages = new WeakSet<Page>()
+  /** Unsubscribe functions of the overlay forwarders, for pages that were shown. */
+  private readonly forwarders = new WeakMap<Page, () => void>()
   private readonly logger: GhostCursorLogger
 
   constructor(options: { logger: GhostCursorLogger }) {
@@ -57,73 +62,55 @@ export class GhostCursorController {
     return defaultPage
   }
 
-  /** Wire onMouseAction. Idempotent. */
+  /** Start recording this page's pointer. Idempotent; touches nothing in the page. */
   attachToPage(options: { page: Page }): void {
-    const { page } = options
+    pointerTrackFor(options.page)
+  }
 
-    if (this.attachedPages.has(page)) {
-      return
-    }
-    this.attachedPages.add(page)
-
-    if (!this.previousMouseActionByPage.has(page)) {
-      this.previousMouseActionByPage.set(page, page.onMouseAction)
-    }
-    const previousMouseAction = this.previousMouseActionByPage.get(page)
-
-    page.onMouseAction = async (event) => {
-      // Ghost cursor must never crash the main Playwright action (click, move, etc).
-      // Wrap the entire cursor logic in try/catch so errors stay cosmetic.
-      try {
-        const pendingCursorApply = this.cursorApplyQueueByPage.get(page) || Promise.resolve()
-        const nextCursorApply = pendingCursorApply
-          .then(async () => {
-            await applyGhostCursorMouseAction({ page, event })
-          })
-          .catch((error) => {
-            if (page.isClosed()) {
-              return
-            }
-            this.logger.error('[playwriter] Failed to apply ghost cursor action', error)
-          })
-        this.cursorApplyQueueByPage.set(page, nextCursorApply)
-      } catch (error) {
-        this.logger.error('[playwriter] Ghost cursor onMouseAction error (non-fatal)', error)
-      }
-
-      if (!previousMouseAction) {
-        return
-      }
-      await previousMouseAction(event)
-    }
+  /** The page's pointer timeline (created on first use). */
+  pointerTrack(options: { page: Page }): PointerTrack {
+    return pointerTrackFor(options.page)
   }
 
   detachFromPage(options: { page: Page }): void {
     const { page } = options
-    if (!this.attachedPages.has(page)) {
-      return
-    }
-    this.attachedPages.delete(page)
-    page.onMouseAction = this.previousMouseActionByPage.get(page) ?? null
-    this.previousMouseActionByPage.delete(page)
-    this.cursorApplyQueueByPage.delete(page)
+    this.forwarders.get(page)?.()
+    this.forwarders.delete(page)
+    releasePointerTrack(page)
   }
 
+  /**
+   * Inject and show the live in-page cursor. MODIFIES THE PAGE — see `enableGhostCursor`.
+   * From here until `hide()`, every Playwright mouse action is also forwarded to it.
+   * Throws when the overlay could not be shown.
+   */
   async show(options: { page: Page; cursorOptions?: GhostCursorClientOptions }): Promise<void> {
-    try {
-      const { page, cursorOptions } = options
-      await enableGhostCursor({ page, cursorOptions })
-    } catch {
-      // Non-fatal — page may be closing or navigating.
-    }
+    const { page, cursorOptions } = options
+    await enableGhostCursor({ page, cursorOptions })
+    if (this.forwarders.has(page)) return
+
+    // Forwarding is queued per page and never awaited by the action: the overlay is
+    // cosmetic and must not slow or fail the click it illustrates. Trajectories recorded
+    // with `recordPath` are not forwarded sample by sample — the human-mouse driver hands
+    // the whole path to the overlay in one call (`playGhostCursorPath`).
+    let queue: Promise<void> = Promise.resolve()
+    const unsubscribe = pointerTrackFor(page).onRecord((sample, origin) => {
+      if (origin === 'path') return
+      const event = { type: sample.kind, x: sample.x, y: sample.y, button: sample.button ?? 'none' } as const
+      queue = queue
+        .then(() => applyGhostCursorMouseAction({ page, event }))
+        .catch((error) => {
+          if (!page.isClosed()) this.logger.error('[playwriter] Failed to forward a mouse action to the ghost cursor', error)
+        })
+    })
+    this.forwarders.set(page, unsubscribe)
   }
 
+  /** Stop forwarding and remove the live cursor from the page. */
   async hide(options: { page: Page }): Promise<void> {
-    try {
-      const { page } = options
-      await disableGhostCursor({ page })
-    } catch {
-      // Non-fatal — page may be closing or navigating.
-    }
+    const { page } = options
+    this.forwarders.get(page)?.()
+    this.forwarders.delete(page)
+    await disableGhostCursor({ page })
   }
 }

@@ -1,6 +1,7 @@
 import { parse } from '@babel/parser'
 import type { ICDPSession } from './cdp-session.js'
 import type { Protocol } from 'devtools-protocol'
+import { debuggerDomainFor, type DebuggerDomain, type PauseLease } from './cdp-domains.js'
 
 export interface BreakpointInfo {
   id: string
@@ -653,11 +654,18 @@ export function verifyNonPausingCondition(condition: string): NonPausingCheck {
  */
 export class Debugger {
   private cdp: ICDPSession
-  private debuggerEnabled = false
+  /** The session's one Debugger owner: scripts, enable-once, the skip-all-pauses policy. */
+  private domain: DebuggerDomain
   private paused = false
   private currentCallFrames: Protocol.Debugger.CallFrame[] = []
   private breakpoints = new Map<string, BreakpointInfo>()
-  private scripts = new Map<string, ScriptInfo>()
+  /**
+   * The pause leases this instance holds, keyed by what needs to pause:
+   * `bp:<breakpointId>`, `xhr:<url>`, `exceptions`. While any is held the page's
+   * `debugger;` statements and breakpoints pause; when the last is released pauses are
+   * skipped again.
+   */
+  private pauseLeases = new Map<string, Promise<PauseLease>>()
   private xhrBreakpoints = new Set<string>()
   private blackboxPatterns: string[] = []
   // Depth counter (not a boolean) so nested `runNonPausingOnly` calls compose.
@@ -679,6 +687,7 @@ export class Debugger {
    */
   constructor({ cdp }: { cdp: ICDPSession }) {
     this.cdp = cdp
+    this.domain = debuggerDomainFor(cdp)
     this.setupEventListeners()
   }
 
@@ -692,65 +701,60 @@ export class Debugger {
       this.paused = false
       this.currentCallFrames = []
     })
+  }
 
-    this.cdp.on('Debugger.scriptParsed', (params) => {
-      if (params.url && !params.url.startsWith('chrome') && !params.url.startsWith('devtools')) {
-        this.scripts.set(params.scriptId, {
-          scriptId: params.scriptId,
-          url: params.url,
-        })
+  /** Scripts with a real URL (not Chrome/DevTools internals), in parse order. */
+  private knownScripts(): ScriptInfo[] {
+    const out: ScriptInfo[] = []
+    for (const script of this.domain.scripts.values()) {
+      if (script.url && !script.url.startsWith('chrome') && !script.url.startsWith('devtools')) {
+        out.push({ scriptId: script.scriptId, url: script.url })
       }
+    }
+    return out
+  }
+
+  /** Hold a pause lease under `key` (shared if already held), so the page may pause for it. */
+  private holdPauses(key: string, reason: string): Promise<PauseLease> {
+    const held = this.pauseLeases.get(key)
+    if (held) return held
+    const acquiring = this.domain.allowPauses(reason)
+    this.pauseLeases.set(key, acquiring)
+    acquiring.catch(() => {
+      if (this.pauseLeases.get(key) === acquiring) this.pauseLeases.delete(key)
     })
+    return acquiring
+  }
+
+  private async releasePauses(key: string): Promise<void> {
+    const held = this.pauseLeases.get(key)
+    if (!held) return
+    this.pauseLeases.delete(key)
+    await (await held).release()
   }
 
   /**
-   * Enables the Debugger domain. Called automatically by other methods. Also resumes
-   * execution if the target was started with --inspect-brk.
+   * Enables the Debugger domain through the session's one owner (`cdp-domains.ts`).
+   * Called automatically by other methods. Also resumes execution if the target was
+   * started with --inspect-brk.
    *
-   * It does NOT touch the Runtime domain, and that omission is load-bearing.
+   * The session is usually Playwright's OWN page session, shared with everything else
+   * in the process, so the domain is enabled once and NEVER disabled (a
+   * `Debugger.disable` would drop every other user's breakpoints), and page pauses stay
+   * skipped until this or another Debugger arms something that is meant to pause
+   * (`setBreakpoint` without a provably non-pausing condition, `setPauseOnExceptions`,
+   * `setXHRBreakpoint`, `pauseOnDebuggerStatements`). Removing the last of those skips
+   * pauses again.
    *
-   * This session is usually Playwright's OWN page session (`getExistingCDPSession`),
-   * shared with everything else in the process. Measured against real Chromium, a
-   * `Runtime.disable` followed by `Runtime.enable` makes V8 REPLAY its entire console
-   * buffer: every line the page had already logged is delivered a second time, plus
-   * Playwright's internal `--playwright--set--content--…` markers, and it happens again
-   * on every subsequent cycle. Downstream that is not cosmetic — `readLogpoints` scans
-   * the same log array, so a replayed `[[logpoint:TAG]]` line is counted as a fresh hit
-   * and "this code path ran once" reads as "it ran twice".
-   *
-   * Nothing here needed those two calls. Measured, with only `Debugger.enable` sent:
-   * `Debugger.scriptParsed` arrives for every already-parsed script (that is what
-   * repopulates `this.scripts`, and it is `Debugger.disable`/`enable` — not Runtime —
-   * that re-emits them); `Runtime.evaluate`, `Runtime.getProperties` and
-   * `Runtime.globalLexicalScopeNames` all answer without `Runtime.enable`; breakpoints
-   * bind and `Debugger.paused` fires. Playwright's own `page.evaluate` and console
-   * capture keep working throughout, with zero replayed lines.
+   * It does NOT touch the Runtime domain, and that omission is load-bearing: measured
+   * against real Chromium, a `Runtime.disable` followed by `Runtime.enable` makes V8
+   * REPLAY its entire console buffer, so a replayed `[[logpoint:TAG]]` line would be
+   * counted by `readLogpoints` as a fresh hit. `Runtime.evaluate`,
+   * `Runtime.getProperties` and `Runtime.globalLexicalScopeNames` all answer without
+   * `Runtime.enable`.
    */
   async enable(): Promise<void> {
-    if (this.debuggerEnabled) {
-      return
-    }
-    await this.cdp.send('Debugger.disable')
-    this.scripts.clear()
-    const scriptsReady = new Promise<void>((resolve) => {
-      let timeout: ReturnType<typeof setTimeout>
-      const listener = () => {
-        clearTimeout(timeout)
-        timeout = setTimeout(() => {
-          this.cdp.off('Debugger.scriptParsed', listener)
-          resolve()
-        }, 100)
-      }
-      this.cdp.on('Debugger.scriptParsed', listener)
-      timeout = setTimeout(() => {
-        this.cdp.off('Debugger.scriptParsed', listener)
-        resolve()
-      }, 100)
-    })
-    await this.cdp.send('Debugger.enable')
-    await this.cdp.send('Runtime.runIfWaitingForDebugger')
-    await scriptsReady
-    this.debuggerEnabled = true
+    await this.domain.enable()
   }
 
   /**
@@ -810,17 +814,27 @@ export class Debugger {
       )
     }
 
-    const response = await this.cdp.send('Debugger.setBreakpointByUrl', {
-      lineNumber: line - 1,
-      urlRegex: buildBreakpointUrlRegex(file),
-      columnNumber: 0,
-      condition,
-    })
+    // A pausing breakpoint needs pauses allowed BEFORE it exists, or its first hit is
+    // skipped; the lease is filed under the breakpoint id once there is one.
+    const lease = check.nonPausing ? null : await this.domain.allowPauses(`breakpoint ${file}:${line}`)
+    let response: Protocol.Debugger.SetBreakpointByUrlResponse
+    try {
+      response = await this.cdp.send('Debugger.setBreakpointByUrl', {
+        lineNumber: line - 1,
+        urlRegex: buildBreakpointUrlRegex(file),
+        columnNumber: 0,
+        condition,
+      })
+    } catch (error) {
+      await lease?.release()
+      throw error
+    }
+    if (lease) this.pauseLeases.set(`bp:${response.breakpointId}`, Promise.resolve(lease))
 
     const locations = response.locations ?? []
     const resolvedLocations = locations.map((location) => ({
       scriptId: location.scriptId,
-      url: this.scripts.get(location.scriptId)?.url ?? '',
+      url: this.domain.scripts.get(location.scriptId)?.url ?? '',
       lineNumber: location.lineNumber,
       ...(location.columnNumber != null ? { columnNumber: location.columnNumber } : {}),
     }))
@@ -830,7 +844,8 @@ export class Debugger {
       // Remove the phantom: leaving it registered would let `listBreakpoints()` show a
       // breakpoint that can never fire.
       await this.cdp.send('Debugger.removeBreakpoint', { breakpointId: response.breakpointId }).catch(() => {})
-      const known = Array.from(this.scripts.values()).map((s) => s.url)
+      await this.releasePauses(`bp:${response.breakpointId}`)
+      const known = this.knownScripts().map((s) => s.url)
       const near = known.filter((url) => url.includes(file) || file.includes(url)).slice(0, 5)
       throw new Error(
         `Debugger.setBreakpointByUrl returned an id for ${file}:${line} but bound it to NO location, so it can never ` +
@@ -923,6 +938,7 @@ export class Debugger {
     await this.enable()
     await this.cdp.send('Debugger.removeBreakpoint', { breakpointId })
     this.breakpoints.delete(breakpointId)
+    await this.releasePauses(`bp:${breakpointId}`)
   }
 
   /**
@@ -1334,7 +1350,52 @@ export class Debugger {
           `callbacks on resume (measured: a 900ms pause inverts a timer-vs-network ordering 10 runs out of 10 — see runNonPausingOnly).`,
       )
     }
-    await this.cdp.send('Debugger.setPauseOnExceptions', { state })
+    if (state === 'none') {
+      await this.cdp.send('Debugger.setPauseOnExceptions', { state })
+      await this.releasePauses('exceptions')
+      return
+    }
+    const alreadyHeld = this.pauseLeases.has('exceptions')
+    await this.holdPauses('exceptions', `pause on ${state} exceptions`)
+    try {
+      await this.cdp.send('Debugger.setPauseOnExceptions', { state })
+    } catch (error) {
+      if (!alreadyHeld) await this.releasePauses('exceptions')
+      throw error
+    }
+  }
+
+  /**
+   * Lets the page's own `debugger;` statements pause it (`enabled: true`) or makes them
+   * harmless again (`false`, the default state).
+   *
+   * Enabling the Debugger domain alone would make every `debugger;` in the page freeze it
+   * with nobody there to resume, so pauses are skipped until a caller asks for one. This
+   * is that request for `debugger;` statements; breakpoints, `setPauseOnExceptions` and
+   * `setXHRBreakpoint` make their own.
+   *
+   * @example
+   * ```ts
+   * await dbg.pauseOnDebuggerStatements({ enabled: true })
+   * // trigger the code with the `debugger;` statement, inspect, then:
+   * await dbg.resume()
+   * await dbg.pauseOnDebuggerStatements({ enabled: false })
+   * ```
+   */
+  async pauseOnDebuggerStatements({ enabled }: { enabled: boolean }): Promise<void> {
+    await this.enable()
+    if (!enabled) {
+      await this.releasePauses('debugger-statements')
+      return
+    }
+    if (this.nonPausingOnlyDepth > 0) {
+      throw new Error(
+        `refusing pauseOnDebuggerStatements({ enabled: true }) while non-pausing-only mode is active` +
+          `${this.nonPausingOnlyReason ? ` (${this.nonPausingOnlyReason})` : ''}: a pause reorders async callbacks on resume ` +
+          `(see runNonPausingOnly).`,
+      )
+    }
+    await this.holdPauses('debugger-statements', 'pause on debugger; statements')
   }
 
   /**
@@ -1358,7 +1419,7 @@ export class Debugger {
    */
   async listScripts({ search }: { search?: string } = {}): Promise<ScriptInfo[]> {
     await this.enable()
-    const scripts = Array.from(this.scripts.values())
+    const scripts = this.knownScripts()
     const filtered = search ? scripts.filter((s) => s.url.toLowerCase().includes(search.toLowerCase())) : scripts
     return filtered.slice(0, 20)
   }
@@ -1371,7 +1432,15 @@ export class Debugger {
           `${this.nonPausingOnlyReason ? ` (${this.nonPausingOnlyReason})` : ''}: it pauses on the request, which is exactly the ordering under test.`,
       )
     }
-    await this.cdp.send('DOMDebugger.setXHRBreakpoint', { url })
+    const key = `xhr:${url}`
+    const alreadyHeld = this.pauseLeases.has(key)
+    await this.holdPauses(key, `XHR breakpoint ${url}`)
+    try {
+      await this.cdp.send('DOMDebugger.setXHRBreakpoint', { url })
+    } catch (error) {
+      if (!alreadyHeld) await this.releasePauses(key)
+      throw error
+    }
     this.xhrBreakpoints.add(url)
   }
 
@@ -1379,6 +1448,7 @@ export class Debugger {
     await this.enable()
     await this.cdp.send('DOMDebugger.removeXHRBreakpoint', { url })
     this.xhrBreakpoints.delete(url)
+    await this.releasePauses(`xhr:${url}`)
   }
 
   listXHRBreakpoints(): string[] {
@@ -1528,21 +1598,8 @@ export class Debugger {
    */
   async getScriptSourceByUrl({ url }: { url: string }): Promise<{ url: string; scriptId: string; source: string } | null> {
     await this.enable()
-    let match: ScriptInfo | undefined
-    for (const s of this.scripts.values()) {
-      if (s.url === url) {
-        match = s
-        break
-      }
-    }
-    if (!match) {
-      for (const s of this.scripts.values()) {
-        if (s.url.includes(url) || url.includes(s.url)) {
-          match = s
-          break
-        }
-      }
-    }
+    const scripts = this.knownScripts()
+    const match = scripts.find((s) => s.url === url) ?? scripts.find((s) => s.url.includes(url) || url.includes(s.url))
     if (!match) return null
     try {
       const { scriptSource } = await this.cdp.send('Debugger.getScriptSource', { scriptId: match.scriptId })

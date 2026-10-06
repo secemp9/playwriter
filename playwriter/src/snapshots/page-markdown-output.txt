@@ -1,8 +1,11 @@
 Console output:
-[log] # Test Article Title
+[log] source: visible page — 40 words (no article: Readability does not judge the visible page to be an article)
+
+# Test Article Title
 
 Home About
-Test Article Title
+
+# Test Article Title
 
 This is the first paragraph of the article content.
 
@@ -10,7 +13,9 @@ This is the second paragraph with more details about the topic.
 
 The article continues with important information here.
 
-Related Posts
-Post 1
-Post 2
+### Related Posts
+
+- Post 1
+- Post 2
+
 Copyright 2024

@@ -35,7 +35,7 @@ import {
   type FixtureLayout,
   type FixtureNode,
 } from './capture-snapshot-fixture.js'
-import { computeElementPath, resolveElementNode } from './styles.js'
+import { computeElementPath } from './element-resolve.js'
 
 const VISIBLE_BLOCK: Record<string, string> = {
   display: 'block',
@@ -1124,7 +1124,7 @@ describe('PAGE_MODEL_COMPUTED_STYLES', () => {
 })
 
 // ---------------------------------------------------------------------------
-// styles.ts — element identity (the old code resolved by screen point)
+// element-resolve.ts — element identity (the old code resolved by screen point)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1196,39 +1196,14 @@ describe('computeElementPath (page side)', () => {
     })
   })
 
-  it('splits the path at an iframe boundary', () => {
+  it('stops at the element\'s own document: frames are resolved through the owner frame, not the path', () => {
     const target = fakeElement('INPUT')
     const innerHtml = fakeElement('HTML', [fakeElement('BODY', [target])])
     const iframe = fakeElement('IFRAME')
     fakeDocument(innerHtml, iframe)
-    const outerHtml = fakeElement('HTML', [fakeElement('BODY', [fakeElement('NAV'), iframe])])
-    fakeDocument(outerHtml)
+    fakeDocument(fakeElement('HTML', [fakeElement('BODY', [fakeElement('NAV'), iframe])]))
 
-    expect(computeElementPath(target)).toEqual({
-      hops: [
-        { enter: 'document', path: [0, 1] },
-        { enter: 'frame', path: [0, 0] },
-      ],
-      tagName: 'input',
-    })
-  })
-
-  it('reports a cross-origin iframe instead of guessing', () => {
-    const target = fakeElement('INPUT')
-    const html = fakeElement('HTML', [target])
-    const doc: any = {
-      nodeType: 9,
-      children: [html],
-      get defaultView() {
-        return {
-          get frameElement(): any {
-            throw new Error('SecurityError: blocked a frame with origin ... from accessing a cross-origin frame')
-          },
-        }
-      },
-    }
-    setRoot(html, doc)
-    expect(computeElementPath(target).error).toMatch(/cross-origin iframe/)
+    expect(computeElementPath(target)).toEqual({ hops: [{ enter: 'document', path: [0, 0] }], tagName: 'input' })
   })
 
   it('reports a detached element instead of guessing', () => {
@@ -1237,149 +1212,3 @@ describe('computeElementPath (page side)', () => {
   })
 })
 
-describe('resolveElementNode', () => {
-  /** A CDP node tree mirroring `documentTree` below. */
-  function cdpNode(nodeId: number, nodeName: string, children: any[] = [], extra: any = {}): any {
-    return { nodeId, backendNodeId: nodeId + 1000, nodeName, nodeType: 1, children, ...extra }
-  }
-
-  function stubSession(root: any, calls: string[] = []) {
-    const cdp = {
-      async send(method: string) {
-        calls.push(method)
-        if (method === 'DOM.getDocument') return { root }
-        return {}
-      },
-    } as unknown as ICDPSession
-    return { cdp, calls }
-  }
-
-  function stubLocator(target: any) {
-    return {
-      async elementHandle() {
-        return { async evaluate(fn: any) { return fn(target) } }
-      },
-    } as any
-  }
-
-  it('resolves the element through its own node, not the topmost node at a point', async () => {
-    // Page side: BODY > [HEADER, DIV > [P, SPAN(target)]]
-    const target = fakeElement('SPAN')
-    const div = fakeElement('DIV', [fakeElement('P'), target])
-    const body = fakeElement('BODY', [fakeElement('HEADER'), div])
-    fakeDocument(fakeElement('HTML', [body]))
-
-    const cdpSpan = cdpNode(7, 'SPAN')
-    const cdpRoot = {
-      nodeId: 1,
-      backendNodeId: 1001,
-      nodeName: '#document',
-      nodeType: 9,
-      children: [
-        cdpNode(2, 'HTML', [
-          cdpNode(3, 'BODY', [cdpNode(4, 'HEADER'), cdpNode(5, 'DIV', [cdpNode(6, 'P'), cdpSpan])]),
-        ]),
-      ],
-    }
-    const { cdp, calls } = stubSession(cdpRoot)
-    const resolved = await resolveElementNode({ locator: stubLocator(target), cdp })
-    expect(resolved.nodeId).toBe(7)
-    expect(resolved.backendNodeId).toBe(1007)
-    // getDocument doubles as the priming call CDP requires before it hands out node ids.
-    expect(calls).toContain('DOM.getDocument')
-  })
-
-  it('walks into a shadow root, skipping user-agent shadow roots', async () => {
-    const target = fakeElement('BUTTON')
-    const host = fakeElement('MY-WIDGET')
-    fakeShadowRoot(host, [fakeElement('DIV', [target])])
-    fakeDocument(fakeElement('HTML', [fakeElement('BODY', [host])]))
-
-    const cdpButton = cdpNode(9, 'BUTTON')
-    const cdpHost = cdpNode(4, 'MY-WIDGET', [], {
-      shadowRoots: [
-        { nodeId: 90, backendNodeId: 1090, nodeName: '#document-fragment', nodeType: 11, shadowRootType: 'user-agent', children: [] },
-        {
-          nodeId: 7,
-          backendNodeId: 1007,
-          nodeName: '#document-fragment',
-          nodeType: 11,
-          shadowRootType: 'open',
-          children: [cdpNode(8, 'DIV', [cdpButton])],
-        },
-      ],
-    })
-    const cdpRoot = {
-      nodeId: 1,
-      backendNodeId: 1001,
-      nodeName: '#document',
-      nodeType: 9,
-      children: [cdpNode(2, 'HTML', [cdpNode(3, 'BODY', [cdpHost])])],
-    }
-    const { cdp } = stubSession(cdpRoot)
-    expect((await resolveElementNode({ locator: stubLocator(target), cdp })).nodeId).toBe(9)
-  })
-
-  it('walks into a same-process iframe content document', async () => {
-    const target = fakeElement('INPUT')
-    const iframe = fakeElement('IFRAME')
-    fakeDocument(fakeElement('HTML', [fakeElement('BODY', [target])]), iframe)
-    fakeDocument(fakeElement('HTML', [fakeElement('BODY', [iframe])]))
-
-    const cdpInput = cdpNode(9, 'INPUT')
-    const cdpIframe = cdpNode(4, 'IFRAME', [], {
-      contentDocument: {
-        nodeId: 5,
-        backendNodeId: 1005,
-        nodeName: '#document',
-        nodeType: 9,
-        children: [cdpNode(6, 'HTML', [cdpNode(7, 'BODY', [cdpInput])])],
-      },
-    })
-    const cdpRoot = {
-      nodeId: 1,
-      backendNodeId: 1001,
-      nodeName: '#document',
-      nodeType: 9,
-      children: [cdpNode(2, 'HTML', [cdpNode(3, 'BODY', [cdpIframe])])],
-    }
-    const { cdp } = stubSession(cdpRoot)
-    expect((await resolveElementNode({ locator: stubLocator(target), cdp })).nodeId).toBe(9)
-  })
-
-  it('fails loudly when the resolved node is not the target (DOM changed under us)', async () => {
-    const target = fakeElement('SPAN')
-    fakeDocument(fakeElement('HTML', [fakeElement('BODY', [target])]))
-    // The CDP tree says that position holds a <b>, not the <span> the page reported.
-    const cdpRoot = {
-      nodeId: 1,
-      backendNodeId: 1001,
-      nodeName: '#document',
-      nodeType: 9,
-      children: [cdpNode(2, 'HTML', [cdpNode(3, 'BODY', [cdpNode(4, 'B')])])],
-    }
-    const { cdp } = stubSession(cdpRoot)
-    await expect(resolveElementNode({ locator: stubLocator(target), cdp })).rejects.toThrow(
-      /resolved to <b> but the locator points at <span>/,
-    )
-  })
-
-  it('fails loudly for a cross-origin iframe rather than resolving a wrong node', async () => {
-    const target = fakeElement('INPUT')
-    const html = fakeElement('HTML', [target])
-    const doc: any = {
-      nodeType: 9,
-      children: [html],
-      get defaultView() {
-        return {
-          get frameElement(): any {
-            throw new Error('SecurityError')
-          },
-        }
-      },
-    }
-    setRoot(html, doc)
-    const { cdp } = stubSession({ nodeId: 1, nodeName: '#document', nodeType: 9, children: [] })
-    await expect(resolveElementNode({ locator: stubLocator(target), cdp })).rejects.toThrow(/cross-origin iframe/)
-  })
-})

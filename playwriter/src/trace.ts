@@ -23,7 +23,9 @@
  * every cap / truncation / dropped record is named in the returned value.
  */
 
-import type { Page, Locator, ElementHandle } from '@xmorse/playwright-core'
+import type { Page, Locator, ElementHandle, Frame, Route } from '@xmorse/playwright-core'
+import type { Protocol } from 'devtools-protocol'
+import { getCDPSessionForPage } from './cdp-session.js'
 import type { ICDPSession } from './cdp-session.js'
 import type { Debugger } from './debugger.js'
 import type { ModuleGraph } from './module-graph.js'
@@ -32,6 +34,9 @@ import type { TraceHop, Loc, Hazard, BlockedReason } from './static-analysis.js'
 import { backwardSlice, isPureFunctionSource, parseModule } from './static-analysis.js'
 import type { PageModelHandle } from './page-model.js'
 import { getReactComponentInfo, type ReactComponentInfo } from './react-source.js'
+import { REACT_FIBER_READER } from './react-source-location.js'
+import { resolveElement, type ResolvedElement } from './element-resolve.js'
+import { withDeadline } from './isolated-world.js'
 import _traverse from '@babel/traverse'
 import type { NodePath } from '@babel/traverse'
 
@@ -232,8 +237,6 @@ export interface StoreDiscovery {
   /** Where in the fiber tree the store came from, when `via === 'react-fiber'`. */
   path?: string
   componentName?: string | null
-  /** Set when the probe pinned the store on the page so it can be re-read. */
-  pinnedAs?: string
 }
 
 /**
@@ -296,6 +299,176 @@ const STORE_REMEDY =
   "(e.g. storeExpr: 'window.myStore.getState()' or 'document.querySelector(\"#root\")._reactRootContainer…'). " +
   'The probe cannot verdict on a store it never read.'
 
+/** Deadline for each protocol call of the store / fiber identity probes. */
+const TRACE_CDP_TIMEOUT_MS = 10_000
+
+/** CDP's answer when a remote object's document is gone (navigation, reload). */
+const STALE_REMOTE_OBJECT = /Could not find object with given id|Cannot find context with specified id|Execution context was destroyed|Argument should belong to the same JavaScript world/i
+
+function describeRemoteException(details: Protocol.Runtime.ExceptionDetails): string {
+  return details.exception?.description ?? details.text
+}
+
+/** Pass a value CDP returned back into another call, by reference when it is an object. */
+function asCallArgument(object: Protocol.Runtime.RemoteObject): Protocol.Runtime.CallArgument {
+  if (object.objectId) return { objectId: object.objectId }
+  if (object.unserializableValue) return { unserializableValue: object.unserializableValue }
+  return { value: object.value }
+}
+
+/**
+ * Page-side search of the React fiber tree for a `<Provider store>` prop or a context value
+ * exposing `getState()`. `want` (`{ componentName, path }`) re-finds a store found before, so
+ * `(FIBER_STORE_SEARCH)(want).store.getState()` is a reusable `storeExpr`. Reads only.
+ */
+const FIBER_STORE_SEARCH = `function (want) {
+  var doc = globalThis.document
+  if (!doc) return { store: null, note: 'react fiber tree (no document in this context)' }
+  var elements = [doc.documentElement]
+  if (doc.body) {
+    var all = doc.body.querySelectorAll('*')
+    for (var i = 0; i < all.length && elements.length < 400; i++) elements.push(all[i])
+  }
+  var rootFiber = null
+  for (var e = 0; e < elements.length && !rootFiber; e++) {
+    var el = elements[e]
+    var keys = Object.keys(el)
+    for (var k = 0; k < keys.length; k++) {
+      var key = keys[k]
+      if (key.indexOf('__reactContainer$') === 0 || key.indexOf('__reactFiber$') === 0) { rootFiber = el[key]; break }
+      if (key === '_reactRootContainer') { rootFiber = el[key] && el[key]._internalRoot ? el[key]._internalRoot.current : null; break }
+    }
+  }
+  if (!rootFiber) {
+    return { store: null, note: 'react fiber tree (scanned ' + elements.length + ' elements; no __reactFiber$/__reactContainer$ key \\u2014 not React, or a production build that strips them)' }
+  }
+  var top = rootFiber
+  for (var climb = 0; top.return && climb < 10000; climb++) top = top.return
+  function nameOf(f) {
+    var t = f && f.type
+    if (!t) return null
+    if (typeof t === 'function') return t.displayName || t.name || null
+    if (typeof t === 'object') {
+      if (t.displayName) return t.displayName
+      if (t._context && t._context.displayName) return t._context.displayName + '.Provider'
+      if (t.$$typeof) return 'Provider'
+    }
+    return null
+  }
+  var stack = [top]
+  var visited = 0
+  while (stack.length > 0 && visited < 20000) {
+    var f = stack.pop()
+    visited++
+    var props = f && f.memoizedProps
+    if (props && typeof props === 'object') {
+      var name = nameOf(f)
+      var candidates = [['props.store', props.store], ['props.value', props.value], ['props.value.store', props.value && props.value.store]]
+      for (var c = 0; c < candidates.length; c++) {
+        var path = candidates[c][0]
+        var v = candidates[c][1]
+        if (want && (want.path !== path || want.componentName !== name)) continue
+        if (!v || (typeof v !== 'object' && typeof v !== 'function') || typeof v.getState !== 'function') continue
+        var state
+        try {
+          state = v.getState()
+        } catch (err) {
+          continue
+        }
+        if (!state || typeof state !== 'object') continue
+        return { store: v, state: state, componentName: name, path: path }
+      }
+    }
+    if (f && f.child) stack.push(f.child)
+    if (f && f.sibling && f !== top) stack.push(f.sibling)
+  }
+  return { store: null, note: 'react fiber tree (' + visited + ' fibers: no <Provider store>, and no context value exposing getState())' }
+}`
+
+/**
+ * Page-side default discovery: conventional globals probed structurally, then the fiber tree.
+ * Returns `[JSON meta, store, state]` (just `[JSON meta]` when nothing was found); the caller
+ * keeps `store` and `state` by reference in its own object group. Reads only.
+ */
+const STORE_DISCOVERY_FUNCTION = `function (globals) {
+  var search = ${FIBER_STORE_SEARCH}
+  var tried = []
+  for (var i = 0; i < globals.length; i++) {
+    var name = globals[i]
+    tried.push('globalThis.' + name)
+    var s = globalThis[name]
+    if (!s || (typeof s !== 'object' && typeof s !== 'function') || typeof s.getState !== 'function') continue
+    var state
+    try {
+      state = s.getState()
+    } catch (e) {
+      tried.push('globalThis.' + name + '.getState() threw: ' + String((e && e.message) || e))
+      continue
+    }
+    if (!state || typeof state !== 'object') {
+      tried.push('globalThis.' + name + '.getState() returned ' + (state === null ? 'null' : typeof state) + ', not an object')
+      continue
+    }
+    return [JSON.stringify({ found: true, via: 'global', global: name, tried: tried }), s, state]
+  }
+  var hit = search(null)
+  if (!hit.store) {
+    tried.push(hit.note)
+    return [JSON.stringify({ found: false, tried: tried })]
+  }
+  return [JSON.stringify({ found: true, via: 'react-fiber', componentName: hit.componentName, propPath: hit.path, tried: tried }), hit.store, hit.state]
+}`
+
+/** What `STORE_DISCOVERY_FUNCTION` reports about itself (its first slot). */
+type StoreDiscoveryMeta =
+  | { found: false; tried: string[] }
+  | { found: true; via: 'global'; global: string; tried: string[] }
+  | { found: true; via: 'react-fiber'; componentName: string | null; propPath: string; tried: string[] }
+
+/**
+ * `this` = the state; a private object holding its top-level values (at most 200 keys). A
+ * SHALLOW snapshot, not just the root reference: when the reducer mutates in place the root
+ * reference is unchanged, so comparing the object against itself afterwards would hide the
+ * mutation. The copy is reachable only through our object group, never from the page.
+ */
+const SHALLOW_COPY_FUNCTION = `function () {
+  var shallow = Object.create(null)
+  var keys = Object.keys(this)
+  for (var i = 0; i < keys.length && i < 200; i++) shallow[keys[i]] = this[keys[i]]
+  return shallow
+}`
+
+/** `this` = the state captured before the action; compares the state read after it. */
+const STATE_COMPARE_FUNCTION = `function (cur, shallow) {
+  var changed = []
+  var capped = false
+  if (cur && typeof cur === 'object') {
+    var seen = Object.create(null)
+    var keys = Object.keys(cur).concat(Object.keys(shallow))
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i]
+      if (seen[k]) continue
+      seen[k] = true
+      if (cur[k] === shallow[k]) continue
+      if (changed.length >= 50) { capped = true; break }
+      changed.push(k)
+    }
+  }
+  return {
+    same: cur === this,
+    changedKeys: changed,
+    changedKeysCapped: capped,
+    kind: Array.isArray(cur) ? 'array' : cur !== null && typeof cur === 'object' ? 'object' : 'other',
+  }
+}`
+
+interface StateComparison {
+  same: boolean
+  changedKeys: string[]
+  changedKeysCapped: boolean
+  kind: 'object' | 'array' | 'other'
+}
+
 /**
  * Prove (or refute) that an action mutates store state IN PLACE rather than
  * returning a fresh object. Captures the store-state reference, runs `action`,
@@ -303,12 +476,15 @@ const STORE_REMEDY =
  * true` is the fingerprint of a mutating reducer (React bails out of the
  * re-render because the reference did not change).
  *
- * Discovery order: a caller `storeExpr` (eval'd in the page), then a list of
- * conventional globals probed structurally, then the React fiber tree — a
- * `<Provider store={…}>` prop or a context provider whose value exposes
- * `getState`. A fiber-discovered store is pinned as
- * `globalThis.__playwriter_trace_store` so it can be re-read after the action and
- * reused as a `storeExpr` later; that pin is reported in `discovery.pinnedAs`.
+ * Discovery order: a caller `storeExpr` (evaluated in the page through CDP), then a
+ * list of conventional globals probed structurally, then the React fiber tree — a
+ * `<Provider store={…}>` prop or a context provider whose value exposes `getState`.
+ * For a fiber-discovered store, `discovery.expr` is a self-contained expression that
+ * re-finds the same provider, reusable as a `storeExpr`.
+ *
+ * Nothing is written to the page: the captured state, its shallow copy and the store are
+ * held by reference in a CDP object group (released at the end), never in a page global.
+ * A navigation destroys them with the document, which is reported, not compared.
  *
  * When nothing is found the result is `{ measured: false }` and carries no
  * verdict field at all — there is no shape in which a failed probe reads as a
@@ -323,316 +499,169 @@ export async function storeIdentity({
   action: () => Promise<void> | void
   storeExpr?: string
 }): Promise<StoreIdentityResult> {
-  type CaptureOut = {
-    found: boolean
-    via?: StoreDiscoveryVia
-    expr?: string
-    path?: string
-    componentName?: string | null
-    kind?: 'object' | 'array' | 'other'
-    tried: string[]
-    error?: string
-    errorKind?: 'eval-blocked-by-csp' | 'expr-threw' | 'not-an-object'
-    pinnedAs?: string
-  }
-
-  let capture: CaptureOut
-  try {
-    capture = await page.evaluate(
-      (arg: { expr: string | null; globals: string[] }): CaptureOut => {
-        const g = globalThis as any
-        const tried: string[] = []
-
-        const kindOf = (v: unknown): 'object' | 'array' | 'other' =>
-          Array.isArray(v) ? 'array' : v !== null && typeof v === 'object' ? 'object' : 'other'
-
-        const remember = (state: unknown, mode: 'expr' | 'store', payload: { expr?: string; store?: any }) => {
-          // A SHALLOW snapshot of the top-level values, not just the root
-          // reference: when the reducer mutates in place the root reference is
-          // unchanged, so comparing the object against itself afterwards would
-          // report "nothing changed" and hide the mutation. Holding the old
-          // top-level values is what makes the mutation provable.
-          const shallow: Record<string, unknown> = {}
-          if (state && typeof state === 'object') {
-            for (const k of Object.keys(state as object).slice(0, 200)) shallow[k] = (state as any)[k]
-          }
-          g.__playwriter_trace_probe = { prev: state, prevShallow: shallow, mode, expr: payload.expr, store: payload.store }
-        }
-
-        // --- 1. caller-supplied expression -------------------------------------
-        if (arg.expr) {
-          tried.push(`storeExpr: ${arg.expr}`)
-          let state: unknown
-          try {
-            state = g.Function('return (' + arg.expr + ')')()
-          } catch (e: any) {
-            const msg = String((e && e.message) || e)
-            const csp = /unsafe-eval|Content Security Policy|EvalError/i.test(msg) || (typeof EvalError === 'function' && e instanceof EvalError)
-            return {
-              found: false,
-              tried,
-              error: `storeExpr \`${arg.expr}\` threw in the page: ${msg}`,
-              errorKind: csp ? 'eval-blocked-by-csp' : 'expr-threw',
-            }
-          }
-          const kind = kindOf(state)
-          if (kind === 'other') {
-            return {
-              found: false,
-              tried,
-              error: `storeExpr \`${arg.expr}\` returned ${state === null ? 'null' : typeof state}, not an object — it must RETURN the state object`,
-              errorKind: 'not-an-object',
-            }
-          }
-          remember(state, 'expr', { expr: arg.expr })
-          return { found: true, via: 'caller-storeExpr', expr: arg.expr, kind, tried }
-        }
-
-        // --- 2. conventional globals (no eval: CSP-proof) ----------------------
-        for (const name of arg.globals) {
-          tried.push(`globalThis.${name}`)
-          const s = g[name]
-          if (s && (typeof s === 'object' || typeof s === 'function') && typeof s.getState === 'function') {
-            let state: unknown
-            try {
-              state = s.getState()
-            } catch (e: any) {
-              tried.push(`globalThis.${name}.getState() threw: ${String((e && e.message) || e)}`)
-              continue
-            }
-            const kind = kindOf(state)
-            if (kind === 'other') {
-              tried.push(`globalThis.${name}.getState() returned ${typeof state}, not an object`)
-              continue
-            }
-            remember(state, 'store', { store: s })
-            return { found: true, via: 'global', expr: `globalThis.${name}.getState()`, kind, tried }
-          }
-        }
-
-        // --- 3. the React fiber tree -------------------------------------------
-        const doc = g.document
-        if (!doc) {
-          return { found: false, tried, error: 'no document in this context', errorKind: 'expr-threw' }
-        }
-        const elements: any[] = [doc.documentElement]
-        if (doc.body) {
-          const all = doc.body.querySelectorAll('*')
-          for (let i = 0; i < all.length && elements.length < 400; i++) elements.push(all[i])
-        }
-        let rootFiber: any = null
-        for (const el of elements) {
-          for (const key of Object.keys(el)) {
-            if (key.startsWith('__reactContainer$') || key.startsWith('__reactFiber$')) {
-              rootFiber = el[key]
-              break
-            }
-            if (key === '_reactRootContainer') {
-              rootFiber = el[key] && el[key]._internalRoot ? el[key]._internalRoot.current : null
-              break
-            }
-          }
-          if (rootFiber) break
-        }
-        if (!rootFiber) {
-          tried.push(`react fiber tree (scanned ${elements.length} elements; no __reactFiber$/__reactContainer$ key — not React, or a production build that strips them)`)
-          return { found: false, tried, errorKind: undefined }
-        }
-
-        let top = rootFiber
-        let climb = 0
-        while (top.return && climb++ < 10000) top = top.return
-
-        const nameOf = (f: any): string | null => {
-          const t = f && f.type
-          if (!t) return null
-          if (typeof t === 'function') return t.displayName || t.name || null
-          if (typeof t === 'object') {
-            if (t.displayName) return t.displayName
-            if (t._context && t._context.displayName) return `${t._context.displayName}.Provider`
-            if (t.$$typeof) return 'Provider'
-          }
-          return null
-        }
-
-        const stack: any[] = [top]
-        let visited = 0
-        while (stack.length > 0 && visited < 20000) {
-          const f = stack.pop()
-          visited++
-          const props = f && f.memoizedProps
-          if (props && typeof props === 'object') {
-            const candidates: Array<[string, any]> = [
-              ['props.store', (props as any).store],
-              ['props.value', (props as any).value],
-              ['props.value.store', (props as any).value && (props as any).value.store],
-            ]
-            for (const [path, v] of candidates) {
-              if (v && (typeof v === 'object' || typeof v === 'function') && typeof v.getState === 'function') {
-                let state: unknown
-                try {
-                  state = v.getState()
-                } catch {
-                  continue
-                }
-                const kind = kindOf(state)
-                if (kind === 'other') continue
-                g.__playwriter_trace_store = v
-                remember(state, 'store', { store: v })
-                return {
-                  found: true,
-                  via: 'react-fiber',
-                  expr: 'globalThis.__playwriter_trace_store.getState()',
-                  path: `<${nameOf(f) ?? '?'}>.${path}`,
-                  componentName: nameOf(f),
-                  kind,
-                  tried,
-                  pinnedAs: 'globalThis.__playwriter_trace_store',
-                }
-              }
-            }
-          }
-          if (f && f.child) stack.push(f.child)
-          if (f && f.sibling && f !== top) stack.push(f.sibling)
-        }
-        tried.push(`react fiber tree (${visited} fibers: no <Provider store>, and no context value exposing getState())`)
-        return { found: false, tried }
-      },
-      { expr: storeExpr ?? null, globals: STORE_GLOBAL_CANDIDATES },
-    )
-  } catch (e) {
-    return {
-      measured: false,
-      reason: 'page-error',
-      tried: [storeExpr ? `storeExpr: ${storeExpr}` : 'default discovery'],
-      detail: `capturing the store threw in the page: ${(e as Error).message}`,
-      remedy: STORE_REMEDY,
-      actionRan: false,
-    }
-  }
-
-  if (!capture.found) {
-    const reason: StoreIdentityFailure =
-      capture.errorKind === 'eval-blocked-by-csp'
-        ? 'eval-blocked-by-csp'
-        : capture.errorKind === 'expr-threw'
-          ? 'expr-threw'
-          : capture.errorKind === 'not-an-object'
-            ? 'not-an-object'
-            : 'store-not-found'
-    return {
-      measured: false,
-      reason,
-      tried: capture.tried,
-      detail:
-        capture.error ??
-        'no store was found: none of the conventional globals exposed getState(), and no fiber carried a store prop or a context value with getState()',
-      remedy:
-        reason === 'eval-blocked-by-csp'
-          ? `the page's CSP blocks the Function constructor, so a string \`storeExpr\` cannot be evaluated in-page. Expose the store on a global (window.__STORE__ = store) or relax CSP for the debug session. ${STORE_REMEDY}`
+  const cdp = await getCDPSessionForPage({ page })
+  const objectGroup = `playwriter-store-identity-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const tried: string[] = []
+  const unmeasured = (reason: StoreIdentityFailure, detail: string, actionRan: boolean): StoreIdentityUnmeasured => ({
+    measured: false,
+    reason,
+    tried,
+    detail,
+    remedy:
+      reason === 'eval-blocked-by-csp'
+        ? `the page's CSP blocked evaluating \`storeExpr\`. Expose the store on a global (window.__STORE__ = store) or relax CSP for the debug session. ${STORE_REMEDY}`
+        : reason === 'store-vanished'
+          ? `re-run with an action that does not navigate, or capture across the navigation with two explicit calls. ${STORE_REMEDY}`
           : STORE_REMEDY,
-      actionRan: false,
-    }
-  }
-
-  await action()
-
-  type RecaptureOut =
-    | { ok: true; same: boolean; changedKeys: string[]; changedKeysCapped: boolean; kind: 'object' | 'array' | 'other' }
-    | { ok: false; reason: 'probe-state-lost' | 'recapture-threw'; error?: string }
-
-  let recapture: RecaptureOut
+    actionRan,
+  })
   try {
-    recapture = await page.evaluate((): RecaptureOut => {
-      const g = globalThis as any
-      const p = g.__playwriter_trace_probe
-      if (!p) return { ok: false, reason: 'probe-state-lost' }
-      let cur: unknown
-      try {
-        cur = p.mode === 'store' ? p.store.getState() : g.Function('return (' + p.expr + ')')()
-      } catch (e: any) {
-        delete g.__playwriter_trace_probe
-        return { ok: false, reason: 'recapture-threw', error: String((e && e.message) || e) }
-      }
-      const prev = p.prev
-      const prevShallow = p.prevShallow || {}
-      const same = cur === prev
-      const changedKeys: string[] = []
-      let capped = false
-      if (cur && typeof cur === 'object') {
-        const keys = new Set<string>([...Object.keys(cur as object), ...Object.keys(prevShallow)])
-        for (const k of keys) {
-          if ((cur as any)[k] !== prevShallow[k]) {
-            if (changedKeys.length >= 50) {
-              capped = true
-              break
-            }
-            changedKeys.push(k)
-          }
+    let discovery: StoreDiscovery
+    let stateId: string
+    let reread: () => Promise<Protocol.Runtime.EvaluateResponse | Protocol.Runtime.CallFunctionOnResponse>
+    try {
+      if (storeExpr) {
+        tried.push(`storeExpr: ${storeExpr}`)
+        const evaluate = () =>
+          withDeadline(
+            cdp.send('Runtime.evaluate', { expression: `(${storeExpr}\n)`, objectGroup }),
+            TRACE_CDP_TIMEOUT_MS,
+            `evaluating storeExpr \`${storeExpr}\``,
+          )
+        const evaluated = await evaluate()
+        if (evaluated.exceptionDetails) {
+          const message = describeRemoteException(evaluated.exceptionDetails)
+          const csp = /unsafe-eval|Content Security Policy|EvalError/i.test(message)
+          return unmeasured(csp ? 'eval-blocked-by-csp' : 'expr-threw', `storeExpr \`${storeExpr}\` threw in the page: ${message}`, false)
         }
+        if (!evaluated.result.objectId) {
+          const got = evaluated.result.subtype === 'null' ? 'null' : evaluated.result.type
+          return unmeasured('not-an-object', `storeExpr \`${storeExpr}\` returned ${got}, not an object — it must RETURN the state object`, false)
+        }
+        stateId = evaluated.result.objectId
+        discovery = { via: 'caller-storeExpr', expr: storeExpr, componentName: null }
+        reread = evaluate
+      } else {
+        const found = await withDeadline(
+          cdp.send('Runtime.evaluate', {
+            expression: `(${STORE_DISCOVERY_FUNCTION})(${JSON.stringify(STORE_GLOBAL_CANDIDATES)})`,
+            objectGroup,
+          }),
+          TRACE_CDP_TIMEOUT_MS,
+          'looking for a store in the page',
+        )
+        if (found.exceptionDetails) throw new Error(describeRemoteException(found.exceptionDetails))
+        if (!found.result.objectId) throw new Error('the store discovery returned no result')
+        const slots = await withDeadline(
+          cdp.send('Runtime.getProperties', { objectId: found.result.objectId, ownProperties: true }),
+          TRACE_CDP_TIMEOUT_MS,
+          'reading the store discovery result',
+        )
+        const slot = (index: number) => slots.result.find((property) => property.name === String(index))?.value
+        const meta: StoreDiscoveryMeta = JSON.parse(String(slot(0)?.value))
+        tried.push(...meta.tried)
+        if (!meta.found) {
+          return unmeasured(
+            'store-not-found',
+            'no store was found: none of the conventional globals exposed getState(), and no fiber carried a store prop or a context value with getState()',
+            false,
+          )
+        }
+        const storeId = slot(1)?.objectId
+        const capturedStateId = slot(2)?.objectId
+        if (!storeId || !capturedStateId) throw new Error('the store discovery result lost its store or state')
+        stateId = capturedStateId
+        discovery =
+          meta.via === 'global'
+            ? { via: 'global', expr: `globalThis.${meta.global}.getState()`, componentName: null }
+            : {
+                via: 'react-fiber',
+                expr: `(${FIBER_STORE_SEARCH})(${JSON.stringify({ componentName: meta.componentName, path: meta.propPath })}).store.getState()`,
+                path: `<${meta.componentName ?? '?'}>.${meta.propPath}`,
+                componentName: meta.componentName,
+              }
+        reread = () =>
+          withDeadline(
+            cdp.send('Runtime.callFunctionOn', { objectId: storeId, functionDeclaration: 'function () { return this.getState() }', objectGroup }),
+            TRACE_CDP_TIMEOUT_MS,
+            're-reading the store state',
+          )
       }
-      // Never retain page state past the measurement.
-      delete g.__playwriter_trace_probe
-      return {
-        ok: true,
-        same,
-        changedKeys,
-        changedKeysCapped: capped,
-        kind: Array.isArray(cur) ? 'array' : cur !== null && typeof cur === 'object' ? 'object' : 'other',
+    } catch (e) {
+      return unmeasured('page-error', `capturing the store threw in the page: ${e instanceof Error ? e.message : String(e)}`, false)
+    }
+
+    let shallowId: string
+    try {
+      const shallow = await withDeadline(
+        cdp.send('Runtime.callFunctionOn', { objectId: stateId, functionDeclaration: SHALLOW_COPY_FUNCTION, objectGroup }),
+        TRACE_CDP_TIMEOUT_MS,
+        'copying the top-level state values',
+      )
+      if (shallow.exceptionDetails) throw new Error(describeRemoteException(shallow.exceptionDetails))
+      if (!shallow.result.objectId) throw new Error('the shallow copy came back empty')
+      shallowId = shallow.result.objectId
+    } catch (e) {
+      return unmeasured('page-error', `capturing the store threw in the page: ${e instanceof Error ? e.message : String(e)}`, false)
+    }
+
+    await action()
+
+    let compared: StateComparison
+    try {
+      const current = await reread()
+      if (current.exceptionDetails) {
+        return unmeasured('store-vanished', `re-reading the store threw: ${describeRemoteException(current.exceptionDetails)}`, true)
       }
-    })
-  } catch (e) {
-    return {
-      measured: false,
-      reason: 'page-error',
-      tried: capture.tried,
-      detail: `re-reading the store after the action threw in the page: ${(e as Error).message}`,
-      remedy: STORE_REMEDY,
-      actionRan: true,
+      const call = await withDeadline(
+        cdp.send('Runtime.callFunctionOn', {
+          objectId: stateId,
+          functionDeclaration: STATE_COMPARE_FUNCTION,
+          arguments: [asCallArgument(current.result), { objectId: shallowId }],
+          returnByValue: true,
+          objectGroup,
+        }),
+        TRACE_CDP_TIMEOUT_MS,
+        'comparing the state before and after the action',
+      )
+      if (call.exceptionDetails) throw new Error(describeRemoteException(call.exceptionDetails))
+      compared = call.result.value
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      if (STALE_REMOTE_OBJECT.test(message)) {
+        return unmeasured(
+          'store-vanished',
+          'the captured reference was gone after the action — the page navigated or reloaded, so the two captures cannot be compared',
+          true,
+        )
+      }
+      return unmeasured('page-error', `re-reading the store after the action threw in the page: ${message}`, true)
     }
-  }
 
-  if (!recapture.ok) {
+    const same = compared.same
     return {
-      measured: false,
-      reason: 'store-vanished',
-      tried: capture.tried,
-      detail:
-        recapture.reason === 'probe-state-lost'
-          ? 'the captured reference was gone after the action — the page navigated or reloaded, so the two captures cannot be compared'
-          : `re-reading the store threw: ${recapture.error}`,
-      remedy: `re-run with an action that does not navigate, or capture across the navigation with two explicit calls. ${STORE_REMEDY}`,
-      actionRan: true,
+      measured: true,
+      sameReference: same,
+      verdict: same ? 'in-place-mutation' : 'fresh-reference',
+      discovery,
+      changedKeys: compared.changedKeys,
+      changedKeysCapped: compared.changedKeysCapped,
+      stateKind: compared.kind === 'array' ? 'array' : 'object',
+      note: same
+        ? `the SAME state object came back after the action${
+            compared.changedKeys.length
+              ? ` while top-level key(s) ${compared.changedKeys.join(', ')} changed value` +
+                ' — that is an in-place mutation: React sees an unchanged reference and bails out of the re-render'
+              : ' and no top-level value changed either — that is EITHER a nested in-place mutation' +
+                ' (state.items.push(…) leaves both the root and the top-level references untouched) OR an action that did nothing.' +
+                ' Distinguish them by logpointing the nested container, or by re-running with a storeExpr aimed at the nested slice'
+          }`
+        : `a NEW state object came back after the action (top-level keys changed: ${
+            compared.changedKeys.join(', ') || 'none'
+          }) — the reducer is producing fresh references, so a missed re-render lies elsewhere`,
     }
-  }
-
-  const same = recapture.same
-  return {
-    measured: true,
-    sameReference: same,
-    verdict: same ? 'in-place-mutation' : 'fresh-reference',
-    discovery: {
-      via: capture.via!,
-      expr: capture.expr!,
-      path: capture.path,
-      componentName: capture.componentName ?? null,
-      pinnedAs: capture.pinnedAs,
-    },
-    changedKeys: recapture.changedKeys,
-    changedKeysCapped: recapture.changedKeysCapped,
-    stateKind: recapture.kind === 'array' ? 'array' : 'object',
-    note: same
-      ? `the SAME state object came back after the action${
-          recapture.changedKeys.length
-            ? ` while top-level key(s) ${recapture.changedKeys.join(', ')} changed value` +
-              ' — that is an in-place mutation: React sees an unchanged reference and bails out of the re-render'
-            : ' and no top-level value changed either — that is EITHER a nested in-place mutation' +
-              ' (state.items.push(…) leaves both the root and the top-level references untouched) OR an action that did nothing.' +
-              ' Distinguish them by logpointing the nested container, or by re-running with a storeExpr aimed at the nested slice'
-        }`
-      : `a NEW state object came back after the action (top-level keys changed: ${
-          recapture.changedKeys.join(', ') || 'none'
-        }) — the reducer is producing fresh references, so a missed re-render lies elsewhere`,
+  } finally {
+    cdp.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => {})
   }
 }
 
@@ -691,7 +720,7 @@ function describeInterception(e: RegistryEntry): string {
     ` [INTERCEPTED NOTHING: ${seen} request(s) reached the interceptor, 0 matched urlPattern ` +
     `${JSON.stringify(e.info.spec.urlPattern)}` +
     (seen === 0
-      ? ` and none reached it at all — no matching request was issued while it was live`
+      ? ` and none reached it at all — the page issued no request while it was live`
       : `; the pattern is a SUBSTRING of the url (or a RegExp), not a glob`) +
     `. This probe has perturbed nothing, so any timing read while it was live is unperturbed, NOT a clean measurement ` +
     `of the delayed case]`
@@ -817,23 +846,10 @@ export interface NetEntry {
 
 /**
  * THE one meaning of `urlPattern` across this module: a SUBSTRING of the URL, or a
- * RegExp tested against it. `netTimeline` has always meant this. `netDelay` did not —
- * it passed the caller's string straight to `Fetch.enable`, whose `urlPattern` is a
- * whole-URL GLOB (`*` = any run, `?` = one char, `\` escapes). Measured against real
- * Chromium on a page fetching `http://127.0.0.1:8897/api/cart?x=1`:
- *
- *     "/api/"    -> intercepted 0 requests
- *     "*​/api/*"  -> intercepted 1
- *     "*"        -> intercepted 1
- *
- * So `net.delay({ urlPattern: '/api/' })` held nothing, continued nothing, and still
- * announced itself LIVE and PERTURBING in `tracePerturbationWarnings()` — a race-class
- * probe reporting a clean measurement having perturbed nothing.
- *
- * Rejecting non-glob strings loudly was the alternative and is worse: it leaves the two
- * neighbouring functions meaning two different things by the same option name, just
- * noisily, and it cannot express a RegExp at all. Translating is what makes the option
- * name honest.
+ * RegExp tested against it — for `netTimeline` and `netDelay` alike, through this one
+ * predicate. (`netDelay` once forwarded the string to `Fetch.enable`, whose `urlPattern`
+ * is a whole-URL glob, so `'/api/'` held nothing while the probe announced itself LIVE
+ * and PERTURBING.)
  */
 /**
  * Reject a glob where a substring is expected, instead of matching nothing.
@@ -865,27 +881,6 @@ export function matchesUrlPattern(url: string, urlPattern: string | RegExp | und
   if (typeof urlPattern !== 'string') return urlPattern.test(url)
   assertNotGlob(urlPattern)
   return url.includes(urlPattern)
-}
-
-/**
- * The `Fetch.enable` glob that intercepts a SUPERSET of what `urlPattern` matches.
- *
- * A substring becomes `*<escaped>*`, with the glob metacharacters (`\`, `*`, `?`)
- * escaped so a literal `?` in a query string is matched as itself rather than as the
- * one-character wildcard. A RegExp cannot be expressed as a glob at all, so it
- * intercepts `*` and is narrowed by `matchesUrlPattern` in the handler.
- *
- * The handler re-checks EVERY paused request with `matchesUrlPattern` regardless, so
- * the glob is only a cheap pre-filter and the two functions' semantics stay identical
- * by construction rather than by two implementations agreeing.
- */
-export function urlPatternToFetchGlob(urlPattern: string | RegExp | undefined): string {
-  if (!urlPattern) return '*'
-  if (typeof urlPattern !== 'string') return '*'
-  // Reject here too, not only in the handler: this runs at arm time, so a glob fails
-  // before Fetch.enable is sent rather than after a run that held nothing.
-  assertNotGlob(urlPattern)
-  return `*${urlPattern.replace(/[\\*?]/g, '\\$&')}*`
 }
 
 export interface NetTimelineController {
@@ -985,9 +980,9 @@ export type NetDelayStats = {
   continued: number
   failed: number
   pending: number
-  /** Every `Fetch.requestPaused` the probe saw, matching or not. */
+  /** Every request of the page that reached the probe while it was live, matching or not. */
   seen: number
-  /** Seen but not matching `urlPattern` — continued immediately, never delayed. */
+  /** Seen but not matching `urlPattern` — passed on at once, never delayed. */
   notMatched: number
   /**
    * TRUE while the probe has held nothing. A `net.delay` that intercepts nothing is
@@ -1009,43 +1004,55 @@ export interface NetDelayController {
 const NET_DELAY_DEFAULT_TTL_MS = 120_000
 
 /**
- * Deterministic race-forcing: hold matching requests for `ms` before continuing, so
- * an async ordering bug reproduces every time. Uses the CDP Fetch domain.
- * PERTURBING — never auto-run.
+ * Deterministic race-forcing: hold matching requests for `ms` before letting them go,
+ * so an async ordering bug reproduces every time. PERTURBING — never auto-run.
+ *
+ * Built on Playwright's own `page.route`, never on CDP `Fetch` directly: Playwright
+ * owns request interception on its page session, and a `Fetch.enable`/`Fetch.disable`
+ * sent behind its back would replace or tear down the interception `page.route` and
+ * `context.route` depend on. A held request is released with `route.fallback()`, so any
+ * route the caller registered earlier still gets to fulfil, abort or modify it after the
+ * delay. While the probe is live Playwright disables the HTTP cache and passes every
+ * request of the page through its route machinery (what it does for any `page.route`);
+ * stopping unroutes, and Playwright restores both when no route is left.
  *
  * Three guarantees replace the old "remember to call stop()" doctrine:
- *   - a second overlapping `net.delay` on the same CDP session is REFUSED (naming
- *     the live one), because `Fetch.enable` replaces the previous patterns and the
- *     two probes would silently fight;
+ *   - a second overlapping `net.delay` on the same page is REFUSED (naming the live
+ *     one), because both would hold the same requests and the delays would compound;
+ *     `force: true` stops the live one and takes over;
  *   - the interception auto-expires after `ttlMs` (default 120s; `0` disables the
- *     expiry and is recorded as `unbounded`);
+ *     expiry and is recorded as `unbounded`); stopping releases every held request at
+ *     once;
  *   - the probe is registered, so `net.active()` lists it and every later
  *     `traceValue` warns while it is live.
  */
 export async function netDelay({
-  cdp,
+  page,
   urlPattern,
   ms,
   ttlMs = NET_DELAY_DEFAULT_TTL_MS,
   force = false,
 }: {
-  cdp: ICDPSession
-  /** A SUBSTRING of the URL, or a RegExp — the same language `netTimeline` uses. NOT a
-   *  `Fetch.enable` glob; see `matchesUrlPattern`. */
+  page: Page
+  /** A SUBSTRING of the URL, or a RegExp — the same language `netTimeline` uses; see `matchesUrlPattern`. */
   urlPattern: string | RegExp
   ms: number
   ttlMs?: number
   force?: boolean
 }): Promise<NetDelayController> {
-  const conflict = [...registry.values()].find((e) => e.info.live && e.info.kind === 'net.delay' && e.owner === cdp)
+  // At arm time, so a glob fails before anything is intercepted rather than after a run
+  // that held nothing.
+  if (typeof urlPattern === 'string') assertNotGlob(urlPattern)
+  const conflict = [...registry.values()].find((e) => e.info.live && e.info.kind === 'net.delay' && e.owner === page)
   if (conflict && !force) {
     throw new Error(
       `refusing to start a second net.delay on this page: ${describeEntry(conflict)}. ` +
-        `Fetch.enable REPLACES the previous interception patterns, so the two probes would silently fight and both ` +
-        `measurements would be wrong. Stop it first — net.stop('${conflict.info.id}') — or pass { force: true } to ` +
-        `deliberately take over.`,
+        `Both would hold the same requests, so the delays would compound and neither probe's \`ms\` would be the ` +
+        `delay the page saw. Stop it first — net.stop('${conflict.info.id}') — or pass { force: true } to stop it ` +
+        `and take over.`,
     )
   }
+  if (conflict) await stopTraceProbe(conflict.info.id)
 
   let paused = 0
   let continued = 0
@@ -1053,42 +1060,45 @@ export async function netDelay({
   let seen = 0
   let notMatched = 0
   let stopped = false
+  const failures: string[] = []
+  /** Wakes every request still being held, so stopping releases them at once. */
+  const wakers = new Set<() => void>()
 
-  const fetchGlob = urlPatternToFetchGlob(urlPattern)
-  await cdp.send('Fetch.enable', { patterns: [{ urlPattern: fetchGlob }] })
-
-  const handler = (params: { requestId: string; request?: { url?: string } }) => {
-    seen++
-    const url = params.request?.url ?? ''
-    // `delayed` is false for a request the glob let through but `urlPattern` does not
-    // match: it is released at once and must not be counted as one this probe held.
-    const release = (delayed: boolean) => {
-      cdp
-        .send('Fetch.continueRequest', { requestId: params.requestId })
-        .then(() => {
-          if (delayed) continued++
-        })
-        .catch(() => {
-          // The request may already be gone (Fetch.disable auto-continues) — count
-          // it rather than swallowing it, so a mismatch is visible in stats().
-          if (delayed) failed++
-        })
+  // `delayed` is false for a request that does not match: it is passed on at once and
+  // must not be counted as one this probe held.
+  const release = async (route: Route, delayed: boolean): Promise<void> => {
+    try {
+      await route.fallback()
+      if (delayed) continued++
+    } catch (error) {
+      if (delayed) failed++
+      failures.push(`${route.request().url()}: ${error instanceof Error ? error.message : String(error)}`)
     }
-    // The glob is a superset of `urlPattern` (and is just `*` for a RegExp), so a paused
-    // request that does not match is continued at once and never counted as delayed.
-    // This is what makes `netDelay`'s urlPattern mean exactly what `netTimeline`'s does.
-    if (!matchesUrlPattern(url, urlPattern)) {
+  }
+  const handler = async (route: Route): Promise<void> => {
+    seen++
+    if (!matchesUrlPattern(route.request().url(), urlPattern)) {
       notMatched++
-      release(false)
+      await release(route, false)
       return
     }
     paused++
-    // Once stopped, release immediately: a held request that nobody continues is a
-    // hung page, which is a worse perturbation than the delay itself.
-    if (stopped) release(true)
-    else setTimeout(() => release(true), ms)
+    // Once stopped, release immediately: a held request that nobody lets go is a hung
+    // page, which is a worse perturbation than the delay itself.
+    if (!stopped) {
+      const { promise, resolve } = Promise.withResolvers<void>()
+      const timer = setTimeout(resolve, ms)
+      const wake = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      wakers.add(wake)
+      await promise
+      wakers.delete(wake)
+    }
+    await release(route, true)
   }
-  cdp.on('Fetch.requestPaused', handler)
+  await page.route('**', handler)
 
   const stats = (): NetDelayStats => ({
     paused,
@@ -1114,25 +1124,21 @@ export async function netDelay({
       spec: {
         urlPattern: String(urlPattern),
         urlPatternKind: typeof urlPattern === 'string' ? 'substring' : 'regexp',
-        // The glob actually sent to Fetch.enable, so a caller can see what Chrome was
-        // asked to intercept rather than inferring it from the substring.
-        fetchGlob,
+        via: 'page.route',
         ms,
         ttlMs,
         unbounded: ttlMs <= 0,
         tookOverFrom: conflict?.info.id ?? null,
       },
     },
-    owner: cdp,
+    owner: page,
     stats,
+    read: () => ({ ...stats(), failures: failures.slice() }),
     doStop: async () => {
       stopped = true
-      cdp.off('Fetch.requestPaused', handler)
-      try {
-        await cdp.send('Fetch.disable')
-      } catch {
-        // interception already gone
-      }
+      for (const wake of wakers) wake()
+      // A closed page took its routes with it; there is nothing left to unroute.
+      if (!page.isClosed()) await page.unroute('**', handler)
     },
   })
 
@@ -1142,7 +1148,7 @@ export async function netDelay({
       void stopEntry(entry, 'ttl')
     }, ttlMs)
     // Never hold the process open for a debug interceptor.
-    ;(entry.timer as any)?.unref?.()
+    entry.timer.unref()
   }
 
   return {
@@ -1157,9 +1163,10 @@ export async function netDelay({
 // fiberSnapshot / fiberDiff
 // ---------------------------------------------------------------------------
 
-/** One prop of an identity-capturing snapshot. `ref` is a page-side identity token. */
+/** One prop of an identity-capturing snapshot. `ref` is an identity token from the frame's registry (held by playwriter, not the page). */
 export interface IdentifiedProp {
-  /** Stable while the reference is unchanged; 0 for primitives. */
+  /** Stable while the reference is unchanged; 0 for primitives, and for a value whose identity
+   *  was not captured because the frame's identity registry is full (see `caps.identitiesOmitted`). */
   ref: number
   type: 'primitive' | 'function' | 'object' | 'array'
   /** Structural projection; functions render as `[fn name/arity]` (paired with `ref`). */
@@ -1177,7 +1184,9 @@ export interface FiberIdentitySnapshot {
   props: Record<string, IdentifiedProp>
   /** Every function reachable in props (bounded), by dotted path -> identity token. */
   fnRefs: Array<{ path: string; ref: number; name: string | null; arity: number }>
-  caps: { maxKeys: number; maxDepth: number; keysOmitted: number; fnRefsOmitted: number }
+  /** `identitiesOmitted`: objects/functions left without a token because the frame's identity
+   *  registry reached its cap; `fiberDiff` reports them as unobservable, never as changed. */
+  caps: { maxKeys: number; maxDepth: number; keysOmitted: number; fnRefsOmitted: number; identitiesOmitted: number }
   note: string
 }
 
@@ -1191,14 +1200,207 @@ export interface FiberDiffInput {
   fnRefs?: Array<{ path: string; ref: number; name: string | null; arity: number }>
 }
 
+/** Objects one frame's identity registry holds before new values are left without a token. */
+const IDENTITY_REGISTRY_CAP = 5000
+
+/**
+ * Page-side identity walk; `this` = the element, `holder` = the frame's identity registry: a
+ * plain array created by playwriter, reachable only through playwriter's CDP object group —
+ * never a page global. A value's token is its 1-based index in the registry; the array is
+ * scanned and appended with plain index reads/writes (no page-patchable Array methods on it).
+ * Everything else only reads: the nearest composite fiber's `memoizedProps`, projected.
+ */
+const IDENTITY_WALK_FUNCTION = `function (arg, holder) {
+${REACT_FIBER_READER}
+  var found = currentReactFiber(this)
+  if (!found) return { ok: false, reason: 'the element no longer has a React fiber' }
+  var composite = found.fiber
+  for (var guard = 0; composite && !isCompositeReactFiber(composite) && guard < 50; guard++) composite = composite.return
+  if (!composite || !isCompositeReactFiber(composite)) return { ok: false, reason: 'no composite fiber above this element' }
+  var identitiesOmitted = 0
+  function idOf(v) {
+    for (var i = 0; i < holder.length; i++) if (holder[i] === v) return i + 1
+    if (holder.length >= arg.maxIdentities) {
+      identitiesOmitted++
+      return 0
+    }
+    holder[holder.length] = v
+    return holder.length
+  }
+  var fnRefs = []
+  var fnRefsOmitted = 0
+  // '[fn …]', NOT '[function …]': the latter is the OPAQUE marker family (a function whose
+  // content was never captured). This one is a projection whose identity token IS captured.
+  function project(v, depth, path, seen) {
+    if (v === null) return null
+    var t = typeof v
+    if (t === 'string') return v.length > 300 ? v.slice(0, 300) + '\\u2026[truncated]' : v
+    if (t === 'number' || t === 'boolean') return v
+    if (t === 'undefined') return '[undefined]'
+    if (t === 'bigint') return v.toString() + 'n'
+    if (t === 'symbol') return '[symbol]'
+    if (t === 'function') {
+      if (fnRefs.length < 200) fnRefs.push({ path: path, ref: idOf(v), name: v.name || null, arity: v.length })
+      else fnRefsOmitted++
+      return '[fn ' + (v.name || 'anonymous') + '/' + v.length + ']'
+    }
+    if (t !== 'object') return '[' + t + ']'
+    var tag = Object.prototype.toString.call(v)
+    if (tag.indexOf('Element]') >= 0 || tag === '[object Window]' || tag === '[object Document]') return '[dom-node]'
+    if (seen.indexOf(v) >= 0) return '[circular]'
+    if (depth >= arg.maxDepth) return '[max-depth]'
+    seen.push(v)
+    var out
+    if (Array.isArray(v)) {
+      out = []
+      for (var i = 0; i < v.length && i < 20; i++) out.push(project(v[i], depth + 1, path + '[' + i + ']', seen))
+      if (v.length > 20) out.push('\\u2026[' + (v.length - 20) + ' more]')
+    } else if (tag === '[object Date]') {
+      out = '[Date ' + v.getTime() + ']'
+    } else if (tag === '[object RegExp]') {
+      out = '[RegExp ' + String(v) + ']'
+    } else if (tag === '[object Map]') {
+      out = { '[Map size]': v.size }
+    } else if (tag === '[object Set]') {
+      out = { '[Set size]': v.size }
+    } else {
+      out = Object.create(null)
+      var keys = Object.keys(v)
+      for (var k = 0; k < keys.length && k < 20; k++) out[keys[k]] = project(v[keys[k]], depth + 1, path + '.' + keys[k], seen)
+      if (keys.length > 20) out['\\u2026'] = '[' + (keys.length - 20) + ' more keys]'
+      var ctor = v.constructor && v.constructor.name
+      if (ctor && ctor !== 'Object') out['[class]'] = ctor
+    }
+    seen.pop()
+    return out
+  }
+  var props = composite.memoizedProps
+  var result = Object.create(null)
+  var taken = 0
+  var keysOmitted = 0
+  if (props && typeof props === 'object') {
+    var propKeys = Object.keys(props)
+    for (var p = 0; p < propKeys.length; p++) {
+      var key = propKeys[p]
+      if (taken >= arg.maxKeys) {
+        keysOmitted++
+        continue
+      }
+      taken++
+      var value = props[key]
+      var type = typeof value
+      if (type === 'function') {
+        var ref = idOf(value)
+        // Also indexed in fnRefs so the flat function list is complete; the diff skips
+        // top-level paths there because they are compared per key already.
+        if (fnRefs.length < 200) fnRefs.push({ path: key, ref: ref, name: value.name || null, arity: value.length })
+        result[key] = {
+          ref: ref,
+          type: 'function',
+          value: '[fn ' + (value.name || 'anonymous') + '/' + value.length + ']',
+          fnName: value.name || null,
+          arity: value.length,
+          fnSource: String(value).slice(0, 240),
+        }
+      } else if (value !== null && type === 'object') {
+        result[key] = { ref: idOf(value), type: Array.isArray(value) ? 'array' : 'object', value: project(value, 0, key, []) }
+      } else {
+        result[key] = { ref: 0, type: 'primitive', value: project(value, 0, key, []) }
+      }
+    }
+  }
+  return { ok: true, props: result, fnRefs: fnRefs, keysOmitted: keysOmitted, fnRefsOmitted: fnRefsOmitted, identitiesOmitted: identitiesOmitted }
+}`
+
+type IdentityWalk =
+  | {
+      ok: true
+      props: Record<string, IdentifiedProp>
+      fnRefs: FiberIdentitySnapshot['fnRefs']
+      keysOmitted: number
+      fnRefsOmitted: number
+      identitiesOmitted: number
+    }
+  | { ok: false; reason: string }
+
+/** One frame's identity registry: an array in the frame's main world, held by our object group. */
+interface IdentityRegistry {
+  objectId: string
+  objectGroup: string
+}
+
+const identityRegistries = new WeakMap<Frame, IdentityRegistry>()
+
+async function createIdentityRegistry(cdp: ICDPSession, elementId: string, frame: Frame): Promise<IdentityRegistry> {
+  const objectGroup = `playwriter-fiber-identity-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const created = await withDeadline(
+    cdp.send('Runtime.callFunctionOn', { objectId: elementId, functionDeclaration: 'function () { return [] }', objectGroup }),
+    TRACE_CDP_TIMEOUT_MS,
+    'creating the fiber identity registry',
+  )
+  if (!created.result.objectId) throw new Error('Creating the fiber identity registry returned no object')
+  const registry = { objectId: created.result.objectId, objectGroup }
+  identityRegistries.set(frame, registry)
+  return registry
+}
+
+/**
+ * Tokens survive across snapshots because the registry does. When the frame navigated, its
+ * registry died with the old document (CDP no longer knows the object); a fresh one is made
+ * for the new document, since nothing from the old one can match there anyway.
+ */
+async function walkFiberIdentity(resolved: ResolvedElement, arg: { maxKeys: number; maxDepth: number }): Promise<IdentityWalk> {
+  const { cdp, frame } = resolved
+  const callGroup = `playwriter-fiber-walk-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  try {
+    const element = await withDeadline(
+      cdp.send('DOM.resolveNode', { backendNodeId: resolved.backendNodeId, objectGroup: callGroup }),
+      TRACE_CDP_TIMEOUT_MS,
+      `resolving node ${resolved.backendNodeId}`,
+    )
+    const elementId = element.object.objectId
+    if (!elementId) throw new Error(`Node ${resolved.backendNodeId} could not be resolved to an object in the page.`)
+    const walk = (registry: IdentityRegistry) =>
+      withDeadline(
+        cdp.send('Runtime.callFunctionOn', {
+          objectId: elementId,
+          functionDeclaration: IDENTITY_WALK_FUNCTION,
+          arguments: [{ value: { ...arg, maxIdentities: IDENTITY_REGISTRY_CAP } }, { objectId: registry.objectId }],
+          returnByValue: true,
+          objectGroup: callGroup,
+        }),
+        TRACE_CDP_TIMEOUT_MS,
+        'walking the fiber props with identity tokens',
+      )
+    const existing = identityRegistries.get(frame)
+    let called: Protocol.Runtime.CallFunctionOnResponse
+    if (existing) {
+      try {
+        called = await walk(existing)
+      } catch (error) {
+        if (!STALE_REMOTE_OBJECT.test(error instanceof Error ? error.message : String(error))) throw error
+        cdp.send('Runtime.releaseObjectGroup', { objectGroup: existing.objectGroup }).catch(() => {})
+        called = await walk(await createIdentityRegistry(cdp, elementId, frame))
+      }
+    } else {
+      called = await walk(await createIdentityRegistry(cdp, elementId, frame))
+    }
+    if (called.exceptionDetails) throw new Error(`The fiber identity walk threw in the page: ${describeRemoteException(called.exceptionDetails)}`)
+    return called.result.value
+  } finally {
+    cdp.send('Runtime.releaseObjectGroup', { objectGroup: callGroup }).catch(() => {})
+  }
+}
+
 /**
  * Capture a React component's props/hierarchy for later diffing.
  *
- * With `identity: true` the snapshot additionally carries page-side identity
- * tokens for every object/function prop (and for nested functions, by path). That
- * is the ONLY way handler-identity churn is observable across the process
- * boundary: the default serialisation renders every function as the string
- * `[function]`, so two different arrows look identical to any comparison.
+ * With `identity: true` the snapshot additionally carries identity tokens for every
+ * object/function prop (and for nested functions, by path). That is the ONLY way
+ * handler-identity churn is observable across the process boundary: the default
+ * serialisation renders every function as the string `[function]`, so two different
+ * arrows look identical to any comparison. The tokens come from a per-frame registry
+ * playwriter holds through CDP (see `walkFiberIdentity`); nothing is stored on the page.
  */
 export async function fiberSnapshot(opts: {
   locator: Locator | ElementHandle
@@ -1225,151 +1427,26 @@ export async function fiberSnapshot({
   maxKeys?: number
   maxDepth?: number
 }): Promise<ReactComponentInfo | FiberIdentitySnapshot | null> {
-  // Also loads bippy into the page, which the identity walk below relies on.
-  const base = await getReactComponentInfo({ locator, cdp })
-  if (!identity) return base
+  if (!identity) return await getReactComponentInfo({ locator, cdp })
+  const resolved = await resolveElement({ target: locator, cdp })
+  const base = await getReactComponentInfo({ backendNodeId: resolved.backendNodeId, frameId: resolved.frameId, cdp: resolved.cdp })
   if (!base) return null
-
-  const walk = (el: any, arg: { maxKeys: number; maxDepth: number }) => {
-    const g = globalThis as any
-    const bippy = g.__bippy
-    if (!bippy) return { ok: false as const, reason: 'bippy is not loaded in the page' }
-    let fiber: any
-    try {
-      fiber = bippy.getFiberFromHostInstance(el)
-    } catch {
-      return { ok: false as const, reason: 'getFiberFromHostInstance threw' }
-    }
-    let composite: any = fiber
-    let guard = 0
-    while (composite && guard++ < 50) {
-      try {
-        if (bippy.isCompositeFiber(composite)) break
-      } catch {
-        /* keep climbing */
-      }
-      composite = composite.return
-    }
-    if (!composite) return { ok: false as const, reason: 'no composite fiber above this element' }
-
-    const reg = (g.__playwriter_trace_ids = g.__playwriter_trace_ids || { next: 1, map: new WeakMap() })
-    const idOf = (v: any): number => {
-      let id = reg.map.get(v)
-      if (!id) {
-        id = reg.next++
-        reg.map.set(v, id)
-      }
-      return id
-    }
-
-    const fnRefs: Array<{ path: string; ref: number; name: string | null; arity: number }> = []
-    let fnRefsOmitted = 0
-    const project = (v: any, depth: number, path: string, seen: any): unknown => {
-      if (v === null) return null
-      const t = typeof v
-      if (t === 'string') return v.length > 300 ? v.slice(0, 300) + '…[truncated]' : v
-      if (t === 'number' || t === 'boolean') return v
-      if (t === 'undefined') return '[undefined]'
-      if (t === 'bigint') return `${v.toString()}n`
-      if (t === 'symbol') return '[symbol]'
-      if (t === 'function') {
-        if (fnRefs.length < 200) fnRefs.push({ path, ref: idOf(v), name: v.name || null, arity: v.length })
-        else fnRefsOmitted++
-        // `[fn …]`, NOT `[function …]`: the latter is the OPAQUE marker family
-        // (a function whose content was never captured). This one is a projection
-        // whose paired identity token IS captured, in `fnRefs`.
-        return `[fn ${v.name || 'anonymous'}/${v.length}]`
-      }
-      if (t !== 'object') return `[${t}]`
-      const tag = Object.prototype.toString.call(v)
-      if (tag.includes('Element]') || tag === '[object Window]' || tag === '[object Document]') return '[dom-node]'
-      if (seen.has(v)) return '[circular]'
-      if (depth >= arg.maxDepth) return '[max-depth]'
-      seen.add(v)
-      let out: unknown
-      if (Array.isArray(v)) {
-        const items = v.slice(0, 20).map((x: any, i: number) => project(x, depth + 1, `${path}[${i}]`, seen))
-        if (v.length > 20) items.push(`…[${v.length - 20} more]`)
-        out = items
-      } else if (tag === '[object Date]') {
-        out = `[Date ${v.getTime()}]`
-      } else if (tag === '[object RegExp]') {
-        out = `[RegExp ${String(v)}]`
-      } else if (tag === '[object Map]') {
-        out = { '[Map size]': v.size }
-      } else if (tag === '[object Set]') {
-        out = { '[Set size]': v.size }
-      } else {
-        const o: Record<string, unknown> = {}
-        const keys = Object.keys(v)
-        for (const k of keys.slice(0, 20)) o[k] = project(v[k], depth + 1, `${path}.${k}`, seen)
-        if (keys.length > 20) o['…'] = `[${keys.length - 20} more keys]`
-        const ctor = v.constructor && v.constructor.name
-        if (ctor && ctor !== 'Object') o['[class]'] = ctor
-        out = o
-      }
-      seen.delete(v)
-      return out
-    }
-
-    const props = composite.memoizedProps
-    const result: Record<string, any> = {}
-    let keysOmitted = 0
-    if (props && typeof props === 'object') {
-      const keys = Object.keys(props)
-      for (const k of keys) {
-        if (Object.keys(result).length >= arg.maxKeys) {
-          keysOmitted++
-          continue
-        }
-        const v = (props as any)[k]
-        const t = typeof v
-        if (t === 'function') {
-          // Also indexed in fnRefs so the flat function list is complete; the diff
-          // skips top-level paths there because they are compared per-key already.
-          if (fnRefs.length < 200) fnRefs.push({ path: k, ref: idOf(v), name: v.name || null, arity: v.length })
-          result[k] = {
-            ref: idOf(v),
-            type: 'function',
-            value: `[fn ${v.name || 'anonymous'}/${v.length}]`,
-            fnName: v.name || null,
-            arity: v.length,
-            fnSource: String(v).slice(0, 240),
-          }
-        } else if (v !== null && t === 'object') {
-          result[k] = {
-            ref: idOf(v),
-            type: Array.isArray(v) ? 'array' : 'object',
-            value: project(v, 0, k, new WeakSet()),
-          }
-        } else {
-          result[k] = { ref: 0, type: 'primitive', value: project(v, 0, k, new WeakSet()) }
-        }
-      }
-    }
-    return { ok: true as const, props: result, fnRefs, keysOmitted, fnRefsOmitted }
-  }
-
-  const arg = { maxKeys, maxDepth }
-  const walked =
-    'page' in locator ? await locator.evaluate(walk as any, arg) : await locator.evaluate(walk as any, arg)
-  const w = walked as
-    | { ok: true; props: Record<string, IdentifiedProp>; fnRefs: FiberIdentitySnapshot['fnRefs']; keysOmitted: number; fnRefsOmitted: number }
-    | { ok: false; reason: string }
-
-  if (!w.ok) return null
-
+  const walked = await walkFiberIdentity(resolved, { maxKeys, maxDepth })
+  if (!walked.ok) throw new Error(`fiberSnapshot could not capture identities: ${walked.reason}`)
   return {
     identityCaptured: true,
     componentName: base.componentName,
     source: base.source,
     hierarchy: base.hierarchy,
-    props: w.props,
-    fnRefs: w.fnRefs,
-    caps: { maxKeys, maxDepth, keysOmitted: w.keysOmitted, fnRefsOmitted: w.fnRefsOmitted },
+    props: walked.props,
+    fnRefs: walked.fnRefs,
+    caps: { maxKeys, maxDepth, keysOmitted: walked.keysOmitted, fnRefsOmitted: walked.fnRefsOmitted, identitiesOmitted: walked.identitiesOmitted },
     note:
-      'identity tokens (`ref`) are page-side and stable while the reference is unchanged: same ref = same object, ' +
-      'different ref with an equal projection = a NEW reference for an equal value (the memoisation-defeating case)',
+      'identity tokens (`ref`) are held by playwriter per frame and stable while the reference is unchanged: same ref = same object, ' +
+      'different ref with an equal projection = a NEW reference for an equal value (the memoisation-defeating case)' +
+      (walked.identitiesOmitted > 0
+        ? `; ${walked.identitiesOmitted} value(s) got no token because this frame's registry holds its cap of ${IDENTITY_REGISTRY_CAP} objects (reload the page to reset it)`
+        : ''),
   }
 }
 
@@ -1764,6 +1841,19 @@ export function fiberDiff(
         unchangedKeys.push(k)
         continue
       }
+      // An object or function without a token (the frame's identity registry was full) has
+      // no identity to compare: neither "unchanged" nor "changed-by-identity" is known.
+      if ((ia.type !== 'primitive' && ia.ref === 0) || (ib.type !== 'primitive' && ib.ref === 0)) {
+        pushChange({
+          key: k,
+          kind: 'unobservable',
+          before: describeValue(ia.value),
+          after: describeValue(ib.value),
+          valueType: ib.type,
+          reason: 'no identity token was captured for this value (the identity registry was full; see caps.identitiesOmitted)',
+        })
+        continue
+      }
       // Functions are settled by the identity token plus the captured source: they
       // must never route through the opaque-marker path, which exists for values
       // whose content was NOT captured. Here it was.
@@ -1860,6 +1950,17 @@ export function fiberDiff(
     for (const rb of b.fnRefs) {
       const ra = byPathA.get(rb.path)
       if (!ra || ra.path.indexOf('.') === -1 && ra.path.indexOf('[') === -1) continue // top-level handled above
+      if (ra.ref === 0 || rb.ref === 0) {
+        pushChange({
+          key: rb.path,
+          kind: 'unobservable',
+          valueType: 'function',
+          before: `[function ${ra.name ?? 'anonymous'}/${ra.arity} #${ra.ref}]`,
+          after: `[function ${rb.name ?? 'anonymous'}/${rb.arity} #${rb.ref}]`,
+          reason: 'no identity token was captured for this function (the identity registry was full; see caps.identitiesOmitted)',
+        })
+        continue
+      }
       if (ra.ref !== rb.ref && ra.name === rb.name && ra.arity === rb.arity) {
         pushChange({
           key: rb.path,

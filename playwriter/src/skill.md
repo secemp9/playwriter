@@ -1,3 +1,67 @@
+## Browse like a human (start here)
+
+You drive a real browser, often the user's own logged-in Chrome. Work like a careful person sitting at it: look, do ONE thing, let the page react, look again. **Human mode** (the default; whoever starts the session picks it) enforces this: a call that breaks a rule is refused with the reason and the right move, and nothing in it runs.
+
+### The loop
+
+1. **Look** — `await observe()` prints what is on screen right now:
+   - `PAGE` url, title, tab, how far down you are · `TABS` when several are open · `BUSY` the app is still working · `MODAL` / `DIALOG` something blocks the page · `FOCUS` · `LIVE` a live region (chat log, status line) and its newest text.
+   - `IN VIEW` — every control with a **ref** in brackets, plus its state and value: `[12] button "Send"`, `[7] textbox "Message" [focused] = "hi"`, `[9] checkbox "Remember me" [unchecked]`, `[4] combobox "Sort" = "Relevance" (options: Relevance · Newest · …)`, `[5] date "Check-in" (takes YYYY-MM-DD: act.fill(ref, "YYYY-MM-DD"))`, `[20] clickable div.card "Free shipping"` (a click target that is not a semantic control), `img "Product" BROKEN`, `partly covered by …`. A control drawn by its styling (`transparent control`) or hidden behind its label (`worked through its label`) is listed and acted on like any other. Long text is kept whole; a printed line cut short says `(+N chars)`.
+   - `BELOW` / `ABOVE` — what is off-screen (counts and headings), so you do not have to scroll to find out. In apps whose page does not scroll (mail, chat, dashboards), `SCROLL [57] main "Messages" — 4 screens below` names the scroll area and `INSIDE [57] …` counts what it hides. `*` marks what is new since your last look.
+   - Iframes are part of the page: `[7] iframe "Secure card payment" — 4 controls` with its controls (refs) indented under it, cross-site ones (payment fields, embedded sign-in, consent walls) included. An iframe that cannot be read says why on its line. `act.*`, `find()` (`· in iframe [n]`), `explain()` and `getPageMarkdown()` work inside iframes the same way.
+2. **Do one thing** with a ref from that output: `await act.click(12)` · `await act.fill(7, 'red running shoes size 10')` · `await act.press('Enter')` · `await act.select(4, 'Price: low to high')` · `await act.check(9)`.
+3. **Read the report** printed after the call. It always says what was hit, whether the page `SETTLED` (or what it is still waiting for), navigation (`in-app route`, `NEW DOCUMENT` = full reload, or a back/forward-cache restore), dialogs, live text (also text that vanished), console errors and failed requests, new tabs (`act.switchTab(i)`), downloads, a `FILE DIALOG` your input opened (it waits for `act.dialog.chooseFiles(path)` or `act.dialog.dismiss()`), and the `CHANGES` (`+` appeared, `-` gone, `~` state or value changed, text that grew). `NO VISIBLE CHANGE` means it probably did not work. Do not assume it did.
+4. **If the app is still working** (`BUSY`, `NOT SETTLED`, an AI reply streaming in): `await act.waitForIdle()`, then read what changed. Never act while it is busy: that is how replies get interrupted and messages get posted twice. Give long waits a bigger call `timeout`.
+5. Repeat. One input action per call; waits and reads are free.
+
+### Finding things
+
+- `await find('Checkout')` — every match on the whole page, off-screen included, whole texts and drop-down options too, with its ref and where it is.
+- `await act.scrollTo(ref)` brings an element into view with the mouse wheel; `await act.scroll('down')` scrolls what the wheel reaches in the middle of the screen (in an app shell, the main list); `act.scroll('down', { ref: 57 })` scrolls that scroll area.
+- `await observe({ all: true })` also lists off-screen elements; `await observe({ scope: ref })` shows only that part of the page.
+- Before clicking something you do not understand: `await explain(ref)` — what it is wired to (React component, handler source, the requests and navigation it triggers).
+- Not sure which element the user means? Ask them to point at it: right-click the page → **Pin an element for Playwriter**, then click it — `observe()` lists it under `PINNED` with its ref. Or tell them what to click, then `await pickElement()` with a long call `timeout` (e.g. 120000): Chrome's picker highlights elements under their pointer, and the call returns the ref of the one they click.
+- Article text: `await getPageMarkdown({ outline: true })`, then `getPageMarkdown({ filter: 'Reviews' })` for one section.
+
+### act
+
+| Call | What it does |
+|---|---|
+| `act.click(ref)` / `act.dblclick(ref)` | moves the pointer like a person, hit-tests the target (refuses and names the cover if something is on top), clicks |
+| `act.fill(ref, text)` / `act.type(ref, text)` | clicks the field, replaces (`fill`) or appends (`type`) key by key at a person's pace; the report reads the value back. A newline in a single-line field is refused (it is Enter: submit with `act.press('Enter')` next). Date/time inputs take ISO text (`2024-05-01`, `13:45`) typed into the field's parts; a slider takes a number on its step; a colour input cannot be set (its picker is browser UI — ask the user). `{ paste: true }` inserts long text in one go as IME text (no paste event fires) |
+| `act.press(key, { ref })` | a key or chord (`'Enter'`, `'Escape'`, `'Tab'`, `'Control+A'`) where focus is, or on `ref` |
+| `act.select(ref, option)` | native `<select>`: clicks it, moves to the option with the arrow keys and presses Enter, as a person does (observe() lists the options; a disabled one is refused). Custom dropdowns: click to open, then click the option |
+| `act.check(ref)` / `act.uncheck(ref)` | sets the state and verifies it took |
+| `act.hover(ref)` · `act.scrollTo(ref)` · `act.scroll('down' \| 'up', { screens, ref })` · `act.drag(from, to)` · `act.upload(ref, files)` | scrolling is the mouse wheel over the area that actually scrolls; if the page ignores the wheel, the action says so, and a third scroll that moves nothing is refused. `upload` clicks the control and chooses the files in the file dialog it opens (more files than it takes is refused); when that control's dialog is already open, it chooses in it without clicking again |
+| `act.waitForIdle({ timeoutMs })` | waits until nothing is loading, streaming or changing (AI replies, searches) |
+| `act.dialog.accept(text?)` / `act.dialog.dismiss()` / `act.dialog.chooseFiles(files)` | answers a native `confirm()` / `prompt()` / `beforeunload` ("Leave site?"); they block the page until answered — leaving with unsaved work is a decision, never made for you. Alerts are accepted automatically and reported. A dialog the user answered at the browser is reported as closed. A file dialog your input opened (`FILE DIALOG OPEN`) stays open like a real one: `chooseFiles` picks files in it, `dismiss` cancels it, and until then the page cannot be used |
+| `act.open(url, { reason })` | a full page load: free on a blank tab, otherwise only with a reason (it wipes client caches) |
+| `act.spaNavigate('/path')` | an in-app route change: clicks the page's own link to it; refuses when the page has none |
+| `act.back()` | the browser's Back button; refused on a tab with no earlier page |
+| `act.switchTab(i)` | makes tab `i` (from `TABS` / a report's `TAB` line) the controlled tab. Not an action on the page. Acting on a ref from another tab switches to it by itself |
+
+### Enforced in human mode
+
+- **One action per call** — checked in your code before it runs (a helper that acts and is called twice or in a loop counts as several; aliases like `const { click } = act` are the same call) and again while it runs. Do the first one, read the report, then decide the next.
+- **No `page.goto` / `reload` after the first load.** A full reload wipes client caches (SWR, React Query, Redux), so a repro made that way is biased. Click the link (observe lists links with their URLs) or use `act.spaNavigate`. `history.pushState` / `location.hash =` from page code are refused too.
+- **No faked conditions:** no `page.route` / `net.delay`, no DOM or style writes, no synthetic events, no calling the backend with `fetch`. Reproduce it the way a user would; `net.requests()` shows what the page itself sent. Page functions must be readable: pass them inline (`page.evaluate((sel) => …, sel)`), not as a variable, a wrapper, `eval` or a string. `getCDPSession()` only reads.
+- **Wait while busy, answer native dialogs first.** A ref from before a navigation is stale: `observe()` again.
+- **The element must still be what you saw.** If a ref now reads differently (`[12] now reads button "Unfollow" (you saw button "Follow")`, or a recycled row now belongs to another item), the action is refused: observe and decide again.
+- **No double sends.** Repeating the action you just did is refused when it sent data-changing requests (`POST …`, a WebSocket message) — that is how a message gets posted twice. Do something else first (type the next message), or pass `{ again: true }` if the first really failed.
+
+Reading is never restricted: `observe`, `find`, `explain`, `snapshot`, `pm.*`, `getLatestLogs`, `net.requests`, `getPageMarkdown`, screenshots, and `page.evaluate` that only reads.
+
+### Be the user, not the tester
+
+- Use the product the way its users do: a new conversation, natural wording, real data. Never "test 1" or "doc 1:".
+- Before saying something works or is fixed, point at the evidence in a report or observation (a visible text, a state, a request status). `NOT SETTLED`, `FAILED`, a timeout or `NO VISIBLE CHANGE` is not success.
+- On a password field outside localhost, stop and ask the user. Do not touch the user's other tabs.
+- Stuck? `explain(ref)`, `find(…)`, `getLatestLogs({ sinceLastCall: true })`, `net.requests({ failedOnly: true })`, or ask the user. Repeating an action that changed nothing three times is refused.
+
+`state` persists between calls, `page` is the controlled tab. Everything else — the Playwright API, `snapshot()` locators, CSS/React/debugger/trace tools, recording — is in the reference below. **Debug mode** (`playwriter session new --policy debug`, or `PLAYWRITER_POLICY=debug` for the MCP server) allows multi-step scripts and network perturbation; only the user switches it on.
+
+---
+
 ## CLI Usage
 
 If `playwriter` command is not found, install globally or use npx/bunx:
@@ -361,16 +425,16 @@ Two limits of that scoping worth knowing: paths are checked textually, so an exi
 ## rules
 
 - **Initialize state.page first**: see "working with pages" — at the start of a task, assign `state.page` (reuse `about:blank` or create one) and use `state.page` for all automation steps.
-- **Multiple calls**: use multiple execute calls for complex logic - helps understand intermediate state and isolate which action failed
+- **One action per call, then read the report**: in human mode (the default) a call may contain one input action; the settle + "what changed" report printed after it replaces printing the URL, snapshot and logs by hand. In debug mode use multiple execute calls anyway — it isolates which action failed.
 - **Never close**: never call `browser.close()` or `context.close()`. Only close pages you created or if user asks
 - **No bringToFront**: never call unless the user asks — it steals the focus of whatever they are actually looking at, and you can drive a background page without it. For recording, `recording.startCdp` captures a backgrounded tab fine on its **screencast** path (measured: 31 frames backgrounded against 30 foregrounded, and 60fps hidden over raw CDP); its **screenshot** path genuinely does need a foreground tab (~0.1fps hidden, single captures blocking up to 26s) and calls `bringToFront()` **itself**, so you still never call it — you choose the mode instead. See the recording section for which modes foreground, `mode: 'auto'` included. **There is exactly one place where YOU make the call, and it is `humanMouse`** — its moves are frame-locked, and a backgrounded renderer stretches every `Input.dispatchMouseEvent` from ~17ms to seconds, which no amount of retrying fixes. Only there is `await page.bringToFront()` the right call, only when the result's `rendererThrottled` flag says so, and the alternative is to not use human motion on that tab. See "humanMouse" for the numbers. Clicking, snapshotting and everything else here works on a background tab.
-- **Check state after actions**: always verify page state after clicking/submitting (see next section)
+- **Check state after actions**: the action report says what changed; if it says `NO VISIBLE CHANGE` or `NOT SETTLED`, the action did not demonstrably work — look again (`observe()`), do not assume.
 - **Clean up listeners**: call `state.page.removeAllListeners()` at end of message to prevent leaks
-- **Always print page logs after every action**: call `getLatestLogs({ page: state.page, sinceLastCall: true })` after every goto, click, or submit to catch console errors and warnings. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.
+- **Logs after actions**: the action report already lists console errors, uncaught exceptions and failed requests caused by the action. For everything else, `getLatestLogs({ page: state.page, sinceLastCall: true })`. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.
 - **CDP sessions**: use `getCDPSession({ page: state.page })` not `state.page.context().newCDPSession()` - NEVER use `newCDPSession()` method, it doesn't work through playwriter relay
 - **Wait for load**: use `state.page.waitForLoadState('domcontentloaded')` not `state.page.waitForEvent('load')` - waitForEvent times out if already loaded
 - **Minimize timeouts**: prefer proper waits (`waitForSelector`, `waitForPageLoad`) over `state.page.waitForTimeout()`. Short timeouts (1-2s) are acceptable for non-deterministic events like animations, tab opens, or async UI updates where no specific selector is available
-- **Snapshot before screenshot**: always use `snapshot()` first to understand page state (text-based, fast, cheap). Only use `screenshot` when you specifically need visual/spatial information. Never take a screenshot just to check if a page loaded or to read text content — snapshot gives you that instantly without burning image tokens
+- **Text before screenshots**: use `observe()` (or `snapshot()` for locators) first to understand the page (text-based, fast, cheap, and readable without vision). Only take a screenshot when you need visual/spatial information and can actually look at images. Never take a screenshot just to check if a page loaded or to read text.
 - **Always use absolute file paths for Playwright artifact APIs**: for `page.screenshot({ path })`, `locator.screenshot({ path })`, `elementHandle.screenshot({ path })`, `page.pdf({ path })`, `download.saveAs(path)`, and `video.saveAs(path)`, always pass an absolute path. Relative paths are resolved by Playwright client internals, not the sandboxed `fs`, so they may use the relay server cwd instead of your session cwd.
 - **Structured readers replace page.evaluate() for inspection**: do NOT write `page.evaluate()` calls to manually query roles, text, child counts, class names, or test ids. `snapshot()` already shows every interactive element with its text, role, and a ready-to-use locator; for tags, attributes, or a custom field set use `pm.query({ page: state.page, fields: ['role', 'name', 'tag', 'locator', 'attributes.class'] })`. If you catch yourself writing `document.querySelector` inside evaluate — stop and pick from the next section. Reserve `page.evaluate()` for the five cases listed there.
 
@@ -384,7 +448,10 @@ Three layers, in cost order. **Never skip down a layer without a reason you can 
 
 | Need | Use |
 |---|---|
-| What's on the page, what can I click | `snapshot({ page: state.page })` |
+| What is on screen, what can I click, what state is it in | `observe()` — refs, states, values, visibility, what covers what |
+| Where is X (also off-screen) | `find('X')` |
+| What does this control do before I click it | `explain(ref)` — React component, handler source, requests/navigation it triggers |
+| Locators for Playwright code, the full accessibility tree | `snapshot({ page: state.page })` |
 | Same, plus tags/attributes or your own field set | `pm.query({ page: state.page, select: 'Interactive', fields: ['role', 'name', 'locator'] })` |
 | Compact fused tree, marking what is new since the last call | `pm.renderText({ page: state.page })` |
 | Article text | `getPageMarkdown({ page: state.page })` |
@@ -422,61 +489,87 @@ Signatures, traps, and real limits for every Layer 2/3 tool are in "debugging: s
 
 **`page.evaluate()` is still the right tool for exactly these:**
 
-1. **Mutating** page state — `localStorage.clear()`, `el.scrollTop += 500`, dispatching an app event.
+1. **Mutating** page state — debug mode only; human mode refuses DOM, style and storage writes: `localStorage.clear()`, `el.scrollTop += 500`, dispatching an app event.
 2. **Non-DOM JS values** — `window.__CONFIG__`, `window.__NEXT_DATA__`, a global store handle.
 3. **Properties the model does not carry** — `naturalWidth`, `videoWidth`, `scrollHeight`, canvas contents, live scroll offsets. Static geometry is NOT on this list any more: `runtime.box`, `paintOrder`, `visible`, `inViewport` and the tracked computed styles all come off the layout snapshot, so `getBoundingClientRect` in an `evaluate` is usually a slower duplicate of `pm.query({ fields: ['runtime.box'] })`.
-4. **In-page `fetch`** to reuse session cookies, and blob downloads.
+4. **In-page `fetch`** to reuse session cookies, and blob downloads — debug mode only; human mode refuses calling the backend from page code.
 5. **Bulk extraction of one repeated non-semantic field** across hundreds of nodes in a single round-trip, where that field is not in the model.
 
 If the body of your `evaluate` is a `querySelectorAll` plus a map of role / name / text / class / testid — that is a `pm.query`, and you should rewrite it.
 
 ## interaction feedback loop
 
-Every browser interaction must follow **observe → act → observe**. Never chain multiple actions blindly.
-
-1. **Open page** — get or create your page, navigate to URL
-2. **Observe** — print `state.page.url()` + `snapshot()` + `getLatestLogs({ sinceLastCall: true })`. Always print URL — pages can redirect unexpectedly.
-3. **Check** — if page isn't ready (loading, wrong URL, content missing), wait and observe again
-4. **Act** — perform one action (click, type, submit)
-5. **Observe again** — print URL + snapshot + page logs to verify the action's effect
-6. **Repeat** from step 3 until task is complete
-
-**Always print page logs after every action** using `getLatestLogs({ sinceLastCall: true })`. This returns only new console messages and errors since the last call, so you catch hydration errors, failed network requests, and runtime exceptions without duplicates. The first call returns all buffered logs from the page, including logs emitted before your script started.
+Every browser interaction follows **observe → one action → report → observe**. The report after an action is automatic: whenever a call performs input (through `act.*` or raw Playwright like `locator.click()`), playwriter waits for the page to settle, looks again, and prints what changed — you do not print URL, snapshot and logs by hand anymore.
 
 ```js
-// Each step should be a separate execute call:
-// Step 1: navigate + observe
+// Call 1: open a page on a blank tab (free), then look
 state.page = context.pages().find((p) => p.url() === 'about:blank') ?? (await context.newPage())
 await state.page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
-console.log('URL:', state.page.url())
-console.log('Page logs:', await getLatestLogs({ page: state.page, sinceLastCall: true }))
-await snapshot({ page: state.page }).then(console.log)
 ```
 
 ```js
-// Step 2: act + observe
-await state.page.locator('button:has-text("Submit")').click()
-console.log('URL:', state.page.url())
-console.log('Page logs:', await getLatestLogs({ page: state.page, sinceLastCall: true }))
-await snapshot({ page: state.page }).then(console.log)
+// Call 2
+await observe()
 ```
 
-If nothing changed after an action, try `waitForPageLoad({ page: state.page, timeout: 3000 })` or you may have clicked the wrong element.
+```js
+// Call 3: one action on a ref from the observation; the report follows automatically
+await act.click(12)
+```
 
-**Deeper observation** — when snapshots aren't enough to understand what happened, combine snapshot with filtered logs:
+What the report contains, in order: the action (`✓`/`✗`, what the pointer actually hit, notes such as "scrolled 640px in main to reach it"), `SETTLED` or `NOT SETTLED` (with the requests your action started that are still open, and where content is still changing), `NAV` (`in-app route` = same document, `NEW DOCUMENT` = full load, or a back/forward-cache restore where the earlier page comes back with its state), `DIALOG`, `LIVE` (live-region and toast text, including text that already vanished), `ERRORS` (console errors from the page's own code, uncaught exceptions, HTTP ≥ 400 and failed requests with their `net.requests` id), `TAB` (a new tab this page opened, with `act.switchTab(i)`), `DOWNLOAD` (`completed`, `FAILED: …` or still downloading), `FILE DIALOG OPEN, opened by your click [12] button "Upload photo" (one file) — … act.dialog.chooseFiles(path) chooses the files, act.dialog.dismiss() cancels` (a file dialog your input opened, held back by the browser and waiting for your answer — also one that opened after a confirm you answered, or from a page timer a moment after your call returned: then it is in the next report, `… 3.0s after that action ended`), then `CHANGES` (`+` appeared, `-` gone, `~` state/value/name changed, `~ text grew by N chars: "…tail"`, `SCROLL [57] … 0 → 840px`), possible duplicates, and `BUSY` if the app is still working. `NO VISIBLE CHANGE` is printed only when a before/after comparison was made and found nothing — navigations, dialogs, new tabs, downloads and file dialogs count as changes. Treat it as "did not work" until proven otherwise. If part of the report could not be produced, that line says why (`NOT SETTLED — …`, `EVENTS UNAVAILABLE — …`, `AFTER-STATE UNAVAILABLE — …`); the ✓/✗ lines and other events are still listed, so do not repeat an action because the after-state is missing.
+
+Raw Playwright input still works and is reported, but it gets no human pointer path, no busy check and no cover check; the report marks it `(raw Playwright)`. Raw input or a navigation on a tab other than the one you control (`state.page = await context.newPage()` in one call, then `await state.page.goto(url)` in the next) is followed on that tab: the line names it (`ACTION  (raw Playwright) goto https://… on tab 1 "Title"`) and SETTLED, NAV and errors are read from it. No before-picture of that tab was taken, so the report shows no element diff and never claims NO VISIBLE CHANGE for it; a navigation counts as a change. `act.switchTab(1)` then `observe()` to see it.
+
+Playwright reads are not neutral either. `page.title()`, `page.content()`, `page.evaluate()` and every locator read (`textContent()`, `count()`, `isVisible()`, …) run in the page as a user gesture: the page gets user activation, which a person who only looked never gives it — it may then prompt "Leave site?", play sound, or open popups and file dialogs. `observe()`, `find()`, `explain()`, `getPageMarkdown()` and `getCleanHTML({ locator: page })` read without it.
+
+**When the page is still working** (an AI reply streaming, a search running): `await act.waitForIdle({ timeoutMs: 90000 })` in a call with a larger `timeout`, then read the CHANGES it reports — the new reply text is in them.
+
+**Waiting and busy.** After every input the report waits for the page's reaction. Quiet is measured from the end of your last input, so a search the page debounces after your last key is still waited for. Only requests your action caused can hold a settle: a long-poll, a stream or a poller the page opened earlier is listed as "open before the action" and never waited on. Chrome's own request facts decide the rest — beacons, prefetches, CSP reports, ad-tagged requests, WebSockets and EventSource channels never hold, and images, fonts and media stop holding once they stall. Ticking clocks, timers, marquees, `aria-live=off` regions, and anything already churning before your action (a reply still streaming from an earlier step) are listed once as ambient and do not keep the page "not settled".
+
+`BUSY` means the page itself says it is working: something marked `aria-busy`, a progressbar with no value or one that moved since your action, an endlessly repeating animation that is on screen and on top (a spinner) and started since your action, content still streaming, or a response body still arriving. Words such as "Loading" or "Processing", class names, and a progressbar standing still never block. A spinner that was already turning before your action is reported but does not block. An alert is accepted automatically and the wait resumes after it closes; a confirm, prompt or "Leave site?" stays open and stops the wait until you answer it.
+
+**What observe() tells you, in detail:**
+- Long text is kept whole; lines are cut only when printed, marked `(+N chars)`. `find("words")` searches the whole text and shows the match in context: `text: (212 chars before) "…costs $14.99 and ships tomorrow."`.
+- Repeated controls (the same role and name more than once) carry what tells them apart, in this order: the item they are in (`(in listitem "Buy milk")`, `(in row "Alice")`), the heading above them (`(under heading "Reviews")`), the text right before their group (`(after "Width")` — the caption above a set of options), else their position (`(2nd of 3)`). A label's words are its control's name and are not repeated as text.
+- Live regions (chat logs, status lines, alerts) stay readable as normal text. `LIVE  log "Conversation" — latest: "…"` names the region and its newest message; changes inside it are marked `— in live region log "Conversation"`.
+- Scroll areas: in apps whose page does not scroll the header says `the page itself does not scroll`; `SCROLL [57] main "Messages" — top, 4 screens below` gives the area a ref, `INSIDE [57] …: N more controls … — act.scroll('down', { ref: 57 })` counts what it hides, and `observe({ scope: 57 })` lists its contents.
+- Tabs: with several open, `TABS  0: "Shop" (controlled) · 1: "Docs"` lists them for `act.switchTab(n)`. Refs are unique across tabs.
+- Iframes: every iframe is an element of the page around it, `[7] iframe "Secure card payment" — 4 controls`, with its content indented under it; `observe({ scope: 7 })` shows only what is inside it. Cross-site iframes, which Chrome runs in their own process, are read the same way. An iframe whose content cannot be read says why on its line (`— not read: the iframe is hidden …`, `… still loading`, `… removed while being read`). Something drawn over an iframe covers what is inside it (`covered by iframe "Cookie consent" [12]`). Acting on a ref inside an iframe scrolls the page to the iframe, then the iframe itself, and hit-tests through it; an iframe's requests and console errors are in the report and journal, and a POST sent from inside an iframe counts for the repeat guard.
+- Fields say what they take: `[range 0–100 step 5]`, `(takes YYYY-MM-DD: …)` on date inputs (dates, datetimes and times are roles `date`, `datetime`, `inputtime`; colour inputs `colorwell`), `(file input: its click opens a file dialog — act.upload(3, path))` on a file input (it reads as a button), `type=email`, `placeholder "…"`, `max 64 chars`, `accepts ".pdf"`, `[multiline]`, `[autocomplete=list] [active=[7]]`, and for an invalid field the page's own message: `[invalid] error "Enter a valid email address"`.
+- Secrets are shown as `••••`: password fields, one-time-code and card-security fields, and any field the page draws as bullets.
+- While a native dialog is open, observe shows only the dialog; title, viewport and scroll say `not readable while the dialog is open`.
+- An open file dialog shows at the top: `FILE DIALOG open, opened by your click [12] button "Upload photo" (one file)`. The page behind it stays readable, but nothing on it can be used until you answer it (`act.dialog.chooseFiles(path)` or `act.dialog.dismiss()`), as for a person facing the browser's file dialog.
+
+**When a ref stops working**, the error says why and what to do:
+- `… is still on the page but hidden right now: its button [30] "File" is collapsed — open it first (act.click(30))`
+- `… is still on the page but cannot be used right now: it is behind the modal dialog "Confirm" [9] — answer or close that first`
+- `… is no longer on the page: it was removed or re-rendered.` When exactly one element now has the same role, name and context, it adds `The same button "Save" is now [41]`.
+- `… is from a tab that has been closed.` / `… is from the previous page — the page has navigated since.`
+- When a modal opens, the report counts the controls behind it (`now inert or behind it — still on the page, not gone`); anything really removed is still listed as `- [12] … (gone)`.
+
+**act, in detail:**
+- **Tabs:** acting on a ref from another tab brings that tab to the front and makes it the controlled page; the report says `switched to the tab "…" this ref belongs to`. `act.switchTab(i)` does it without acting and does not use up the call's one action.
+- **Upload:** `act.upload(ref, 'file.pdf')` (or an array) clicks the control; the files are chosen in the file dialog that click opens. A control that opens no dialog within 4s is not an upload control; if the click opens a confirm() first, answer it — the file dialog that follows is reported, and `act.dialog.chooseFiles(path)` chooses in it. More files than the dialog takes is refused, and the dialog stays open. A file dialog can open as long as the browser lets the page act on your input (5 s after it): it is held back and waits for you; cancelling it with `act.dialog.dismiss()` is not told to the page (the browser sends no cancel event for a dialog it held back).
+- **Back:** `act.back()` goes to the previous entry of this tab's history; with no earlier page it is refused (`Nothing to go back to`). If the page holds the navigation ("Leave site?"), the report says so.
+- **Scroll:** `act.scroll('down')` with no ref scrolls what the mouse wheel reaches in the middle of the screen, and the note names it (`scrolled [57] main "Messages" 840px; 2.1 screens below`). A third scroll in the same direction after two that moved 0px is refused: you are at the end, so read the screen or use find().
+- **Date, time, slider and colour fields:** `act.fill(ref, value)` on a native date/time input takes ISO text — `2024-05-01` (date), `13:45` (time), `2024-05-01T13:45` (datetime-local), `2024-05` (month), `2024-W18` (week) — typed into the field's parts in the order the field shows them; the value read back must equal what you asked for, or the action fails. A slider (`type=range`) takes a number on its step grid and is moved with the arrow keys. A colour input cannot be set: its picker is browser UI that page input cannot operate, so ask the user.
+- **Text fields:** a newline in a single-line field is refused (it is the Enter key and submits the form): `act.press('Enter')` in the next call. `{ paste: true }` inserts text as IME text in one go — no paste event fires, so apps that react to pasting will not see one.
+- **When the element changed since you looked:** act refuses instead of clicking it — `Not done: [12] now reads button "Unfollow" (you saw button "Follow")`, or `[7] button "Delete" is now in listitem "Bob" (you saw it in listitem "Alice")`. Call observe() and decide again.
+- **One action per call, also at run time:** a second action reached while the code runs (through helpers, aliases, or raw Playwright input) is refused — `Not done: this call already performed click [3] button "Send" — one action per call in human mode.` Waiting (`act.wait`, `act.waitForIdle`) and `act.switchTab` do not count.
+
+**Deeper observation** — combine the structured readers with filtered logs:
 
 ```js
 // Search for specific errors in all logs (not just since last call)
 const errors = await getLatestLogs({ page: state.page, search: /error|fail/i, count: 20 })
-
-// Combine snapshot + filtered logs for full picture
-const snap = await snapshot({ page: state.page, search: /dialog|error|message/ })
-const logs = await getLatestLogs({ page: state.page, search: /error/i, count: 10 })
-console.log('UI:', snap)
-console.log('Logs:', logs)
+// Every request the page made, failed ones only
+const failed = await net.requests({ failedOnly: true })
+// The response body of one of them
+const body = await net.request('r17')
 ```
 
-Use `getLatestLogs({ sinceLastCall: true })` after every action, `getLatestLogs({ search })` for targeted debugging, `state.page.url()` for navigation, screenshots only for visual layout issues.
+`getLatestLogs({ search })` for targeted debugging, `net.requests()` for what the page sent and got back, screenshots only for visual layout issues.
 
 ## debugging: symptom → cause
 
@@ -484,7 +577,7 @@ Signatures, traps, and current limits for the Layer 2/3 tools named above.
 
 **All of these are sandbox globals — already in scope, so never try to load one.** Loading is not how you would get them anyway: there is no `import` at all (no global, and the syntax cannot work either — a static `import` is a SyntaxError inside the async wrapper your code runs in, and a dynamic `import()` throws in a `vm` context), while `require` genuinely exists but only ever hands back the allowlisted Node built-ins listed under "context variables" — never a Playwriter global. Nearly all of the globals below are async — `await` them. To see a value, `return` it, or `console.log` it: sandbox console output is collected and returned to **you** in the execute result. (The `console.log` that goes to the browser console instead of to you is the one written *inside* `page.evaluate()`.) Full types and examples live in the `page-model-api` and `trace-api` MCP resources.
 
-**`{ page: state.page }` is not optional.** Everything that *can* default to a page defaults to the sandbox `page` global — **not** `state.page` — so omitting it silently drives or inspects the wrong tab. The full list: `pm.*`, `queryPage`, `snapshot`, `refToLocator`, `traceValue`, `storeIdentity`, `net.*`, `setLogpoint`, `readLogpoints`, `getScriptSourceByUrl`, `humanMouse.*`, `ghostCursor.show`/`hide`, `recording.start`, and `recording.startCdp`. (`debugStyle`, `whyOccluded` and `fiberSnapshot` take their page from the `locator` you pass, so they are exempt — and so is `snapshot` when you scope it with a `locator` or a `frame`, which carries its own page.)
+**`{ page: state.page }` is not optional.** Everything that *can* default to a page defaults to the sandbox `page` global — **not** `state.page` — so omitting it silently drives or inspects the wrong tab. The full list: `pm.*`, `queryPage`, `snapshot`, `refToLocator`, `traceValue`, `storeIdentity`, `net.*`, `setLogpoint`, `readLogpoints`, `getScriptSourceByUrl`, `humanMouse.*`, `ghostCursor.show`/`hide`, `pickElement`, `recording.start`, and `recording.startCdp`. (`debugStyle`, `whyOccluded` and `fiberSnapshot` take their page from the `locator` you pass, so they are exempt — and so is `snapshot` when you scope it with a `locator` or a `frame`, which carries its own page.)
 
 `getLatestLogs` is the one exception, and it is surprising in the other direction: with no `page` it returns the logs of **every** page in the session, interleaved, not the default page's. Pass `page` when you want one tab's console.
 
@@ -588,7 +681,7 @@ backwardSlice({ startFile, startExpr: 'total', maxHops: 16 })  // the static sli
 - `readLogpoints` returns an object, not an array — iterate `read.hits`. **It is capped by default: the newest `maxHits: 20` hits, each value cut to `maxLen: 50` characters.** Both caps are echoed in `read.caps`, both are raisable, and neither is ever applied silently: `droppedHits > 0` means the window hid older hits (raise `maxHits`); `hit.truncated` means that value was cut (raise `maxLen`); `hit.malformed` means the page could not serialise it and the raw text was kept rather than coerced into something plausible. Pass `sinceCursor: read.cursor` on the next call to read only what arrived after this one.
 - `t.render()` is capped too: `maxLines` defaults to **60** and `codeFrames` to **true**. A collapse always announces itself on the last line, so a truncated trace never reads as a complete one — but it is still a truncated trace. Raise `maxLines`, or drill with `t.expand(hopId, { depth })`.
 - **A probe outlives the `execute()` call that created it** — that is the point of the registry, and the trap it replaces. A dropped `net.timeline` controller keeps recording (drain it with `net.read(id)`); a dropped `net.delay` keeps intercepting. Probes are stopped automatically when their page closes, on `reset`, and on session delete — but not at the end of a call. `net.active()` lists them, including stopped ones, so "who perturbed my measurement?" always has an answer. `net.stopAll()` is scoped to your own session.
-- `net.delay` **refuses** a second overlapping delay on the same page by name (`Fetch.enable` replaces the previous patterns, so two would silently fight). Stop the first, or pass `force: true`. It also auto-expires after `ttlMs` (default 120s; `0` = unbounded).
+- `net.delay` runs on Playwright's `page.route`: matching requests are held for `ms`, then handed on to any routes you registered (they keep working during and after). While it is live Playwright disables the HTTP cache. It **refuses** a second delay on the same page; stop the first, or pass `force: true` to take over. `net.stop(id)` releases held requests at once. It also auto-expires after `ttlMs` (default 120s; `0` = unbounded).
 - `replayPure` runs in the **Node executor process** — no window, no document, no page network. Pass what the function needs via `args` / `bindings`. `console` is **virtualised**, not blocked: logging code replays fine and the calls come back in `logs`. Refusals split offenders into `admissible` (supply via `bindings`) and `categoricallyUnsafe` (nothing here can supply them honestly), each with a source position.
 - **`fiberDiff` only sees handler churn when both snapshots were taken with `identity: true`.** Without it every function serialises to `[function]` and two different arrows compare equal. With it, `identityChangedKeys` is the list of deep-equal-but-new-reference props — the ones that defeat `React.memo`. A comparison it could not make lands in `unobservableKeys`, never in `unchangedKeys`.
 - **Real limits of the static lane:** callee resolution leaves large **typed-unresolved buckets** — read `summary().unresolvedByReason` before concluding "nothing calls this". Escape analysis stays at **chain depth 0**: it sees `ref.push(x)` and `obj.x =`, not a value handed three functions deep. Async boundaries stop the slice by design.
@@ -605,15 +698,14 @@ await snapshot({ page: state.page, search: /my text/ })
 ```
 
 **2. Assuming paste/upload worked**
-Clipboard paste (`Meta+v`) can silently fail. For file uploads, prefer file input:
+Clipboard paste (`Meta+v`) can silently fail. For file uploads, do what a person does — click the upload control and choose the file in the dialog it opens:
 
 ```js
-// Reliable: use file input
-const fileInput = state.page.locator('input[type="file"]').first()
-await fileInput.setInputFiles('/path/to/image.png')
+// Reliable, and the way a user does it: the report says whether a file dialog opened
+await act.upload(ref, '/path/to/image.png')
 
 // Unreliable: clipboard paste may silently fail, need to focus textarea first for example
-await state.page.keyboard.press('Meta+v') // always verify with screenshot!
+await state.page.keyboard.press('Meta+v') // always verify with observe() or a screenshot
 ```
 
 **3. Using stale locators from old snapshots**
@@ -628,9 +720,9 @@ await snapshot({ page: state.page, showDiffSinceLastCall: true })
 Before destructive actions (delete, submit), verify you're targeting the right thing:
 
 ```js
-// Before deleting, verify it's the right item
-await screenshotWithAccessibilityLabels({ page: state.page })
-// READ the screenshot to confirm, THEN proceed with delete
+// Before deleting, check which row the button is in and what it is wired to
+await observe()          // the Delete button's context names its row: (in listitem "Logitech M185")
+await explain(ref)       // the request it sends, before you click
 ```
 
 **5. Text concatenation without line breaks**
@@ -735,11 +827,11 @@ await snapshot({ page: state.page, search?, showDiffSinceLastCall?, interactiveO
 For the same tree fused with tags, attributes, and React/CSS edges — and with new nodes marked — use `pm.renderText({ page: state.page })` or `pm.query` instead (see "reading a page: pick the narrowest tool").
 
 - `search` - string/regex to filter results (returns first 10 matching lines)
-- `showDiffSinceLastCall` - returns diff since last snapshot (default: `true`, but `false` when `search` is provided). Pass `false` to get full snapshot.
+- `showDiffSinceLastCall` - return a unified diff against the last snapshot of the same scope and URL instead of the full tree. **Default `false`.**
 - `interactiveOnly` - **default `false`**: the whole accessible tree, because a snapshot is usually read to find out what is *on* the page. Pass `true` for only the elements you can act on. Note `screenshotWithAccessibilityLabels` defaults this the other way (`true`) — a label overlay exists to find click targets, so labelling every static node is clutter.
 - `frame` / `locator` - scope the snapshot to an iframe or a subtree (see below).
 
-Snapshots return full content on first call, then diffs on subsequent calls. Diff is only returned when shorter than full content. If nothing changed, returns "No changes since last snapshot" message. Use `showDiffSinceLastCall: false` to always get full content. When `search` is provided, diffing is disabled by default so the search filters the full content — pass `showDiffSinceLastCall: true` explicitly to combine both. This diffing behavior also applies to `getCleanHTML` and `getPageMarkdown`.
+Every snapshot line carries the element's state and value after its name (or after its locator): `[checked]` / `[unchecked]` / `[checked=mixed]`, `[disabled]`, `[expanded]` / `[collapsed]`, `[pressed]`, `[selected]`, `[focused]`, `[required]`, `[invalid]`, `[level=2]`, and ` = "typed value"` for text fields (password values are always `••••`). Snapshots return the full tree on every call. Pass `showDiffSinceLastCall: true` to get only what changed since the last snapshot of the same scope and URL (a navigation, including an SPA route change, starts a new baseline); if nothing changed it says so. The same opt-in diff exists on `getCleanHTML` and `getPageMarkdown`. For "what changed after my action" you rarely need it: the action report already lists the changes.
 
 Example output:
 
@@ -882,11 +974,11 @@ The extension intercepts Chrome popup windows (`window.open(url, '', 'width=...'
 
 ## navigation
 
-**Use `domcontentloaded`** for `page.goto()`:
+**`page.goto()` is for the first load of a blank tab.** After that, in human mode, `page.goto`/`reload`/`goBack` are refused: a full document load wipes client-side caches and in-memory state (SWR, React Query, Redux), which a person clicking around never does, so anything reproduced that way is biased. Move around the way a user does — `act.click(ref)` on a link (observe() shows links with their URLs), `act.spaNavigate('/path')` for an in-app route, `act.back()` for the Back button. When a full load IS what you are testing (cold cache, hard refresh), say so: `act.open(url, { reason: 'cold cache after deploy' })`.
 
 ```js
+// first load of a blank tab: use domcontentloaded, then look
 await state.page.goto('https://example.com', { waitUntil: 'domcontentloaded' })
-await waitForPageLoad({ page: state.page, timeout: 5000 })
 ```
 
 ## common patterns
@@ -1047,7 +1139,7 @@ await state.page.click('button')
 console.log(await getLatestLogs({ page: state.page, sinceLastCall: true }))  // just this action's logs
 ```
 
-Three readers below (`getCleanHTML`, `getPageMarkdown`, and `snapshot`) share the same two options: `search` (string/regex — returns the first 10 matching lines with 5 lines of context) and `showDiffSinceLastCall` (default `true`, forced `false` when `search` is given; pass `false` for the full text).
+Three readers below (`getCleanHTML`, `getPageMarkdown`, and `snapshot`) share the same two options: `search` (string/regex — returns the first 10 matching lines with 5 lines of context) and `showDiffSinceLastCall` (default `false`; `true` returns only what changed since the last call on the same page).
 
 **getCleanHTML** - get cleaned HTML from a locator or page:
 
@@ -1064,25 +1156,28 @@ const wide = await getCleanHTML({ locator: state.page, maxAttrLen: 500, maxConte
 
 **The truncation is real and it is capped by default**: attribute values are cut at `maxAttrLen` (**200** chars) and text content at `maxContentLen` (**500**). A long `data-*` payload or a paragraph past those limits comes back cut, so raise them before concluding the page does not contain something.
 
-**getPageMarkdown** - extract main page content as plain text using Mozilla Readability (same algorithm as Firefox Reader View). Strips navigation, ads, sidebars, and other clutter. Returns formatted text with title, author, and content:
+**getPageMarkdown** - what is on screen, as markdown: the main content when Mozilla Readability (Firefox Reader View's algorithm) finds an article, otherwise the whole visible page. Every result starts with its source: `source: article — N words (visible page: M words)` (M > N means there is on-screen content outside the article: nav, sidebars, other panels) or `source: visible page — M words (no article: <why>)`. Hidden content never appears: inactive tab panels, `display:none` templates and errors, closed `<details>` bodies, unslotted light DOM. Open shadow-DOM components (Lit, Shoelace, …) are read in flat-tree order, slotted content included; closed shadow roots are not readable from script and are not read. Iframes are read inline, in page order, under `[iframe "title"]` … `[end of iframe "title"]`; one that cannot be read says why. Headings stay headings, so you can read the outline first and then one section. It runs in a private world: nothing is added to the page.
 
 ```js
-await getPageMarkdown({ page: state.page, search?, showDiffSinceLastCall? })
+await getPageMarkdown({ page: state.page, search?, outline?, filter?, showDiffSinceLastCall? })
 // Examples:
-const content = await getPageMarkdown({ page: state.page, showDiffSinceLastCall: false })  // full article
-const matches = await getPageMarkdown({ page: state.page, search: /API/i })  // search within content
+const outline = await getPageMarkdown({ page: state.page, outline: true })  // headings only
+const reviews = await getPageMarkdown({ page: state.page, filter: 'Reviews' })  // sections whose heading contains "Reviews"
+const matches = await getPageMarkdown({ page: state.page, search: /API/i })  // the first 10 matching lines with context, then how many more were not shown
 ```
 
-Output is a title line, an `Author | Site | Published` line, the excerpt as a blockquote, then the article text.
+Output is a title line, an `Author | Site | Published` line, the excerpt as a blockquote, then the article as markdown (`#` headings, `-`/`1.` lists, `>` quotes, fenced code, table rows joined with `|`).
 
-**waitForPageLoad** - smart load detection that ignores analytics/ads:
+**waitForPageLoad** - wait until the page has settled: content stopped changing (a MutationObserver in a private world, shadow roots included) and the requests started since this call (or since this call's first action on that page) finished — the same request rules as the action report's settle (see "Waiting and busy"):
 
 ```js
-await waitForPageLoad({ page: state.page, timeout?, pollInterval?, minWait? })
+await waitForPageLoad({ page: state.page, timeout?, minWait? })
 // Returns: { success, readyState, pendingRequests, waitTimeMs, timedOut }
 ```
 
-**getCDPSession** - send raw CDP commands:
+After an action you rarely need it: the action report already waited. For an app that keeps working for a while (an AI reply streaming in), use `act.waitForIdle()`, which also waits for busy indicators to go away.
+
+**getCDPSession** - raw CDP on the page's own session (the same object on every call; never send `*.disable` on it, `detach()` does nothing). In human mode it only reads — `DOM.get*`, `DOM.describeNode`, `CSS.get*`, `Accessibility.*` (not `disable`), `DOMSnapshot.captureSnapshot`, `Network.getResponseBody`, `Page.getFrameTree` / `getLayoutMetrics` / `getNavigationHistory` / `captureScreenshot`; anything else (`Input.*`, `Page.navigate`, `Runtime.evaluate`, …) is refused, because `act.*` does input and navigation:
 
 ```js
 const cdp = await getCDPSession({ page: state.page })
@@ -1096,26 +1191,32 @@ const selector = await getLocatorStringForElement(state.page.locator('[id="submi
 // => "getByRole('button', { name: 'Save' })"
 ```
 
-**getReactSource** - get React component source location (dev mode only):
+**getReactSource** - get React component source location (dev mode only). It reads React's fiber with one read-only call and maps React 19 `_debugStack` sites through the scripts' source maps, which playwriter fetches itself — nothing is injected into the page and the page makes no requests. A source map that exists but cannot be fetched or used is an error naming why; a script without one gives its served position:
 
 ```js
 const source = await getReactSource({ locator: state.page.locator('[data-testid="submit-btn"]') })
 // => { fileName, lineNumber, columnNumber, componentName }
 ```
 
-**getReactComponentInfo** - get best-effort React component info for an element. Returns `null` for non-React elements and never throws just because an element was not rendered by React. Source locations are usually only available in React dev builds. Props are sanitized and truncated so functions, DOM nodes, circular refs, and huge objects do not flood the output.
+**getReactComponentInfo** - React component info for an element: `null` when the element was not rendered by React (no fiber, no component, no debug records); an error when React is there but reading it fails (CDP failure, a source map that cannot be used). Source locations are usually only available in React dev builds. Props are sanitized and truncated so functions, DOM nodes, circular refs, and huge objects do not flood the output. For an element you have a ref for, `explain(ref)` gives the component chain with its handlers.
 
-`fiberSnapshot({ locator })` is the same call under its trace-lane name — but `fiberSnapshot({ locator, identity: true })` is **not**: it returns a different shape carrying page-side identity tokens for every object/function prop, which is the only way `fiberDiff` can see handler churn. Use `getReactComponentInfo` to read props once; use `fiberSnapshot({ identity: true })` when you are going to diff two of them.
+`fiberSnapshot({ locator })` is the same call under its trace-lane name — but `fiberSnapshot({ locator, identity: true })` is **not**: it returns a different shape carrying identity tokens for every object/function prop (held by playwriter per frame; nothing is stored on the page), which is the only way `fiberDiff` can see handler churn. A value that could not be given a token is reported by `fiberDiff` as `unobservable`, never as changed or unchanged. Use `getReactComponentInfo` to read props once; use `fiberSnapshot({ identity: true })` when you are going to diff two of them.
 
 ```js
 const info = await getReactComponentInfo({ locator: state.page.locator('[data-testid="submit-btn"]') })
 // => { componentName, source, hierarchy, props } | null
 ```
 
-**inspectPinnedElement** - inspect a Playwriter pinned element and print the element `outerHTML` plus React component info when available. Used by the in-page toolbar and right-click copy flow.
+**inspectPinnedElement** - the command the extension's "Pin an element for Playwriter" puts on the clipboard. Finds the tab the element was pinned in, makes it `state.page`, and prints the element's ref, its markup and `explain()` of it (component chain, handlers, what they do). Read-only.
 
 ```js
-await inspectPinnedElement('https://example.com', 'globalThis.playwriterPinnedElem1')
+await inspectPinnedElement({ url: 'https://example.com/cart', backendNodeId: 1234 })
+```
+
+**pickElement** - ask the user to click the element they mean. Turns on Chrome's element picker in the tab (elements highlight under their pointer; Esc cancels) and waits for the click, then prints which element it was and returns `{ ref, text }`. Nothing is added to the page. Tell the user what to click *before* the call, and give the call a long `timeout`: the wait is bounded by it.
+
+```js
+const { ref } = await pickElement({ page: state.page })   // timeoutMs defaults to what is left of the call
 ```
 
 **getStylesForLocator** - raw DevTools-style listing of every matching rule (selector, source `file:line`, declarations, inherited styles). For "why is this property THIS value", prefer `debugStyle` — it resolves the cascade and names the winner plus every overridden loser. Reach for this when you want the unresolved rule list. Full reference: `https://playwriter.dev/resources/styles-api.md`.
@@ -1136,7 +1237,7 @@ const cdp = await getCDPSession({ page: state.page })
 const again = await getStylesForLocator({ locator: state.page.locator('.btn'), cdp })
 ```
 
-**createDebugger** - set breakpoints, step through code, inspect variables at runtime. Useful for debugging issues that only reproduce in browser, understanding code flow, and inspecting state at specific points. Can pause on exceptions, evaluate expressions in scope, and blackbox framework code. ALWAYS fetch `https://playwriter.dev/resources/debugger-api.md` first.
+**createDebugger** - set breakpoints, step through code, inspect variables at runtime (debug mode: it drives the Debugger through `getCDPSession()`, which only reads in human mode). Useful for debugging issues that only reproduce in browser, understanding code flow, and inspecting state at specific points. Can pause on exceptions, evaluate expressions in scope, and blackbox framework code. ALWAYS fetch `https://playwriter.dev/resources/debugger-api.md` first. The Debugger is enabled once per page and never disabled, and the page's own `debugger;` statements do NOT pause it: pauses are allowed only while you have armed something meant to pause — `setBreakpoint` without a provably non-pausing condition, `setPauseOnExceptions({ state: 'uncaught' | 'all' })`, `setXHRBreakpoint`, or `pauseOnDebuggerStatements({ enabled: true })`. Removing it makes the page pause-free again. Logpoints never pause. A pause nobody asked for is resumed automatically and noted.
 
 ```js
 const cdp = await getCDPSession({ page: state.page })
@@ -1147,7 +1248,7 @@ await dbg.setBreakpoint({ file: scripts[0].url, line: 42 })
 // when paused: dbg.inspectLocalVariables(), dbg.stepOver(), dbg.resume()
 ```
 
-**createEditor** - view and live-edit page scripts and CSS at runtime. Edits are in-memory (persist until reload). Useful for testing quick fixes, searching page scripts with grep, and toggling debug flags. ALWAYS read `https://playwriter.dev/resources/editor-api.md` first.
+**createEditor** - view and live-edit page scripts and CSS at runtime (debug mode: it changes the page). Edits are in-memory (persist until reload). Useful for testing quick fixes, searching page scripts with grep, and toggling debug flags. `dryRun: true` writes nothing: for a script V8 compiles it as a check; for a stylesheet it only checks that `oldString` matches exactly once. ALWAYS read `https://playwriter.dev/resources/editor-api.md` first.
 
 ```js
 const cdp = await getCDPSession({ page: state.page })
@@ -1157,41 +1258,27 @@ const matches = await editor.grep({ regex: /console\.log/ })
 await editor.edit({ url: matches[0].url, oldString: 'DEBUG = false', newString: 'DEBUG = true' })
 ```
 
-**screenshotWithAccessibilityLabels** - take a screenshot with Vimium-style visual labels overlaid on interactive elements. Shows labels, captures screenshot, then removes labels. The image and accessibility snapshot are automatically included in the response. Can be called multiple times to capture multiple screenshots. Use a timeout of **20 seconds** for complex pages.
+**screenshotWithAccessibilityLabels** - a viewport screenshot with a colour-coded `[N]` label at the top-left of every visible element `observe()` lists. These are the same refs `act.*` takes (`act.click(5)`), and the observation text comes back with the image. The image is drawn in Node from one CDP capture, so nothing is injected into the page. It is in CSS pixels (image x/y = page x/y), downscaled only above 1568 px. `scope: ref` labels only that element and what is inside it. It refuses a background tab (Chrome paints nothing there — `observe()` still works; if a picture is needed, ask the user to switch to the tab), a pinch-zoomed page, and an observation the page has navigated or scrolled away from (observe again).
 
-This is only for **finding interactive elements** on the page. To share a screenshot with the user or save an image, use `page.screenshot()` + `resizeImageForAgent()` instead (see "taking screenshots" section below).
-
-Prefer this for pages with grids, image galleries, maps, or complex visual layouts where spatial position matters. For simple text-heavy pages, `snapshot` with search is faster and uses fewer tokens.
+This is for **finding where things are** when position matters (grids, galleries, maps, canvas-heavy layouts). To share a screenshot with the user or save an image, use `page.screenshot()` + `resizeImageForAgent()` instead (see "taking screenshots" below). For text, `observe()` / `find()` are faster and cheaper.
 
 ```js
-await screenshotWithAccessibilityLabels({ page: state.page })
-// Image and accessibility snapshot are automatically included in response
-// Use refs from snapshot to interact with elements
-await state.page.locator('[id="submit-btn"]').click()
+await screenshotWithAccessibilityLabels({ page: state.page })   // labels = observe() refs
+await act.click(5)                                               // act on a ref you saw labelled
 
-// Scope it to a subtree — same idea as snapshot({ locator }), and the same saving:
-// only that region is labelled, so the labels stay legible on a busy page.
-await screenshotWithAccessibilityLabels({ page: state.page, locator: state.page.locator('[role="dialog"]') })
-
-// Label EVERY node, not just the interactive ones (default: interactiveOnly true).
-await screenshotWithAccessibilityLabels({ page: state.page, interactiveOnly: false })
-
-// Can take multiple screenshots in one execution
-await screenshotWithAccessibilityLabels({ page: state.page })
-await state.page.click('button')
-await screenshotWithAccessibilityLabels({ page: state.page })
-// Both images are included in the response
+// Only one region — the labels stay legible on a busy page
+await screenshotWithAccessibilityLabels({ page: state.page, scope: 12 })
 ```
 
-Labels are colour-coded by role (links, buttons, inputs, checkboxes, sliders, menus, tabs).
+Labels are colour-coded by role (links, buttons, inputs, checkboxes, sliders, menus, tabs). `snapshot({ locator })` cuts its tree at the locator's element (shadow DOM and same-process iframes included; pass `frame` for an iframe) without touching the page. `showAriaRefLabels` / `hideAriaRefLabels` no longer exist.
 
 **resizeImageForAgent** - shrink an image so it consumes fewer tokens when read back into context. The resized image is automatically included in the response (visible to the LLM). `await resizeImageForAgent({ input: '/absolute/path/to/screenshot.png' })`. Also accepts `width`, `height`, `maxDimension` (default 1568 — Claude re-scales anything larger anyway), `quality` (80), `format` (default: `'png'`), `fit`, `output`. Alias: `resizeImage`.
 
 `fit` decides what happens when you give **both** `width` and `height` and they disagree with the source aspect ratio: `'inside'` (default) preserves the ratio and fits within the box, `'cover'` fills the box and crops, `'contain'` pads, `'fill'` stretches. With only one dimension the ratio is preserved and `fit` does nothing.
 
-**recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Auto-overlays a ghost cursor that follows mouse actions. Requires user to have clicked the Playwriter extension icon on the tab. Auto-resizes viewport to 16:9 (override with `aspectRatio: null`). Auto-stops after 15 min (override with `maxDurationMs`).
+**recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Requires user to have clicked the Playwriter extension icon on the tab. The viewport is left as it is: a fixed aspect is made afterwards (`ffmpeg -i in.mp4 -vf "pad=ceil(ih*16/9/2)*2:ih:(ow-iw)/2:0" out.mp4`); `aspectRatio: { width, height }` is an explicit opt-in that DOES perturb the page — it resizes the viewport (resize events, media queries), restores it on stop/cancel, and throws on a page with no emulated viewport. `recording.stop()` burns the pointer into the video from the inputs that were dispatched (nothing is added to the page) and returns `pointer: { drawn, samples, segments, pulses, note? }`; `pointer: false` at start turns it off, an object (`sizePx`, `fillColor`, `outlineColor`, `pulseColor`, `pulseMs`) styles it. It needs an ffmpeg with libass: left at the default without libass the pointer is skipped with a note, asked for explicitly it is an error; it is also not drawn (note, or error if explicit) when the video's shape does not match the viewport. Auto-stops after 15 min (override with `maxDurationMs`).
 
-For demos, use interaction methods (`locator.click()`, `page.mouse.move()`) instead of `goto()` to show realistic cursor motion.
+For demos, act through the page (`act.*`, `locator.click()`) instead of `goto()`, so the recording shows the steps a person would take.
 
 ```js
 await recording.start({
@@ -1200,7 +1287,7 @@ await recording.start({
   frameRate: 30, // default
   audio: false, // default (tab audio)
   videoBitsPerSecond: 2500000,
-  aspectRatio: { width: 16, height: 9 }, // default, set null to skip
+  // aspectRatio: { width: 16, height: 9 }, // opt-in: resizes the page's viewport while recording
   maxDurationMs: 15 * 60 * 1000, // default, set 0 to disable
 })
 
@@ -1223,37 +1310,28 @@ recording.frameCount()                // is it actually capturing? check BEFORE 
 const r = await recording.stopCdp()   // { outputPath, frames, durationMs, mode, wrote }
 ```
 
-**Defaults, and the two that stop the recording on their own.** `fps` **10**, `quality` **70** (JPEG), `probeMs` **1500**, `mode` `'auto'`. The examples here pass `fps: 8, quality: 55` because a smaller file is usually the better trade for a bug repro — they are choices, not the defaults. Two limits end a recording without being asked: `maxDurationMs` (**10 minutes** — half the tabCapture recorder's 15) and `maxFrames` (**5000**, ≈165MB retained). Both are a hard stop, not a warning, so a long unattended repro needs them raised explicitly. `maxWidth` / `maxHeight` cap the captured frame size (Chrome scales to fit) and are unset by default, i.e. full viewport. `inputEvents: [{ action, atMs }]` seeds the input overlay with events known up front, exactly as `captions` seeds the caption track.
+**Defaults, and the two that stop the recording on their own.** `fps` **10**, `quality` **70** (JPEG), `mode` `'screencast'`. The examples here pass `fps: 8, quality: 55` because a smaller file is usually the better trade for a bug repro — they are choices, not the defaults. Two limits end a recording without being asked: `maxDurationMs` (**10 minutes** — half the tabCapture recorder's 15) and `maxFrames` (**5000**, ≈165MB retained). Both are a hard stop, not a warning, so a long unattended repro needs them raised explicitly. `maxWidth` / `maxHeight` cap the captured frame size (Chrome scales to fit) and are unset by default, i.e. full viewport. `inputEvents: [{ action, atMs }]` seeds the input overlay with events known up front, exactly as `captions` seeds the caption track.
 
 `recording.frameCount()` returns what the recorder has captured so far, so `frames: 0` — the change-driven-screencast failure below — is catchable while you can still do something about it. It throws when no `startCdp` recording is running, like every other member of this group.
 
-**Never call `bringToFront()` for a recording — but know that the recorder sometimes calls it for you.** The two capture paths differ completely here, and the difference decides which mode you should ask for.
+**The pointer is drawn into the video** (`pointer`, on by default): an arrow at every position this session's mouse input went through — `act.*`, `humanMouse` paths and Playwright's own `page.mouse.*` / `locator.click()`, as dispatched — and a ring on each press and release. It is burned in at encode time from those inputs, so nothing is added to the page. `pointer: false` turns it off; `result.pointer` reports what was drawn. It needs an ffmpeg with libass, like burned captions: left at the default without libass it is skipped with a note, asked for explicitly it is an error.
 
-`screencast` does not need a foreground tab. Measured through the extension on a backgrounded tab: 31 frames against 30 on a foreground one; re-measured over raw CDP on Chrome for Testing 148 with two real tabs in one window, **60.0 fps hidden against 59.8 fps foreground**. Record a tab the user is not looking at.
+**The default never takes the user's focus.** `mode: 'screencast'` (the default) records a tab the user is not looking at at full rate — measured through the extension on a backgrounded tab: 31 frames against 30 on a foreground one; over raw CDP with two real tabs in one window, **60.0 fps hidden against 59.8 fps foreground**. Screencast is change-driven, so on a visible tab the recorder takes one screenshot at start as the first frame; the encoder then holds each frame until the next one, so a page that never repaints still gives a constant-rate clip as long as the recording, with the pointer and captions drawn on every frame. A tab that is hidden at start and never repaints gives no frames at all: `wrote: false`, and `note` says why. `mode: 'auto'` and `probeMs` no longer exist; passing `'auto'` throws.
 
-`screenshot` does need one, and this was measured on the same rig — a 10fps poll, three runs of a 38-second hidden window:
+`mode: 'screenshot'` is an explicit opt-in that polls `Page.captureScreenshot` and calls `bringToFront()` on the tab first, because a screenshot of a hidden tab blocks — measured on the same rig, a 10fps poll, three runs of a 38-second hidden window:
 
 | | foreground | tab hidden behind another | after `bringToFront` |
 |---|---|---|---|
 | frames captured per second | 9.95–9.97 | **0.08–0.18** | 9.95–9.96 |
 | longest gap between frames | 116–129ms | **17.7–26.0s** | 118–134ms |
 
-It never errors and it never returns a stale frame — every attempt eventually came back, and a change made from outside while the tab was hidden appeared in the next frame to complete, 25–55ms later. It simply *blocks*, for up to 26 seconds at a time, which for a serialised poller is a 26-second hole in the video.
+It never errors and never returns a stale frame; it simply *blocks*, for up to 26 seconds at a time. Ask for it only when the user is present and agrees to lose focus.
 
-So the recorder foregrounds the tab itself before screenshot polling: **`mode: 'screenshot'` always, and `mode: 'auto'` — the default — the moment it falls back**, which is precisely the static-page case `auto` exists to handle. If a recording must not steal the user's focus, pass `mode: 'screencast'`: it never foregrounds and captures a hidden tab at full rate, at the cost of capturing almost nothing from a page that never repaints.
-
-If a recording comes back with `frames: 0`, the cause is almost always that **`screencast` is change-driven**: a page that never repaints sends nothing. That is what `mode: 'auto'` handles by falling back to screenshot polling. Check `mode` and `frames` on the result rather than assuming a focus problem.
-
-Two capture paths, selected automatically (`mode: 'auto'` by default, reported back on the result):
-
-| | `screencast` | `screenshot` |
+| | `screencast` (default) | `screenshot` (opt-in) |
 |---|---|---|
-| Source | `Page.startScreencast` | polls `Page.captureScreenshot` |
-| Rate | change-driven (frame per repaint) — measured 177 frames in 3s on an animating page | ~8.5fps through the extension, 15.3fps over direct CDP (measured) |
-| Static page | yields ~nothing (measured: 1 frame in 3s over direct CDP; 0 through the extension) | still captures |
-| Backgrounded tab | full rate, no foregrounding (measured 60fps hidden) | ~0.1fps with captures blocking up to 26s — **so this path calls `bringToFront()`** |
-
-`'auto'` starts with screencast and falls back to screenshot polling if no frame arrives within `probeMs` (1500ms), which covers a page that simply never repaints. Force one with `mode: 'screencast' | 'screenshot'`. Remember that falling back foregrounds the tab, so `'auto'` on a static page is a mode that steals focus.
+| Source | `Page.startScreencast`, plus one screenshot at start on a visible tab | polls `Page.captureScreenshot` |
+| Rate | change-driven (frame per repaint) — measured 177 frames in 3s on an animating page; frames are held between repaints | ~8.5fps through the extension, 15.3fps over direct CDP (measured) |
+| Backgrounded tab | full rate, no foregrounding (measured 60fps hidden) | calls `bringToFront()` (a hidden tab blocks captures up to 26s) |
 
 **recording.caption / recording.clearCaption** — narrate the clip so a human can follow a repro without you there. `caption(text)` stamps at call time and stays up until the next caption; `clearCaption()` blanks it. Burned into the pixels by default, because GitHub comments, Slack previews and bare `<video>` tags never show a soft subtitle track. Throws if no `startCdp` recording is running.
 
@@ -1297,7 +1375,7 @@ const r = await recording.stopCdp()
 ```js
 await recording.startCdp({
   outputPath: '/abs/path/shortcut-bug.mp4',
-  mode: 'screenshot',            // strongly preferred with the overlay on — but it foregrounds the tab, see below
+  mode: 'screenshot',            // keeps chips on frames while typing — but it foregrounds the tab, see above
   inputOverlay: true,
 })
 await state.page.fill('#email', 'alice@example.com')   // chip: Fill ••••••
@@ -1306,10 +1384,10 @@ const r = await recording.stopCdp()                    // r.inputEvents[] in VID
 ```
 
 - **Captures** every input this session drives through Playwright — `click`/`dblclick`/`hover`/`fill`/`type`/`press`/`check`/`selectOption`/`setInputFiles`/`focus` on `page`, `locator`, `frame` or `ElementHandle`, plus all of `page.keyboard.*` and `page.mouse.*`. A chip appears only when the action SUCCEEDS; one that timed out or threw gets none, because it never happened.
-- **Does NOT capture**: a real human typing or clicking in the browser (nothing reaches this process); input the page synthesises itself (`el.dispatchEvent(new KeyboardEvent(…))`); raw `cdp.send('Input.dispatch…')`; and `page.mouse.move()`, which is movement, not a press — the ghost cursor already shows it.
+- **Does NOT capture**: a real human typing or clicking in the browser (nothing reaches this process); input the page synthesises itself (`el.dispatchEvent(new KeyboardEvent(…))`); raw `cdp.send('Input.dispatch…')`; and `page.mouse.move()`, which is movement, not a press — the pointer layer already shows it.
 - **Layout**: a single row in the **bottom-right**, ON the page. Bottom-right because page content is top- and left-anchored — a top-left overlay lands on the nav, the heading and the first form field. The chips deliberately stay on the picture even though the caption left it: a NohBoard-style keystroke HUD that is not on the recording is not a keystroke HUD, and a chip's position is itself information about where the input landed. They are therefore **the only thing that still covers page content**, one line tall in the emptiest corner. Chips and captions are now in disjoint regions of the frame and cannot overlap at all.
 - **The chip strip sits on an opaque merge plate**, for the same reason the caption sits on a band: overlay text landing beside or on top of page text makes the composite read as a word in NEITHER layer. The chips cannot have the caption's full-frame-width band — a bar behind a corner HUD would be worse than the defect — so they get three narrower guarantees instead. The plate is **opaque**, so nothing of the page survives under a chip. It runs to the **frame edge it is anchored to**, so on a chip's own scanlines there is no page pixel on that side at all. And it extends a **measured clear distance inboard** (1.5 chip faces; measured, two glyph runs stop reading as one word at about twice the page's own inter-word gap, and the 3px that shipped is narrower than a 12px page's 4px space). The first two are proofs; the third holds for page text up to about 2.1x the chip face. Lowering `boxOpacity` gives that up.
-- **Use `mode: 'screenshot'`, and know that it foregrounds the tab.** A burned overlay only exists on frames that exist, and typing into a field that renders nothing produces no screencast frame at all. The overlay compensates by forcing one `captureScreenshot` per event (`captureFrameOnEvent`, on by default, reported in `note`), but polling is what actually keeps the clip moving. The cost is that this mode calls `bringToFront()` once before polling — it has to, see the foreground table above. If the user must not lose focus, keep `mode: 'screencast'` and accept that chips land only on frames the page itself produced, plus the one forced per event.
+- **`mode: 'screenshot'` keeps chips moving, and it foregrounds the tab.** A burned overlay only exists on frames that exist, and typing into a field that renders nothing produces no screencast frame at all. The overlay compensates by forcing one `captureScreenshot` per event (`captureFrameOnEvent`, on by default, reported in `note`), but polling is what actually keeps the clip moving. The cost is that this mode calls `bringToFront()` once before polling — it has to, see the foreground table above. If the user must not lose focus, keep the default `mode: 'screencast'` and accept that chips land only on frames the page itself produced, plus the one forced per event.
 - **Typed text is HIDDEN by default** — `fill`/`type`/`insertText` render as `Fill ••••••`, a fixed six dots, so not even the length leaks. `inputOverlayOptions.revealTypedText: true` shows it, and even then a target that looks like a secret (`#password`, `[name=otp]`, `#api_key`, …) stays masked. Every mask is named in that event's `adjustments`.
 - **Rapid sequences**: consecutive single-character keys within `coalesceWindowMs` (400) merge into one chip (`abcdefghij`). Beyond that the row holds at most `maxVisible` (4) chips — fewer if they would not fit across the frame — and retires the oldest early. Chords are one chip (`Ctrl+Shift+K`), never three. A chip stays up `dwellMs` (1600) — less than a caption, because a key name is a glance and not prose. Four inputs in one beat (fill, fill, click, press) fit without shedding; cram in more and the retired chip's `adjustments` say whether anyone could have seen it.
 - `stopCdp()` adds `inputEvents[]` — `{ index, kind, label, startMs, endMs, atMs, coalescedCount?, dropped?, adjustments[] }` — plus `inputOverlayNote`. Read `adjustments` for coalescing, truncation, redaction, early retirement and drops.
@@ -1318,16 +1396,16 @@ const r = await recording.stopCdp()                    // r.inputEvents[] in VID
 
 **When to use the other recorder instead:** `recording.start` (tabCapture) gives true compositor output at a higher, fixed frame rate and survives navigation. It needs one extension-icon click per tab, so prefer it when a human is present and picture quality matters; prefer `startCdp` when nothing can click.
 
-**ghostCursor.show / ghostCursor.hide** - the ghost cursor overlay is always on: the extension injects it on every Playwriter-attached tab and it stays visible at the last spot Playwright clicked or moved. These methods only matter if you want to change the cursor style or temporarily hide it:
+**ghostCursor.show / ghostCursor.hide** - a live cursor drawn INSIDE the page, for a human watching the tab. Off unless you call `show()`, and `show()` modifies the page: it adds a cursor element and a global, which a page that watches its own DOM can see — so human mode refuses it. Recordings do not need it: `recording.startCdp` draws the pointer into the video without touching the page. `hide()` removes both.
 
 ```js
-await ghostCursor.show({ page: state.page, style: 'screenstudio' }) // 'minimal' (default), 'dot', 'screenstudio'
-await ghostCursor.hide({ page: state.page }) // hide until next show() or hard navigation
+await ghostCursor.show({ page: state.page, style: 'screenstudio' }) // debug mode only. 'minimal' (default), 'dot', 'screenstudio'
+await ghostCursor.hide({ page: state.page })
 ```
 
 ## humanMouse — real human pointer motion (opt-in, off by default)
 
-**This is a behaviour change, not a visual polish.** The ghost cursor draws an overlay; `humanMouse` moves the *actual* CDP pointer along a sampled trajectory. Every element between origin and target therefore receives real `mouseover` / `mouseenter` / `mousemove`. That can open dropdowns, fire tooltips, dismiss popovers, start hover-intent timers and change what the page does. It is more realistic **and** it is a genuine way to make a working automation start failing. Turn it on deliberately, per action, and read `crossed` when something moves that you did not expect.
+**This is a behaviour change, not a visual polish.** A recording's pointer layer only draws; `humanMouse` moves the *actual* CDP pointer along a sampled trajectory. Every element between origin and target therefore receives real `mouseover` / `mouseenter` / `mousemove`. That can open dropdowns, fire tooltips, dismiss popovers, start hover-intent timers and change what the page does. It is more realistic **and** it is a genuine way to make a working automation start failing. Turn it on deliberately, per action, and read `crossed` when something moves that you did not expect.
 
 Ordinary Playwright teleports: one `Input.dispatchMouseEvent` at the destination. Nothing in between is ever hovered.
 
@@ -1359,6 +1437,8 @@ await humanMouse.hover({ page: state.page, locator: state.page.locator('#menu') 
 
 `humanMouse.defaults` is the mutable option bag every call falls back to — `{ seed, sampleRateHz, maxSamples, tuning, reportCrossings }`. Setting `humanMouse.defaults.reportCrossings = true` once is how you get the crossing report on every move without repeating it. `enable({ page, …defaults })` stores a *separate* set of defaults for the patched clicks on that page.
 
+The crossing recorder listens in a private world, so the page sees nothing of it. If it cannot be armed the move throws; if the page navigates during the move, `crossed` is `undefined` and `warnings` says the crossings of the old document were lost.
+
 ### What the model actually is
 
 Not "Bézier plus jitter". Each piece is a named result and the code says which:
@@ -1379,7 +1459,7 @@ Every stochastic element comes from a seeded PRNG. `Math.random()` is never call
 - `humanMouse.click({ locator })` does the human move, then calls `locator.click()`. Playwright then runs its own actionability and its own move to the element centre — but the pointer is already there, so that move is zero-distance and contributes one extra `mousemove` at the resting point and nothing else. **Actionability is not bypassed.**
 - `humanMouse.click({ x, y })` has no element, so there is no actionability to run. It presses where you told it to.
 - `humanMouse.enable()` patches `Locator.prototype.click/dblclick/hover` but the patch is **scoped to the pages you enabled** — other sessions sharing the relay process are unaffected, and `disable()` genuinely restores the old behaviour.
-- The ghost cursor overlay receives the whole polyline in one call and plays it back on the page's own rAF clock with CSS transitions off, so the drawn cursor traces the same curve as the real pointer instead of easing a transition behind it.
+- When `ghostCursor.show()` is on (debug mode), its overlay receives the whole polyline in one call and plays it back on the page's own rAF clock with CSS transitions off, so the drawn cursor traces the same curve as the real pointer instead of easing a transition behind it. Recordings get the same path from the pointer track, as dispatched.
 
 ### Timing is real, and it is reported
 
@@ -1402,11 +1482,11 @@ The result always carries `fittsDurationMs` (what the law asked for), `plannedDu
 
 ### Options
 
-`moveTo` / `click` / `hover` / `plan` take: `{ locator }` or `{ x, y }`; `page`, `position` (offset within the element), `from` (override the origin — the real lever for keeping a path out of a hazard corridor), `seed`, `sampleRateHz` (60), `maxSamples` (260 — binding reduces the *rate*, preserving the profile's shape, and says so), `tuning` (any Fitts/curvature/tremor/submovement parameter), `reportCrossings`, `includeTrajectory`, `heldButton` (for drags). `click` also takes `button`, `clickCount`, `delayMs`.
+`moveTo` / `click` / `hover` / `plan` take: `{ locator }` or `{ x, y }`; `page`, `position` (offset within the element), `from` (override the origin — the real lever for keeping a path out of a hazard corridor), `seed`, `sampleRateHz` (60), `maxSamples` (260 — binding reduces the *rate*, preserving the profile's shape, and says so), `tuning` (any Fitts/curvature/tremor/submovement parameter), `reportCrossings`, `includeTrajectory`, `heldButton` (for drags: press first with `page.mouse.down()`, move with `heldButton`, then `page.mouse.up()` — every move in between carries the held button, so the page sees one continuous drag and the release lands at the target). `click` also takes `button`, `clickCount`, `delayMs`.
 
 There is deliberately **no** "route around this element" option. A real user's hand does not dodge invisible rectangles, so a dodging path is less human, not more. If a hover hazard sits on the line, either start the move somewhere else (`from`) or do not use human motion for that action.
 
-**createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, so always send `timeout: 120000` (or higher) alongside `code` in this `execute` call — `timeout` is the second parameter of the `execute` tool, and its 10000ms default will kill the encode midway.
+**createDemoVideo** - speeds up idle sections (time between execute() calls) while keeping interactions at normal speed. Requires `ffmpeg`/`ffprobe`. Timestamps are tracked automatically during recording and returned by `recording.stop()`. **Timeout**: can take 60–120+ seconds, so always send `timeout: 120000` (or higher) alongside `code` in this `execute` call — `timeout` is the second parameter of the `execute` tool, and its 30000ms default will kill the encode midway.
 
 Save the whole `recording.stop()` result to `state` (shown above) — its `executionTimestamps` are what drive idle detection.
 
@@ -1422,12 +1502,12 @@ const demoPath = await createDemoVideo({
 
 ## pinned elements
 
-Users can right-click → "Copy Playwriter Element Reference" to store elements in `globalThis.playwriterPinnedElem1` (increments for each pin). The reference is copied to clipboard:
+The user can point at an element instead of describing it: right-click the page (or the extension icon) → **Pin an element for Playwriter**, then click the element in Chrome's element picker (Esc cancels). Nothing is injected into the page.
 
-```js
-const el = await state.page.evaluateHandle(() => globalThis.playwriterPinnedElem1)
-await el.click()
-```
+- `observe()` lists pins under `PINNED`, newest first: the ref of the element, of the control the point is inside, or the text it is on. A pin whose element is gone is reported once, then dropped.
+- The clipboard gets `playwriter -e 'inspectPinnedElement({"url":…,"backendNodeId":N})'`; pasted into the chat, it is the command for you to run.
+- **Copy React component source (click an element next)**, in the same menu, puts the `file:line` of the JSX that rendered the clicked element on the clipboard.
+- `pickElement()` is the same picker started by you, waiting for the click (see utility functions).
 
 ## taking screenshots
 
@@ -1456,7 +1536,7 @@ const info = await state.page.evaluate(() => ({
 }))
 console.log(info)
 
-// Mutating page state — the other legitimate use
+// Mutating page state — debug mode only (human mode refuses it)
 await state.page.evaluate(() => localStorage.clear())
 await state.page.locator('.scrollable-list').evaluate((el) => { el.scrollTop += 500 })
 ```
@@ -1473,7 +1553,7 @@ await state.page.locator('textarea').fill(content)
 
 ## network interception
 
-For scraping or reverse-engineering APIs, intercept network requests instead of scrolling DOM. Store in `state` to analyze across calls:
+**Observing is always allowed; faking is not (human mode).** Every request the page makes is already journaled: `await net.requests({ urlIncludes: '/api/' })` lists them (method, url, status, timing, `r…` id) and `await net.request('r12')` returns one response body. Listeners like the ones below also only observe. What human mode refuses is changing traffic — `page.route`, `fulfill`, `net.delay`, `routeWebSocket` — because a bug "reproduced" through faked responses is not one a user can hit; those need a debug session (`--policy debug`). For scraping or reverse-engineering APIs, listening beats scrolling the DOM. Store results in `state` to analyze across calls:
 
 ```js
 state.requests = []

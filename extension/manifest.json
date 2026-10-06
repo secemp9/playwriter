@@ -12,6 +12,7 @@
     "tabs",
     "tabCapture",
     "offscreen",
+    "clipboardWrite",
     "storage",
     "identity",
     "identity.email",

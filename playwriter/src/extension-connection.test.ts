@@ -27,7 +27,8 @@ describe('Extension Connection Tests', () => {
   beforeAll(async () => {
     testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-conn-test-', toggleExtension: true })
 
-    const result = await createMCPClient({ port: TEST_PORT })
+    // Connection mechanics with multi-step Playwright code, not the human-mode policy.
+    const result = await createMCPClient({ port: TEST_PORT, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
   }, 600000)

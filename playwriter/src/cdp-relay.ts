@@ -140,6 +140,14 @@ export async function startPlayWriterCDPRelayServer({
   const emitter = new EventEmitter()
   const store = relayState.createRelayStore()
   const extensionDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
+  /**
+   * `${extensionId}:${child sessionId}` → the session an out-of-process iframe's
+   * Target.attachedToTarget was routed on (the page, or the iframe, that owns its frame). A client
+   * that connects later is told about the iframe on that same session: Playwright drops an iframe
+   * attach that arrives on its root session (crBrowser answers it with Target.detachFromTarget,
+   * which tears the iframe's session down for every client).
+   */
+  const iframeOwnerSessions = new Map<string, string>()
 
   const resolvedCdpLogger = cdpLogger || createCdpLogger()
   const logCdpJson = (entry: CdpLogEntry) => {
@@ -1767,44 +1775,63 @@ export async function startPlayWriterCDPRelayServer({
               }
               // Re-read state after async routeCdpCommand — targets may have changed
               const freshExt = store.getState().extensions.get(extensionConn.id)
-              const freshTargets = freshExt?.connectedTargets || new Map()
-              for (const target of freshTargets.values()) {
+              const freshTargets: Map<string, relayState.ConnectedTarget> = freshExt?.connectedTargets || new Map()
+              // Pages first, then each iframe once the session that owns it has been announced
+              // (a nested OOPIF is owned by another iframe's session).
+              const announced = new Set<string>()
+              const pending = [...freshTargets.values()].filter(
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
-                if (isRestrictedTarget(target.targetInfo)) {
-                  continue
-                }
                 // Z6/I3: strict-equality workspace filter. A freestyle target
                 // (workspaceKey === null) matches no keyed client, so it is never
                 // replayed here. No claiming, no fallback, no prefix stripping.
-                if (!visibleToWorkspace(target, clientWorkspaceKey)) {
-                  continue
-                }
-                const attachedPayload = {
-                  method: 'Target.attachedToTarget',
-                  params: {
-                    sessionId: target.sessionId,
-                    targetInfo: {
-                      ...target.targetInfo,
-                      attached: true,
+                (target) => !isRestrictedTarget(target.targetInfo) && visibleToWorkspace(target, clientWorkspaceKey),
+              )
+              for (let progressed = true; progressed && pending.length > 0; ) {
+                progressed = false
+                for (const target of [...pending]) {
+                  const ownerSessionId =
+                    target.targetInfo.type === 'iframe' ? iframeOwnerSessions.get(`${extensionConn.id}:${target.sessionId}`) : undefined
+                  if (target.targetInfo.type === 'iframe' && (ownerSessionId === undefined || !announced.has(ownerSessionId))) continue
+                  pending.splice(pending.indexOf(target), 1)
+                  announced.add(target.sessionId)
+                  progressed = true
+                  const attachedPayload = {
+                    ...(ownerSessionId !== undefined ? { sessionId: ownerSessionId } : {}),
+                    method: 'Target.attachedToTarget',
+                    params: {
+                      sessionId: target.sessionId,
+                      targetInfo: {
+                        ...target.targetInfo,
+                        attached: true,
+                      },
+                      waitingForDebugger: false,
                     },
-                    waitingForDebugger: false,
-                  },
-                } satisfies CDPEventFor<'Target.attachedToTarget'>
-                if (!target.targetInfo.url) {
-                  logger?.error(
-                    pc.red('[Server] WARNING: Target.attachedToTarget sent with empty URL!'),
+                  } satisfies CDPEventFor<'Target.attachedToTarget'> & { sessionId?: string }
+                  if (!target.targetInfo.url) {
+                    logger?.error(
+                      pc.red('[Server] WARNING: Target.attachedToTarget sent with empty URL!'),
+                      JSON.stringify(attachedPayload),
+                    )
+                  }
+                  logger?.log(
+                    pc.magenta('[Server] Target.attachedToTarget full payload:'),
                     JSON.stringify(attachedPayload),
                   )
+                  sendToPlaywright({
+                    message: attachedPayload,
+                    clientId,
+                    source: 'server',
+                  })
                 }
-                logger?.log(
-                  pc.magenta('[Server] Target.attachedToTarget full payload:'),
-                  JSON.stringify(attachedPayload),
+              }
+              // An iframe whose owning session is unknown (or not visible to this client) cannot be
+              // routed: on the root session Playwright would detach it for everyone. Said, not sent.
+              for (const target of pending) {
+                logger?.error(
+                  pc.red('[Server] Not replaying an iframe attach: the session that owns its frame is not known to this client'),
+                  target.sessionId,
+                  target.targetInfo.url,
                 )
-                sendToPlaywright({
-                  message: attachedPayload,
-                  clientId,
-                  source: 'server',
-                })
               }
             }
 
@@ -2221,6 +2248,10 @@ export async function startPlayWriterCDPRelayServer({
               }
 
               // Only forward to Playwright if this is a new target to avoid duplicates
+              const iframeOwnerSession = targetParams.targetInfo.type === 'iframe' ? (iframeOwnerSessionId ?? incomingSessionId) : incomingSessionId
+              if (targetParams.targetInfo.type === 'iframe' && iframeOwnerSession) {
+                iframeOwnerSessions.set(`${connectionId}:${targetParams.sessionId}`, iframeOwnerSession)
+              }
               if (!alreadyConnected) {
                 sendToPlaywright({
                   message: {
@@ -2280,7 +2311,7 @@ export async function startPlayWriterCDPRelayServer({
                     // the A56D… row cannot recur; the fallback below still carries the F526…/11F7… rows.
                     // relay-oopif-attach.test.ts pins the A56D… row (it reproduces that shape without a
                     // race and fails on every run with the background.ts change reverted, 5/5).
-                    sessionId: iframeOwnerSessionId ?? incomingSessionId,
+                    sessionId: iframeOwnerSession,
                     method: 'Target.attachedToTarget',
                     params: targetParams,
                   } as CDPEventBase,
@@ -2293,6 +2324,7 @@ export async function startPlayWriterCDPRelayServer({
               store.setState((s) =>
                 relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
               )
+              iframeOwnerSessions.delete(`${connectionId}:${detachParams.sessionId}`)
 
               sendToPlaywright({
                 message: {
@@ -2600,7 +2632,7 @@ export async function startPlayWriterCDPRelayServer({
     try {
       const body = (await c.req.json()) as { sessionId: string | number; code: string; timeout?: number }
       const sessionId = normalizeSessionId(body.sessionId)
-      const { code, timeout = 10000 } = body
+      const { code, timeout = 30000 } = body
 
       if (!sessionId || !code) {
         return c.json({ error: 'sessionId and code are required' }, 400)
@@ -2699,7 +2731,13 @@ export async function startPlayWriterCDPRelayServer({
         /** Block images/video/fonts to save proxy bandwidth */
         blockProxyResources?: boolean
       }
+      /** human (default) or debug — fixed for the session by whoever creates it, never by the model. */
+      policy?: string
     }
+    if (body.policy !== undefined && body.policy !== 'human' && body.policy !== 'debug') {
+      return c.json({ error: `policy must be "human" or "debug" (got ${JSON.stringify(body.policy)})` }, 400)
+    }
+    const policy = body.policy
     const sessionId = String(nextSessionNumber++)
     const cwd = body.cwd
 
@@ -2711,6 +2749,7 @@ export async function startPlayWriterCDPRelayServer({
       const executor = manager.getExecutor({
         sessionId,
         cwd,
+        policy,
         cdpConfig: { headless: true },
         sessionMetadata: {
           extensionId: null,
@@ -2751,6 +2790,7 @@ export async function startPlayWriterCDPRelayServer({
       const executor = manager.getExecutor({
         sessionId,
         cwd,
+        policy,
         cdpConfig: { directCdpUrl: appendSessionToWsUrl(body.cdpEndpoint, sessionId) },
         sessionMetadata: {
           extensionId: null,
@@ -2817,6 +2857,7 @@ export async function startPlayWriterCDPRelayServer({
     const executor = manager.getExecutor({
       sessionId,
       cwd,
+      policy,
       sessionMetadata: {
         extensionId: conn.stableKey,
         browser: conn.info.browser || null,

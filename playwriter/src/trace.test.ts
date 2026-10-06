@@ -617,7 +617,7 @@ describe('fiberDiff', () => {
         { path: 'onClick', ref: onClickRef, name: 'onClick', arity: 1 },
         { path: 'rows[0].render', ref: rowFnRef, name: 'render', arity: 0 },
       ],
-      caps: { maxKeys: 60, maxDepth: 3, keysOmitted: 0, fnRefsOmitted: 0 },
+      caps: { maxKeys: 60, maxDepth: 3, keysOmitted: 0, fnRefsOmitted: 0, identitiesOmitted: 0 },
       note: '',
     })
 
@@ -628,6 +628,12 @@ describe('fiberDiff', () => {
     const churned = fiberDiff(mk(1, 2, 3), mk(9, 8, 7))
     expect(churned.identityChangedKeys.sort()).toEqual(['onClick', 'rows', 'rows[0].render'])
     expect(churned.changes.find((c) => c.key === 'rows[0].render')?.valueType).toBe('function')
+
+    // A value left without a token (registry full: ref 0) is unobservable, never "changed".
+    const uncaptured = fiberDiff(mk(1, 2, 3), mk(0, 2, 0))
+    expect(uncaptured.unobservableKeys.sort()).toEqual(['onClick', 'rows[0].render'])
+    expect(uncaptured.identityChangedKeys).toEqual([])
+    expect(uncaptured.unchangedKeys.sort()).toEqual(['count', 'rows'])
   })
 })
 

@@ -10,7 +10,12 @@ import { imageSize } from 'image-size'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
 import type { CDPCommand } from './cdp-types.js'
-import { screenshotWithAccessibilityLabels } from './aria-snapshot.js'
+import { getAriaSnapshot } from './aria-snapshot.js'
+import { PageFrames } from './page-frames.js'
+import { RefRegistry } from './ref-registry.js'
+import { observePage } from './page-observe.js'
+import { renderLabelledScreenshot } from './labelled-screenshot.js'
+import { decodePng } from './png-pixels.js'
 import {
   setupTestContext,
   cleanupTestContext,
@@ -28,22 +33,19 @@ import './test-declarations.js'
 const TEST_PORT = testRelayPort(import.meta.url)
 
 /**
- * Floors for the ref-label overlay, one per committed page fixture.
+ * Floors for the labelled screenshot, one per committed page fixture.
  *
- * Floors rather than exact counts: how many nodes aria-snapshot.ts calls interactive is allowed
- * to change without this test caring. What is NOT allowed is the number collapsing — which is
- * exactly what a live old.reddit.com did when it served headless Chromium a bot-check stub and
- * the old `expect(labelCount).toBeGreaterThan(0)` reported success on 3 labels for a page that
- * should have produced hundreds.
+ * Floors rather than exact counts: how many elements observe() lists is allowed to change
+ * without this test caring. What is NOT allowed is the number collapsing — which is exactly
+ * what a live old.reddit.com did when it served headless Chromium a bot-check stub and the old
+ * `expect(labelCount).toBeGreaterThan(0)` reported success on 3 labels for a page that should
+ * have produced hundreds.
  *
- * `minLabels` counts only refs whose box lands inside the 1280x720 viewport, which is why it is
- * so much smaller than `minSnapshotLines` — that one covers the whole document. Both are
- * measured against the committed fixtures and set to roughly half the observed value, so there
- * is real room for drift before either means anything.
+ * `minLabels` counts only refs drawn inside the 1280x720 viewport, which is why it is so much
+ * smaller than `minSnapshotLines` — that one covers the whole document. Both are set to roughly
+ * half the observed value, so there is real room for drift before either means anything.
  */
 const MIN_ARIA_LABELS = {
-  // Observed on the committed fixtures: wikipedia 71 labels / 695 lines,
-  // hacker-news 101 labels / 475 lines.
   wikipedia: { minLabels: 35, minSnapshotLines: 350 },
   hackerNews: { minLabels: 50, minSnapshotLines: 235 },
 } as const
@@ -112,7 +114,8 @@ describe('Snapshot & Screenshot Tests', () => {
   beforeAll(async () => {
     testCtx = await setupTestContext({ suiteUrl: import.meta.url, tempDirPrefix: 'pw-snap-test-', toggleExtension: true })
 
-    const result = await createMCPClient({ port: TEST_PORT })
+    // Snapshot and screenshot tools through the relay, not the human-mode policy.
+    const result = await createMCPClient({ port: TEST_PORT, policy: 'debug' })
     client = result.client
     cleanup = result.cleanup
   }, 600000)
@@ -464,6 +467,7 @@ describe('Snapshot & Screenshot Tests', () => {
 
     await new Promise((r) => setTimeout(r, 400))
 
+    const globalsBefore = await page.evaluate(() => Object.getOwnPropertyNames(globalThis).sort())
     const result = await client.callTool({
       name: 'execute',
       arguments: {
@@ -477,11 +481,6 @@ describe('Snapshot & Screenshot Tests', () => {
                     const btn = testPage.locator('#test-btn');
                     const locatorString = await getLocatorStringForElement(btn);
                     console.log('Locator string:', locatorString);
-                    const locatorFromString = eval('testPage.' + locatorString);
-                    const count = await locatorFromString.count();
-                    console.log('Locator count:', count);
-                    const text = await locatorFromString.textContent();
-                    console.log('Locator text:', text);
                 `,
         timeout: 30000,
       },
@@ -489,11 +488,15 @@ describe('Snapshot & Screenshot Tests', () => {
 
     expect(result.isError).toBeFalsy()
     const text = (result.content as any)[0]?.text || ''
-    expect(text).toContain('Locator string:')
-    expect(text).toContain("getByRole('button', { name: 'Click Me' })")
-    expect(text).toContain('Locator count:')
-    expect(text).toContain('Locator text:')
-    expect(text).toContain('Click Me')
+    const locatorString = text.match(/Locator string: (.+)/)?.[1]?.trim() ?? ''
+    expect(locatorString).toBe("getByRole('button', { name: 'Click Me' })")
+    // The string is a working locator: build it on the same tab, here in the test process (the
+    // human-mode policy refuses eval in execute code, since it cannot read code built at run time).
+    const locatorFromString = new Function('page', `return page.${locatorString}`)(page)
+    expect(await locatorFromString.count()).toBe(1)
+    expect(await locatorFromString.textContent()).toBe('Click Me')
+    // The generator ran in playwriter's isolated world: the page's own globals are unchanged.
+    expect(await page.evaluate(() => Object.getOwnPropertyNames(globalThis).sort())).toEqual(globalsBefore)
 
     await page.close()
   }, 60000)
@@ -953,15 +956,13 @@ describe('Snapshot & Screenshot Tests', () => {
     await page.close()
   }, 60000)
 
-  // ── The ref-label overlay on a dense real-world page ─────────────────────────────────
+  // ── The labelled screenshot on a dense real-world page ───────────────────────────────
   //
   // This used to open https://old.reddit.com/ and https://news.ycombinator.com/ for real. Two
   // separate things went wrong with that, and only one of them looked like a failure:
   //
-  //   - Hacker News timed out — but NOT because of the network, which is what it looked like.
-  //     `showAriaRefLabels` never got past its first page.evaluate, and it does the same thing
-  //     against a local fixture: see the note on the loop below. The live site was hiding a
-  //     relay-side stall, not causing one.
+  //   - Hacker News timed out — but NOT because of the network: a relay-side stall (see the
+  //     note on the loop below). The live site was hiding it, not causing it.
   //   - old.reddit.com "passed" with 3 labels. Three. On a page that should produce hundreds —
   //     reddit serves headless Chromium a 17-element bot-check stub, verified by loading it.
   //     `expect(labelCount).toBeGreaterThan(0)` cannot tell that from success, so that half of
@@ -972,21 +973,14 @@ describe('Snapshot & Screenshot Tests', () => {
   // elements, 21 tables, nesting 31 deep), but a site that answers. And the assertion is a
   // per-page floor on the label count rather than `> 0`, so a stub page — or a regression that
   // labels only a handful of the refs — fails instead of passing quietly.
-  it('should show aria ref labels on real pages and save screenshots', async () => {
+  it('should draw observe() refs onto screenshots of real pages without touching them', async () => {
     const browserContext = getBrowserContext()
     const serviceWorker = await getExtensionServiceWorker(browserContext)
 
-    const { showAriaRefLabels, hideAriaRefLabels } = await import('./aria-snapshot.js')
-
-    // Create assets folder for screenshots
     const assetsDir = path.join(path.dirname(new URL(import.meta.url).pathname), 'assets')
-    if (!fs.existsSync(assetsDir)) {
-      fs.mkdirSync(assetsDir, { recursive: true })
-    }
+    fs.mkdirSync(assetsDir, { recursive: true })
 
     const testPages = [
-      // Floors are set well under what the committed fixtures actually produce, so ordinary
-      // drift in how refs are assigned does not fail the test, but losing most of the page does.
       { name: 'wikipedia', fixture: 'wikipedia', ...MIN_ARIA_LABELS.wikipedia },
       { name: 'hacker-news', fixture: 'hacker-news', ...MIN_ARIA_LABELS.hackerNews },
     ]
@@ -1009,52 +1003,35 @@ describe('Snapshot & Screenshot Tests', () => {
       }
     }
 
+    // Every CDP read below already carries its own deadline; this one bounds the whole step so a
+    // regression fails the test with the step's name instead of hanging the run.
     const withTimeout = async <T>(label: string, task: () => Promise<T>, timeoutMs: number): Promise<T> => {
-      let timeoutId: NodeJS.Timeout | null = null
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error(`Timed out after ${timeoutMs}ms: ${label}`))
-        }, timeoutMs)
-      })
-
+      const expired = Promise.withResolvers<never>()
+      const timeoutId = setTimeout(
+        () => expired.reject(new Error(`Timed out after ${timeoutMs}ms: ${label}`)),
+        timeoutMs,
+      )
       try {
-        return await Promise.race([task(), timeoutPromise])
+        return await Promise.race([task(), expired.promise])
       } finally {
-        if (timeoutId) {
-          clearTimeout(timeoutId)
-        }
+        clearTimeout(timeoutId)
       }
     }
 
     // ── One tab per fixture, all connected before the CDP client attaches ──────────────
     //
-    // This is the test's original shape, restored. For a while it was reshaped into "one tab
-    // navigated between fixtures", because with a SECOND connected target in the session the
-    // first `page.evaluate` against it — the one inside showAriaRefLabels' ensureA11yClient,
-    // which returns in ~30ms — hung forever, about one run in two. That was never a property
-    // of this test: it was a relay bug. The relay let a session's Runtime.enable execution
-    // context events overtake the response to the Page.getFrameTree that same client had sent
-    // earlier on that session, and Playwright drops context events that arrive before it has
-    // the frame tree (crPage.ts:457 registers the listener inside the getFrameTree callback,
-    // and crPage.ts:654 needs the frame to exist). Chrome emits those events once, so the main
-    // world was lost for good and `frame._context('main')` never resolved. Fixed by the
-    // Runtime.enable ordering fence in cdp-relay.ts; guarded directly by
-    // relay-two-targets.test.ts.
-    //
-    // The reshape is reverted rather than kept because it was symptom avoidance, and because a
-    // suite in which several tabs are connected at once is the ordinary way an agent drives a
-    // browser — this test should keep exercising it. Navigation through the relay, the one
-    // thing the reshaped version added, is relay-navigation.test.ts's subject.
-    //
-    // The `withTimeout` wrappers below stay: page.evaluate has no deadline of its own, so
-    // without them a regression of this class would hang the run instead of failing it.
+    // Several connected tabs at once is the ordinary way an agent drives a browser. With a
+    // second connected target the first main-world read against it used to hang about one run
+    // in two: the relay let a session's Runtime.enable context events overtake the response to
+    // the Page.getFrameTree the client had sent earlier, and Playwright drops context events
+    // that arrive before it has the frame tree. Fixed by the Runtime.enable ordering fence in
+    // cdp-relay.ts; guarded directly by relay-two-targets.test.ts.
     const ownPages = new Map<string, Page>()
     for (const testPage of testPages) {
       const url = `${server.baseUrl}/${testPage.name}`
       const p = await browserContext.newPage()
       p.setDefaultNavigationTimeout(30000)
       p.on('request', requestListener)
-      console.log(`[labels] opening ${testPage.name}: ${url}`)
       await p.goto(url, { waitUntil: 'load' })
       await p.bringToFront()
       await serviceWorker.evaluate(
@@ -1068,7 +1045,7 @@ describe('Snapshot & Screenshot Tests', () => {
 
     const browser = await chromium.connectOverCDP(getCdpUrl({ port: TEST_PORT, workspace: TEST_WORKSPACE }))
     try {
-      for (const { name, fixture, minLabels, minSnapshotLines } of testPages) {
+      for (const { name, minLabels, minSnapshotLines } of testPages) {
         const url = `${server.baseUrl}/${name}`
         const cdpPage = browser
           .contexts()[0]
@@ -1077,76 +1054,65 @@ describe('Snapshot & Screenshot Tests', () => {
         if (!cdpPage) {
           throw new Error(`Could not find the fixture page over CDP (looked for ${url})`)
         }
-        console.log(`[labels] loaded ${name}: ${cdpPage.url()} (fixture ${fixture})`)
+        // Chrome paints only the front tab; the labelled screenshot refuses a hidden one.
+        await ownPages.get(url)!.bringToFront()
 
-        console.log(`[labels] show labels ${name}`)
-        const { labelCount, snapshot } = await withTimeout(
-          `showAriaRefLabels(${name})`,
-          async () => {
-            return await showAriaRefLabels({ page: cdpPage })
-          },
-          60000,
-        )
-        const snapshotLines = snapshot.split('\n').filter((line) => {
-          return line.trim().length > 0
-        }).length
-        console.log(`${name}: ${labelCount} labels shown, ${snapshotLines} snapshot lines`)
-        // Two floors, because they fail for different reasons. The label count only counts refs
-        // whose box lands in the 1280x720 viewport, so it says "the overlay drew a real number of
-        // boxes"; the snapshot line count covers the whole document, so it says "the whole page
-        // was there to be labelled". A stub page fails both; a regression that stops rendering
-        // labels fails only the first.
-        expect(labelCount, `${name}: expected the overlay to label a real number of refs`).toBeGreaterThanOrEqual(
-          minLabels,
-        )
-        expect(snapshotLines, `${name}: expected the full page in the aria snapshot`).toBeGreaterThanOrEqual(
-          minSnapshotLines,
-        )
+        const cdp = await getCDPSessionForPage({ page: cdpPage })
+        const frames = new PageFrames({ page: cdpPage, cdp })
+        const world = frames.main.world
+        try {
+          const elementCount = () => cdpPage.evaluate(() => document.getElementsByTagName('*').length)
+          const elementsBefore = await withTimeout(`count elements (${name})`, elementCount, 10000)
 
-        console.log(`[labels] screenshot ${name}`)
-        const screenshot = await withTimeout(
-          `screenshot(${name})`,
-          async () => {
-            return await cdpPage.screenshot({ type: 'png', fullPage: false })
-          },
-          30000,
-        )
-        const screenshotPath = path.join(assetsDir, `aria-labels-${name}.png`)
-        fs.writeFileSync(screenshotPath, screenshot)
-        console.log(`Screenshot saved: ${screenshotPath}`)
+          const { targetInfo } = await cdp.send('Target.getTargetInfo')
+          const observation = await withTimeout(
+            `observePage(${name})`,
+            () =>
+              observePage({
+                page: cdpPage,
+                frames,
+                registry: new RefRegistry(),
+                targetId: targetInfo.targetId,
+                shown: true,
+              }),
+            60000,
+          )
+          const shot = await withTimeout(
+            `renderLabelledScreenshot(${name})`,
+            () => renderLabelledScreenshot({ cdp, world, observation }),
+            30000,
+          )
+          fs.writeFileSync(path.join(assetsDir, `aria-labels-${name}.png`), shot.png)
 
-        console.log(`[labels] count dom labels ${name}`)
-        const labelElements = await withTimeout(
-          `countLabels(${name})`,
-          async () => {
-            return await cdpPage.evaluate(() => document.querySelectorAll('.__pw_label__').length)
-          },
-          10000,
-        )
-        expect(labelElements).toBe(labelCount)
+          const { snapshot } = await withTimeout(
+            `getAriaSnapshot(${name})`,
+            () => getAriaSnapshot({ page: cdpPage }),
+            30000,
+          )
+          const snapshotLines = snapshot.split('\n').filter((line) => line.trim().length > 0).length
+          console.log(`${name}: ${shot.labels.length} labels drawn, ${snapshotLines} snapshot lines`)
+          // Two floors, because they fail for different reasons: the label count says "a real number
+          // of on-screen refs was drawn"; the snapshot line count says "the whole page was there".
+          expect(shot.labels.length, `${name}: expected a real number of labels`).toBeGreaterThanOrEqual(minLabels)
+          expect(snapshotLines, `${name}: expected the full page in the aria snapshot`).toBeGreaterThanOrEqual(
+            minSnapshotLines,
+          )
 
-        console.log(`[labels] hide labels ${name}`)
-        await withTimeout(
-          `hideAriaRefLabels(${name})`,
-          async () => {
-            await hideAriaRefLabels({ page: cdpPage })
-          },
-          10000,
-        )
+          // The labels are observe()'s own refs, and the PNG is what the result says it is.
+          const observedRefs = new Set(observation.elements.map((element) => element.ref))
+          expect(shot.labels.filter((label) => !observedRefs.has(label.ref))).toEqual([])
+          const image = decodePng(shot.png)
+          expect({ width: image.width, height: image.height }).toEqual({ width: shot.width, height: shot.height })
 
-        const labelsAfterHide = await withTimeout(
-          `verifyHide(${name})`,
-          async () => {
-            return await cdpPage.evaluate(() => document.getElementById('__playwriter_labels__'))
-          },
-          10000,
-        )
-        expect(labelsAfterHide).toBeNull()
+          // Nothing was added to the page.
+          expect(await withTimeout(`count elements again (${name})`, elementCount, 10000)).toBe(elementsBefore)
+        } finally {
+          frames.dispose()
+        }
 
         expect(requestedUrls, `expected ${name}'s own request in the log`).toContain(url)
       }
     } finally {
-      console.log('[labels] closing page')
       await browser.close()
       for (const p of ownPages.values()) {
         p.off('request', requestListener)
@@ -1154,8 +1120,6 @@ describe('Snapshot & Screenshot Tests', () => {
       }
       await server.close()
     }
-
-    console.log(`Screenshots saved to: ${assetsDir}`)
 
     // Guard the guard first: no request log means the check below would pass by seeing nothing.
     expect(requestedUrls.length, 'expected request events from the fixture pages').toBeGreaterThan(0)

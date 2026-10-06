@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Order details</title>
+</head>
+<body>
+<h1>Order 1042</h1>
+<p><button id="confirm" onclick="document.getElementById('state').textContent = 'Confirmed: ' + (++window.confirmations)">Confirm order</button></p>
+<p id="state">Not confirmed</p>
+<script>window.confirmations = 0</script>
+</body>
+</html>

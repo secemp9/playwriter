@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Search swap</title>
+<style>
+  body { font: 14px sans-serif; margin: 40px; }
+  .box { position: relative; width: 320px; margin-bottom: 24px; }
+  .box input { width: 100%; height: 32px; padding-left: 32px; box-sizing: border-box; }
+  .box svg { position: absolute; left: 8px; top: 8px; }
+  #elsewhere { display: block; margin-top: 160px; }
+</style>
+</head>
+<body>
+  <!-- Like Wikipedia's search: the server-rendered input is replaced by the app's own on first focus, at the same spot, with an icon drawn over it. -->
+  <div class="box">
+    <svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="#555"/></svg>
+    <input id="search" type="search" aria-label="Search the shop" placeholder="Search the shop">
+  </div>
+  <!-- A field whose click is answered by moving the caret to another field, away from the pointer. -->
+  <input id="coupon" aria-label="Coupon code">
+  <input id="elsewhere" aria-label="Gift message">
+  <script>
+    document.getElementById('search').addEventListener('focus', () => {
+      const next = document.createElement('input')
+      next.id = 'search-app'
+      next.type = 'search'
+      next.setAttribute('role', 'combobox')
+      next.setAttribute('aria-label', 'Search the shop')
+      next.placeholder = 'Search the shop'
+      document.getElementById('search').replaceWith(next)
+      next.focus()
+    }, { once: true })
+    document.getElementById('coupon').addEventListener('focus', () => {
+      const next = document.createElement('input')
+      next.id = 'coupon-app'
+      next.setAttribute('aria-label', 'Coupon code')
+      document.getElementById('coupon').replaceWith(next)
+      document.getElementById('elsewhere').focus()
+    }, { once: true })
+  </script>
+</body>
+</html>

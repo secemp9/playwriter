@@ -1,7 +1,7 @@
 ---
 title: Record Browser Automation as MP4 Video
 sidebarTitle: Recording
-description: Record browser sessions as MP4 video that survives page navigation, with ghost cursor overlay and automatic demo acceleration for idle sections.
+description: Record browser sessions as MP4 video that survives page navigation, with the pointer drawn into the video and automatic demo acceleration for idle sections — nothing is added to the page.
 icon: lucide:video
 ---
 
@@ -19,20 +19,17 @@ await recording.start({
 
 ## Navigate and interact
 
-Recording continues across page navigations. No restart needed:
+Recording continues across page navigations. No restart needed. Act through the page the way a person does, so the video shows the steps:
 
 ```js
-await state.page.click('a')
-await state.page.waitForLoadState('domcontentloaded')
-await state.page.goBack()
-// Still recording
+await act.click(12)   // a link ref from observe(); the pointer path is drawn into the video
 ```
 
 ## Stop and save
 
 ```js
 state.recordingResult = await recording.stop({ page: state.page })
-// => { path, duration, executionTimestamps }
+// => { path, duration, executionTimestamps, pointer: { drawn, samples, segments, pulses, note? } }
 ```
 
 Save the full result to `state` because `executionTimestamps` is needed for `createDemoVideo`.
@@ -46,7 +43,8 @@ Save the full result to `state` because `executionTimestamps` is needed for `cre
 | `frameRate` | number | 30 | Frames per second |
 | `audio` | boolean | false | Record tab audio |
 | `videoBitsPerSecond` | number | 2500000 | Video bitrate |
-| `aspectRatio` | object \| null | `{ width: 16, height: 9 }` | Auto-resize viewport; `null` to skip |
+| `aspectRatio` | object | none | Opt-in: resizes the viewport while recording (fires resize events and media-query changes), restored on stop. For a fixed aspect without touching the page, pad or crop the file afterwards with ffmpeg |
+| `pointer` | boolean \| object | `true` | Draw the pointer into the video at stop time, from the inputs that were dispatched; `false` turns it off, an object (`sizePx`, `fillColor`, `outlineColor`, `pulseColor`, `pulseMs`) styles it. Needs an ffmpeg with libass |
 | `maxDurationMs` | number | 15 min | Auto-stop safety limit; `0` to disable |
 
 ## Other recording commands
@@ -59,20 +57,16 @@ await recording.isRecording({ page: state.page })
 await recording.cancel({ page: state.page })
 ```
 
-## Ghost cursor
+## The pointer
 
-The extension injects a **ghost cursor** overlay on every Playwriter-attached tab. It follows mouse actions automatically, making recordings look natural.
+Nothing is injected into the page to show the pointer. Every mouse input playwriter dispatches — `act.*`, `humanMouse` paths, Playwright's own `page.mouse.*` and `locator.click()` — is recorded on the Node side, and `recording.stop()` (and `recording.startCdp`'s encoder) draws an arrow along that path, with a ring on each press and release. Without libass the default skips the pointer with a note; asking for it explicitly makes that an error.
+
+A live cursor drawn inside the page is still available for a human watching the tab, but it modifies the page (an element and a global), so it is opt-in and refused in human mode:
 
 ```js
-// Change cursor style
-await ghostCursor.show({ page: state.page, style: 'screenstudio' })
-// Styles: 'minimal' (default), 'dot', 'screenstudio'
-
-// Temporarily hide the cursor
+await ghostCursor.show({ page: state.page, style: 'screenstudio' }) // debug mode only
 await ghostCursor.hide({ page: state.page })
 ```
-
-For best-looking recordings, use **locator-based interactions** (`locator.click()`, `page.mouse.move()`) instead of `goto()` to show realistic cursor motion.
 
 ## Demo video acceleration
 
@@ -98,7 +92,7 @@ This can take **60-120+ seconds**. Always pass `--timeout 120000` or higher.
 - **Extension mode only.** Recording uses `chrome.tabCapture` which requires the extension. Not available in direct CDP mode or headless mode.
 - **User must click the extension icon** on the tab before recording starts.
 - **Auto-stops after 15 minutes** by default. Override with `maxDurationMs`.
-- **Viewport auto-resizes** to 16:9 aspect ratio. Pass `aspectRatio: null` to keep the current size.
+- **The viewport is left as it is.** Pass `aspectRatio` only when resizing the page is acceptable.
 
 ## Automatic tab capture
 

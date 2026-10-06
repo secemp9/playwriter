@@ -20,47 +20,16 @@ import type {
   OffscreenIsRecordingResult,
 } from './offscreen-types'
 import { store, connectionManager, logger, sendMessage, getTabBySessionId } from './background'
+import { ensureOffscreenDocument } from './offscreen-document'
 
 // Active recordings - kept outside store since MediaRecorder/MediaStream can't be serialized
 const activeRecordings: Map<number, RecordingInfo> = new Map()
-
-// Offscreen document management
-let offscreenDocumentCreating: Promise<void> | null = null
 
 /**
  * Get the active recordings map (for cleanup on tab disconnect).
  */
 export function getActiveRecordings(): Map<number, RecordingInfo> {
   return activeRecordings
-}
-
-async function ensureOffscreenDocument(): Promise<void> {
-  // Check if already exists
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
-    documentUrls: [chrome.runtime.getURL('src/offscreen.html')],
-  })
-
-  if (existingContexts.length > 0) {
-    return
-  }
-
-  // Reuse in-progress creation
-  if (offscreenDocumentCreating) {
-    return offscreenDocumentCreating
-  }
-
-  offscreenDocumentCreating = chrome.offscreen.createDocument({
-    url: 'src/offscreen.html',
-    reasons: [chrome.offscreen.Reason.USER_MEDIA],
-    justification: 'Screen recording via chrome.tabCapture',
-  })
-
-  try {
-    await offscreenDocumentCreating
-  } finally {
-    offscreenDocumentCreating = null
-  }
 }
 
 function resolveTabIdFromSessionId(sessionId?: string): number | undefined {

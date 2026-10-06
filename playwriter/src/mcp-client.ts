@@ -4,15 +4,21 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { Stream } from 'node:stream'
 import path from 'node:path'
 import url from 'node:url'
+import type { PolicyMode } from './probe-types.js'
 
 const __filename = url.fileURLToPath(import.meta.url)
 
 export interface CreateTransportOptions {
   clientName?: string
   port?: number
+  /**
+   * The code policy of the spawned MCP server (`PLAYWRITER_POLICY`). Unset: the server's default
+   * (`human`), or whatever PLAYWRITER_POLICY the test process itself runs with.
+   */
+  policy?: PolicyMode
 }
 
-export async function createTransport({ args = [], port }: { args?: string[]; port?: number } = {}): Promise<{
+export async function createTransport({ args = [], port, policy }: { args?: string[]; port?: number; policy?: PolicyMode } = {}): Promise<{
   transport: Transport
   stderr: Stream | null
 }> {
@@ -24,6 +30,9 @@ export async function createTransport({ args = [], port }: { args?: string[]; po
   }
   if (port) {
     env.PLAYWRITER_PORT = String(port)
+  }
+  if (policy) {
+    env.PLAYWRITER_POLICY = policy
   }
   const transport = new StdioClientTransport({
     command: 'pnpm',
@@ -49,7 +58,7 @@ export async function createMCPClient(options?: CreateTransportOptions): Promise
     version: '1.0.0',
   })
 
-  const { transport, stderr } = await createTransport({ port: options?.port })
+  const { transport, stderr } = await createTransport({ port: options?.port, policy: options?.policy })
 
   let stderrBuffer = ''
   stderr?.on('data', (data) => {

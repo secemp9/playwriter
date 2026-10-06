@@ -4,11 +4,11 @@
  * These bundles are injected into pages via CDP Runtime.evaluate or page.evaluate().
  * All bundles are built as browser-targeted IIFEs that expose their APIs on globalThis.
  *
- * Injection flow (see react-source.ts, page-markdown.ts for examples):
+ * Injection flow (see page-markdown.ts for an example):
  * 1. Bundle is read from dist/*.js via fs.readFileSync (cached after first read)
  * 2. Check if already injected: `await page.evaluate(() => !!globalThis.__name)`
  * 3. If not present, inject: `await page.evaluate(code)` or `cdp.send('Runtime.evaluate', { expression: code })`
- * 4. Use the exposed global in subsequent evaluate calls: `globalThis.__readability`, `globalThis.__bippy`, etc.
+ * 4. Use the exposed global in subsequent evaluate calls: `globalThis.__readability`, etc.
  *
  * Each bundle uses a separate Bun.build() call (not multiple entrypoints in one call)
  * to ensure fully self-contained output with no shared chunks.
@@ -43,11 +43,6 @@ type BundleConfig = SourceBundle | WrapperBundle
 const BUNDLES: BundleConfig[] = [
   // Source file bundles
   {
-    name: 'a11y-client',
-    type: 'source',
-    entry: 'a11y-client.ts',
-  },
-  {
     name: 'ghost-cursor-client',
     type: 'source',
     entry: 'ghost-cursor-client.ts',
@@ -61,26 +56,6 @@ const BUNDLES: BundleConfig[] = [
 import { createSelectorGenerator, toLocator } from '@mizchi/selector-generator'
 
 globalThis.__selectorGenerator = { createSelectorGenerator, toLocator }
-`,
-  },
-  {
-    name: 'bippy',
-    type: 'wrapper',
-    code: `
-import { getFiberFromHostInstance, getDisplayName, traverseFiber, isCompositeFiber, isHostFiber } from 'bippy'
-import { getSource, getOwnerStack, normalizeFileName, isSourceFile } from 'bippy/source'
-
-globalThis.__bippy = {
-  getFiberFromHostInstance,
-  getDisplayName,
-  traverseFiber,
-  isCompositeFiber,
-  isHostFiber,
-  getSource,
-  getOwnerStack,
-  normalizeFileName,
-  isSourceFile,
-}
 `,
   },
   {

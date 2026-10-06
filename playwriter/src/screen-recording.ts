@@ -6,6 +6,7 @@
  * sessionId (pw-tab-* format) is used to identify which tab to record.
  */
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
@@ -17,6 +18,13 @@ import type {
   CancelRecordingResult,
 } from './protocol.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
+import {
+  burnPointerIntoVideo,
+  validatePointerOptions,
+  type PointerBurnResult,
+  type PointerOverlayOptions,
+} from './cdp-screencast.js'
+import { pointerTrackFor } from './pointer-track.js'
 
 /**
  * Build headers for the relay's privileged /recording/* HTTP endpoints.
@@ -43,8 +51,6 @@ export function getChromeRestartCommand(): string {
   return `playwriter browser start${headlessFlag}`
 }
 
-const DEFAULT_ASPECT_RATIO = { width: 16, height: 9 }
-
 /** Default max recording duration: 15 minutes in milliseconds */
 const DEFAULT_MAX_DURATION_MS = 15 * 60 * 1000
 
@@ -55,7 +61,7 @@ const DEFAULT_MAX_DURATION_MS = 15 * 60 * 1000
  */
 export function fitToAspectRatio(
   current: { width: number; height: number },
-  ratio: { width: number; height: number } = DEFAULT_ASPECT_RATIO,
+  ratio: { width: number; height: number },
 ): { width: number; height: number } {
   const targetRatio = ratio.width / ratio.height
   const currentRatio = current.width / current.height
@@ -95,12 +101,27 @@ export interface StartRecordingOptions {
   outputPath: string
   /** Relay server port (default: 19988) */
   relayPort?: number
-  /** Aspect ratio to fit viewport to before recording (default: { width: 16, height: 9 }).
-   *  Set to null to skip viewport resizing. */
-  aspectRatio?: { width: number; height: number } | null
+  /**
+   * Resize the viewport to this aspect ratio before recording. **Off by default, and it
+   * perturbs the page:** `setViewportSize` fires `resize` and re-evaluates every media query
+   * in the page, so the recording shows a page laid out differently from the one the agent
+   * was driving. The original size is restored on stop/cancel. For a fixed-aspect clip
+   * without touching the page, record as-is and pad or crop the file afterwards with
+   * ffmpeg (`-vf pad=...` / `-vf crop=...`).
+   */
+  aspectRatio?: { width: number; height: number }
   /** Max recording duration in ms (default: 15 min = 900000). Auto-stops recording
    *  when exceeded to prevent accidentally filling disk. Set to 0 or Infinity to disable. */
   maxDurationMs?: number
+  /**
+   * Draw the pointer into the video at `stop()`. **On by default**; `false` turns it off, an
+   * object styles it. Drawn from the page's pointer track — the positions the automation
+   * dispatched — never from anything in the page, so nothing is injected to show it.
+   *
+   * Burning it needs libass. Left at the default on an ffmpeg without libass it is skipped
+   * and the stop result's `pointer.note` says so; requested explicitly, that is an error.
+   */
+  pointer?: boolean | PointerOverlayOptions
 }
 
 export interface StopRecordingOptions {
@@ -136,6 +157,11 @@ interface CreateRecordingApiOptions {
   onStart: () => void
   onFinish: () => void
   getExecutionTimestamps: () => ExecutionTimestamp[]
+  /**
+   * The page's CSS viewport (`innerWidth` × `innerHeight`), read without touching it: Playwright's
+   * `page.evaluate` runs as a user gesture and gives the page user activation.
+   */
+  viewportOf: (page: Page) => Promise<{ width: number; height: number }>
 }
 
 interface StartRecordingWithDefaultsOptions extends Omit<StartRecordingOptions, 'relayPort'> {}
@@ -175,18 +201,39 @@ function withRecordingDefaults<T extends { page?: Page; sessionId?: string }, R>
   }
 }
 
+/** What `recording.stop()` returns. */
+export interface RecordingStopResult {
+  path: string
+  duration: number
+  size: number
+  executionTimestamps: ExecutionTimestamp[]
+  /** What the pointer layer drew. Present unless the recording was started with `pointer: false`. */
+  pointer?: PointerBurnResult
+}
+
+/** What `start()` captured so `stop()` can burn the pointer on the recording's own clock. */
+interface PointerBurnPlan {
+  startedAt: number
+  cssViewport: { width: number; height: number }
+  fps: number
+  options?: PointerOverlayOptions
+  required: boolean
+}
+
 export function createRecordingApi(options: CreateRecordingApiOptions): {
   start: (opts?: StartRecordingWithDefaultsOptions) => Promise<RecordingState>
-  stop: (opts?: StopRecordingWithDefaultsOptions) => Promise<{ path: string; duration: number; size: number; executionTimestamps: ExecutionTimestamp[] }>
+  stop: (opts?: StopRecordingWithDefaultsOptions) => Promise<RecordingStopResult>
   isRecording: (opts?: IsRecordingWithDefaultsOptions) => Promise<RecordingState>
   cancel: (opts?: CancelRecordingWithDefaultsOptions) => Promise<void>
 } {
-  const { context, defaultPage, relayPort, ghostCursorController, onStart, onFinish, getExecutionTimestamps } = options
+  const { context, defaultPage, relayPort, ghostCursorController, onStart, onFinish, getExecutionTimestamps, viewportOf } = options
 
-  // Stores the original viewport before aspect-ratio resize so we can restore on stop/cancel
+  // Stores the original viewport before an explicit aspect-ratio resize so we can restore on stop/cancel
   let preRecordingViewport: { width: number; height: number } | null = null
   // Auto-stop timer to prevent unbounded recordings
-  let maxDurationTimer: ReturnType<typeof setTimeout> | null = null
+  let maxDurationTimer: NodeJS.Timeout | null = null
+  // Per recorded page; absent when the recording was started with pointer: false.
+  const pointerPlans = new Map<Page, PointerBurnPlan>()
 
   const startWithDefaults = withRecordingDefaults<StartRecordingWithDefaultsOptions, RecordingState>({
     relayPort,
@@ -213,22 +260,45 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
   const start = async (opts?: StartRecordingWithDefaultsOptions): Promise<RecordingState> => {
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
 
-    // Resize viewport to target aspect ratio (default 16:9) before recording.
+    // Only on explicit request: resizing fires `resize` and media-query changes in the page.
     // Only shrinks — never increases width or height beyond current values.
-    const aspectRatio = opts?.aspectRatio === undefined ? DEFAULT_ASPECT_RATIO : opts.aspectRatio
-    if (aspectRatio) {
+    if (opts?.aspectRatio) {
       const current = targetPage.viewportSize()
-      if (current) {
-        const fitted = fitToAspectRatio(current, aspectRatio)
-        if (fitted.width !== current.width || fitted.height !== current.height) {
-          preRecordingViewport = current
-          await targetPage.setViewportSize(fitted)
-        }
+      if (!current) {
+        throw new Error(
+          'recording.start: aspectRatio needs an emulated viewport to shrink, and this page has none (it is sized by ' +
+            'its browser window). Omit aspectRatio and pad or crop the recorded file with ffmpeg instead.',
+        )
+      }
+      const fitted = fitToAspectRatio(current, opts.aspectRatio)
+      if (fitted.width !== current.width || fitted.height !== current.height) {
+        preRecordingViewport = current
+        await targetPage.setViewportSize(fitted)
       }
     }
 
+    const pointer = opts?.pointer ?? true
+    // Refused now rather than after the recording has been made.
+    validatePointerOptions(typeof pointer === 'object' ? pointer : undefined)
+    // The CSS viewport the pointer track's coordinates live in, which `stop()` scales onto the
+    // captured video. Measured after any resize above.
+    const cssViewport = pointer === false ? undefined : await viewportOf(targetPage)
+    if (pointer !== false) pointerTrackFor(targetPage)
+
     const result = await startWithDefaults(opts)
     onStart()
+    if (cssViewport) {
+      if (result.startedAt === undefined) {
+        throw new Error('recording.start: the relay reported no startedAt, so the pointer cannot be aligned with the video.')
+      }
+      pointerPlans.set(targetPage, {
+        startedAt: result.startedAt,
+        cssViewport,
+        fps: opts?.frameRate ?? 30,
+        options: typeof pointer === 'object' ? pointer : undefined,
+        required: opts?.pointer !== undefined,
+      })
+    }
 
     // Schedule auto-stop to prevent unbounded recordings filling disk.
     // Default 15 min. Set maxDurationMs to 0 or Infinity to disable.
@@ -259,22 +329,37 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     await targetPage.setViewportSize(saved)
   }
 
-  const stop = async (
-    opts?: StopRecordingWithDefaultsOptions,
-  ): Promise<{ path: string; duration: number; size: number; executionTimestamps: ExecutionTimestamp[] }> => {
+  const stop = async (opts?: StopRecordingWithDefaultsOptions): Promise<RecordingStopResult> => {
     clearMaxDurationTimer()
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
     const result = await stopWithDefaults(opts)
+    const recordingEndedAt = Date.now()
     const executionTimestamps = [...getExecutionTimestamps()]
     onFinish()
     await restoreViewport(targetPage)
-    return { ...result, executionTimestamps }
+    const plan = pointerPlans.get(targetPage)
+    pointerPlans.delete(targetPage)
+    if (!plan) return { ...result, executionTimestamps }
+    const pointer = await burnPointerIntoVideo({
+      videoPath: result.path,
+      timeline: pointerTrackFor(targetPage),
+      recordingStartedAt: plan.startedAt,
+      recordingEndedAt,
+      cssViewport: plan.cssViewport,
+      fps: plan.fps,
+      options: plan.options,
+      required: plan.required,
+    }).catch((error: Error) => {
+      throw new Error(`${error.message} The recording itself was saved, without the pointer, at ${result.path}.`)
+    })
+    return { ...result, size: fs.statSync(result.path).size, executionTimestamps, pointer }
   }
 
   const cancel = async (opts?: CancelRecordingWithDefaultsOptions): Promise<void> => {
     clearMaxDurationTimer()
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
     await cancelWithDefaults(opts)
+    pointerPlans.delete(targetPage)
     onFinish()
     await restoreViewport(targetPage)
   }

@@ -1,6 +1,14 @@
 /**
- * Node-side ghost cursor helpers.
- * Injects the browser bundle and forwards mouse action events to the page overlay.
+ * Node-side helpers for the LIVE in-page ghost cursor — an opt-in that MODIFIES THE PAGE.
+ *
+ * The overlay is a DOM element plus a `globalThis.__playwriterGhostCursor` API injected into
+ * the page's main world. That is exactly what the page under test must never get by
+ * default, so nothing injects it except an explicit `enableGhostCursor` (the sandbox's
+ * `ghostCursor.show()`). Every other entry point here is a no-op on a page that was not
+ * shown, and never touches it.
+ *
+ * Recordings do not need it: the CDP recorder draws the pointer into the video at encode
+ * time from `pointer-track.ts`, which observes the dispatched positions without the page.
  */
 
 import fs from 'node:fs'
@@ -29,10 +37,17 @@ export interface GhostCursorPathSample {
 interface GhostCursorBrowserApi {
   enable: (options?: GhostCursorClientOptions) => void
   disable: () => void
+  isEnabled: () => boolean
   applyMouseAction: (event: MouseActionEvent) => void
   playPath: (options: { samples: GhostCursorPathSample[] }) => { playing: boolean; durationMs: number }
   cancelPath: () => void
   isPlayingPath: () => boolean
+}
+
+declare global {
+  // The overlay's API in the page's main world. Exists only on a page `enableGhostCursor`
+  // was called for; these declarations type the page-side callbacks below.
+  var __playwriterGhostCursor: GhostCursorBrowserApi | undefined
 }
 
 let ghostCursorCode: string | null = null
@@ -49,150 +64,121 @@ function getGhostCursorCode(): string {
 }
 
 /**
- * `requiredMethod` guards against VERSION SKEW, which is not hypothetical: the Chrome
- * extension bundles its own copy of this overlay and injects it into every attached tab.
- * A tab can therefore already hold an older `__playwriterGhostCursor` that predates a
- * method this process wants to call. Testing only for the object's existence would skip
- * re-injection and then silently fail on the missing method, so the capability itself is
- * what gets probed.
+ * Pages the caller explicitly asked to show the overlay on, with the options they asked
+ * for. Presence is the opt-in; nothing else in this module may touch a page that is absent.
  */
-async function ensureGhostCursorInjected(options: { page: Page; requiredMethod?: string }): Promise<void> {
-  const { page, requiredMethod } = options
-  const isUsable = await page.evaluate((method) => {
-    const api = (globalThis as { __playwriterGhostCursor?: Record<string, unknown> }).__playwriterGhostCursor
-    if (!api) {
-      return false
-    }
-    return method ? typeof api[method] === 'function' : true
-  }, requiredMethod)
+const shownPages = new WeakMap<Page, GhostCursorClientOptions | undefined>()
 
-  if (isUsable) {
-    return
-  }
-
-  const code = getGhostCursorCode()
-  await page.evaluate(code)
+export function isGhostCursorShown(page: Page): boolean {
+  return shownPages.has(page)
 }
 
+/**
+ * Inject (when the document has no overlay, or an older bundle without `requiredMethod`)
+ * and enable it with the shown options. Only ever reached for a shown page: a hard
+ * navigation replaces the document and takes the overlay with it, and because the caller
+ * opted in until `hide()`, the next use re-creates it.
+ */
+async function reviveOverlay(page: Page, requiredMethod?: keyof GhostCursorBrowserApi): Promise<void> {
+  const present = await page.evaluate((method) => {
+    const api = globalThis.__playwriterGhostCursor
+    return !!api && (!method || typeof api[method] === 'function')
+  }, requiredMethod)
+  if (!present) await page.evaluate(getGhostCursorCode())
+  await page.evaluate((optionsFromNode) => {
+    const api = globalThis.__playwriterGhostCursor
+    if (!api) throw new Error('The ghost cursor bundle did not install __playwriterGhostCursor (not the top frame?).')
+    api.enable(optionsFromNode)
+  }, shownPages.get(page))
+}
+
+/**
+ * Inject and show the live overlay. THIS MODIFIES THE PAGE (a DOM element and a main-world
+ * global); it is the explicit opt-in behind `ghostCursor.show()`. Throws when the page
+ * cannot take it (closed, restricted, mid-navigation) — a show that silently did nothing
+ * would leave the caller believing the cursor is visible. Calling it again re-applies the
+ * options, so it also changes the style of an overlay that is already up.
+ */
 export async function enableGhostCursor(options: {
   page: Page
   cursorOptions?: GhostCursorClientOptions
 }): Promise<void> {
+  const { page, cursorOptions } = options
+  shownPages.set(page, cursorOptions)
   try {
-    const { page, cursorOptions } = options
-    await ensureGhostCursorInjected({ page })
-
-    await page.evaluate(
-      ({ optionsFromNode }) => {
-        const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-        api?.enable(optionsFromNode)
-      },
-      { optionsFromNode: cursorOptions },
-    )
-  } catch {
-    // Non-fatal — page may be closed or navigating.
+    await reviveOverlay(page)
+  } catch (error) {
+    shownPages.delete(page)
+    throw error
   }
 }
 
+/** Remove the overlay from a page it was shown on. A page never shown is not touched. */
 export async function disableGhostCursor(options: { page: Page }): Promise<void> {
-  try {
-    const { page } = options
-    await page.evaluate(() => {
-      const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-      api?.disable()
-    })
-  } catch {
-    // Non-fatal — page may be closed or navigating.
-  }
+  const { page } = options
+  if (!shownPages.delete(page)) return
+  if (page.isClosed()) return
+  await page.evaluate(() => {
+    globalThis.__playwriterGhostCursor?.disable()
+  })
 }
 
 /**
- * Hand a whole sampled trajectory to the overlay in ONE round trip and let it play the
- * path back against the page's rAF clock.
- *
- * The alternative — one `applyMouseAction` per sample — costs a full page.evaluate round
- * trip each (measured at ~4-5ms through the extension) AND restarts a CSS transition
- * every sample, so the overlay both lags and smooths away the trajectory's shape. This is
- * the coordination fix that lets the drawn cursor and the real CDP pointer trace the same
- * curve.
- *
- * Returns whether the overlay actually started playing, so the caller can report it
- * rather than assume it.
+ * Hand a whole sampled trajectory to a SHOWN overlay in one round trip and let it play the
+ * path against the page's rAF clock, so the drawn cursor and the real CDP pointer trace the
+ * same curve. On a page the overlay was not shown on this returns `playing: false` without
+ * touching the page.
  */
 export async function playGhostCursorPath(options: {
   page: Page
   samples: GhostCursorPathSample[]
 }): Promise<{ playing: boolean; durationMs: number }> {
+  const { page, samples } = options
+  if (!shownPages.has(page) || samples.length < 2) {
+    return { playing: false, durationMs: 0 }
+  }
   try {
-    const { page, samples } = options
-    if (samples.length < 2) {
-      return { playing: false, durationMs: 0 }
-    }
-
-    await ensureGhostCursorInjected({ page, requiredMethod: 'playPath' })
-
-    return await page.evaluate(
-      ({ pathSamples }) => {
-        const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-        if (!api?.playPath) {
-          return { playing: false, durationMs: 0 }
-        }
+    const play = () =>
+      page.evaluate((pathSamples) => {
+        const api = globalThis.__playwriterGhostCursor
+        if (!api || typeof api.playPath !== 'function' || !api.isEnabled()) return null
         return api.playPath({ samples: pathSamples })
-      },
-      { pathSamples: samples },
-    )
+      }, samples)
+    const played = await play()
+    if (played) return played
+    await reviveOverlay(page, 'playPath')
+    return (await play()) ?? { playing: false, durationMs: 0 }
   } catch {
-    // The overlay is cosmetic — a closed or navigating page must not fail the move.
+    // The overlay is cosmetic — a closed or navigating page must not fail the move. The
+    // result reports that it did not play.
     return { playing: false, durationMs: 0 }
   }
 }
 
-/** Stop any in-flight path playback and hand the cursor back to `applyMouseAction`. */
+/** Stop any in-flight path playback on a shown overlay. A page never shown is not touched. */
 export async function cancelGhostCursorPath(options: { page: Page }): Promise<void> {
-  try {
-    await options.page.evaluate(() => {
-      const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-      api?.cancelPath?.()
-    })
-  } catch {
-    // Non-fatal — page may be closed or navigating.
-  }
+  const { page } = options
+  if (!shownPages.has(page) || page.isClosed()) return
+  await page.evaluate(() => {
+    globalThis.__playwriterGhostCursor?.cancelPath()
+  })
 }
 
-export async function applyGhostCursorMouseAction(options: {
-  page: Page
-  event: MouseActionEvent
-}): Promise<void> {
-  // Never throw — the cursor is cosmetic and must not break the caller's action.
-  try {
-    const { page, event } = options
-
-    const applied = await page.evaluate(
-      ({ serializedEvent }) => {
-        const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-        if (!api) {
-          return false
-        }
-
-        api.applyMouseAction(serializedEvent)
-        return true
-      },
-      { serializedEvent: event },
-    )
-
-    if (applied) {
-      return
-    }
-
-    await ensureGhostCursorInjected({ page })
-    await page.evaluate(
-      ({ serializedEvent }) => {
-        const api = (globalThis as { __playwriterGhostCursor?: GhostCursorBrowserApi }).__playwriterGhostCursor
-        api?.applyMouseAction(serializedEvent)
-      },
-      { serializedEvent: event },
-    )
-  } catch {
-    // Swallow — page may be closed, navigating, or debugger detached.
-  }
+/**
+ * Forward one Playwright mouse action to a shown overlay. A page never shown is not
+ * touched. Throws on failure; the caller decides whether a cosmetic failure matters.
+ */
+export async function applyGhostCursorMouseAction(options: { page: Page; event: MouseActionEvent }): Promise<void> {
+  const { page, event } = options
+  if (!shownPages.has(page)) return
+  const apply = () =>
+    page.evaluate((serializedEvent) => {
+      const api = globalThis.__playwriterGhostCursor
+      if (!api?.isEnabled()) return false
+      api.applyMouseAction(serializedEvent)
+      return true
+    }, event)
+  if (await apply()) return
+  await reviveOverlay(page)
+  await apply()
 }

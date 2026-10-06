@@ -223,6 +223,9 @@ const SANDBOX_GLOBALS = [
   'require', 'resetPlaywright', 'resizeImage', 'resizeImageForAgent', 'screenshotWithAccessibilityLabels',
   'setInterval', 'setLogpoint', 'setTimeout', 'snapshot', 'startRecording', 'state', 'stopRecording',
   'storeIdentity', 'structuredClone', 'traceValue', 'waitForPageLoad', 'whyOccluded',
+  // The browse-like-a-human layer. None loads modules or touches the sandbox fs: observe/find/
+  // explain/act/pickElement talk to the page over CDP, docs reads the package's own skill.md by fixed path.
+  'act', 'docs', 'explain', 'find', 'observe', 'pickElement',
 ].sort()
 
 describe('the sandbox global surface is a closed, reviewed set', () => {

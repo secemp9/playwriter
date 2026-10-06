@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Nothing is injected into connected tabs.** The in-page toolbar, the context-menu helper script and the ghost-cursor bundle are gone, and so is their re-injection after navigations. A page under automation now sees exactly its own DOM and globals.
+- **Pin and React-source picking use Chrome's own element picker.** "Pin an element for Playwriter" and "Copy React component source" (page and extension-icon context menus) turn on `Overlay.setInspectMode`; the click you make is answered by the picker and never reaches the page. A pin copies `playwriter -e 'inspectPinnedElement({"url":…,"backendNodeId":N})'` and also shows up under `PINNED` in the agent's `observe()`. The React source path is read with one read-only fiber read and mapped through the scripts' source maps in the service worker — bippy is no longer injected into the page. The badge shows `PICK` while the picker waits.
+- **`clipboardWrite` permission**: the clipboard copy runs in the offscreen document, which needs it.
+
 ## 0.0.97
 
 ### Changes

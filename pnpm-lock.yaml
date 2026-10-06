@@ -58,9 +58,6 @@ importers:
       playwriter:
         specifier: workspace:^
         version: link:../playwriter
-      string-dedent:
-        specifier: ^3.0.2
-        version: 3.0.2
       zustand:
         specifier: ^5.0.8
         version: 5.0.14(@types/react@19.2.7)(react@19.2.7)
@@ -436,9 +433,6 @@ importers:
       '@vitest/ui':
         specifier: ^4.0.8
         version: 4.0.8(vitest@4.0.8)
-      bippy:
-        specifier: ^0.5.27
-        version: 0.5.27(@types/react@19.2.7)(react@19.2.7)
       devtools-protocol:
         specifier: ^0.0.1568893
         version: 0.0.1568893
@@ -3886,10 +3880,6 @@ packages:
     resolution: {integrity: sha512-Ceh+7ox5qe7LJuLHoY0feh3pHuUDHAcRUeyL2VYghZwfpkNIy/+8Ocg0a3UuSoYzavmylwuLWQOf3hl0jjMMIw==}
     engines: {node: '>=8'}
 
-  bippy@0.5.27:
-    resolution: {integrity: sha512-LvGYTQm5cMqEhnUT2tr6mSE1mrhmX/xxu3jiypHAscThhxC+9SWdaQW8Nye5CT/sR79LObNJlQpOUgi4DopTMg==}
-    peerDependencies:
-      react: '>=17.0.1'
 
   bl@6.1.6:
     resolution: {integrity: sha512-jLsPgN/YSvPUg9UX0Kd73CXpm2Psg9FxMeCSXnk3WBO3CMT10JMwijubhGfHCnFu6TPn1ei3b975dxv7K2pWVg==}
@@ -11566,12 +11556,6 @@ snapshots:
 
   binary-extensions@2.3.0: {}
 
-  bippy@0.5.27(@types/react@19.2.7)(react@19.2.7):
-    dependencies:
-      '@types/react-reconciler': 0.28.9(@types/react@19.2.7)
-      react: 19.2.7
-    transitivePeerDependencies:
-      - '@types/react'
 
   bl@6.1.6:
     dependencies:

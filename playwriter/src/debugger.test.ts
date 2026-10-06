@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Debugger, buildLogpointCondition, verifyNonPausingCondition, readRemoteObject, newPreviewAccounting } from './debugger.js'
 import type { ICDPSession } from './cdp-session.js'
+import { debuggerDomainFor } from './cdp-domains.js'
 
 // A minimal mock ICDPSession: records sent commands, lets tests emit events, and
 // returns canned responses via a per-test responder.
@@ -675,5 +676,47 @@ describe('getCallFrames', () => {
     const mock = new MockCdp()
     const dbg = new Debugger({ cdp: asCdp(mock) })
     await expect(dbg.getCallFrames()).rejects.toThrow(/not paused/)
+  })
+})
+
+describe('the per-session Debugger owner', () => {
+  const pausedAt = (url: string) => ({ reason: 'other', callFrames: [{ url, location: { scriptId: '1', lineNumber: 4 } }] })
+
+  it('resumes a pause nobody asked for and records it', async () => {
+    const mock = new MockCdp()
+    const domain = debuggerDomainFor(asCdp(mock))
+    await domain.enable()
+    mock.emit('Debugger.paused', pausedAt('https://example.com/app.js'))
+    await expect.poll(() => domain.takeResumeNotes()).toEqual([
+      'the page paused at https://example.com/app.js:5 (reason: other) although no debugger user had asked for pauses; it was resumed',
+    ])
+    expect(mock.sent.filter((s) => s.method === 'Debugger.resume')).toHaveLength(1)
+  })
+
+  it('leaves a pause alone while a caller holds a lease, and skips pauses again after release', async () => {
+    const mock = new MockCdp()
+    const domain = debuggerDomainFor(asCdp(mock))
+    const lease = await domain.allowPauses('breakpoint app.js:5')
+    mock.emit('Debugger.paused', pausedAt('https://example.com/app.js'))
+    expect(mock.find('Debugger.resume')).toBeUndefined()
+    await lease.release()
+    expect(mock.sent.filter((s) => s.method === 'Debugger.setSkipAllPauses').map((s) => s.params)).toEqual([
+      { skip: true },
+      { skip: false },
+      { skip: true },
+    ])
+    expect(mock.sent.map((s) => s.method).filter((m) => m.endsWith('.disable'))).toEqual([])
+  })
+
+  it('reports a failed resume instead of claiming the page runs', async () => {
+    const mock = new MockCdp((method) => {
+      if (method === 'Debugger.resume') throw new Error('Target closed')
+      return {}
+    })
+    const domain = debuggerDomainFor(asCdp(mock))
+    mock.emit('Debugger.paused', pausedAt(''))
+    await expect.poll(() => domain.takeResumeNotes()).toEqual([
+      'the page paused at (inline script):5 (reason: other) although no debugger user had asked for pauses; resuming it FAILED (Target closed), so the page may still be frozen',
+    ])
   })
 })
