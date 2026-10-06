@@ -51,6 +51,7 @@
 import type { Locator, Page } from '@xmorse/playwright-core'
 import type { ICDPSession } from './cdp-session.js'
 import { IsolatedWorld, withDeadline } from './isolated-world.js'
+import type { ScreenRect } from './page-frames.js'
 import {
   planHumanTrajectory,
   DEFAULT_SAMPLE_RATE_HZ,
@@ -139,6 +140,8 @@ export interface HumanMouseDefaults {
 export interface HumanMoveOptions extends HumanMouseDefaults {
   page?: Page
   locator?: Locator
+  /** A ref from observe()/find(): the element's position is read over CDP, nothing runs in the page. Its tab is the page. */
+  ref?: number | string
   x?: number
   y?: number
   /** Override the starting point. The real lever for keeping a path out of a hazard corridor. */
@@ -164,6 +167,14 @@ export interface HumanClickOptions extends HumanMoveOptions {
 interface ResolvedTarget {
   point: Point
   extent?: { width: number; height: number }
+}
+
+/** Where the element a ref names is drawn: its tab, and its content boxes in main-viewport CSS px. */
+export interface RefBoxes {
+  page: Page
+  rects: ScreenRect[]
+  /** The ref and what it is, for errors: `[12] button "Save"`. */
+  label: string
 }
 
 // ---------------------------------------------------------------------------
@@ -217,11 +228,22 @@ async function resolveStartPoint(options: {
 
 async function resolveTarget(options: {
   locator?: Locator
+  ref?: RefBoxes
   x?: number
   y?: number
   position?: Point
 }): Promise<ResolvedTarget> {
-  const { locator, x, y, position } = options
+  const { locator, ref, x, y, position } = options
+
+  if (ref) {
+    // The largest box the element is drawn as (a wrapped link has one per line), like act's aim.
+    const [box] = [...ref.rects].sort((a, b) => b.width * b.height - a.width * a.height)
+    if (!box) {
+      throw new Error(`humanMouse: ${ref.label} has no box on the page (hidden, or zero size). observe() shows what is visible now.`)
+    }
+    const point = position ? { x: box.x + position.x, y: box.y + position.y } : { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    return { point, extent: { width: box.width, height: box.height } }
+  }
 
   if (locator) {
     const box = await locator.boundingBox()
@@ -238,7 +260,7 @@ async function resolveTarget(options: {
   }
 
   if (typeof x !== 'number' || typeof y !== 'number') {
-    throw new Error('humanMouse: pass either { locator } or both { x, y }.')
+    throw new Error('humanMouse: pass { ref }, { locator } or both { x, y }.')
   }
 
   return { point: { x, y } }
@@ -444,9 +466,11 @@ export interface HumanMouseApi {
 export function createHumanMouseApi(options: {
   defaultPage: Page
   getCdpSession: (options: { page: Page }) => Promise<ICDPSession>
+  /** Where a ref's element is drawn (read over CDP). Without it, `{ ref }` is refused. */
+  resolveRef?: (ref: number | string) => Promise<RefBoxes>
   defaults?: HumanMouseDefaults
 }): HumanMouseApi {
-  const { defaultPage, getCdpSession } = options
+  const { defaultPage, getCdpSession, resolveRef } = options
 
   // The seed counter makes consecutive moves in one session differ (a user does not trace
   // the identical arc twice) while staying reproducible: pass an explicit `seed` to pin a
@@ -497,9 +521,20 @@ export function createHumanMouseApi(options: {
     from: Point
     to: Point
   }> {
-    const page = resolvePage(moveOptions.page)
+    if (moveOptions.ref !== undefined && moveOptions.locator) {
+      throw new Error('humanMouse: pass { ref } or { locator }, not both.')
+    }
+    if (moveOptions.ref !== undefined && !resolveRef) {
+      throw new Error('humanMouse: { ref } needs the page probes of an execute() call; pass { locator } or { x, y } here.')
+    }
+    const ref = moveOptions.ref === undefined || !resolveRef ? undefined : await resolveRef(moveOptions.ref)
+    if (ref && moveOptions.page && moveOptions.page !== ref.page) {
+      throw new Error(`humanMouse: ${ref.label} is in another tab than the \`page\` passed. Leave \`page\` out: a ref names its tab.`)
+    }
+    const page = ref ? ref.page : resolvePage(moveOptions.page)
     const target = await resolveTarget({
       locator: moveOptions.locator,
+      ref,
       x: moveOptions.x,
       y: moveOptions.y,
       position: moveOptions.position,
@@ -519,7 +554,7 @@ export function createHumanMouseApi(options: {
     return { trajectory, page, from, to: target.point }
   }
 
-  async function moveTo(moveOptions: HumanMoveOptions): Promise<HumanMoveResult> {
+  async function move(moveOptions: HumanMoveOptions): Promise<{ result: HumanMoveResult; page: Page }> {
     const { trajectory, page, from, to } = await buildPlan(moveOptions)
     const cdp = await getCdpSession({ page })
     const warnings: string[] = []
@@ -596,7 +631,7 @@ export function createHumanMouseApi(options: {
       }
     }
 
-    return {
+    const result: HumanMoveResult = {
       from,
       to,
       fittsDurationMs: trajectory.fittsDurationMs,
@@ -620,11 +655,11 @@ export function createHumanMouseApi(options: {
       warnings,
       trajectory: moveOptions.includeTrajectory ? trajectory : undefined,
     }
+    return { result, page }
   }
 
   async function click(clickOptions: HumanClickOptions): Promise<HumanMoveResult> {
-    const result = await moveTo(clickOptions)
-    const page = resolvePage(clickOptions.page)
+    const { result, page } = await move(clickOptions)
 
     if (clickOptions.locator) {
       // Delegate the press itself to Playwright so actionability, hit-target interception
@@ -651,8 +686,8 @@ export function createHumanMouseApi(options: {
       return result
     }
 
-    // Bare coordinates: there is no element, so there is no actionability to run. This
-    // path presses where it was told to press.
+    // Bare coordinates, or a ref (located over CDP, so no Playwright actionability runs in the
+    // page): this path presses where the pointer now is.
     await page.mouse.down({ button: clickOptions.button, clickCount: clickOptions.clickCount ?? 1 })
     if (clickOptions.delayMs) {
       await new Promise((resolve) => setTimeout(resolve, clickOptions.delayMs))
@@ -700,7 +735,7 @@ export function createHumanMouseApi(options: {
         try {
           const pageDefaults = enabledPageDefaults.get(page) ?? {}
           const positionOption = (args[0] as { position?: Point } | undefined)?.position
-          await moveTo({ page, locator: this, position: positionOption, ...pageDefaults })
+          await move({ page, locator: this, position: positionOption, ...pageDefaults })
           return await original.apply(this, args)
         } finally {
           inHumanWrapper.delete(this)
@@ -711,9 +746,9 @@ export function createHumanMouseApi(options: {
 
   return {
     plan: async (planOptions) => (await buildPlan(planOptions)).trajectory,
-    moveTo,
+    moveTo: async (moveOptions) => (await move(moveOptions)).result,
     click,
-    hover: moveTo,
+    hover: async (moveOptions) => (await move(moveOptions)).result,
     enable: async (enableOptions) => {
       const page = resolvePage(enableOptions?.page)
       installLocatorPatch(page.locator('body'))

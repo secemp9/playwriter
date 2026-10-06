@@ -7,7 +7,7 @@ import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import { getCDPSessionForPage, getCDPSessionForFrame } from './cdp-session.js'
 import { axStatesFromNode, formatAxStates, type AxStates } from './ax-states.js'
-import { resolveElement } from './element-resolve.js'
+import { resolveElement, type ElementTarget } from './element-resolve.js'
 import { withDeadline } from './isolated-world.js'
 
 // Import sharp at module level - resolves to null if not available
@@ -1070,7 +1070,8 @@ export async function getAriaSnapshot({
 }: {
   page: Page
   frame?: Frame | FrameLocator
-  locator?: Locator
+  /** Scope to this element's subtree: a Locator (resolved with Playwright's script, debug mode only) or an element resolved from a ref. */
+  locator?: ElementTarget
   refFilter?: (info: { role: string; name: string }) => boolean
   interactiveOnly?: boolean
   cdp?: ICDPSession

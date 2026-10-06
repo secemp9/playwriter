@@ -273,7 +273,7 @@ describe('human mode, end to end', () => {
 
   it('left nothing in the page: no playwriter globals or elements in its own world', async () => {
     const result = await executor.execute(
-      "return await page.evaluate(() => ({ globals: Object.getOwnPropertyNames(window).filter((k) => /playwriter/i.test(k)), elements: document.querySelectorAll('[data-playwriter-toolbar], [id*=playwriter], [class*=playwriter]').length }))",
+      "return await readPage(() => ({ globals: Object.getOwnPropertyNames(window).filter((k) => /playwriter/i.test(k)), elements: document.querySelectorAll('[data-playwriter-toolbar], [id*=playwriter], [class*=playwriter]').length }))",
       30000,
     )
     expect(result.isError, result.text).toBe(false)
@@ -304,7 +304,7 @@ describe('act refuses a ref whose element changed since the model saw it', () =>
     const result = await executor.execute(`await act.click(${follow})`, 30000)
     expect(result.isError).toBe(true)
     expect(result.text).toMatch(/now reads button "Unfollow" \(you saw button "Follow"\)/)
-    const state = await executor.execute("return await page.evaluate(() => document.getElementById('follows').textContent)", 30000)
+    const state = await executor.execute("return await readPage(() => document.getElementById('follows').textContent)", 30000)
     expect(state.text).toMatch(/Follow clicks: 0/)
   })
 
@@ -314,7 +314,7 @@ describe('act refuses a ref whose element changed since the model saw it', () =>
     const result = await executor.execute(`await act.click(${aliceDelete})`, 30000)
     expect(result.isError).toBe(true)
     expect(result.text).toMatch(/is now in .*"Bob" \(you saw it in .*"Alice"\)/)
-    const state = await executor.execute("return await page.evaluate(() => document.getElementById('deleted').textContent)", 30000)
+    const state = await executor.execute("return await readPage(() => document.getElementById('deleted').textContent)", 30000)
     expect(state.text).toMatch(/Deleted: nobody/)
   })
 })
@@ -332,8 +332,18 @@ describe('act types where the caret is when the page swaps the field it clicked'
     const result = await executor.execute(`await act.fill(${search}, 'wireless mouse')`, 60000)
     expect(result.isError, result.text).toBe(false)
     expect(result.text).toMatch(new RegExp(`the page replaced \\[${search}\\] when it was clicked; the caret is in \\[\\d+\\] combobox "Search the shop" under the pointer`))
-    const value = await executor.execute("return await page.evaluate(() => document.getElementById('search-app').value)", 30000)
+    const value = await executor.execute("return await readPage(() => document.getElementById('search-app').value)", 30000)
     expect(value.text).toMatch(/wireless mouse/)
+  })
+
+  it('follows a field the page swaps in while the text is typed, and reads the value back from it', async () => {
+    const notes = refOf(look, /searchbox "Search the notes"/)
+    const result = await executor.execute(`await act.fill(${notes}, 'quarterly tax receipts')`, 60000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(new RegExp(`the page replaced \\[${notes}\\] while the text was typed; the caret is in \\[\\d+\\] combobox "Search the notes" under the pointer`))
+    expect(result.text).toMatch(/value read back: "quarterly tax receipts"/)
+    const value = await executor.execute("return await readPage(() => document.getElementById('notes-app').value)", 30000)
+    expect(value.text).toMatch(/quarterly tax receipts/)
   })
 
   it('refuses when the caret lands in a field away from the pointer, and types nothing', async () => {
@@ -342,7 +352,7 @@ describe('act types where the caret is when the page swaps the field it clicked'
     expect(result.isError).toBe(true)
     expect(result.text).toMatch(/Keyboard focus is now in \[\d+\] textbox "Gift message", away from where the pointer clicked/)
     const typed = await executor.execute(
-      "return await page.evaluate(() => JSON.stringify({ gift: document.getElementById('elsewhere').value, coupon: document.getElementById('coupon-app').value }))",
+      "return await readPage(() => JSON.stringify({ gift: document.getElementById('elsewhere').value, coupon: document.getElementById('coupon-app').value }))",
       30000,
     )
     expect(typed.text).toContain('{"gift":"","coupon":""}')
@@ -365,7 +375,7 @@ describe('file dialogs: held back while an input can open one, open until answer
   })
 
   const textOf = async (on: PlaywrightExecutor, id: string): Promise<string> =>
-    (await on.execute(`return await page.evaluate(() => document.getElementById('${id}').textContent)`, 30000)).text
+    (await on.execute(`return await readPage(() => document.getElementById('${id}').textContent)`, 30000)).text
 
   it('answers a confirm without waiting on file-dialog bookkeeping while the page is frozen', async () => {
     const remove = refOf(look, /button "Delete draft"/)
@@ -491,7 +501,7 @@ describe('act on native form controls', () => {
   })
 
   const valueOf = async (id: string): Promise<string> =>
-    (await executor.execute(`return await page.evaluate(() => document.getElementById('${id}').value)`, 30000)).text
+    (await executor.execute(`return await readPage(() => document.getElementById('${id}').value)`, 30000)).text
 
   it('fills a date input from ISO text by typing into its parts, and reads the ISO value back', async () => {
     const departure = refOf(look, /Departure/)
@@ -529,7 +539,7 @@ describe('act on native form controls', () => {
     const result = await executor.execute(`await act.fill(${name}, 'Ada\\nLovelace')`, 30000)
     expect(result.isError).toBe(true)
     expect(result.text).toMatch(/single-line field/)
-    const submitted = await executor.execute("return await page.evaluate(() => document.getElementById('submitted').textContent)", 30000)
+    const submitted = await executor.execute("return await readPage(() => document.getElementById('submitted').textContent)", 30000)
     expect(submitted.text).not.toMatch(/Submitted/)
   })
 
@@ -538,7 +548,7 @@ describe('act on native form controls', () => {
     const result = await executor.execute(`await act.upload(${passport}, 'scan.pdf')`, 30000)
     expect(result.isError, result.text).toBe(false)
     expect(result.text).toMatch(/a file dialog \(one file\): scan\.pdf was chosen in it/)
-    const chosen = await executor.execute("return await page.evaluate(() => Array.from(document.getElementById('passport').files).map((f) => f.name))", 30000)
+    const chosen = await executor.execute("return await readPage(() => Array.from(document.getElementById('passport').files).map((f) => f.name))", 30000)
     expect(chosen.text).toMatch(/scan\.pdf/)
   })
 
@@ -587,7 +597,7 @@ describe('act on native form controls', () => {
     const result = await executor.execute(`await act.drag(${card}, ${done})`, 30000)
     expect(result.isError, result.text).toBe(false)
     expect(result.text).toMatch(/the page started an HTML drag/)
-    const dropped = await executor.execute("return await page.evaluate(() => document.getElementById('done').textContent)", 30000)
+    const dropped = await executor.execute("return await readPage(() => document.getElementById('done').textContent)", 30000)
     expect(dropped.text).toMatch(/Done: Lyon/)
   })
 })
@@ -612,7 +622,7 @@ describe('act across history, tabs and scroll areas', () => {
     const clicked = await executor.execute(`await act.click(${confirm})`, 30000)
     expect(clicked.isError, clicked.text).toBe(false)
     expect(clicked.text).toMatch(/switched to the tab "Order details" this ref belongs to/)
-    const state = await executor.execute("return [page.url(), await page.evaluate(() => document.getElementById('state').textContent)]", 30000)
+    const state = await executor.execute("return [page.url(), await readPage(() => document.getElementById('state').textContent)]", 30000)
     expect(state.text).toMatch(/act-tab-details\.html/)
     expect(state.text).toMatch(/Confirmed: 1/)
     const back = await executor.execute('await act.switchTab(0)', 30000)
@@ -632,7 +642,7 @@ describe('act across history, tabs and scroll areas', () => {
     )
     expect(result.isError).toBe(true)
     expect(result.text).toMatch(/this call already performed click \[\d+\] button "First" — one action per call in human mode/)
-    const log = await executor.execute("return await page.evaluate(() => document.getElementById('log').textContent)", 30000)
+    const log = await executor.execute("return await readPage(() => document.getElementById('log').textContent)", 30000)
     expect(log.text).toMatch(/Log: first/)
     expect(log.text).not.toMatch(/second/)
   })
@@ -644,7 +654,7 @@ describe('act across history, tabs and scroll areas', () => {
     expect(result.isError, result.text).toBe(false)
     expect(result.text).toMatch(/scrolled .*Messages.* \d+px; \d+\.\d screens below/)
     const offsets = await executor.execute(
-      "return await page.evaluate(() => [document.getElementById('inbox').scrollTop, document.scrollingElement.scrollTop])",
+      "return await readPage(() => [document.getElementById('inbox').scrollTop, document.scrollingElement.scrollTop])",
       30000,
     )
     const [, inner, documentTop] = /\[\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)\s*\]/.exec(offsets.text)?.map(Number) ?? []

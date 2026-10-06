@@ -23,7 +23,7 @@
  * every cap / truncation / dropped record is named in the returned value.
  */
 
-import type { Page, Locator, ElementHandle, Frame, Route } from '@xmorse/playwright-core'
+import type { Page, Frame, Route } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import { getCDPSessionForPage } from './cdp-session.js'
 import type { ICDPSession } from './cdp-session.js'
@@ -35,7 +35,7 @@ import { backwardSlice, isPureFunctionSource, parseModule } from './static-analy
 import type { PageModelHandle } from './page-model.js'
 import { getReactComponentInfo, type ReactComponentInfo } from './react-source.js'
 import { REACT_FIBER_READER } from './react-source-location.js'
-import { resolveElement, type ResolvedElement } from './element-resolve.js'
+import { resolveElement, type ElementTarget, type ResolvedElement } from './element-resolve.js'
 import { withDeadline } from './isolated-world.js'
 import _traverse from '@babel/traverse'
 import type { NodePath } from '@babel/traverse'
@@ -1403,12 +1403,12 @@ async function walkFiberIdentity(resolved: ResolvedElement, arg: { maxKeys: numb
  * playwriter holds through CDP (see `walkFiberIdentity`); nothing is stored on the page.
  */
 export async function fiberSnapshot(opts: {
-  locator: Locator | ElementHandle
+  locator: ElementTarget
   cdp: ICDPSession
   identity?: false
 }): Promise<ReactComponentInfo | null>
 export async function fiberSnapshot(opts: {
-  locator: Locator | ElementHandle
+  locator: ElementTarget
   cdp: ICDPSession
   identity: true
   maxKeys?: number
@@ -1421,7 +1421,7 @@ export async function fiberSnapshot({
   maxKeys = 60,
   maxDepth = 3,
 }: {
-  locator: Locator | ElementHandle
+  locator: ElementTarget
   cdp: ICDPSession
   identity?: boolean
   maxKeys?: number
@@ -2462,7 +2462,7 @@ export interface TraceDeps {
 
 export interface TraceValueOptions {
   node?: PageModelHandle
-  locator?: Locator | ElementHandle
+  locator?: ElementTarget
   selector?: string
   slot?: string
   maxHops?: number

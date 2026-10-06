@@ -178,11 +178,17 @@ describe('human mode at run time', () => {
 
   it('refuses a second raw action that only shows up at run time', async () => {
     const { executor } = await openFixture('human')
+    const centres = await executor.execute(
+      "return JSON.stringify(await readPage(() => ['#a', '#b'].map((id) => { const box = document.querySelector(id).getBoundingClientRect(); return [box.x + box.width / 2, box.y + box.height / 2] })))",
+      30000,
+    )
+    expect(centres.isError, centres.text).toBe(false)
+    const [[ax, ay], [bx, by]]: number[][] = JSON.parse(/\[return value\] (.*)$/m.exec(centres.text)?.[1] ?? '[]')
     // One click as far as the static pass can tell (the helper is called through an array element);
-    // two when it runs.
-    const result = await executor.execute("const press = (selector) => page.click(selector)\nconst steps = [press]\nawait steps[0]('#a')\nawait steps[0]('#b')", 30000)
+    // two when it runs. Page-level mouse input is the raw input human mode still runs.
+    const result = await executor.execute(`const press = (x, y) => page.mouse.click(x, y)\nconst steps = [press]\nawait steps[0](${ax}, ${ay})\nawait steps[0](${bx}, ${by})`, 30000)
     expect(result.isError).toBe(true)
-    expect(result.text).toMatch(/Refused \(human mode\): Click on #b would be another action in this call, after Click on #a/)
+    expect(result.text).toMatch(/Refused \(human mode\): \S.* would be another action in this call, after /)
     const look = await executor.execute('await observe()', 30000)
     expect(look.text).toMatch(/A pressed/)
     expect(look.text).not.toMatch(/B pressed/)

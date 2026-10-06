@@ -226,6 +226,9 @@ const SANDBOX_GLOBALS = [
   // The browse-like-a-human layer. None loads modules or touches the sandbox fs: observe/find/
   // explain/act/pickElement talk to the page over CDP, docs reads the package's own skill.md by fixed path.
   'act', 'docs', 'explain', 'find', 'observe', 'pickElement',
+  // Runs the model's function in the PAGE over CDP (Runtime.callFunctionOn under V8's side-effect
+  // check): its source is compiled by the page's V8, never by Node, and it gets no module loader or fs.
+  'readPage',
 ].sort()
 
 describe('the sandbox global surface is a closed, reviewed set', () => {

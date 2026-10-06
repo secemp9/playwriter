@@ -15,9 +15,8 @@
  * or does not map the position — throws an Error that names it.
  */
 
-import type { Locator, ElementHandle } from '@xmorse/playwright-core'
 import type { ICDPSession } from './cdp-session.js'
-import { resolveElement } from './element-resolve.js'
+import { resolveElement, type ElementTarget } from './element-resolve.js'
 import { PageUnresponsiveError, withDeadline } from './isolated-world.js'
 import {
   READ_REACT_FIBER_FUNCTION,
@@ -57,12 +56,13 @@ export interface ReactComponentInfo {
 
 /**
  * The element to read: a Playwright locator / element handle (resolved through
- * `resolveElement`), or a node the caller already knows by `backendNodeId` on `cdp` — then
- * nothing runs in the page except the fiber read itself. `frameId` names the node's frame for
- * fetching source maps; the session's main frame when omitted.
+ * `resolveElement`) or an element already resolved from a ref, or a node the caller already
+ * knows by `backendNodeId` on `cdp` — then nothing runs in the page except the fiber read
+ * itself. `frameId` names the node's frame for fetching source maps; the session's main frame
+ * when omitted.
  */
 export type ReactElementTarget =
-  | { locator: Locator | ElementHandle; cdp: ICDPSession }
+  | { locator: ElementTarget; cdp: ICDPSession }
   | { backendNodeId: number; frameId?: string; cdp: ICDPSession }
 
 const CDP_TIMEOUT_MS = 5000

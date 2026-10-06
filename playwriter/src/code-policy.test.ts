@@ -15,39 +15,41 @@ interface Summary {
   forced: string[]
   bypass: string[]
   waits: string[]
+  scripts: string[]
   unreadable: string[]
 }
 
 /** A compact view of an analysis: `api@line` per category. */
 function summary(analysis: CodeAnalysis): Summary {
   return {
-    input: analysis.inputActions.map((s) => `${s.api}@${s.line}${s.loop ? ' loop' : ''}${s.viaAct ? ' act' : ''}`),
+    input: analysis.inputActions.map((s) => `${s.api}@${s.line}${s.loop ? ' loop' : ''}${s.viaAct ? ' act' : ''}${s.viaScript ? ' script' : ''}`),
     nav: analysis.navigations.map((s) => `${s.api}@${s.line} ${s.kind}`),
     forced: analysis.forcedState.map((s) => `${s.api}@${s.line}`),
     bypass: analysis.apiBypass.map((s) => `${s.api}@${s.line}`),
     waits: analysis.waits.map((s) => `${s.api}@${s.line}`),
+    scripts: analysis.scriptReads.map((s) => `${s.api}@${s.line}`),
     unreadable: analysis.unanalysable.map((s) => `${s.api}@${s.line}`),
   }
 }
 
-const EMPTY: Summary = { input: [], nav: [], forced: [], bypass: [], waits: [], unreadable: [] }
+const EMPTY: Summary = { input: [], nav: [], forced: [], bypass: [], waits: [], scripts: [], unreadable: [] }
 
 describe('analyzeCode', () => {
   const cases: Array<{ name: string; code: string; expected: Partial<Summary> }> = [
     {
-      name: 'chained getByRole click is one input action',
+      name: 'chained getByRole click is one input action, through Playwright script',
       code: "await page.getByRole('button', { name: 'Send' }).click()",
-      expected: { input: ["page.getByRole('button', { name: 'Send' }).click@1"] },
+      expected: { input: ["page.getByRole('button', { name: 'Send' }).click@1 script"] },
     },
     {
       name: "locator('a').click() counts once, not once per call in the chain",
       code: "await page.locator('a').first().click()",
-      expected: { input: ["page.locator('a').first().click@1"] },
+      expected: { input: ["page.locator('a').first().click@1 script"] },
     },
     {
       name: 'multi-line chain reports the line of the action, not of `page`',
       code: "await page\n  .getByRole('link', { name: 'Docs' })\n  .click()",
-      expected: { input: ["page.getByRole('link', { name: 'Docs' }).click@3"] },
+      expected: { input: ["page.getByRole('link', { name: 'Docs' }).click@3 script"] },
     },
     {
       name: 'msg.type() is the console message getter, not typing',
@@ -55,7 +57,7 @@ describe('analyzeCode', () => {
       expected: EMPTY,
     },
     {
-      name: 'keyboard, mouse, touchscreen and humanMouse are input',
+      name: 'keyboard, mouse, touchscreen and humanMouse are input without Playwright script',
       code: [
         "await page.keyboard.press('Enter')",
         'await page.mouse.click(10, 20)',
@@ -68,9 +70,24 @@ describe('analyzeCode', () => {
       },
     },
     {
-      name: 'focus() on a locator is not input',
+      name: 'focus() on a locator is an element action through Playwright script',
       code: "await page.locator('input').focus()",
-      expected: EMPTY,
+      expected: { input: ["page.locator('input').focus@1 script"] },
+    },
+    {
+      name: 'Playwright reads run Playwright script in the page; Promise.all is not Locator.all',
+      code: "const t = await page.title()\nconst n = await page.locator('li').count()\nawait Promise.all([act.waitForIdle()])\nconst shot = await page.screenshot()",
+      expected: { scripts: ['page.title@1', "page.locator('li').count@2", 'page.screenshot@4'], waits: ['act.waitForIdle@3'] },
+    },
+    {
+      name: "readPage's function is page code",
+      code: "await readPage((el) => { el.textContent = 'x' }, { ref: 3 })",
+      expected: { forced: ['el.textContent =@1'] },
+    },
+    {
+      name: 'printing, fake timers, raw CDP sessions and exposed functions are forced state',
+      code: "await page.pdf()\nawait page.clock.install()\nawait context.newCDPSession(page)\nawait page.exposeFunction('f', () => 1)",
+      expected: { forced: ['page.pdf@1', 'page.clock.install@2', 'context.newCDPSession@3', 'page.exposeFunction@4'] },
     },
     {
       name: 'act input, dialogs, navigation and waits',
@@ -96,7 +113,7 @@ describe('analyzeCode', () => {
     {
       name: '.click() inside page.evaluate is a synthetic event, not input',
       code: "await page.evaluate(() => {\n  document.querySelector('button').click()\n})",
-      expected: { input: [], forced: ["document.querySelector('button').click@2"] },
+      expected: { input: [], forced: ["document.querySelector('button').click@2"], scripts: ['page.evaluate@1'] },
     },
     {
       name: 'page-code DOM, style, storage, event and React writes are forced state',
@@ -114,6 +131,7 @@ describe('analyzeCode', () => {
         '})',
       ].join('\n'),
       expected: {
+        scripts: ['page.evaluate@1'],
         forced: [
           'el.innerHTML =@3',
           'el.style.pointerEvents =@4',
@@ -128,29 +146,32 @@ describe('analyzeCode', () => {
       },
     },
     {
-      name: 'reading through page.evaluate is not forced state',
+      name: 'reading through page.evaluate is not forced state, but it is Playwright script in the page',
       code: "const t = await page.evaluate(() => document.querySelector('h1').textContent)\nreturn t",
-      expected: EMPTY,
+      expected: { scripts: ['page.evaluate@1'] },
     },
     {
       name: 'string page code is parsed as page code, at the right line',
       code: "\nawait page.evaluate(\"document.body.innerHTML = ''\")",
-      expected: { forced: ['document.body.innerHTML =@2'] },
+      expected: { forced: ['document.body.innerHTML =@2'], scripts: ['page.evaluate@2'] },
     },
     {
       name: '$eval: the page function is the second argument',
       code: "await page.$eval('#q', (el) => { el.value = 'shoes' })",
-      expected: { forced: ['el.value =@1'] },
+      expected: { forced: ['el.value =@1'], scripts: ['page.$eval@1'] },
     },
     {
       name: 'a function passed to evaluate by name is page code',
       code: "const poke = () => { document.querySelector('a').click() }\nawait page.evaluate(poke)",
-      expected: { input: [], forced: ["document.querySelector('a').click@1"] },
+      expected: { input: [], forced: ["document.querySelector('a').click@1"], scripts: ['page.evaluate@2'] },
     },
     {
       name: 'navigation from page code',
       code: "await page.evaluate(() => { location.href = '/a' })\nawait page.evaluate(() => history.pushState({}, '', '/b'))\nawait page.evaluate(() => window.history.back())",
-      expected: { nav: ['location.href =@1 document', 'history.pushState@2 spa', 'window.history.back@3 history'] },
+      expected: {
+        nav: ['location.href =@1 document', 'history.pushState@2 spa', 'window.history.back@3 history'],
+        scripts: ['page.evaluate@1', 'page.evaluate@2', 'page.evaluate@3'],
+      },
     },
     {
       name: 'network fakes and injections are forced state',
@@ -168,7 +189,7 @@ describe('analyzeCode', () => {
     {
       name: 'force: true is a click a person may not be able to make',
       code: "await page.locator('#hidden').click({ force: true })",
-      expected: { input: ["page.locator('#hidden').click@1"], forced: ["page.locator('#hidden').click@1"] },
+      expected: { input: ["page.locator('#hidden').click@1 script"], forced: ["page.locator('#hidden').click@1"] },
     },
     {
       name: 'direct backend calls',
@@ -176,6 +197,7 @@ describe('analyzeCode', () => {
       expected: {
         bypass: ['fetch@1', "require('node:http')@2", 'page.request.post@3', 'fetch@4'],
         forced: ['fetch@4'],
+        scripts: ['page.evaluate@4'],
       },
     },
     {
@@ -187,8 +209,9 @@ describe('analyzeCode', () => {
         "let n = 0; while (n++ < 3) { await act.press('ArrowDown') }",
       ].join('\n'),
       expected: {
-        input: ['b.click@1 loop', 'page.locator(i).hover@2 loop', 'page.click@3 loop', 'act.press@4 loop act'],
+        input: ['b.click@1 loop script', 'page.locator(i).hover@2 loop script', 'page.click@3 loop script', 'act.press@4 loop act'],
         waits: ['page.waitForNavigation@3'],
+        scripts: ["page.locator('button').all@1"],
       },
     },
     {
@@ -197,18 +220,11 @@ describe('analyzeCode', () => {
       expected: EMPTY,
     },
     {
-      name: 'Playwright waits',
+      name: "Playwright waits; waitForSelector and waitFor poll with Playwright's script",
       code: "await page.waitForSelector('.done')\nawait page.waitForLoadState('load')\nawait page.locator('x').waitFor()\nawait waitForPageLoad({ page })\nawait page.waitForTimeout(100)\nawait page.waitForURL('**/b')\nawait page.waitForResponse('**/api')",
       expected: {
-        waits: [
-          'page.waitForSelector@1',
-          'page.waitForLoadState@2',
-          "page.locator('x').waitFor@3",
-          'waitForPageLoad@4',
-          'page.waitForTimeout@5',
-          'page.waitForURL@6',
-          'page.waitForResponse@7',
-        ],
+        waits: ['page.waitForLoadState@2', 'waitForPageLoad@4', 'page.waitForTimeout@5', 'page.waitForURL@6', 'page.waitForResponse@7'],
+        scripts: ['page.waitForSelector@1', "page.locator('x').waitFor@3"],
       },
     },
     {
@@ -370,6 +386,26 @@ describe('checkPolicy', () => {
       'forced state: page.route on line 2 (intercepts network requests and answers them from the script)',
     ])
   })
+
+  it("refuses Playwright reads, teaching readPage, observe and find", () => {
+    const verdict = checkPolicy(analyzeCode("const t = await page.title()\nreturn await page.locator('h1').textContent()"), human)
+    expect(verdict.allowed).toBe(false)
+    expect(verdict.refusal).toContain("page.title on line 1, page.locator('h1').textContent on line 2 run Playwright's script in the page")
+    expect(verdict.refusal).toContain('the page then counts as clicked (navigator.userActivation)')
+    expect(verdict.refusal).toContain('readPage((el) => el.textContent, { ref: 12 })')
+  })
+
+  it('refuses Playwright element actions, naming the act.* call for each', () => {
+    const verdict = checkPolicy(analyzeCode("await page.locator('#q').fill('shoes')"), human)
+    expect(verdict.allowed).toBe(false)
+    expect(verdict.refusal).toContain("page.locator('#q').fill on line 1 → act.fill(ref, 'text')")
+  })
+
+  it('debug mode allows Playwright reads and notes them', () => {
+    const verdict = checkPolicy(analyzeCode('return await page.title()'), debug)
+    expect(verdict.allowed).toBe(true)
+    expect(verdict.notes).toEqual(['Playwright script in the page (a user gesture): page.title on line 1'])
+  })
 })
 
 /**
@@ -397,6 +433,8 @@ describe('checkPolicy by bindings (human mode)', () => {
       code: 'const go = (n) => act.click(n);\n[1, 2].forEach(go)',
       says: 'runs inside a .forEach callback (through helper go() on line 2)',
     },
+    { name: 'readPage function from a variable', code: 'return await readPage(script)', says: 'readPage on line 1 is unanalysable — its page code comes from `script`' },
+    { name: 'a DOM write inside readPage', code: "await readPage((el) => { el.value = 'x' }, { ref: 4 })", says: 'el.value = on line 1 (writes the DOM from a script)' },
     { name: 'aliased act', code: 'const a = act\nawait a.click(1)\nawait a.click(2)', says: 'this call does 2 input actions — act.click on line 2, act.click on line 3' },
     { name: 'destructured act method', code: 'const { click } = act\nawait click(1)\nawait click(2)', says: 'this call does 2 input actions' },
     { name: 'aliased page.mouse', code: 'const m = page.mouse\nawait m.click(1, 2)\nawait m.click(3, 4)', says: 'this call does 2 input actions — m.click on line 2, m.click on line 3' },
@@ -441,21 +479,21 @@ describe('checkPolicy by bindings (human mode)', () => {
   }
 
   const allowed: Array<{ name: string; code: string }> = [
-    { name: 'a local style object', code: 'return await page.evaluate(() => { const style = {}; style.color = getComputedStyle(document.body).color; return style })' },
-    { name: 'a local row object', code: "return await page.evaluate(() => { const row = {}; row.value = document.querySelector('input').value; return row })" },
-    { name: 'a local location object', code: "return await page.evaluate(() => { const location = { href: 'x' }; location.href = 'y'; return location })" },
-    { name: 'nested data the page code made', code: 'return await page.evaluate(() => { const data = { rows: [] }; data.rows.push(1); data.count = 2; return data })' },
-    { name: 'values passed as arguments', code: "const sel = '#q'\nreturn await page.evaluate((s) => document.querySelector(s).textContent, sel)" },
-    { name: 'a constant string of page code', code: "const js = 'document.title'\nreturn await page.evaluate(js)" },
-    { name: 'a page function declared by name', code: 'function read() { return document.title }\nreturn await page.evaluate(read)' },
+    { name: 'a local style object', code: 'return await readPage(() => { const style = {}; style.color = getComputedStyle(document.body).color; return style })' },
+    { name: 'a local row object', code: "return await readPage(() => { const row = {}; row.value = document.querySelector('input').value; return row })" },
+    { name: 'a local location object', code: "return await readPage(() => { const location = { href: 'x' }; location.href = 'y'; return location })" },
+    { name: 'nested data the page code made', code: 'return await readPage(() => { const data = { rows: [] }; data.rows.push(1); data.count = 2; return data })' },
+    { name: 'values passed as its arg', code: "const sel = '#q'\nreturn await readPage((doc, s) => doc.querySelector(s).textContent, { arg: sel })" },
+    { name: 'a page function declared by name', code: 'function read() { return document.title }\nreturn await readPage(read)' },
     {
       name: 'document.evaluate inside page code is the page API',
-      code: "return await page.evaluate(() => document.evaluate('//h1', document, null, XPathResult.STRING_TYPE, null).stringValue)",
+      code: "return await readPage(() => document.evaluate('//h1', document, null, XPathResult.STRING_TYPE, null).stringValue)",
     },
     { name: 'a local object named act', code: 'const act = { click: () => 1 }\nact.click(1)\nact.click(2)' },
-    { name: "the code's own array methods", code: 'const items = []\nitems.push(await page.title())\nawait act.click(3)' },
+    { name: "the code's own array methods", code: 'const items = []\nitems.push(page.url())\nawait act.click(3)' },
     { name: 'one action through an alias', code: 'const { click } = act\nawait click(3)\nawait act.waitForIdle()' },
     { name: 'act.spaNavigate', code: "await act.spaNavigate('/cart')" },
+    { name: 'Promise.all of act waits', code: 'await Promise.all([act.waitForIdle()])' },
   ]
   for (const testCase of allowed) {
     it(`allows: ${testCase.name}`, () => {

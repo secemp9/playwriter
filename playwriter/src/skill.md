@@ -22,6 +22,7 @@ You drive a real browser, often the user's own logged-in Chrome. Work like a car
 - Before clicking something you do not understand: `await explain(ref)` — what it is wired to (React component, handler source, the requests and navigation it triggers).
 - Not sure which element the user means? Ask them to point at it: right-click the page → **Pin an element for Playwriter**, then click it — `observe()` lists it under `PINNED` with its ref. Or tell them what to click, then `await pickElement()` with a long call `timeout` (e.g. 120000): Chrome's picker highlights elements under their pointer, and the call returns the ref of the one they click.
 - Article text: `await getPageMarkdown({ outline: true })`, then `getPageMarkdown({ filter: 'Reviews' })` for one section.
+- Anything else on the page: `await readPage((el) => el.closest('tr').querySelector('.price').textContent, { ref: 12 })` runs your function in the page, in the element's frame, under Chrome's side-effect check — it can only read (a write, focus, scroll or request stops it and changes nothing). Without a ref `el` is the `document`; `{ arg }` passes data in (the function cannot see your variables). It returns data, or refs for elements it returns (`readPage(() => document.querySelectorAll('.result a'))`). Synchronous only; a loop that waits for the page never ends (the page cannot change while it runs) — read, `act.waitForIdle()`, read again. `console.log` inside prints with the call's output.
 
 ### act
 
@@ -44,12 +45,13 @@ You drive a real browser, often the user's own logged-in Chrome. Work like a car
 
 - **One action per call** — checked in your code before it runs (a helper that acts and is called twice or in a loop counts as several; aliases like `const { click } = act` are the same call) and again while it runs. Do the first one, read the report, then decide the next.
 - **No `page.goto` / `reload` after the first load.** A full reload wipes client caches (SWR, React Query, Redux), so a repro made that way is biased. Click the link (observe lists links with their URLs) or use `act.spaNavigate`. `history.pushState` / `location.hash =` from page code are refused too.
-- **No faked conditions:** no `page.route` / `net.delay`, no DOM or style writes, no synthetic events, no calling the backend with `fetch`. Reproduce it the way a user would; `net.requests()` shows what the page itself sent. Page functions must be readable: pass them inline (`page.evaluate((sel) => …, sel)`), not as a variable, a wrapper, `eval` or a string. `getCDPSession()` only reads.
+- **No faked conditions:** no `page.route` / `net.delay`, no DOM or style writes, no synthetic events, no calling the backend with `fetch`. Reproduce it the way a user would; `net.requests()` shows what the page itself sent. Page functions must be readable: pass them inline (`readPage((doc, sel) => …, { arg: sel })`), not as a variable, a wrapper, `eval` or a string. `getCDPSession()` only reads.
+- **No Playwright script in the page.** `page.evaluate`, `page.title()`, `page.content()`, `page.screenshot()`, `waitForSelector`, every locator read (`textContent()`, `count()`, `isVisible()`, `boundingBox()`, …) and every locator action (`click()`, `fill()`, `hover()`, `focus()`, `selectOption()`, …) run Playwright's script in the page as a user gesture: the page then counts as clicked (`navigator.userActivation`), which unlocks popups, file dialogs, sound and "Leave site?" prompts a person who only looked never unlocks. Refused before it runs, and at run time for what the check could not see. Read with `observe` / `find` / `explain` / `readPage`, act with `act.*`.
 - **Wait while busy, answer native dialogs first.** A ref from before a navigation is stale: `observe()` again.
 - **The element must still be what you saw.** If a ref now reads differently (`[12] now reads button "Unfollow" (you saw button "Follow")`, or a recycled row now belongs to another item), the action is refused: observe and decide again.
 - **No double sends.** Repeating the action you just did is refused when it sent data-changing requests (`POST …`, a WebSocket message) — that is how a message gets posted twice. Do something else first (type the next message), or pass `{ again: true }` if the first really failed.
 
-Reading is never restricted: `observe`, `find`, `explain`, `snapshot`, `pm.*`, `getLatestLogs`, `net.requests`, `getPageMarkdown`, screenshots, and `page.evaluate` that only reads.
+Reading without Playwright's script is never restricted: `observe`, `find`, `explain`, `readPage`, `snapshot`, `pm.*`, `getLatestLogs`, `net.requests`, `getPageMarkdown`, `screenshotWithAccessibilityLabels`.
 
 ### Be the user, not the tester
 
@@ -433,10 +435,10 @@ Two limits of that scoping worth knowing: paths are checked textually, so an exi
 - **Logs after actions**: the action report already lists console errors, uncaught exceptions and failed requests caused by the action. For everything else, `getLatestLogs({ page: state.page, sinceLastCall: true })`. Do not manually collect `page.on('console')` events; manual listeners miss logs emitted before the listener is attached. The first `sinceLastCall` call returns all buffered logs including startup and hydration errors.
 - **CDP sessions**: use `getCDPSession({ page: state.page })` not `state.page.context().newCDPSession()` - NEVER use `newCDPSession()` method, it doesn't work through playwriter relay
 - **Wait for load**: use `state.page.waitForLoadState('domcontentloaded')` not `state.page.waitForEvent('load')` - waitForEvent times out if already loaded
-- **Minimize timeouts**: prefer proper waits (`waitForSelector`, `waitForPageLoad`) over `state.page.waitForTimeout()`. Short timeouts (1-2s) are acceptable for non-deterministic events like animations, tab opens, or async UI updates where no specific selector is available
+- **Minimize timeouts**: prefer proper waits — `act.waitForIdle()` (any mode), `waitForPageLoad`, and in debug mode `waitForSelector` (human mode refuses it: it polls with Playwright's script in the page) — over `state.page.waitForTimeout()`. Short timeouts (1-2s) are acceptable for non-deterministic events like animations, tab opens, or async UI updates where no specific selector is available
 - **Text before screenshots**: use `observe()` (or `snapshot()` for locators) first to understand the page (text-based, fast, cheap, and readable without vision). Only take a screenshot when you need visual/spatial information and can actually look at images. Never take a screenshot just to check if a page loaded or to read text.
 - **Always use absolute file paths for Playwright artifact APIs**: for `page.screenshot({ path })`, `locator.screenshot({ path })`, `elementHandle.screenshot({ path })`, `page.pdf({ path })`, `download.saveAs(path)`, and `video.saveAs(path)`, always pass an absolute path. Relative paths are resolved by Playwright client internals, not the sandboxed `fs`, so they may use the relay server cwd instead of your session cwd.
-- **Structured readers replace page.evaluate() for inspection**: do NOT write `page.evaluate()` calls to manually query roles, text, child counts, class names, or test ids. `snapshot()` already shows every interactive element with its text, role, and a ready-to-use locator; for tags, attributes, or a custom field set use `pm.query({ page: state.page, fields: ['role', 'name', 'tag', 'locator', 'attributes.class'] })`. If you catch yourself writing `document.querySelector` inside evaluate — stop and pick from the next section. Reserve `page.evaluate()` for the five cases listed there.
+- **Structured readers replace page.evaluate() for inspection**: do NOT write `page.evaluate()` / `readPage()` calls to manually query roles, text, child counts, class names, or test ids. `observe()` and `snapshot()` already show every interactive element with its text, role and state; for tags, attributes, or a custom field set use `pm.query({ page: state.page, fields: ['role', 'name', 'tag', 'locator', 'attributes.class'] })`. If you catch yourself writing `document.querySelector` in a page function — stop and pick from the next section. Reserve page functions for the cases listed there: `readPage(fn)` in human mode (`page.evaluate` is refused there — it runs as a user gesture), `page.evaluate` in debug mode.
 
 ## reading a page: pick the narrowest tool
 
@@ -455,7 +457,7 @@ Three layers, in cost order. **Never skip down a layer without a reason you can 
 | Same, plus tags/attributes or your own field set | `pm.query({ page: state.page, select: 'Interactive', fields: ['role', 'name', 'locator'] })` |
 | Compact fused tree, marking what is new since the last call | `pm.renderText({ page: state.page })` |
 | Article text | `getPageMarkdown({ page: state.page })` |
-| Structural HTML | `getCleanHTML({ locator: state.page })` |
+| Structural HTML | `getCleanHTML({ locator: state.page })`; one element: `getCleanHTML({ ref: 12 })` |
 | One stable handle to carry into React/CSS | `pm.anchor('role=button[name="Save"]', { page: state.page })` |
 | What is actually at this pixel | `pm.anchorAt({ x, y }, { page: state.page })` — a real hit test |
 
@@ -463,10 +465,10 @@ Three layers, in cost order. **Never skip down a layer without a reason you can 
 
 | Symptom | Use |
 |---|---|
-| Wrong colour / size / spacing, "my CSS isn't applying" | `debugStyle({ locator, property })` — winner **and** losers, with `file:line` |
-| Renders but won't take a click | `whyOccluded({ locator })` — names the covering nodes **and** hit-tests the box centre |
-| Which component rendered this, with what props | `fiberSnapshot({ locator })`, or `handle.reactFiber()` from a `pm.anchor` handle |
-| Which props changed across a render | two `fiberSnapshot({ identity: true })` + `fiberDiff` |
+| Wrong colour / size / spacing, "my CSS isn't applying" | `debugStyle({ ref, property })` — winner **and** losers, with `file:line` |
+| Renders but won't take a click | `whyOccluded({ ref })` — names the covering nodes **and** hit-tests the box centre |
+| Which component rendered this, with what props | `fiberSnapshot({ ref })`, or `handle.reactFiber()` from a `pm.anchor` handle |
+| Which props changed across a render | two `fiberSnapshot({ ref, identity: true })` + `fiberDiff` |
 | Clicked, DOM looks right, nothing persisted | `storeIdentity({ page: state.page, action })` — check `measured` first |
 | Intermittent / order-dependent | `net.timeline` (passive), then `net.delay` (perturbing) to force it |
 | Something is perturbing my measurements | `net.active()` / `net.warnings()` — the session probe registry |
@@ -476,7 +478,7 @@ Three layers, in cost order. **Never skip down a layer without a reason you can 
 
 | Need | Use |
 |---|---|
-| Where this on-screen value comes from | `traceValue({ page: state.page, selector })` → read `render()`, then `blocked` |
+| Where this on-screen value comes from | `traceValue({ ref })` (debug mode also `{ page: state.page, selector }`) → read `render()`, then `blocked` |
 | Continue past a blocked leaf | `await t.runProbe(id)` — never guess the value |
 | Detail on one hop | `t.expand(id, { depth: 3 })` — one call, whole bounded subtree |
 | "It's a `const`, it can't have changed" | `inspectBinding({ file, graph, name })` — constant ≠ unmutated |
@@ -487,15 +489,15 @@ Three layers, in cost order. **Never skip down a layer without a reason you can 
 
 Signatures, traps, and real limits for every Layer 2/3 tool are in "debugging: symptom → cause" below — read them before your first call.
 
-**`page.evaluate()` is still the right tool for exactly these:**
+**A page function is still the right tool for exactly these** — `readPage(fn)` (any mode; it can only read) or, in debug mode, `page.evaluate()`:
 
-1. **Mutating** page state — debug mode only; human mode refuses DOM, style and storage writes: `localStorage.clear()`, `el.scrollTop += 500`, dispatching an app event.
-2. **Non-DOM JS values** — `window.__CONFIG__`, `window.__NEXT_DATA__`, a global store handle.
-3. **Properties the model does not carry** — `naturalWidth`, `videoWidth`, `scrollHeight`, canvas contents, live scroll offsets. Static geometry is NOT on this list any more: `runtime.box`, `paintOrder`, `visible`, `inViewport` and the tracked computed styles all come off the layout snapshot, so `getBoundingClientRect` in an `evaluate` is usually a slower duplicate of `pm.query({ fields: ['runtime.box'] })`.
-4. **In-page `fetch`** to reuse session cookies, and blob downloads — debug mode only; human mode refuses calling the backend from page code.
+1. **Mutating** page state — `page.evaluate` in debug mode only; human mode refuses DOM, style and storage writes, and `readPage` cannot make them: `localStorage.clear()`, `el.scrollTop += 500`, dispatching an app event.
+2. **Non-DOM JS values** — `window.__CONFIG__`, `window.__NEXT_DATA__`, a global store handle: `readPage(() => window.__NEXT_DATA__.props.pageProps.user.id)` (it runs in the page's own world; a store getter that caches or logs is refused by the check).
+3. **Properties the model does not carry** — `naturalWidth`, `videoWidth`, `scrollHeight`, canvas contents, live scroll offsets. Static geometry is NOT on this list any more: `runtime.box`, `paintOrder`, `visible`, `inViewport` and the tracked computed styles all come off the layout snapshot, so `getBoundingClientRect` in a page function is usually a slower duplicate of `pm.query({ fields: ['runtime.box'] })`.
+4. **In-page `fetch`** to reuse session cookies, and blob downloads — `page.evaluate` in debug mode only; human mode refuses calling the backend from page code.
 5. **Bulk extraction of one repeated non-semantic field** across hundreds of nodes in a single round-trip, where that field is not in the model.
 
-If the body of your `evaluate` is a `querySelectorAll` plus a map of role / name / text / class / testid — that is a `pm.query`, and you should rewrite it.
+If the body of your page function is a `querySelectorAll` plus a map of role / name / text / class / testid — that is a `pm.query`, and you should rewrite it.
 
 ## interaction feedback loop
 
@@ -519,9 +521,9 @@ await act.click(12)
 
 What the report contains, in order: the action (`✓`/`✗`, what the pointer actually hit, notes such as "scrolled 640px in main to reach it"), `SETTLED` or `NOT SETTLED` (with the requests your action started that are still open, and where content is still changing), `NAV` (`in-app route` = same document, `NEW DOCUMENT` = full load, or a back/forward-cache restore where the earlier page comes back with its state), `DIALOG`, `LIVE` (live-region and toast text, including text that already vanished), `ERRORS` (console errors from the page's own code, uncaught exceptions, HTTP ≥ 400 and failed requests with their `net.requests` id), `TAB` (a new tab this page opened, with `act.switchTab(i)`), `DOWNLOAD` (`completed`, `FAILED: …` or still downloading), `FILE DIALOG OPEN, opened by your click [12] button "Upload photo" (one file) — … act.dialog.chooseFiles(path) chooses the files, act.dialog.dismiss() cancels` (a file dialog your input opened, held back by the browser and waiting for your answer — also one that opened after a confirm you answered, or from a page timer a moment after your call returned: then it is in the next report, `… 3.0s after that action ended`), then `CHANGES` (`+` appeared, `-` gone, `~` state/value/name changed, `~ text grew by N chars: "…tail"`, `SCROLL [57] … 0 → 840px`), possible duplicates, and `BUSY` if the app is still working. `NO VISIBLE CHANGE` is printed only when a before/after comparison was made and found nothing — navigations, dialogs, new tabs, downloads and file dialogs count as changes. Treat it as "did not work" until proven otherwise. If part of the report could not be produced, that line says why (`NOT SETTLED — …`, `EVENTS UNAVAILABLE — …`, `AFTER-STATE UNAVAILABLE — …`); the ✓/✗ lines and other events are still listed, so do not repeat an action because the after-state is missing.
 
-Raw Playwright input still works and is reported, but it gets no human pointer path, no busy check and no cover check; the report marks it `(raw Playwright)`. Raw input or a navigation on a tab other than the one you control (`state.page = await context.newPage()` in one call, then `await state.page.goto(url)` in the next) is followed on that tab: the line names it (`ACTION  (raw Playwright) goto https://… on tab 1 "Title"`) and SETTLED, NAV and errors are read from it. No before-picture of that tab was taken, so the report shows no element diff and never claims NO VISIBLE CHANGE for it; a navigation counts as a change. `act.switchTab(1)` then `observe()` to see it.
+Raw Playwright input on the page — `page.mouse.*`, `page.keyboard.*`, `page.touchscreen.tap` — still works and is reported, but it gets no human pointer path, no busy check and no cover check; the report marks it `(raw Playwright)`. Locator and element actions (`locator.click()`, `page.fill(selector, …)`, …) are refused in human mode: Playwright runs them through its injected script. Raw input or a navigation on a tab other than the one you control (`state.page = await context.newPage()` in one call, then `await state.page.goto(url)` in the next) is followed on that tab: the line names it (`ACTION  (raw Playwright) goto https://… on tab 1 "Title"`) and SETTLED, NAV and errors are read from it. No before-picture of that tab was taken, so the report shows no element diff and never claims NO VISIBLE CHANGE for it; a navigation counts as a change. `act.switchTab(1)` then `observe()` to see it.
 
-Playwright reads are not neutral either. `page.title()`, `page.content()`, `page.evaluate()` and every locator read (`textContent()`, `count()`, `isVisible()`, …) run in the page as a user gesture: the page gets user activation, which a person who only looked never gives it — it may then prompt "Leave site?", play sound, or open popups and file dialogs. `observe()`, `find()`, `explain()`, `getPageMarkdown()` and `getCleanHTML({ locator: page })` read without it.
+Playwright reads are not neutral either. `page.title()`, `page.content()`, `page.evaluate()`, `page.screenshot()` and every locator read (`textContent()`, `count()`, `isVisible()`, …) run in the page as a user gesture: the page gets user activation, which a person who only looked never gives it — it may then prompt "Leave site?", play sound, or open popups and file dialogs (`page.screenshot()` also writes `caret-color` into the inline style of every text field unless `caret: 'initial'`). Human mode refuses them; `observe()`, `find()`, `explain()`, `readPage()`, `getPageMarkdown()` and `getCleanHTML({ locator: page })` read without it.
 
 **When the page is still working** (an AI reply streaming, a search running): `await act.waitForIdle({ timeoutMs: 90000 })` in a call with a larger `timeout`, then read the CHANGES it reports — the new reply text is in them.
 
@@ -577,9 +579,11 @@ Signatures, traps, and current limits for the Layer 2/3 tools named above.
 
 **All of these are sandbox globals — already in scope, so never try to load one.** Loading is not how you would get them anyway: there is no `import` at all (no global, and the syntax cannot work either — a static `import` is a SyntaxError inside the async wrapper your code runs in, and a dynamic `import()` throws in a `vm` context), while `require` genuinely exists but only ever hands back the allowlisted Node built-ins listed under "context variables" — never a Playwriter global. Nearly all of the globals below are async — `await` them. To see a value, `return` it, or `console.log` it: sandbox console output is collected and returned to **you** in the execute result. (The `console.log` that goes to the browser console instead of to you is the one written *inside* `page.evaluate()`.) Full types and examples live in the `page-model-api` and `trace-api` MCP resources.
 
-**`{ page: state.page }` is not optional.** Everything that *can* default to a page defaults to the sandbox `page` global — **not** `state.page` — so omitting it silently drives or inspects the wrong tab. The full list: `pm.*`, `queryPage`, `snapshot`, `refToLocator`, `traceValue`, `storeIdentity`, `net.*`, `setLogpoint`, `readLogpoints`, `getScriptSourceByUrl`, `humanMouse.*`, `ghostCursor.show`/`hide`, `pickElement`, `recording.start`, and `recording.startCdp`. (`debugStyle`, `whyOccluded` and `fiberSnapshot` take their page from the `locator` you pass, so they are exempt — and so is `snapshot` when you scope it with a `locator` or a `frame`, which carries its own page.)
+**`{ page: state.page }` is not optional.** Everything that *can* default to a page defaults to the sandbox `page` global — **not** `state.page` — so omitting it silently drives or inspects the wrong tab. The full list: `pm.*`, `queryPage`, `snapshot`, `refToLocator`, `traceValue`, `storeIdentity`, `net.*`, `setLogpoint`, `readLogpoints`, `getScriptSourceByUrl`, `humanMouse.*`, `ghostCursor.show`/`hide`, `pickElement`, `recording.start`, and `recording.startCdp`. (`debugStyle`, `whyOccluded` and `fiberSnapshot` take their page from the `ref` or `locator` you pass, so they are exempt — and so is every call given a `ref` (a ref names its tab), and `snapshot` when you scope it with a `locator` or a `frame`, which carries its own page.)
 
 `getLatestLogs` is the one exception, and it is surprising in the other direction: with no `page` it returns the logs of **every** page in the session, interleaved, not the default page's. Pass `page` when you want one tab's console.
+
+**Element arguments: `{ ref }` everywhere, a Playwright `locator` in debug mode only.** `snapshot`, `getCleanHTML`, `getLocatorStringForElement`, `getStylesForLocator`, `debugStyle`, `whyOccluded`, `getReactSource`, `getReactComponentInfo`, `fiberSnapshot`, `traceValue`, `humanMouse.*` and `pm.*` (`rootRef`) take a ref from `observe()` / `find()` and read the element over CDP, without running anything in the page. Their `locator` / ElementHandle / FrameLocator / selector forms (`node`, `selector`, `rootSelector`) resolve the element with Playwright's script in the page, which Playwright runs as a user gesture — human mode refuses them before anything runs, so use them in debug mode only.
 
 **PageModel & CSS provenance** — a queryable tree fusing the ARIA snapshot, flattened DOM, and lazy React/CSS edges. Prefer it over raw DOM scraping. It returns cycle-free projections, and it is rebuilt on every execute call, so handles do not survive across calls.
 
@@ -589,7 +593,8 @@ await pm.query({ page: state.page, select: 'Interactive', fields: ['role', 'name
 await pm.query({ page: state.page, visibleOnly: true })   // runtime.visible === true
 await pm.query({ page: state.page, inViewportOnly: true })// a DIFFERENT question — visible can be scrolled out
 await pm.query({ page: state.page, within: 'element#main' })      // scope the QUERY (page-path)
-await pm.query({ page: state.page, rootSelector: 'main' })        // scope the FETCH (Playwright selector)
+await pm.query({ page: state.page, rootSelector: 'main' })        // scope the FETCH (Playwright selector — debug mode only)
+await pm.query({ rootRef: 12 })                                   // scope the FETCH to a ref's element (its tab is the page)
 await pm.query({ page: state.page, changedSince: true })  // + changedSince/changes per row
 await queryPage({ page: state.page, select: 'Interactive' })  // same projection, top-level
 const h = await pm.anchor('role=button[name="Submit"]', { page: state.page }) // → handle | null
@@ -598,12 +603,12 @@ await h.reactFiber()                                      // lazy edge: { compon
 await h.styles()                                          // lazy edge: cascade winner per property
 await pm.renderText({ page: state.page, visibleOnly, inViewportOnly, includeRemoved })
 await pm.debugMode({ page: state.page })                  // projection config with lossy levers off (you pass it yourself)
-await debugStyle({ locator, property: 'color' })          // cascade winner + overridden losers ({ node } also works)
-await whyOccluded({ locator })                            // who is covering it + a real hit test
-await whyOccluded({ node: h, page: state.page })          // `page` only when a { node } handle carries no page of its own
+await debugStyle({ ref: 12, property: 'color' })          // cascade winner + overridden losers ({ locator } / { node }: debug mode only)
+await whyOccluded({ ref: 12 })                            // who is covering it + a real hit test
+await whyOccluded({ node: h, page: state.page })          // debug mode only; `page` only when a { node } handle carries no page of its own
 ```
 
-**Two scopes, two selector languages — this is the one trap worth memorising.** `rootSelector` is a **Playwright** selector and scopes what is *fetched*, before any tree exists (CSS and `:has-text` work). `within` is a **page-path** selector over the tree that already exists (`'element#main'`, `'Interactive'`, `Type[attr=value]` with an **unquoted** value). `scope` is the deprecated alias, and everywhere in the sandbox — `pm.query`, `pm.anchor`, `pm.renderText`, `pm.debugMode`, `queryPage` — it means **`rootSelector`**, the fetch scope. It is never read as a query `within`. Say `within` when you mean the query.
+**Two scopes, two selector languages — this is the one trap worth memorising.** `rootSelector` is a **Playwright** selector and scopes what is *fetched*, before any tree exists (CSS and `:has-text` work; debug mode only — in human mode scope the fetch with `rootRef: 12`). `within` is a **page-path** selector over the tree that already exists (`'element#main'`, `'Interactive'`, `Type[attr=value]` with an **unquoted** value). `scope` is the deprecated alias, and everywhere in the sandbox — `pm.query`, `pm.anchor`, `pm.renderText`, `pm.debugMode`, `queryPage` — it means **`rootSelector`**, the fetch scope. It is never read as a query `within`. Say `within` when you mean the query.
 
 **Selector traps:**
 - **`pm.anchor` is not a CSS engine.** Working forms: a locator exactly as `snapshot` printed it (`'role=button[name="Submit"]'`, `'[data-testid="total"]'`), a page-path selector (`'element[data-testid=total]'` — value **unquoted** — `'element#submit'`, `'Interactive'`, `'*'`), `{ backendNodeId }`, or `{ x, y, frameId? }`. `'button:has-text("Submit")'` and `'.card'` match nothing and return `null`. **`traceValue({ selector })` is the opposite** — a real Playwright selector, so `:has-text` works there. Identical-looking arguments, opposite rules.
@@ -624,7 +629,7 @@ await whyOccluded({ node: h, page: state.page })          // `page` only when a 
 **Trace lane & probe toolkit** — turns a wrong on-screen value into a cause.
 
 ```js
-const t = await traceValue({ page: state.page, selector: '[data-testid="total"]' })
+const t = await traceValue({ ref: 12 })                     // or { page: state.page, selector: '[data-testid="total"]' } in debug mode
 t.render()                                                  // token-bounded summary — read FIRST. A METHOD: render({ maxLines: 60, codeFrames: true })
 t.anchor                                                    // where the symptom was pinned: { componentName, file, line, slot, note } | null
 t.warnings                                                  // live PERTURBING probes + blind spots with no probe. Read before trusting timings
@@ -643,13 +648,13 @@ await net.stopAll()                                          // only the probes 
 // urlPattern is a SUBSTRING of the URL or a RegExp — never a glob. '*/api/*' is rejected;
 // write '/api/'. Omit it to match every request. A delay that held nothing says so in
 // net.warnings() and in stats().interceptedNothing.
-await fiberSnapshot({ locator, identity: true })            // identity:true is what makes handler churn visible
+await fiberSnapshot({ ref: 12, identity: true })            // identity:true is what makes handler churn visible ({ locator }: debug mode only)
 fiberDiff(before, after)                                    // → changes / identityChangedKeys / unobservableKeys
 replayPure({ fn, args, bindings })                          // re-run a pure sliced fn in-process
 await replayPureAsync({ fn, args })                         // …when the sliced fn is async
 ```
 
-**How to drive `traceValue`:** anchor with `{ selector }`, a `pm.anchor` handle via `{ node }`, or explicit `{ startFile, startExpr }`. `root` defaults to **your session's cwd** — pass it only when the app source lives elsewhere. Read `t.render()` first, then `t.warnings`, then `t.blocked`. Each blocked leaf names its blind spot and carries an armed-but-un-run probe. **Never fabricate a value past a `blockedBy`** — the static pass stopped there because it cannot see runtime state. Run the probe instead.
+**How to drive `traceValue`:** anchor with `{ ref }`, a `pm.anchor` handle via `{ node }`, or explicit `{ startFile, startExpr }` (`{ selector }` / `{ locator }` work in debug mode only). `root` defaults to **your session's cwd** — pass it only when the app source lives elsewhere. Read `t.render()` first, then `t.warnings`, then `t.blocked`. Each blocked leaf names its blind spot and carries an armed-but-un-run probe. **Never fabricate a value past a `blockedBy`** — the static pass stopped there because it cannot see runtime state. Run the probe instead.
 
 **Not every `blockedBy` wants a probe.** `mutation`, `interprocedural`, `async`, `unresolved-module` and `dynamic` are runtime blind spots: run the armed probe. These three are **static remedies** — the armed probe type is `static-remedy`, and going to get runtime evidence is the wrong move:
 
@@ -675,7 +680,7 @@ backwardSlice({ startFile, startExpr: 'total', maxHops: 16 })  // the static sli
 
 **⚠️ Pitfalls that actually bite:**
 - `startExpr` is a **variable name** (`'count'`, `'state'`) — never a file path or an expression like `'state.items.push(x)'`. Paths go in `startFile` (absolute). It binds to the **first** identifier of that name in the file, so a name used twice traces the wrong one (`inspectBinding` takes an `occurrence` index; `backwardSlice` does not).
-- `debugStyle` / `whyOccluded` / `fiberSnapshot` take `{ locator: state.page.locator('...') }`, not a raw selector string.
+- `debugStyle` / `whyOccluded` / `fiberSnapshot` take `{ ref: 12 }` (or, in debug mode, `{ locator: state.page.locator('...') }`), not a raw selector string.
 - **`storeIdentity` returns a union: check `measured` first.** The `measured: false` arm carries **no `sameReference` field at all**, so a probe that never found your store cannot be misread as a store that behaved. When it is false, read `reason` / `tried` / `remedy` and pass `storeExpr` — any expression that *returns* the state object.
 - `setLogpoint` **throws** when `expr` cannot be assembled into a provably non-pausing condition (a stray paren, an injected statement, a `debugger`). That refusal is the feature: a breakpoint that can pause reorders timers on resume and destroys exactly the race hypotheses this lane exists to test. Fix the expression — it must be a single JS **expression**.
 - `readLogpoints` returns an object, not an array — iterate `read.hits`. **It is capped by default: the newest `maxHits: 20` hits, each value cut to `maxLen: 50` characters.** Both caps are echoed in `read.caps`, both are raisable, and neither is ever applied silently: `droppedHits > 0` means the window hid older hits (raise `maxHits`); `hit.truncated` means that value was cut (raise `maxLen`); `hit.malformed` means the page could not serialise it and the raw text was kept rather than coerced into something plausible. Pass `sinceCursor: read.cursor` on the next call to read only what arrived after this one.
@@ -829,7 +834,7 @@ For the same tree fused with tags, attributes, and React/CSS edges — and with 
 - `search` - string/regex to filter results (returns first 10 matching lines)
 - `showDiffSinceLastCall` - return a unified diff against the last snapshot of the same scope and URL instead of the full tree. **Default `false`.**
 - `interactiveOnly` - **default `false`**: the whole accessible tree, because a snapshot is usually read to find out what is *on* the page. Pass `true` for only the elements you can act on. Note `screenshotWithAccessibilityLabels` defaults this the other way (`true`) — a label overlay exists to find click targets, so labelling every static node is clutter.
-- `frame` / `locator` - scope the snapshot to an iframe or a subtree (see below).
+- `ref` / `frame` / `locator` - scope the snapshot to an element's subtree or an iframe (see below). `locator`, and a `frame` that is a FrameLocator (`locator.contentFrame()`), are debug mode only; a `Frame` from `page.frames()` works in both modes.
 
 Every snapshot line carries the element's state and value after its name (or after its locator): `[checked]` / `[unchecked]` / `[checked=mixed]`, `[disabled]`, `[expanded]` / `[collapsed]`, `[pressed]`, `[selected]`, `[focused]`, `[required]`, `[invalid]`, `[level=2]`, and ` = "typed value"` for text fields (password values are always `••••`). Snapshots return the full tree on every call. Pass `showDiffSinceLastCall: true` to get only what changed since the last snapshot of the same scope and URL (a navigation, including an SPA route change, starts a new baseline); if nothing changed it says so. The same opt-in diff exists on `getCleanHTML` and `getPageMarkdown`. For "what changed after my action" you rarely need it: the action report already lists the changes.
 
@@ -875,16 +880,16 @@ Search for specific elements:
 const snap = await snapshot({ page: state.page, search: /button|submit/i })
 ```
 
-**Scoping snapshots to a specific element** — pass a `locator` instead of `page` to snapshot only a subtree. This dramatically reduces output size when you only care about one section of the page (e.g., the main content area, ignoring the sidebar/header/footer):
+**Scoping snapshots to a specific element** — pass a `ref` (from `observe()` / `find()`) to snapshot only that element's subtree; its tab is the page. In debug mode a `locator` does the same. This dramatically reduces output size when you only care about one section of the page (e.g., the main content area, ignoring the sidebar/header/footer):
 
 ```js
 // Full page snapshot: ~150 lines (sidebar, nav, header, footer, everything)
 await snapshot({ page: state.page })
 
-// Scoped to main: ~20 lines (just the content you care about)
-await snapshot({ locator: state.page.locator('main') })
+// Scoped to one element (a ref observe() or find() printed): just the subtree you care about
+await snapshot({ ref: 4 })
 
-// Scope to a specific form, dialog, or section
+// Debug mode only: scope with a Playwright locator
 await snapshot({ locator: state.page.locator('[role="dialog"]') })
 await snapshot({ locator: state.page.locator('form#checkout') })
 ```
@@ -1141,12 +1146,13 @@ console.log(await getLatestLogs({ page: state.page, sinceLastCall: true }))  // 
 
 Three readers below (`getCleanHTML`, `getPageMarkdown`, and `snapshot`) share the same two options: `search` (string/regex — returns the first 10 matching lines with 5 lines of context) and `showDiffSinceLastCall` (default `false`; `true` returns only what changed since the last call on the same page).
 
-**getCleanHTML** - get cleaned HTML from a locator or page:
+**getCleanHTML** - get cleaned HTML of the page or of one element. `{ ref }` reads the element in playwriter's isolated world; `{ locator: <Locator> }` reads it with Playwright's script in the page, debug mode only (`{ locator: state.page }`, the whole page, works in both modes):
 
 ```js
 await getCleanHTML({ locator, search?, showDiffSinceLastCall?, includeStyles?, maxAttrLen?, maxContentLen? })
 // Examples:
-const html = await getCleanHTML({ locator: state.page.locator('body') })
+const form = await getCleanHTML({ ref: 12 })  // a ref from observe() or find()
+const html = await getCleanHTML({ locator: state.page.locator('body') })  // debug mode only
 const html = await getCleanHTML({ locator: state.page, search: /button/i })
 const fullHtml = await getCleanHTML({ locator: state.page, showDiffSinceLastCall: false })  // disable diff
 const wide = await getCleanHTML({ locator: state.page, maxAttrLen: 500, maxContentLen: 2000 })
@@ -1184,26 +1190,27 @@ const cdp = await getCDPSession({ page: state.page })
 const metrics = await cdp.send('Page.getLayoutMetrics')
 ```
 
-**getLocatorStringForElement** - get stable Playwright selector from an element:
+**getLocatorStringForElement** - get stable Playwright selector from an element (a ref, or in debug mode a Locator/ElementHandle):
 
 ```js
-const selector = await getLocatorStringForElement(state.page.locator('[id="submit-btn"]'))
+const selector = await getLocatorStringForElement({ ref: 12 })
 // => "getByRole('button', { name: 'Save' })"
+const same = await getLocatorStringForElement(state.page.locator('[id="submit-btn"]'))  // debug mode only
 ```
 
 **getReactSource** - get React component source location (dev mode only). It reads React's fiber with one read-only call and maps React 19 `_debugStack` sites through the scripts' source maps, which playwriter fetches itself — nothing is injected into the page and the page makes no requests. A source map that exists but cannot be fetched or used is an error naming why; a script without one gives its served position:
 
 ```js
-const source = await getReactSource({ locator: state.page.locator('[data-testid="submit-btn"]') })
+const source = await getReactSource({ ref: 12 })  // or, debug mode only: { locator: state.page.locator('[data-testid="submit-btn"]') }
 // => { fileName, lineNumber, columnNumber, componentName }
 ```
 
 **getReactComponentInfo** - React component info for an element: `null` when the element was not rendered by React (no fiber, no component, no debug records); an error when React is there but reading it fails (CDP failure, a source map that cannot be used). Source locations are usually only available in React dev builds. Props are sanitized and truncated so functions, DOM nodes, circular refs, and huge objects do not flood the output. For an element you have a ref for, `explain(ref)` gives the component chain with its handlers.
 
-`fiberSnapshot({ locator })` is the same call under its trace-lane name — but `fiberSnapshot({ locator, identity: true })` is **not**: it returns a different shape carrying identity tokens for every object/function prop (held by playwriter per frame; nothing is stored on the page), which is the only way `fiberDiff` can see handler churn. A value that could not be given a token is reported by `fiberDiff` as `unobservable`, never as changed or unchanged. Use `getReactComponentInfo` to read props once; use `fiberSnapshot({ identity: true })` when you are going to diff two of them.
+`fiberSnapshot({ ref })` is the same call under its trace-lane name — but `fiberSnapshot({ ref, identity: true })` is **not**: it returns a different shape carrying identity tokens for every object/function prop (held by playwriter per frame; nothing is stored on the page), which is the only way `fiberDiff` can see handler churn. A value that could not be given a token is reported by `fiberDiff` as `unobservable`, never as changed or unchanged. Use `getReactComponentInfo` to read props once; use `fiberSnapshot({ identity: true })` when you are going to diff two of them. All three take `{ ref }` (a ref from observe() or find()); their `{ locator }` form is debug mode only.
 
 ```js
-const info = await getReactComponentInfo({ locator: state.page.locator('[data-testid="submit-btn"]') })
+const info = await getReactComponentInfo({ ref: 12 })  // or, debug mode only: { locator: state.page.locator('[data-testid="submit-btn"]') }
 // => { componentName, source, hierarchy, props } | null
 ```
 
@@ -1219,10 +1226,13 @@ await inspectPinnedElement({ url: 'https://example.com/cart', backendNodeId: 123
 const { ref } = await pickElement({ page: state.page })   // timeoutMs defaults to what is left of the call
 ```
 
-**getStylesForLocator** - raw DevTools-style listing of every matching rule (selector, source `file:line`, declarations, inherited styles). For "why is this property THIS value", prefer `debugStyle` — it resolves the cascade and names the winner plus every overridden loser. Reach for this when you want the unresolved rule list. Full reference: `https://playwriter.dev/resources/styles-api.md`.
+**getStylesForLocator** - raw DevTools-style listing of every matching rule (selector, source `file:line`, declarations, inherited styles). For "why is this property THIS value", prefer `debugStyle` — it resolves the cascade and names the winner plus every overridden loser. Reach for this when you want the unresolved rule list. It takes `{ ref }` (a ref from observe() or find()); the `{ locator }` form below is debug mode only. Full reference: `https://playwriter.dev/resources/styles-api.md`.
 
 ```js
-const styles = await getStylesForLocator({ locator: state.page.locator('.btn') })
+const btn = await getStylesForLocator({ ref: 12 })
+console.log(formatStylesAsText(btn))
+
+const styles = await getStylesForLocator({ locator: state.page.locator('.btn') })  // debug mode only
 console.log(formatStylesAsText(styles))
 
 // Include the browser's own default rules — off by default, and usually noise.
@@ -1409,18 +1419,23 @@ await ghostCursor.hide({ page: state.page })
 
 Ordinary Playwright teleports: one `Input.dispatchMouseEvent` at the destination. Nothing in between is ever hovered.
 
+Point it at a ref from `observe()` / `find()` (`{ ref }`: the element's box is read over CDP and its tab is the page), or at `{ x, y }`. `{ locator }` measures the element with Playwright's script in the page (`locator.boundingBox()`) and is debug mode only, as is `enable()`.
+
 ```js
 // One move. Returns the full accounting — never assume it went to plan.
-const res = await humanMouse.moveTo({ page: state.page, locator: state.page.locator('#save'), reportCrossings: true })
+const res = await humanMouse.moveTo({ ref: 12, reportCrossings: true })
 console.log(res.plannedDurationMs, res.achievedDurationMs, res.durationDriftMs)
 console.log(res.crossed?.map((c) => c.description))  // what the path actually hovered
 console.log(res.warnings)                            // non-empty = something did not match the model
 
-// Move + click. With a locator the press is delegated to locator.click(), so Playwright's
+// Move + press at the element's centre (the largest visible part of its box).
+await humanMouse.click({ ref: 12 })
+
+// Debug mode only: with a locator the press is delegated to locator.click(), so Playwright's
 // actionability, hit-target interception and retry loop all still run.
 await humanMouse.click({ page: state.page, locator: state.page.locator('#save') })
 
-// Make every locator.click/dblclick/hover on THIS page take a human route first.
+// Debug mode only: make every locator.click/dblclick/hover on THIS page take a human route first.
 await humanMouse.enable({ page: state.page })
 await state.page.locator('#save').click()   // human move, then the normal click
 humanMouse.isEnabled({ page: state.page })  // → true. Synchronous, and per page
@@ -1432,7 +1447,7 @@ const plan = await humanMouse.plan({ page: state.page, x: 900, y: 500, seed: 42 
 // Where the driver believes the pointer is. `hover` is an alias of `moveTo` —
 // with no button pressed, the move IS the hover.
 const at = await humanMouse.position({ page: state.page })
-await humanMouse.hover({ page: state.page, locator: state.page.locator('#menu') })
+await humanMouse.hover({ ref: 7 })
 ```
 
 `humanMouse.defaults` is the mutable option bag every call falls back to — `{ seed, sampleRateHz, maxSamples, tuning, reportCrossings }`. Setting `humanMouse.defaults.reportCrossings = true` once is how you get the crossing report on every move without repeating it. `enable({ page, …defaults })` stores a *separate* set of defaults for the patched clicks on that page.
@@ -1456,8 +1471,8 @@ Every stochastic element comes from a seeded PRNG. `Math.random()` is never call
 
 ### How it composes with `locator.click()`
 
-- `humanMouse.click({ locator })` does the human move, then calls `locator.click()`. Playwright then runs its own actionability and its own move to the element centre — but the pointer is already there, so that move is zero-distance and contributes one extra `mousemove` at the resting point and nothing else. **Actionability is not bypassed.**
-- `humanMouse.click({ x, y })` has no element, so there is no actionability to run. It presses where you told it to.
+- `humanMouse.click({ locator })` (debug mode) does the human move, then calls `locator.click()`. Playwright then runs its own actionability and its own move to the element centre — but the pointer is already there, so that move is zero-distance and contributes one extra `mousemove` at the resting point and nothing else. **Actionability is not bypassed.**
+- `humanMouse.click({ ref })` and `humanMouse.click({ x, y })` run no Playwright actionability: they press where the pointer now is. A ref's point is the centre of the largest part of its box inside the viewport; an element outside the viewport is refused (`act.scrollTo(ref)` first). For a click with cover and disabled checks and an action report, use `act.click(ref)`.
 - `humanMouse.enable()` patches `Locator.prototype.click/dblclick/hover` but the patch is **scoped to the pages you enabled** — other sessions sharing the relay process are unaffected, and `disable()` genuinely restores the old behaviour.
 - When `ghostCursor.show()` is on (debug mode), its overlay receives the whole polyline in one call and plays it back on the page's own rAF clock with CSS transitions off, so the drawn cursor traces the same curve as the real pointer instead of easing a transition behind it. Recordings get the same path from the pointer track, as dispatched.
 
@@ -1511,10 +1526,18 @@ The user can point at an element instead of describing it: right-click the page 
 
 ## taking screenshots
 
-Always use `scale: 'css'` to avoid 2-4x larger images on high-DPI displays:
+In human mode `page.screenshot()` is refused: Playwright prepares the page with its own script, as a user gesture, and by default writes `caret-color` into the inline style of every text field while it shoots. Take the pixels from the browser instead — `screenshotWithAccessibilityLabels({ page: state.page })` (labels drawn into the image, not the page), or plain:
 
 ```js
-await state.page.screenshot({ path: '/absolute/path/to/shot.png', scale: 'css' })
+const cdp = await getCDPSession({ page: state.page })
+const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' })
+require('node:fs').writeFileSync('/absolute/path/to/shot.png', Buffer.from(data, 'base64'))
+```
+
+In debug mode `page.screenshot()` works; always use `scale: 'css'` to avoid 2-4x larger images on high-DPI displays, and `caret: 'initial'` to keep it from styling the page:
+
+```js
+await state.page.screenshot({ path: '/absolute/path/to/shot.png', scale: 'css', caret: 'initial' })
 ```
 
 If you want to read back the image file into context, resize it first so it consumes fewer tokens:
@@ -1523,9 +1546,28 @@ If you want to read back the image file into context, resize it first so it cons
 await resizeImageForAgent({ input: '/absolute/path/to/shot.png' })
 ```
 
+## readPage
+
+`readPage(fn, { ref, arg, page })` runs `fn(el, arg)` in the page and returns what it returns. It is the page function of human mode, and works the same in debug mode.
+
+- **Where:** in the page's own JavaScript world (`window.__NEXT_DATA__`, a store's state and the page's globals are visible), in the frame of the element of `ref` — `document` is that frame's document. Without a ref, `el` is the `document` of `page` (default: the current page).
+- **Read-only, enforced by Chrome:** it runs under V8's side-effect check (the one DevTools' eager evaluation uses) and without a user gesture. Anything that could change the page stops it before it happens — DOM, style and storage writes, focus, scrolling, events, requests, timers, promises, writes into the page's objects, a page function that caches, logs or reads `arguments`. Chrome does not say where it stopped; readPage finds out by running the function again under the same check, and the error shows the call in your code with why and what to read instead: ``It stopped in `window.siteConfig.get('title')` (line 3)`` … ``Object.keys(window.siteConfig) lists what window.siteConfig holds.`` Read the data the page's function would have read (`window.siteConfig.values.title`).
+- Some reads Chrome has not marked read-only are routed to exact equivalents for you: `closest`, `matches`, `getRootNode`, `getElementById`, `isSameNode`, `localStorage.getItem` / `key`, `rect.toJSON()`, `getPropertyValue` of standard properties, `location.toString()`, `Object.fromEntries`, `Object.assign`, `{ ...spread }`. Still refused: `getClientRects`, `elementFromPoint`, `checkVisibility`, `matchMedia`, `new URL` (use `a.pathname` / `a.search` / `location.*`), `getPropertyValue('--custom')`, object rest (`{ a, ...rest } = obj`), `arguments`.
+- **Synchronous.** No `async`/`await`. It may run 5 s: a loop waiting for the page to change never ends (the page cannot run while your function does) — read, `act.waitForIdle()`, read again.
+- **Data in, data out.** `fn` cannot see your code's variables: pass them as `{ arg }` (JSON data). It returns JSON data; an element, an array of elements or a NodeList comes back as `{ ref, text }` entries (the ref observe() uses, or what contains the element). `console.log` inside prints with the call's output.
+
+```js
+// The price in the row of [12]
+await readPage((el) => el.closest('tr').querySelector('.price').textContent, { ref: 12 })
+// App state the page keeps in a global
+await readPage(() => window.__NEXT_DATA__.props.pageProps.cart.items.length)
+// Values in, refs out: every result link whose text has the word
+await readPage((doc, word) => [...doc.querySelectorAll('.results a')].filter((a) => a.textContent.includes(word)), { arg: 'mouse' })
+```
+
 ## page.evaluate
 
-Code inside `page.evaluate()` runs in the browser - use plain JavaScript only, no TypeScript syntax. Return values and log outside (console.log inside evaluate runs in browser, not visible). Use it only for the five cases in "reading a page: pick the narrowest tool" — never to count or describe elements, which is `pm.query`'s job:
+Debug mode. Human mode refuses `page.evaluate` (Playwright runs it as a user gesture): use `readPage`. Code inside `page.evaluate()` runs in the browser - use plain JavaScript only, no TypeScript syntax. Return values and log outside (console.log inside evaluate runs in browser, not visible). Use it only for the five cases in "reading a page: pick the narrowest tool" — never to count or describe elements, which is `pm.query`'s job:
 
 ```js
 // Reading non-DOM JS state — nothing else can see this
@@ -1543,12 +1585,13 @@ await state.page.locator('.scrollable-list').evaluate((el) => { el.scrollTop += 
 
 ## loading files
 
-Fill inputs with file content:
+Fill inputs with file content — in human mode type or paste it into the field's ref, in debug mode a locator works too:
 
 ```js
 const fs = require('node:fs')
 const content = fs.readFileSync('./data.txt', 'utf-8')
-await state.page.locator('textarea').fill(content)
+await act.fill(12, content, { paste: true })                // any mode: a ref from observe()
+await state.page.locator('textarea').fill(content)         // debug mode only
 ```
 
 ## network interception
@@ -1584,7 +1627,7 @@ const resp = state.responses.find((r) => r.url.includes('users'))
 console.log(JSON.stringify(resp.body, null, 2).slice(0, 2000))
 ```
 
-Replay API directly (useful for pagination):
+Replay API directly (useful for pagination) — debug mode only: human mode refuses calling the backend from page code:
 
 ```js
 const { url, headers } = state.requests.find((r) => r.url.includes('feed'))
@@ -1602,10 +1645,12 @@ Clean up listeners when done: `state.page.removeAllListeners('request'); state.p
 
 ## computer use (low-level mouse/keyboard)
 
+In human mode act on refs — `act.click(ref)`, `act.hover(ref)`, `act.scrollTo(ref)` / `act.scroll('down', { ref })`, `act.drag(from, to)` — and use the raw `page.mouse` / `page.keyboard` calls below only where there is no element to name (a canvas, a map, a drawn stroke); they run in both modes and are reported as raw Playwright. The locator forms (`locator.click()`, `.hover()`, `.dragTo()`, `.scrollIntoViewIfNeeded()`, `locator.evaluate`), `setViewportSize` and `page.screenshot` run Playwright's script in the page or force a state, so they are debug mode only.
+
 ### clicking
 
 ```js
-// Preferred: by locator (stable, auto-waits, no coordinates needed)
+// Debug mode: by locator (stable, auto-waits, no coordinates needed)
 await state.page.locator('button[name="Submit"]').click()
 await state.page.locator('text=Login').click({ button: 'right' })
 await state.page.locator('text=Login').dblclick()
@@ -1614,7 +1659,7 @@ await state.page
   .first()
   .click({ modifiers: ['Meta'] }) // cmd+click opens link in new background tab
 
-// By coordinates (when locators aren't available, e.g. canvas, maps, custom widgets)
+// By coordinates, any mode (when there is no element to name, e.g. canvas, maps, custom widgets)
 await state.page.mouse.click(450, 320) // left click
 await state.page.mouse.click(450, 320, { button: 'right' }) // right click
 await state.page.mouse.dblclick(450, 320) // double click
@@ -1625,14 +1670,14 @@ await state.page.mouse.click(450, 320, { modifiers: ['Shift'] }) // shift+click
 ### hover
 
 ```js
-await state.page.locator('.tooltip-trigger').hover() // by locator (preferred)
+await state.page.locator('.tooltip-trigger').hover() // by locator (debug mode)
 await state.page.mouse.move(450, 320) // by coordinates
 ```
 
 ### scroll
 
 ```js
-// By locator (preferred)
+// By locator (debug mode)
 await state.page.locator('#footer').scrollIntoViewIfNeeded()
 
 // By pixel (for canvas, maps, infinite scroll)
@@ -1645,7 +1690,7 @@ await state.page.mouse.wheel(-300, 0) // scroll left
 await state.page.mouse.move(450, 320)
 await state.page.mouse.wheel(0, 500)
 
-// Scroll inside a container
+// Scroll inside a container (debug mode: it writes scrollTop from page code)
 await state.page.locator('.scrollable-list').evaluate((el) => {
   el.scrollTop += 500
 })
@@ -1654,7 +1699,7 @@ await state.page.locator('.scrollable-list').evaluate((el) => {
 ### drag
 
 ```js
-// By locator (preferred)
+// By locator (debug mode)
 await state.page.locator('#item').dragTo(state.page.locator('#target'))
 
 // By coordinates (for canvas, sliders, custom drag targets)
@@ -1687,7 +1732,7 @@ await state.page.keyboard.up('Shift')
 for (let i = 0; i < 5; i++) await state.page.keyboard.press('ArrowDown')
 ```
 
-### resize viewport
+### resize viewport (debug mode)
 
 ```js
 await state.page.setViewportSize({ width: 1280, height: 720 })
@@ -1696,10 +1741,15 @@ await state.page.setViewportSize({ width: 1280, height: 720 })
 ### region screenshot (zoom equivalent)
 
 ```js
+// Debug mode:
 await state.page.screenshot({ path: '/absolute/path/to/region.png', scale: 'css', clip: { x: 100, y: 200, width: 400, height: 300 } })
+// Any mode: the browser's own capture of the region
+const cdp = await getCDPSession({ page: state.page })
+const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', clip: { x: 100, y: 200, width: 400, height: 300, scale: 1 } })
+require('node:fs').writeFileSync('/absolute/path/to/region.png', Buffer.from(data, 'base64'))
 ```
 
-Prefer locator-based actions over coordinates — locators are stable across scroll/resize, auto-wait for elements, and don't require screenshot round-trips that burn ~800 image tokens per cycle.
+In debug mode prefer locator-based actions over coordinates — locators are stable across scroll/resize, auto-wait for elements, and don't require screenshot round-trips that burn ~800 image tokens per cycle. In human mode refs from `observe()` give the same without a screenshot.
 
 ## Ghost Browser integration
 

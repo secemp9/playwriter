@@ -30,6 +30,7 @@ import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import type { AriaSnapshotNode } from './aria-snapshot.js'
 import type { AxStates } from './ax-states.js'
+import type { ResolvedElement } from './element-resolve.js'
 import { getAriaSnapshot } from './aria-snapshot.js'
 import { getReactComponentInfo } from './react-source.js'
 import { fetchNormalizedStyles } from './styles.js'
@@ -1360,9 +1361,12 @@ export class PageModel {
         // rules + winner map on the node's edges, and return a compact, cycle-free
         // winner-per-property projection.
         if (!node.edges.winnerFor) {
-          if (!deps.page || !deps.cdp || !node.locator) return null
+          // Aria-only nodes carry a synthetic negative id: there is no element to style.
+          if (!deps.cdp || node.backendNodeId < 0) return null
+          // Every node of the model was read through `deps.cdp` (buildPageModel), so its id is that
+          // session's: no locator round trip through Playwright's script in the page.
           const { rules } = await fetchNormalizedStyles({
-            locator: deps.page.locator(node.locator),
+            locator: { sessionBackendNodeId: node.backendNodeId },
             cdp: deps.cdp,
           })
           const cascade = resolveCascade(rules)
@@ -1943,7 +1947,9 @@ export async function fetchPageGeometry({ cdp }: { cdp: ICDPSession }): Promise<
  * layout snapshot over CDP, then delegate to the pure `buildPageModelFromRaw`.
  *
  * `rootSelector` is a **Playwright selector** and scopes what is FETCHED (it is applied
- * before any tree exists, by `page.locator`). It is a different language from
+ * before any tree exists, by `page.locator`, which resolves it with Playwright's script in the
+ * page — debug mode only). `root` scopes the fetch the same way to an element already
+ * resolved from a ref, without that script. Both are a different language from
  * `query({ within })`, which is a page-path selector over the already-built tree — the
  * two used to share the name `scope`, which made one of them look like the other.
  */
@@ -1952,12 +1958,14 @@ export async function buildPageModel({
   cdp,
   rootSelector,
   scope,
+  root,
 }: {
   page: Page
   cdp: ICDPSession
   rootSelector?: string
   /** @deprecated Alias for `rootSelector` (same Playwright-selector language). */
   scope?: string
+  root?: ResolvedElement
 }): Promise<PageModel> {
   if (rootSelector != null && scope != null && rootSelector !== scope) {
     throw new Error(
@@ -1966,7 +1974,10 @@ export async function buildPageModel({
     )
   }
   const selector = rootSelector ?? scope
-  const locator = selector ? page.locator(selector) : undefined
+  if (root && selector != null) {
+    throw new Error(`buildPageModel: both a root element and \`rootSelector\` ("${selector}") were given. Pass only one.`)
+  }
+  const locator = root ?? (selector ? page.locator(selector) : undefined)
   const aria = await getAriaSnapshot({ page, locator, cdp })
 
   const { nodes } = (await cdp.send('DOM.getFlattenedDocument', {

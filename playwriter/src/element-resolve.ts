@@ -26,6 +26,7 @@ import type { Protocol } from 'devtools-protocol'
 import { getCDPSessionForFrame } from './cdp-session.js'
 import type { ICDPSession } from './cdp-session.js'
 import { IsolatedWorld, withDeadline } from './isolated-world.js'
+import type { RefElement } from './page-probe.js'
 
 const CDP_TIMEOUT_MS = 5000
 
@@ -179,10 +180,33 @@ function objectIdOf(called: Protocol.Runtime.CallFunctionOnResponse, what: strin
 }
 
 /**
- * Resolve a Locator (waits for the element to be attached, like any Playwright action) or an
- * ElementHandle to its CDP node. `cdp` is the page's session.
+ * What the element readers (styles, React, fiber, snapshot scope, clean HTML) take: a Playwright
+ * Locator / ElementHandle — resolved here with Playwright's script in the page, which Playwright runs
+ * as a user gesture, so debug mode only — or an element already resolved without touching the page
+ * (`refElementTarget`, from a ref).
  */
-export async function resolveElement({ target, cdp }: { target: Locator | ElementHandle; cdp: ICDPSession }): Promise<ResolvedElement> {
+export type ElementTarget = Locator | ElementHandle | ResolvedElement
+
+/** The element a ref names (`PageProbes.element`), as the readers take it: read through CDP and the frame's isolated world only. */
+export function refElementTarget({ probe, target, frame, node }: RefElement): ResolvedElement {
+  return {
+    backendNodeId: target.backendNodeId,
+    node,
+    cdp: frame.cdp,
+    ownSession: frame.cdp !== probe.cdp,
+    frameId: frame.frameId,
+    frame: frame.frame,
+    world: frame.world,
+  }
+}
+
+/**
+ * Resolve a Locator (waits for the element to be attached, like any Playwright action) or an
+ * ElementHandle to its CDP node. `cdp` is the page's session. An already resolved element is
+ * returned as it is, so both forms go through the same readers.
+ */
+export async function resolveElement({ target, cdp }: { target: ElementTarget; cdp: ICDPSession }): Promise<ResolvedElement> {
+  if ('backendNodeId' in target) return target
   const handle = 'elementHandle' in target ? await target.elementHandle() : target
   if (!handle) throw new Error('Could not resolve the element over CDP: the locator matched no element')
   try {

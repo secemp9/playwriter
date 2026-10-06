@@ -488,30 +488,71 @@ function indexModule(file: string): ModuleIndex {
   return index
 }
 
-/** The object literal a function returns directly (not one returned by a nested function). */
+/**
+ * The object literal a function returns (not one returned by a nested function): as written, or
+ * through the local it was built in (`const api = { … }; return api`, as `createActApi` does).
+ */
 function returnedObjectLiteral(fn: Node): Node | null {
-  let found: Node | null = null
+  // An expression-bodied arrow returns its body.
+  if (fn.type === 'ArrowFunctionExpression' && fn.body?.type === 'ObjectExpression') return fn.body
+  const literals = new Map<string, Node>()
+  const returned: Node[] = []
   const walk = (n: any): void => {
-    if (found || !n || typeof n !== 'object') return
+    if (!n || typeof n !== 'object') return
     if (Array.isArray(n)) {
       for (const c of n) walk(c)
       return
     }
     if (typeof n.type !== 'string') return
     if (isFunctionNode(n) && n !== fn) return // a nested function's return is not ours
-    if (n.type === 'ReturnStatement' && n.argument?.type === 'ObjectExpression') {
-      found = n.argument
-      return
-    }
+    if (n.type === 'VariableDeclarator' && n.id?.type === 'Identifier' && n.init?.type === 'ObjectExpression') literals.set(n.id.name, n.init)
+    if (n.type === 'ReturnStatement' && n.argument) returned.push(n.argument)
     for (const key of Object.keys(n)) {
       if (key === 'loc' || key === 'leadingComments' || key === 'trailingComments' || key === 'innerComments') continue
       walk(n[key])
     }
   }
-  // An expression-bodied arrow returns its body.
-  if (fn.type === 'ArrowFunctionExpression' && fn.body?.type === 'ObjectExpression') return fn.body
   walk(fn.body)
-  return found
+  for (const value of returned) {
+    if (value.type === 'ObjectExpression') return value
+    if (value.type === 'Identifier' && literals.has(value.name)) return literals.get(value.name) ?? null
+  }
+  return null
+}
+
+/**
+ * The index of the parameter a function hands back — itself (`return api`) or behind a Proxy over
+ * it (`return new Proxy(api, handler)`, as `markedAsAct` wraps the act API to tag its calls) — when
+ * every return of the function does; otherwise null. A Proxy is taken to forward its calls: the
+ * options the docs pass then reach the wrapped object's own methods, which are what get checked.
+ */
+function passedThroughParameter(fn: Node): number | null {
+  const names = (fn.params ?? []).map((param: Node) => (param.type === 'Identifier' ? param.name : null))
+  const returned: Node[] = []
+  const walk = (n: any): void => {
+    if (!n || typeof n !== 'object') return
+    if (Array.isArray(n)) {
+      for (const c of n) walk(c)
+      return
+    }
+    if (typeof n.type !== 'string') return
+    if (isFunctionNode(n) && n !== fn) return // a nested function's return is not ours
+    if (n.type === 'ReturnStatement') returned.push(n.argument)
+    for (const key of Object.keys(n)) {
+      if (key === 'loc' || key === 'leadingComments' || key === 'trailingComments' || key === 'innerComments') continue
+      walk(n[key])
+    }
+  }
+  if (fn.type === 'ArrowFunctionExpression' && fn.body?.type !== 'BlockStatement') returned.push(fn.body)
+  else walk(fn.body)
+  let index: number | null = null
+  for (const value of returned) {
+    const handedBack = value?.type === 'NewExpression' && value.callee?.type === 'Identifier' && value.callee.name === 'Proxy' ? value.arguments[0] : value
+    const at = handedBack?.type === 'Identifier' ? names.indexOf(handedBack.name) : -1
+    if (at === -1 || (index !== null && index !== at)) return null
+    index = at
+  }
+  return index
 }
 
 function objectProperty(obj: Node, name: string): Node | null {
@@ -589,6 +630,9 @@ function resolveValue(node: Node | null, file: string, member: string | null, de
     // `createHumanMouseApi({ … })` — the value is whatever the callee returns.
     const factory = resolveValue(node.callee, file, null, depth + 1)
     if (!factory) return null
+    // `markedAsAct(createActApi({ … }))` — a wrapper that hands back its argument: follow the argument.
+    const passed = passedThroughParameter(factory.fn)
+    if (passed !== null) return resolveValue(node.arguments[passed] ?? null, file, member, depth + 1)
     const returned = returnedObjectLiteral(factory.fn)
     if (!returned) return null
     if (!member) return null

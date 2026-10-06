@@ -48,10 +48,13 @@ export interface CodeSite {
 
 /**
  * An input action. `viaAct`: an `act.*` call (human pointer path, busy and cover checks).
+ * `viaScript`: a Playwright element action (`locator.click()`, `page.fill(selector, …)`): its
+ * actionability checks run Playwright's script in the page as a user gesture, and fill/selectOption/
+ * focus/… set values and focus from a script; `instead` is the act.* call that does it as a person.
  * `loop`, when set, names what runs it more than once in one call: a loop, a concurrent
  * callback, or a helper function called more than once.
  */
-export type InputActionSite = CodeSite & { viaAct: boolean; loop?: string }
+export type InputActionSite = CodeSite & { viaAct: boolean; viaScript?: { instead: string }; loop?: string }
 
 /**
  * `document` — a new document loads (goto, reload, setContent, act.open, location.href=).
@@ -74,6 +77,13 @@ export type ForcedStateSite = CodeSite & { why: string }
 /** Code the analysis cannot read, so it cannot say what it does. `why` names what is unreadable. */
 export type UnanalysableSite = CodeSite & { why: string }
 
+/**
+ * A Playwright read that runs Playwright's script in the page (`page.title()`, `locator.textContent()`,
+ * `page.evaluate(…)`, `page.screenshot()`): Playwright runs it as a user gesture, so the page counts as
+ * clicked afterwards. `note` adds what else it does to the page, when it does more.
+ */
+export type ScriptReadSite = CodeSite & { note?: string }
+
 export interface CodeAnalysis {
   parseError?: string
   /** A ReturnStatement not inside a nested function (nor inside page-evaluated code). */
@@ -83,6 +93,7 @@ export interface CodeAnalysis {
   forcedState: ForcedStateSite[]
   apiBypass: CodeSite[]
   waits: CodeSite[]
+  scriptReads: ScriptReadSite[]
   unanalysable: UnanalysableSite[]
 }
 
@@ -122,28 +133,34 @@ const ACT_NAVIGATION_KIND: Record<string, NavigationSite['kind']> = {
 }
 
 /**
- * Playwright Locator/Page/ElementHandle/Frame methods that send real input. `type`/`press`
- * need an argument: with none they are getters elsewhere (`ConsoleMessage.type()`), while
- * Playwright's input versions always take one.
+ * Playwright Locator/Page/ElementHandle/Frame methods that act on an element (`page.click(selector)`
+ * is one too), with the act.* call that does the same as a person. Playwright runs each through its
+ * injected script: the actionability checks run in the page as a user gesture, and fill, clear,
+ * selectOption, selectText, setInputFiles, focus and blur set values, selection and focus from a
+ * script. `type`/`press` need an argument: with none they are getters elsewhere
+ * (`ConsoleMessage.type()`), while Playwright's input versions always take one.
  */
-const PLAYWRIGHT_INPUT_METHODS: Record<string, { needsArgument: boolean }> = {
-  click: { needsArgument: false },
-  dblclick: { needsArgument: false },
-  tap: { needsArgument: false },
-  fill: { needsArgument: false },
-  type: { needsArgument: true },
-  press: { needsArgument: true },
-  pressSequentially: { needsArgument: false },
-  check: { needsArgument: false },
-  uncheck: { needsArgument: false },
-  setChecked: { needsArgument: false },
-  selectOption: { needsArgument: false },
-  setInputFiles: { needsArgument: false },
-  hover: { needsArgument: false },
-  dragTo: { needsArgument: false },
-  dragAndDrop: { needsArgument: false },
-  clear: { needsArgument: false },
-  selectText: { needsArgument: false },
+const PLAYWRIGHT_INPUT_METHODS: Record<string, { needsArgument: boolean; instead: string }> = {
+  click: { needsArgument: false, instead: 'act.click(ref)' },
+  dblclick: { needsArgument: false, instead: 'act.dblclick(ref)' },
+  tap: { needsArgument: false, instead: 'act.click(ref)' },
+  fill: { needsArgument: false, instead: "act.fill(ref, 'text')" },
+  type: { needsArgument: true, instead: "act.type(ref, 'text')" },
+  press: { needsArgument: true, instead: "act.press('Key', { ref })" },
+  pressSequentially: { needsArgument: false, instead: "act.type(ref, 'text')" },
+  check: { needsArgument: false, instead: 'act.check(ref)' },
+  uncheck: { needsArgument: false, instead: 'act.uncheck(ref)' },
+  setChecked: { needsArgument: false, instead: 'act.check(ref) or act.uncheck(ref)' },
+  selectOption: { needsArgument: false, instead: "act.select(ref, 'option')" },
+  setInputFiles: { needsArgument: false, instead: 'act.upload(ref, path)' },
+  hover: { needsArgument: false, instead: 'act.hover(ref)' },
+  dragTo: { needsArgument: false, instead: 'act.drag(fromRef, toRef)' },
+  dragAndDrop: { needsArgument: false, instead: 'act.drag(fromRef, toRef)' },
+  clear: { needsArgument: false, instead: "act.fill(ref, '')" },
+  selectText: { needsArgument: false, instead: "act.click(ref), then act.press('Control+A')" },
+  focus: { needsArgument: false, instead: "act.click(ref) — a person focuses a field by clicking it — or act.press('Tab')" },
+  blur: { needsArgument: false, instead: "act.press('Tab'), or act.click on something else" },
+  scrollIntoViewIfNeeded: { needsArgument: false, instead: 'act.scrollTo(ref)' },
 }
 
 const MOUSE_METHODS: Record<string, true> = { click: true, dblclick: true, down: true, up: true, move: true, wheel: true }
@@ -170,20 +187,90 @@ const FORCED_STATE_METHODS: Record<string, string> = {
   clearCookies: 'deletes cookies directly',
   setOffline: 'forces the browser offline',
   dispatchEvent: 'fires a synthetic event instead of real input',
+  exposeBinding: 'adds a global function to the page',
+  exposeFunction: 'adds a global function to the page',
+  highlight: "draws Playwright's highlight overlay into the page",
+  setViewportSize: 'resizes the viewport (the page lays out again and gets a resize event)',
+  emulateMedia: 'emulates another media type, color scheme or motion setting',
+  setGeolocation: 'fakes the location the page reads',
+  grantPermissions: 'changes what the browser lets the page do (permissions)',
+  clearPermissions: 'changes what the browser lets the page do (permissions)',
+  setExtraHTTPHeaders: 'adds headers to every request the page makes',
+  setHTTPCredentials: 'answers HTTP authentication prompts from the script',
+  setStorageState: 'writes cookies and storage directly',
+  pdf: 'prints the page: its beforeprint and afterprint handlers run and it lays out for paper',
+  newCDPSession: "opens a CDP session that can send any command (getCDPSession({ page }) gives the page's session, read-only in human mode)",
+  getExistingCDPSession: "opens a CDP session that can send any command (getCDPSession({ page }) gives the page's session, read-only in human mode)",
+  newBrowserCDPSession: 'opens a browser CDP session that can send any command to any page',
 }
+
+/** `page.clock.*` / `context.clock.*`: Playwright's fake timers. */
+const CLOCK_METHODS: Record<string, true> = { install: true, fastForward: true, pauseAt: true, resume: true, runFor: true, setFixedTime: true, setSystemTime: true }
 
 const WAIT_METHODS: Record<string, true> = {
   waitForTimeout: true,
-  waitForSelector: true,
   waitForLoadState: true,
   waitForURL: true,
   waitForResponse: true,
   waitForRequest: true,
   waitForEvent: true,
   waitForNavigation: true,
-  waitForFunction: true,
-  waitFor: true,
 }
+
+const SCREENSHOT_NOTE = 'unless caret is "initial" it also writes caret-color into the inline style of every text field while it shoots'
+
+/**
+ * Playwright reads that run Playwright's script in the page (Locator, Page, Frame, ElementHandle,
+ * JSHandle, BrowserContext), which Playwright runs as a user gesture — measured: `page.title()` or
+ * `locator.count()` alone leaves a fresh page with `navigator.userActivation.hasBeenActive`. The
+ * waits among them poll with that script. `all` is `Locator.all()`; `Promise.all` is told apart by
+ * its receiver.
+ */
+const SCRIPT_READ_METHODS: Record<string, { note?: string }> = {
+  textContent: {},
+  innerText: {},
+  innerHTML: {},
+  getAttribute: {},
+  inputValue: {},
+  isChecked: {},
+  isDisabled: {},
+  isEditable: {},
+  isEnabled: {},
+  isHidden: {},
+  isVisible: {},
+  count: {},
+  all: {},
+  allTextContents: {},
+  allInnerTexts: {},
+  boundingBox: {},
+  elementHandle: {},
+  elementHandles: {},
+  evaluate: {},
+  evaluateAll: {},
+  evaluateHandle: {},
+  $eval: {},
+  $$eval: {},
+  $: {},
+  $$: {},
+  ariaSnapshot: {},
+  _snapshotForAI: {},
+  screenshot: { note: SCREENSHOT_NOTE },
+  title: {},
+  content: {},
+  frameElement: {},
+  ownerFrame: {},
+  jsonValue: {},
+  getProperty: {},
+  getProperties: {},
+  waitForSelector: {},
+  waitForFunction: {},
+  waitFor: {},
+  waitForElementState: {},
+  storageState: { note: 'it runs that script in every open page and opens a tab for each other origin it saves' },
+}
+
+/** Sandbox globals that are Playwright objects: a script-read name called on any other global (`Promise.all`) is not Playwright's. */
+const PLAYWRIGHT_GLOBALS: Record<string, true> = { page: true, context: true, browser: true }
 
 /** Methods whose page-function argument runs inside the page, and the index of that argument. */
 const PAGE_FUNCTION_ARGUMENT: Record<string, number> = {
@@ -195,6 +282,9 @@ const PAGE_FUNCTION_ARGUMENT: Record<string, number> = {
   $eval: 1,
   $$eval: 1,
 }
+
+/** Sandbox globals whose function argument runs inside the page, and the index of that argument. */
+const PAGE_FUNCTION_GLOBALS: Record<string, number> = { readPage: 0 }
 
 /** `page.request` / `context.request` — Playwright's APIRequestContext talks to the server directly. */
 const API_REQUEST_METHODS: Record<string, true> = { get: true, post: true, put: true, patch: true, delete: true, head: true, fetch: true }
@@ -609,6 +699,7 @@ class Analyzer {
     forcedState: [],
     apiBypass: [],
     waits: [],
+    scriptReads: [],
     unanalysable: [],
   }
   /** Function nodes the page evaluates: their bodies are page code. */
@@ -667,7 +758,13 @@ class Analyzer {
 
   private pageArgumentIndex(call: AnyPath): number | null {
     if (!call.isCallExpression() && !call.isOptionalCallExpression()) return null
-    const method = propertyKey(call.get('callee'))
+    const callee = call.get('callee')
+    // `readPage(fn)`: the sandbox global, unless the code bound the name itself.
+    if (callee.isIdentifier()) {
+      const name = callee.node.name
+      return listed(PAGE_FUNCTION_GLOBALS, name) && !callee.scope.getBinding(name) ? PAGE_FUNCTION_GLOBALS[name] : null
+    }
+    const method = propertyKey(callee)
     return listed(PAGE_FUNCTION_ARGUMENT, method) ? PAGE_FUNCTION_ARGUMENT[method] : null
   }
 
@@ -809,9 +906,9 @@ class Analyzer {
     return text.length > 80 ? `…${text.slice(-79)}` : text
   }
 
-  private pushInput(path: AnyPath, site: CodeSite, viaAct: boolean): void {
+  private pushInput(path: AnyPath, site: CodeSite, viaAct: boolean, viaScript?: { instead: string }): void {
     const loop = repetitionOf(path)
-    this.result.inputActions.push({ ...site, viaAct, ...(loop ? { loop } : {}) })
+    this.result.inputActions.push({ ...site, viaAct, ...(viaScript ? { viaScript } : {}), ...(loop ? { loop } : {}) })
   }
 
   private pushNavigation(path: AnyPath, site: CodeSite & { kind: NavigationSite['kind']; viaAct: boolean; reason?: string; inPage?: true }): void {
@@ -885,6 +982,10 @@ class Analyzer {
       this.result.apiBypass.push({ api, line })
       return
     }
+    if (receiverKey === 'clock') {
+      if (listed(CLOCK_METHODS, method)) this.result.forcedState.push({ api, line, why: 'installs fake timers in the page' })
+      return
+    }
     if (listed(NAVIGATION_METHODS, method)) {
       this.pushNavigation(path, { api, line, kind: NAVIGATION_METHODS[method], viaAct: false })
       return
@@ -898,8 +999,15 @@ class Analyzer {
       return
     }
     if (listed(PLAYWRIGHT_INPUT_METHODS, method) && !(PLAYWRIGHT_INPUT_METHODS[method].needsArgument && args.length === 0)) {
-      this.pushInput(path, { api, line }, false)
+      this.pushInput(path, { api, line }, false, { instead: PLAYWRIGHT_INPUT_METHODS[method].instead })
       if (args.some(hasForceTrue)) this.result.forcedState.push({ api, line, why: WHY.force })
+      return
+    }
+    // A script-read name on a global that is not one of the sandbox's Playwright objects (`Promise.all`) is not Playwright's.
+    const otherGlobal = receiver.kind === 'global' && receiver.chain.length === 0 && !listed(PLAYWRIGHT_GLOBALS, receiver.name)
+    if (listed(SCRIPT_READ_METHODS, method) && !otherGlobal) {
+      const { note } = SCRIPT_READ_METHODS[method]
+      this.result.scriptReads.push({ api, line, ...(note ? { note } : {}) })
     }
   }
 
@@ -1101,7 +1209,7 @@ function patternKeys(pattern: AnyPath, name: string): Array<string | null> | nul
 
 // --- public API -------------------------------------------------------------------------
 
-/** Every input, navigation, forced-state, API-bypass, wait and unreadable site in `code`, by line. */
+/** Every input, navigation, forced-state, API-bypass, wait, script-read and unreadable site in `code`, by line. */
 export function analyzeCode(code: string): CodeAnalysis {
   const parsed = parseScript(code)
   if ('error' in parsed) {
@@ -1113,13 +1221,14 @@ export function analyzeCode(code: string): CodeAnalysis {
       forcedState: [],
       apiBypass: [],
       waits: [],
+      scriptReads: [],
       unanalysable: [],
     }
   }
   const analyzer = new Analyzer()
   analyzer.analyze(parsed, code)
   const result = analyzer.result
-  for (const list of [result.inputActions, result.navigations, result.forcedState, result.apiBypass, result.waits, result.unanalysable]) {
+  for (const list of [result.inputActions, result.navigations, result.forcedState, result.apiBypass, result.waits, result.scriptReads, result.unanalysable]) {
     list.sort((a: CodeSite, b: CodeSite) => a.line - b.line)
   }
   return result
@@ -1197,6 +1306,7 @@ function describeAnalysis(analysis: CodeAnalysis): string[] {
     notes.push(`forced state: ${analysis.forcedState.map((site) => `${site.api} on line ${site.line} (${site.why})`).join(', ')}`)
   }
   if (analysis.apiBypass.length > 0) notes.push(`direct backend calls: ${siteList(analysis.apiBypass)}`)
+  if (analysis.scriptReads.length > 0) notes.push(`Playwright script in the page (a user gesture): ${siteList(analysis.scriptReads)}`)
   if (analysis.unanalysable.length > 0) {
     notes.push(`not analysable: ${analysis.unanalysable.map((site) => `${site.api} on line ${site.line} (${site.why})`).join(', ')}`)
   }
@@ -1208,7 +1318,9 @@ function describeAnalysis(analysis: CodeAnalysis): string[] {
  * call (navigations count), none in a loop or a repeated helper, no full-document or history
  * navigation once a page is loaded except `act.open(url, { reason })` / `act.back()`, no URL
  * change from page code (only act.spaNavigate / a link click), no forced state, no direct
- * backend calls, and no code the analysis cannot read. Waits and reads are never limited.
+ * backend calls, no Playwright call that runs Playwright's script in the page (reads, element
+ * actions — readPage, observe and act.* do those without it), and no code the analysis cannot
+ * read. Waits and reads that do not touch the page are never limited.
  */
 export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode; pageIsBlank: boolean }): PolicyVerdict {
   if (context.mode === 'debug') {
@@ -1231,8 +1343,32 @@ export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode;
   for (const site of analysis.unanalysable) {
     reasons.push(
       `${REFUSED} ${site.api} on line ${site.line} is unanalysable — ${site.why}, so the policy cannot read what it does ` +
-        'to the page. Pass the page function inline — page.evaluate(() => …), with values as arguments: ' +
-        'page.evaluate((sel) => document.querySelector(sel).textContent, sel) — and write act calls out (act.click(3)).',
+        'to the page. Pass the page function inline — readPage((el) => …), with values as its arg: ' +
+        "readPage((doc, sel) => doc.querySelector(sel).textContent, { arg: sel }) — and write act calls out (act.click(3)).",
+    )
+  }
+
+  if (analysis.scriptReads.length > 0) {
+    const sites = analysis.scriptReads.map((site) => `${site.api} on line ${site.line}${site.note ? ` (${site.note})` : ''}`).join(', ')
+    reasons.push(
+      `${REFUSED} ${sites} ${analysis.scriptReads.length === 1 ? 'runs' : 'run'} Playwright's script in the page, and Playwright ` +
+        'runs it as a user gesture: the page then counts as clicked (navigator.userActivation), which unlocks popups, file ' +
+        'dialogs, sound and "Leave site?" prompts that a person who only looks never unlocks. Read without touching the ' +
+        "page: readPage((el) => el.textContent, { ref: 12 }) runs your function in the page under Chrome's side-effect " +
+        'check (it can only read; without a ref, el is the document), observe() and find(text) list what is on screen with ' +
+        'refs, explain(ref) says what an element does, getPageMarkdown() reads the text. To wait for something, ' +
+        'act.waitForIdle() and then observe().',
+    )
+  }
+
+  const scripted = analysis.inputActions.filter((site) => site.viaScript)
+  if (scripted.length > 0) {
+    const sites = scripted.map((site) => `${site.api} on line ${site.line} → ${site.viaScript?.instead}`).join('; ')
+    reasons.push(
+      `${REFUSED} Playwright element actions — ${sites}. Playwright runs them through its injected script: the checks ` +
+        'run in the page as a user gesture (a hover or a focus already unlocks what only a click should), and fill, clear, ' +
+        'selectOption, selectText, setInputFiles, focus and blur set values, selection and focus from a script instead of ' +
+        'producing the input. Do it as a person with the act.* call named after each, with a ref from observe().',
     )
   }
 
@@ -1259,7 +1395,7 @@ export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode;
         'net.delay/page.route, DOM or style writes and synthetic events fake the conditions the bug needs, so what ' +
         'happens next is not something a user can hit. Reproduce it the way a user would: one act.* step per call, ' +
         'act.waitForIdle() while the app works, then observe() and the backend log to see the outcome. Reading is ' +
-        'fine (page.evaluate that only reads, getLatestLogs(), net.requests()). Faking conditions on purpose needs ' +
+        'fine (readPage(fn), getLatestLogs(), net.requests()). Faking conditions on purpose needs ' +
         'debug mode (ask the user).',
     )
   }

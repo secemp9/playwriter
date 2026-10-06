@@ -16,17 +16,18 @@
  */
 
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
+import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import { getCDPSessionForPage, tabTitle } from './cdp-session.js'
 import { withDeadline, type IsolatedWorld } from './isolated-world.js'
-import { PageFrames } from './page-frames.js'
-import { RefRegistry } from './ref-registry.js'
+import { PageFrames, type FrameHandle } from './page-frames.js'
+import { RefRegistry, type RefTarget } from './ref-registry.js'
 import { PageWatch } from './page-watch.js'
 import { DialogController } from './dialog-controller.js'
 import { PinTracker } from './element-pins.js'
 import { chooserOpener, describeOpener, FileChooserGate } from './file-chooser-gate.js'
 import { outgoingCallsOf, type OutgoingCallListener } from './playwright-client-hooks.js'
-import type { ActionRecord, ActProbe } from './human-actions.js'
+import { ActError, type ActionRecord, type ActProbe } from './human-actions.js'
 import { observePage, quote, type Observation, type ObservedElement, type ObserveOptions } from './page-observe.js'
 
 export interface PageProbe extends ActProbe {
@@ -69,6 +70,17 @@ export type LocatedNode =
   | { kind: 'element'; element: ObservedElement; exact: boolean }
   | { kind: 'content'; tag: string; text: string; inClosedFrame: boolean }
   | { kind: 'gone' }
+
+/** The element a ref names, resolved for reading (`PageProbes.element`). */
+export interface RefElement {
+  page: Page
+  probe: PageProbe
+  target: RefTarget
+  /** The element's frame: the session that owns its document and the frame's isolated world. */
+  frame: FrameHandle
+  /** `DOM.describeNode` of the element, on the frame's session. */
+  node: Protocol.DOM.Node
+}
 
 /** One line a model can act on: the ref when there is one, what it is otherwise. */
 export function renderLocatedNode(located: LocatedNode): string {
@@ -326,13 +338,52 @@ export class PageProbes {
     return await this.observe(page, context, {}, false)
   }
 
-  /** Place a node the human pointed at (a pin, a pick) among `observation`'s listed elements. */
-  async locateNode(page: Page, observation: Observation, backendNodeId: number): Promise<LocatedNode> {
-    const listed = new Map(observation.elements.map((element) => [element.backendNodeId, element]))
+  /**
+   * The element `ref` names, resolved for reading: its tab, probe, frame (session and isolated world)
+   * and CDP node. Throws an ActError the model can act on when the ref names no live element, or when
+   * a native dialog freezes its tab (nothing in it can be read until the dialog is answered).
+   */
+  async element(ref: number | string): Promise<RefElement> {
+    const resolution = this.registry.resolve(ref)
+    if (!resolution.ok) throw new ActError(resolution.error)
+    const { target } = resolution
+    const page = this.pageOf(target.targetId)
+    if (!page) {
+      throw new ActError(`[${target.ref}] was listed in a tab that is no longer open. observe() the tab you are working in for current refs.`)
+    }
+    const probe = await this.get(page)
+    const dialog = probe.dialogs.current()
+    if (dialog) {
+      throw new ActError(
+        `A native ${dialog.type}("${dialog.message}") dialog is open and freezes the page, so [${target.ref}] cannot be read. ` +
+          'Handle it first, like a person would: act.dialog.accept() or act.dialog.dismiss().',
+      )
+    }
+    const frame = await probe.frames.handle(target.frameId)
+    const { node } = await withDeadline(
+      frame.cdp.send('DOM.describeNode', { backendNodeId: target.backendNodeId }),
+      CDP_TIMEOUT_MS,
+      `describing [${target.ref}]`,
+    )
+    return { page, probe, target, frame, node }
+  }
+
+  /**
+   * Place a node the human pointed at (a pin, a pick) or a read returned among `observation`'s
+   * listed elements. `frame`: the frame whose session the backend id belongs to (the main frame
+   * when absent) — backend ids are per renderer process, so only elements read through the same
+   * session can be the node or contain it.
+   */
+  async locateNode(page: Page, observation: Observation, backendNodeId: number, frame?: FrameHandle): Promise<LocatedNode> {
+    const probe = await this.get(page)
+    const where = frame ?? probe.frames.main
+    const sessionOf = new Map((await probe.frames.list()).frames.map((entry) => [entry.frameId, entry.cdp]))
+    const listed = new Map(
+      observation.elements.filter((element) => sessionOf.get(element.frameId) === where.cdp).map((element) => [element.backendNodeId, element]),
+    )
     const direct = listed.get(backendNodeId)
     if (direct) return { kind: 'element', element: direct, exact: true }
-    const probe = await this.get(page)
-    const ancestry = await probe.world.nodesReturnedBy([backendNodeId], ANCESTRY_FN, {
+    const ancestry = await where.world.nodesReturnedBy([backendNodeId], ANCESTRY_FN, {
       what: `reading the ancestors of node ${backendNodeId}`,
     })
     if (ancestry.length === 0) return { kind: 'gone' }
@@ -340,7 +391,7 @@ export class PageProbes {
       const element = id === null ? undefined : listed.get(id)
       if (element) return { kind: 'element', element, exact: false }
     }
-    const description = await probe.world.callFunctionOnNodes<{ tag: string; text: string; inClosedFrame: boolean } | null>(
+    const description = await where.world.callFunctionOnNodes<{ tag: string; text: string; inClosedFrame: boolean } | null>(
       [backendNodeId],
       DESCRIBE_FN,
       { what: `describing node ${backendNodeId}` },

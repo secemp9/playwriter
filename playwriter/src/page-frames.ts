@@ -87,6 +87,14 @@ export interface FrameBox {
   height: number
 }
 
+/** A rectangle in main-viewport CSS px. */
+export interface ScreenRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 /** The `<iframe>`/`<frame>` element that embeds a frame, in its parent's session id space. */
 export interface FrameOwner {
   parentId: string
@@ -325,6 +333,31 @@ export class PageFrames {
     if (handle.cdp === this.cdp) return IDENTITY_BOX
     const root = await this.box(handle.sessionRootId)
     return { x: root.x, y: root.y, scale: root.scale }
+  }
+
+  /**
+   * Where node `backendNodeId` of `handle`'s document is drawn: its content quads
+   * (`DOM.getContentQuads`) as axis-aligned rects in main-viewport CSS px, for a node in an iframe
+   * too; slivers under half a pixel are dropped. CDP's own error when the node has no layout box or
+   * is gone.
+   */
+  async contentRects(handle: FrameHandle, backendNodeId: number, what: string): Promise<ScreenRect[]> {
+    const { quads } = await withDeadline(handle.cdp.send('DOM.getContentQuads', { backendNodeId }), CDP_TIMEOUT_MS, what)
+    const origin = await this.sessionBox(handle)
+    return quads
+      .map((quad) => {
+        const xs = [quad[0], quad[2], quad[4], quad[6]]
+        const ys = [quad[1], quad[3], quad[5], quad[7]]
+        const x = Math.min(...xs)
+        const y = Math.min(...ys)
+        return {
+          x: origin.x + x * origin.scale,
+          y: origin.y + y * origin.scale,
+          width: (Math.max(...xs) - x) * origin.scale,
+          height: (Math.max(...ys) - y) * origin.scale,
+        }
+      })
+      .filter((rect) => rect.width > 0.5 && rect.height > 0.5)
   }
 
   /**

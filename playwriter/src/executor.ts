@@ -75,7 +75,7 @@ import { startCdpScreencast, type CdpScreencastHandle, type CdpScreencastOptions
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
 import { GhostCursorController } from './ghost-cursor-controller.js'
-import { createHumanMouseApi } from './human-mouse-driver.js'
+import { createHumanMouseApi, type HumanClickOptions, type HumanMouseApi, type HumanMoveOptions } from './human-mouse-driver.js'
 import { formatInputLabel } from './cdp-screencast.js'
 import { ModelFacingError, type PolicyMode, type SettleResult, type WatchCheckpoint, type WatchEvents } from './probe-types.js'
 import { PageProbes, renderLocatedNode, type PageProbe } from './page-probe.js'
@@ -91,9 +91,11 @@ import { withDeadline } from './isolated-world.js'
 import { analyzeCode, checkPolicy, type CodeAnalysis } from './code-policy.js'
 import { explainElement, renderExplanation } from './element-explain.js'
 import { ActError, BLOCKING_BUSY_KINDS, createActApi, isBlankUrl, renderActionReport, type ActionRecord } from './human-actions.js'
-import { resolveElement } from './element-resolve.js'
+import { refElementTarget, resolveElement, type ElementTarget, type ResolvedElement } from './element-resolve.js'
 import { chooserOpener, describeOpener, type ChooserWindow } from './file-chooser-gate.js'
-import { outgoingCallsOf, type OutgoingCallListener } from './playwright-client-hooks.js'
+import { outgoingCallsOf, outgoingGuardsOf, openingOwnCdpSession, type OutgoingCallGuard, type OutgoingCallListener } from './playwright-client-hooks.js'
+import { callEffect, isRefusedEffect, refusalFor, unclassifiedRefusal } from './playwright-call-effects.js'
+import { readPage } from './read-page.js'
 
 
 const __filename = fileURLToPath(import.meta.url)
@@ -453,6 +455,12 @@ export interface ExecuteRun {
   start?: { page: Page; checkpoint: WatchCheckpoint }
   /** Called when act switches the controlled tab, so the action scope watches that tab as well. */
   follow?: (page: Page) => void
+  /**
+   * Set in human mode: the pages under test (this context's) and the browser. Every protocol call made
+   * in this run's async context that would run Playwright's script in them or change them is refused
+   * as it goes out ({@link guardHumanRun}).
+   */
+  humanGuard?: { context: BrowserContext; browser: Browser | null }
 }
 
 /** A download that started during the call. `status` settles to `completed`, `FAILED: <Chrome's reason>` or why it is unknown. */
@@ -545,12 +553,48 @@ function markedAsAct<T extends object>(api: T): T {
   })
 }
 
+/** Whether human mode refuses the protocol call `type.method` (wherever it goes): unknown, or with a refused effect. */
+function refusedInHumanMode(type: string, method: string, params: unknown): boolean {
+  const effect = callEffect(type, method, params)
+  return effect === null || isRefusedEffect(effect)
+}
+
+/**
+ * Human mode, at run time: no protocol call made in a human-mode run's async context may run
+ * Playwright's script in the pages under test or change them (playwright-call-effects.ts) — the
+ * code's own calls, a helper's and act's alike, the ones Playwright's instrumentation never reports
+ * (internal methods, the second call of `locator.boundingBox()`) and the ones the code leaves running
+ * after its call returned. The static policy refuses what it can read before anything runs; this is
+ * the boundary for the rest. playwriter's own CDP-session borrowing is the one raw-CDP exception.
+ */
+const guardHumanRun: OutgoingCallGuard = ({ owner, method, params }) => {
+  const scope = executeContext.getStore()?.humanGuard
+  if (!scope) return
+  const type: unknown = Reflect.get(owner, '_type')
+  if (typeof type !== 'string') return
+  const protocol = `${type}.${method}`
+  const effect = callEffect(type, method, params)
+  if (effect === null) {
+    if (reachesContext(owner, scope.context, scope.browser)) throw new ActError(unclassifiedRefusal(protocol))
+    return
+  }
+  if (!isRefusedEffect(effect) || !reachesContext(owner, scope.context, scope.browser)) return
+  if (effect.kind === 'rawCdp' && openingOwnCdpSession.getStore()) return
+  throw new ActError(refusalFor(effect, protocol))
+}
+
 /**
  * The CDP session human-mode code gets from getCDPSession(): the page's shared session, with every
- * command outside {@link READ_ONLY_CDP_COMMANDS} refused before it is sent.
+ * command outside {@link READ_ONLY_CDP_COMMANDS} refused before it is sent. The shared session is an
+ * ES private field: a TypeScript `private` property is an ordinary one at run time, and
+ * `(await getCDPSession({ page })).session.send(…)` would have bypassed the check.
  */
 class ReadOnlyCdpSession implements ICDPSession {
-  constructor(private readonly session: ICDPSession) {}
+  readonly #session: ICDPSession
+
+  constructor(session: ICDPSession) {
+    this.#session = session
+  }
 
   async send<K extends keyof ProtocolMapping.Commands>(
     method: K,
@@ -562,24 +606,25 @@ class ReadOnlyCdpSession implements ICDPSession {
           '(DOM.get*, DOM.describeNode, Accessibility.*, DOMSnapshot.captureSnapshot, CSS.get*, Network.getResponseBody, ' +
           'Page.getFrameTree/getLayoutMetrics/getNavigationHistory/captureScreenshot). Input, navigation and script go ' +
           'through act.* — act.click(ref), act.press(key), act.fill(ref, text), act.open(url, { reason }) — which move ' +
-          'like a person and report what happened. Raw CDP that changes the page needs debug mode (ask the user).',
+          'like a person and report what happened; readPage(fn) reads the page. Raw CDP that changes the page needs debug ' +
+          'mode (ask the user).',
       )
     }
-    return await this.session.send(method, params)
+    return await this.#session.send(method, params)
   }
 
   on<K extends keyof ProtocolMapping.Events>(event: K, callback: (params: ProtocolMapping.Events[K][0]) => void): this {
-    this.session.on(event, callback)
+    this.#session.on(event, callback)
     return this
   }
 
   off<K extends keyof ProtocolMapping.Events>(event: K, callback: (params: ProtocolMapping.Events[K][0]) => void): this {
-    this.session.off(event, callback)
+    this.#session.off(event, callback)
     return this
   }
 
   async detach(): Promise<void> {
-    await this.session.detach()
+    await this.#session.detach()
   }
 }
 
@@ -907,6 +952,22 @@ function pageOfCallOwner(owner: object, context: BrowserContext): Page | null {
 }
 
 /**
+ * Whether a protocol call made on `owner` reaches the pages under test: this session's browser
+ * context, one of its pages, or anything inside them (frames, element handles, workers, tracing, the
+ * context's request client) — or the browser itself, whose CDP sessions reach every page. A page of
+ * another context (`browser.newContext()`) is not under test.
+ */
+function reachesContext(owner: object, context: BrowserContext, browser: Browser | null): boolean {
+  if (owner === browser) return true
+  for (let current: unknown = owner; typeof current === 'object' && current !== null; ) {
+    if (current === context) return true
+    const framePage: unknown = Reflect.get(current, '_type') === 'Frame' ? Reflect.get(current, '_page') : undefined
+    current = framePage ?? Reflect.get(current, '_parent')
+  }
+  return false
+}
+
+/**
  * Subscribe to the instrumentation and hand every input to `onAction`.
  *
  * Emitted on `onApiCallEnd`, not `onApiCallBegin`, for two reasons that both matter:
@@ -1192,7 +1253,7 @@ export class PlaywrightExecutor {
 
     const applyToPage = async (page: Page) => {
       try {
-        const cdpSession = await page.context().newCDPSession(page)
+        const cdpSession = await openingOwnCdpSession.run(true, () => page.context().newCDPSession(page))
         await cdpSession.send('Network.enable')
         await cdpSession.send('Network.setBlockedURLs', {
           urls: blockedPatterns,
@@ -1964,12 +2025,29 @@ export class PlaywrightExecutor {
         },
       }
 
+      /**
+       * Human mode: the Locator / ElementHandle / FrameLocator / selector forms of the element readers
+       * resolve the element with Playwright's script in the page, which Playwright runs as a user
+       * gesture. Refused before any Playwright call, naming the ref form that reads the same element
+       * over CDP. Debug mode keeps every form.
+       */
+      const refuseScriptForm = (call: string, what: string, instead: string): void => {
+        if (self.policy !== 'human') return
+        throw new ActError(
+          `Refused (human mode): ${call} resolves ${what} with Playwright's script in the page, which Playwright runs as a user ` +
+            `gesture (the page then counts as clicked: navigator.userActivation). Pass a ref from observe() or find(): ${instead}. ` +
+            'Nothing from this call was run.',
+        )
+      }
+
       const snapshot = async (options: {
         page?: Page
         /** Optional frame to scope the snapshot (e.g. from iframe.contentFrame() or page.frames()) */
         frame?: Frame | FrameLocator
-        /** Optional locator to scope the snapshot to a subtree */
+        /** Optional locator to scope the snapshot to a subtree (debug mode only) */
         locator?: Locator
+        /** Scope the snapshot to the subtree of this element: a ref from observe()/find() */
+        ref?: number | string
         search?: string | RegExp
         showDiffSinceLastCall?: boolean
         /** Snapshot format. `'raw'` is the only one that exists; anything else THROWS. */
@@ -1987,6 +2065,7 @@ export class PlaywrightExecutor {
           page: targetPage,
           frame,
           locator,
+          ref,
           search,
           // Opt-in. As a default the second call returned a unified diff whose `>> nth=` locators
           // shift whenever anything is inserted above them, and weak models read it as the page.
@@ -2004,6 +2083,18 @@ export class PlaywrightExecutor {
               'article text use getPageMarkdown().',
           )
         }
+        if (locator && ref !== undefined) {
+          throw new ModelFacingError('snapshot: pass `locator` or `ref` to scope it, not both.')
+        }
+        if (locator) refuseScriptForm('snapshot({ locator })', 'the locator', 'snapshot({ ref: 12 })')
+        if (frame && !('frameId' in frame)) {
+          refuseScriptForm(
+            'snapshot({ frame })',
+            'the frame locator',
+            'snapshot({ ref: 12 }) with an element in the frame, or the Frame itself: snapshot({ frame: page.frames()[1] })',
+          )
+        }
+        const element = ref === undefined ? null : await self.probes.element(ref)
         /**
          * Explicit `page` wins; otherwise take it from the `locator` or `frame` being
          * scoped to, and only then fall back to the sandbox default.
@@ -2016,11 +2107,12 @@ export class PlaywrightExecutor {
          * makes `snapshot` agree with them. A `FrameLocator` has no `page()`, so it still
          * falls through to the default.
          */
-        const pageFromScope: Page | undefined =
-          typeof (locator as any)?.page === 'function'
-            ? (locator as any).page()
-            : typeof (frame as any)?.page === 'function'
-              ? (frame as any).page()
+        const pageFromScope: Page | undefined = element
+          ? element.page
+          : locator
+            ? locator.page()
+            : frame && 'page' in frame
+              ? frame.page()
               : undefined
         const resolvedPage = targetPage || pageFromScope || page
         if (!resolvedPage) {
@@ -2035,7 +2127,7 @@ export class PlaywrightExecutor {
         } = await getAriaSnapshot({
           page: resolvedPage,
           frame,
-          locator,
+          locator: element ? refElementTarget(element) : locator,
           interactiveOnly,
         })
         const snapshotStr = rawSnapshot.toWellFormed?.() ?? rawSnapshot
@@ -2052,7 +2144,7 @@ export class PlaywrightExecutor {
         const shouldCacheSnapshot = !frame
         // Baselines are keyed by scope AND url: a diff must never span a navigation (an SPA route
         // change included), where "what changed" is the whole page.
-        const snapshotKey = `${locator ? `locator:${locator.selector()}` : 'page'}@${resolvedPage.url()}`
+        const snapshotKey = `${locator ? `locator:${locator.selector()}` : element ? `ref:${element.target.ref}` : 'page'}@${resolvedPage.url()}`
         let pageSnapshots = this.lastSnapshots.get(resolvedPage)
         if (!pageSnapshots) {
           pageSnapshots = new Map()
@@ -2122,12 +2214,23 @@ export class PlaywrightExecutor {
        * three agree on what "since last call" means. Everything else is theirs — the
        * options object is forwarded whole, so neither wrapper can drop one, and the store
        * is applied AFTER the spread so sandbox code cannot opt itself back out of the
-       * session scoping.
+       * session scoping. `{ ref }` reads one element through playwriter's isolated world.
        */
-      const getCleanHTMLFn = (options: GetCleanHTMLOptions) => {
-        if (options?.locator === undefined) {
-          throw new ModelFacingError('getCleanHTML needs what to read: getCleanHTML({ locator: page }) for the whole page, or a Locator for one part of it.')
+      const getCleanHTMLFn = async (
+        options: GetCleanHTMLOptions | (Omit<GetCleanHTMLOptions, 'locator' | 'diffStore'> & { ref: number | string }),
+      ) => {
+        if (options !== undefined && 'ref' in options) {
+          const { ref, ...rest } = options
+          if ('locator' in rest) throw new ModelFacingError('getCleanHTML: pass `locator` or `ref`, not both.')
+          return getCleanHTML({ ...rest, locator: refElementTarget(await self.probes.element(ref)), diffStore: this.lastCleanHtml })
         }
+        if (options?.locator === undefined) {
+          throw new ModelFacingError(
+            'getCleanHTML needs what to read: getCleanHTML({ locator: page }) for the whole page, or getCleanHTML({ ref: 12 }) for one element (a ref from observe() or find()).',
+          )
+        }
+        // A Page is read over CDP; a Locator is read with Playwright's script in the page.
+        if (!('goto' in options.locator)) refuseScriptForm('getCleanHTML({ locator })', 'the locator', 'getCleanHTML({ ref: 12 })')
         return getCleanHTML({ ...options, diffStore: this.lastCleanHtml })
       }
       // Every option is optional: `getPageMarkdown()` reads the controlled page.
@@ -2151,17 +2254,24 @@ export class PlaywrightExecutor {
       }
 
       /**
-       * Read-only and invisible to the page: the element is resolved to its CDP node, and Playwright's
-       * selector generator (dist/selector-generator.js) runs in playwriter's isolated world on the
-       * element's frame — installed there once per world copy, never in the page's own realm.
+       * Read-only and invisible to the page: the element is resolved to its CDP node (from a ref, or
+       * from a Locator/ElementHandle in debug mode), and Playwright's selector generator
+       * (dist/selector-generator.js) runs in playwriter's isolated world on the element's frame —
+       * installed there once per world copy, never in the page's own realm.
        */
-      const getLocatorStringForElement = async (element: Locator | ElementHandle): Promise<string> => {
-        if (!element || typeof element.evaluate !== 'function') {
-          throw new Error('getLocatorStringForElement: argument must be a Playwright Locator or ElementHandle')
+      const getLocatorStringForElement = async (element: Locator | ElementHandle | { ref: number | string }): Promise<string> => {
+        const usage = 'getLocatorStringForElement: argument must be { ref } (a ref from observe() or find()), or a Playwright Locator or ElementHandle'
+        if (typeof element !== 'object' || element === null) throw new Error(usage)
+        let resolved: ResolvedElement
+        if ('ref' in element) {
+          resolved = refElementTarget(await self.probes.element(element.ref))
+        } else {
+          if (typeof element.evaluate !== 'function') throw new Error(usage)
+          refuseScriptForm('getLocatorStringForElement(locator)', 'the element', 'getLocatorStringForElement({ ref: 12 })')
+          const elementPage = 'page' in element ? element.page() : ((await element.ownerFrame())?.page() ?? page)
+          const probe = await self.probes.get(elementPage)
+          resolved = await resolveElement({ target: element, cdp: probe.cdp })
         }
-        const elementPage = 'page' in element ? element.page() : ((await element.ownerFrame())?.page() ?? page)
-        const probe = await self.probes.get(elementPage)
-        const resolved = await resolveElement({ target: element, cdp: probe.cdp })
         const installed = await resolved.world.evaluate<boolean>('typeof globalThis.__selectorGenerator === "object"', {
           what: 'checking for the selector generator in the isolated world',
         })
@@ -2272,6 +2382,12 @@ export class PlaywrightExecutor {
       const createDebugger = (options: { cdp: ICDPSession }) => new Debugger(options)
       const createEditor = (options: { cdp: ICDPSession }) => new Editor(options)
 
+      /** The element a ref names, as the element readers take it, with its tab and that tab's session. */
+      const elementOfRef = async (ref: number | string): Promise<{ target: ResolvedElement; page: Page; cdp: ICDPSession }> => {
+        const element = await self.probes.element(ref)
+        return { target: refElementTarget(element), page: element.page, cdp: element.probe.cdp }
+      }
+
       /**
        * Both of the options here used to be dropped on the floor, and each dropped one
        * silently:
@@ -2284,12 +2400,20 @@ export class PlaywrightExecutor {
        *     that bought nothing. It is reused when given.
        */
       const getStylesForLocatorFn = async (options: {
-        locator: any
-        /** Reused when supplied; otherwise one is opened for the locator's page. */
+        locator?: any
+        /** A ref from observe()/find(): read over CDP, no Playwright script in the page. */
+        ref?: number | string
+        /** Reused when supplied; otherwise the element's page session. */
         cdp?: ICDPSession
         /** Include browser default (user-agent) rules in `rules`. Default false. */
         includeUserAgentStyles?: boolean
       }) => {
+        if (options.ref !== undefined) {
+          const element = await elementOfRef(options.ref)
+          // Its own document's session by default, so an out-of-process iframe's element reads too.
+          return getStylesForLocator({ locator: element.target, cdp: options.cdp ?? element.target.cdp, includeUserAgentStyles: options.includeUserAgentStyles })
+        }
+        refuseScriptForm('getStylesForLocator({ locator })', 'the locator', 'getStylesForLocator({ ref: 12 })')
         const cdp = options.cdp ?? (await getCDPSession({ page: options.locator.page() }))
         return getStylesForLocator({
           locator: options.locator,
@@ -2298,38 +2422,59 @@ export class PlaywrightExecutor {
         })
       }
 
-      const getReactSourceFn = async (options: { locator: any }) => {
+      const getReactSourceFn = async (options: { locator?: any; ref?: number | string }) => {
+        if (options.ref !== undefined) {
+          const element = await elementOfRef(options.ref)
+          return getReactSource({ locator: element.target, cdp: element.cdp })
+        }
+        refuseScriptForm('getReactSource({ locator })', 'the locator', 'getReactSource({ ref: 12 })')
         const cdp = await getCDPSession({ page: options.locator.page() })
         return getReactSource({ locator: options.locator, cdp })
       }
 
-      const getReactComponentInfoFn = async (options: { locator: Locator | ElementHandle }) => {
+      const getReactComponentInfoFn = async (options: { locator?: Locator | ElementHandle; ref?: number | string }) => {
+        if (options.ref !== undefined) {
+          const element = await elementOfRef(options.ref)
+          return getReactComponentInfo({ locator: element.target, cdp: element.cdp })
+        }
+        if (!options.locator) throw new ModelFacingError('getReactComponentInfo needs { ref } (a ref from observe() or find()) or { locator }.')
+        refuseScriptForm('getReactComponentInfo({ locator })', 'the locator', 'getReactComponentInfo({ ref: 12 })')
+        const locator = options.locator
         const targetPage = await (async (): Promise<Page | null> => {
-          if ('page' in options.locator) {
-            return options.locator.page()
+          if ('page' in locator) {
+            return locator.page()
           }
 
-          return (await options.locator.ownerFrame())?.page() ?? null
+          return (await locator.ownerFrame())?.page() ?? null
         })()
         if (!targetPage) {
           throw new Error('Could not get page from locator')
         }
         const cdp = await getCDPSession({ page: targetPage })
-        return getReactComponentInfo({ locator: options.locator, cdp })
+        return getReactComponentInfo({ locator, cdp })
       }
 
-      // Resolve a { locator } | { node } arg to a Playwright Locator. `node` may be
-      // a PageModel handle (carries a `.locator` selector string) or a raw locator.
-      const resolveStyleTargetLocator = (options: { locator?: any; node?: any }): Locator => {
-        if (options.locator && typeof options.locator.page === 'function') {
-          return options.locator
-        }
-        const node = options.node
-        if (node) {
-          if (typeof node.page === 'function') return node as Locator
-          if (typeof node.locator === 'string') return page.locator(node.locator)
-        }
-        throw new Error('debugStyle/whyOccluded require a { locator } or a { node } with a locator')
+      /**
+       * The element debugStyle/whyOccluded read, its page and that page's session. `ref` is read over
+       * CDP; `locator`, or `node` — a PageModel handle (carries a `.locator` selector string) or a raw
+       * locator — is resolved with Playwright's script in the page, so human mode refuses those.
+       */
+      const resolveStyleTarget = async (
+        options: { ref?: number | string; locator?: any; node?: any },
+        call: 'debugStyle' | 'whyOccluded',
+      ): Promise<{ target: ElementTarget; page: Page; cdp: ICDPSession }> => {
+        if (options.ref !== undefined) return await elementOfRef(options.ref)
+        const locator: Locator | null =
+          options.locator && typeof options.locator.page === 'function'
+            ? options.locator
+            : typeof options.node?.page === 'function'
+              ? options.node
+              : typeof options.node?.locator === 'string'
+                ? page.locator(options.node.locator)
+                : null
+        if (!locator) throw new Error(`${call} needs { ref } (a ref from observe() or find()), a { locator }, or a { node } with a locator`)
+        refuseScriptForm(`${call}({ ${options.locator ? 'locator' : 'node'} })`, options.locator ? 'the locator' : "the node's locator", `${call}({ ref: 12 })`)
+        return { target: locator, page: locator.page(), cdp: await getCDPSession({ page: locator.page() }) }
       }
 
       // Best-effort code-frame for a winning declaration. Fetches the stylesheet
@@ -2369,10 +2514,11 @@ export class PlaywrightExecutor {
       // debugStyle: explain WHY a property has the value it does — the winning
       // declaration plus the ordered losers, with source locations (and, when
       // cheaply available, a code-frame of the winning rule).
-      const debugStyle = async (options: { locator?: any; node?: any; property?: string }) => {
-        const locator = resolveStyleTargetLocator(options)
-        const cdp = await getCDPSession({ page: locator.page() })
-        const { rules } = await fetchNormalizedStyles({ locator, cdp })
+      const debugStyle = async (options: { ref?: number | string; locator?: any; node?: any; property?: string }) => {
+        const { target, cdp: pageCdp } = await resolveStyleTarget(options, 'debugStyle')
+        // A ref's element is read in its own document's session, an out-of-process iframe's too.
+        const cdp = 'backendNodeId' in target ? target.cdp : pageCdp
+        const { rules } = await fetchNormalizedStyles({ locator: target, cdp })
         const cascade = resolveCascade(rules)
 
         // Which props to report: the requested one, else contested props (a real
@@ -2424,9 +2570,10 @@ export class PlaywrightExecutor {
        * different language from `query({ within })`, a page-path selector over the tree
        * that already exists. `scope` is the deprecated alias each layer still accepts;
        * it is passed straight through so `buildPageModel`'s own disagreement check (not a
-       * silent pick here) is the thing that reports a conflict.
+       * silent pick here) is the thing that reports a conflict. `root` scopes the fetch to
+       * an element resolved from a ref instead.
        */
-      type BuildPageModelOptions = { page?: Page; rootSelector?: string; scope?: string }
+      type BuildPageModelOptions = { page?: Page; rootSelector?: string; scope?: string; root?: ResolvedElement }
       const buildPageModelFn = async (options?: BuildPageModelOptions): Promise<PageModel> => {
         const p = options?.page || page
         const cdp = await getCDPSession({ page: p })
@@ -2435,6 +2582,7 @@ export class PlaywrightExecutor {
           cdp,
           rootSelector: options?.rootSelector,
           scope: options?.scope,
+          root: options?.root,
         })
         const prev = self.lastPageModel.get(p)
         if (prev) model.diffAgainst(prev)
@@ -2444,19 +2592,27 @@ export class PlaywrightExecutor {
 
       /**
        * `pm`: lazy per-execute accessor. Builds the page model once (per page + root
-       * selector) and reuses it across anchor/query/renderText/debugMode calls in the
-       * same turn. Returns only cycle-free projections (handles/rows/strings), never the
-       * live model.
+       * selector or root ref) and reuses it across anchor/query/renderText/debugMode calls
+       * in the same turn. Returns only cycle-free projections (handles/rows/strings), never
+       * the live model.
        *
-       * The cache is keyed by page AND `rootSelector`, because a root-scoped model is a
-       * DIFFERENT tree: keying by page alone would let the first call's scope silently
-       * decide what every later call in the turn can see.
+       * The cache is keyed by page AND root, because a root-scoped model is a DIFFERENT
+       * tree: keying by page alone would let the first call's scope silently decide what
+       * every later call in the turn can see.
        */
       const pmModels = new Map<string, PageModel>()
       const pmPageKeys = new WeakMap<Page, number>()
       let pmPageSeq = 0
-      const getPmModel = async (opts?: BuildPageModelOptions): Promise<PageModel> => {
-        const p = opts?.page || page
+      const getPmModel = async (opts?: PmModelOptions): Promise<PageModel> => {
+        const rootSelector = opts?.rootSelector ?? opts?.scope
+        if (rootSelector != null) {
+          refuseScriptForm('pm.*({ rootSelector })', 'the root selector', 'pm.query({ rootRef: 12 }) builds the model under that element')
+        }
+        const root = opts?.rootRef === undefined ? null : await elementOfRef(opts.rootRef)
+        if (root && opts?.page && opts.page !== root.page) {
+          throw new ModelFacingError(`pm: rootRef [${opts.rootRef}] is in another tab than the \`page\` passed. Leave \`page\` out: a ref names its tab.`)
+        }
+        const p = root?.page ?? opts?.page ?? page
         if (!p) {
           throw new Error('pm requires a page')
         }
@@ -2465,20 +2621,24 @@ export class PlaywrightExecutor {
           pageKey = ++pmPageSeq
           pmPageKeys.set(p, pageKey)
         }
-        // NUL separates the two halves because neither a page id nor a selector can
-        // contain it, so no (page, selector) pair can collide with another. It MUST stay
+        // NUL separates the parts because neither a page id, a selector nor a ref can
+        // contain it, so no (page, selector, ref) triple can collide with another. It MUST stay
         // written as an escape: a raw NUL byte here makes the whole file read as binary,
         // and grep then skips it in silence — which is exactly how one slipped in.
-        const cacheKey = `${pageKey}\u0000${opts?.rootSelector ?? opts?.scope ?? ''}`
+        const cacheKey = `${pageKey}\u0000${rootSelector ?? ''}\u0000${opts?.rootRef ?? ''}`
         const existing = pmModels.get(cacheKey)
         if (existing) return existing
-        const model = await buildPageModelFn({ page: p, rootSelector: opts?.rootSelector, scope: opts?.scope })
+        const model = await buildPageModelFn({ page: p, rootSelector: opts?.rootSelector, scope: opts?.scope, root: root?.target })
         pmModels.set(cacheKey, model)
         return model
       }
 
-      /** Everything `pm.*` accepts for choosing/scoping the model it builds. */
-      type PmModelOptions = { page?: Page; rootSelector?: string; scope?: string }
+      /**
+       * Everything `pm.*` accepts for choosing/scoping the model it builds. `rootSelector` (a
+       * Playwright selector, debug mode only) or `rootRef` (a ref from observe()/find()) scopes the
+       * build to one element's subtree.
+       */
+      type PmModelOptions = { page?: Page; rootSelector?: string; scope?: string; rootRef?: number | string }
       /**
        * `pm.query`'s options. `within` scopes the QUERY (page-path, over the built tree);
        * `rootSelector` scopes the BUILD (Playwright, before any tree exists). Both are
@@ -2508,7 +2668,7 @@ export class PlaywrightExecutor {
        */
       const queryOptionsOnly = (opts?: PmQueryOptions): QueryOptions | undefined => {
         if (!opts) return opts
-        const { scope: _buildScope, rootSelector: _rootSelector, page: _page, ...queryOpts } = opts
+        const { scope: _buildScope, rootSelector: _rootSelector, rootRef: _rootRef, page: _page, ...queryOpts } = opts
         return queryOpts
       }
       const pm = {
@@ -2567,11 +2727,21 @@ export class PlaywrightExecutor {
        *      the layout tree; the reasons (and `stacking` below) are the DECLARATIONS that
        *      explain it. The declarations never decide the flag.
        */
-      const whyOccluded = async (options: { locator?: any; node?: any; page?: Page }) => {
-        const locator = resolveStyleTargetLocator(options)
-        const targetPage: Page = options.page ?? locator.page()
-        const cdp = await getCDPSession({ page: targetPage })
-        const { rules } = await fetchNormalizedStyles({ locator, cdp })
+      const whyOccluded = async (options: { ref?: number | string; locator?: any; node?: any; page?: Page }) => {
+        const { target, page: elementPage, cdp: elementCdp } = await resolveStyleTarget(options, 'whyOccluded')
+        if (options.ref !== undefined && options.page && options.page !== elementPage) {
+          throw new ModelFacingError(`whyOccluded: [${options.ref}] is in another tab than the \`page\` passed. Leave \`page\` out: a ref names its tab.`)
+        }
+        if ('backendNodeId' in target && target.ownSession) {
+          throw new ModelFacingError(
+            `whyOccluded: [${options.ref}] is inside an out-of-process iframe (frame ${target.frameId}, ${target.frame.url()}). ` +
+              "whyOccluded measures the tab's own document, which cannot see into another renderer process. observe() reports " +
+              `what covers that iframe's controls, and debugStyle({ ref: ${options.ref} }) reads the element's cascade.`,
+          )
+        }
+        const targetPage: Page = options.page ?? elementPage
+        const cdp = targetPage === elementPage ? elementCdp : await getCDPSession({ page: targetPage })
+        const { rules } = await fetchNormalizedStyles({ locator: target, cdp })
         const cascade = resolveCascade(rules)
 
         const stacking: Record<string, { value: string; selector: string; important: boolean; source: DeclRef['source'] }> =
@@ -2583,16 +2753,15 @@ export class PlaywrightExecutor {
           }
         }
 
-        // Join the element to the measured model. A handle from THIS turn resolves by key;
-        // otherwise fall back to the locator string the model indexes nodes under.
+        // Join the element to the measured model. A ref joins by its node; a handle from THIS turn
+        // resolves by key; otherwise fall back to the locator string the model indexes nodes under.
         const model = await getPmModel({ page: targetPage })
         const handleKey = typeof options.node?.key === 'string' ? options.node.key : null
         const selector: string | undefined =
           (typeof options.node?.locator === 'string' ? options.node.locator : undefined) ??
-          (typeof locator.selector === 'function' ? locator.selector() : undefined)
-        const modelNode =
-          (handleKey ? model.byKey.get(handleKey as never) : undefined) ??
-          (selector ? (model.anchor(selector) ? model.byKey.get(model.anchor(selector)!.key) : undefined) : undefined)
+          ('selector' in target ? target.selector() : undefined)
+        const anchored = 'backendNodeId' in target ? model.anchor({ backendNodeId: target.backendNodeId }) : selector ? model.anchor(selector) : null
+        const modelNode = (handleKey ? model.byKey.get(handleKey as never) : undefined) ?? (anchored ? model.byKey.get(anchored.key) : undefined)
 
         const runtime = modelNode?.runtime
         const box = runtime?.box ?? null
@@ -2750,11 +2919,75 @@ export class PlaywrightExecutor {
       }
 
       // Human pointer motion. OFF unless called: a real trajectory fires mouseover on
-      // everything it crosses, which is a behaviour change, not a visual nicety.
-      const humanMouse = createHumanMouseApi({
+      // everything it crosses, which is a behaviour change, not a visual nicety. act.* drives
+      // the driver itself; sandbox code gets `humanMouse` below.
+      const humanMouseDriver = createHumanMouseApi({
         defaultPage: page,
         getCdpSession: getCDPSession,
+        // A ref's element is measured over CDP (content quads, mapped through its iframes), clipped
+        // to the viewport: nothing runs in the page.
+        resolveRef: async (ref) => {
+          const element = await self.probes.element(ref)
+          const label = `[${element.target.ref}] ${element.target.role}${element.target.name ? ` "${element.target.name}"` : ''}`
+          const rects = await element.probe.frames
+            .contentRects(element.frame, element.target.backendNodeId, `measuring ${label}`)
+            .catch((error: unknown) => {
+              if (error instanceof Error && /Could not compute content quads/i.test(error.message)) {
+                throw new ActError(`${label} has no box on the page now (hidden, removed, or not laid out). observe() shows what is visible.`)
+              }
+              throw error
+            })
+          const viewport = await element.probe.frames.box(element.probe.frames.mainFrameId())
+          const visible = rects.flatMap((rect) => {
+            const x = Math.max(rect.x, 0)
+            const y = Math.max(rect.y, 0)
+            const right = Math.min(rect.x + rect.width, viewport.width)
+            const bottom = Math.min(rect.y + rect.height, viewport.height)
+            return right > x && bottom > y ? [{ x, y, width: right - x, height: bottom - y }] : []
+          })
+          if (rects.length > 0 && visible.length === 0) {
+            throw new ActError(`${label} is outside the visible page. Bring it into view first: act.scrollTo(${element.target.ref}).`)
+          }
+          return { page: element.page, rects: visible, label }
+        },
       })
+      /** Human mode: the locator forms measure the element with Playwright's script in the page (`locator.boundingBox()`). */
+      const refuseHumanMouseLocator = (method: string, moveOptions: HumanMoveOptions | undefined): void => {
+        if (moveOptions?.locator) refuseScriptForm(`humanMouse.${method}({ locator })`, 'the locator', `humanMouse.${method}({ ref: 12 })`)
+      }
+      const humanMouse: HumanMouseApi = {
+        plan: async (moveOptions: HumanMoveOptions) => {
+          refuseHumanMouseLocator('plan', moveOptions)
+          return await humanMouseDriver.plan(moveOptions)
+        },
+        moveTo: async (moveOptions: HumanMoveOptions) => {
+          refuseHumanMouseLocator('moveTo', moveOptions)
+          return await humanMouseDriver.moveTo(moveOptions)
+        },
+        click: async (clickOptions: HumanClickOptions) => {
+          refuseHumanMouseLocator('click', clickOptions)
+          return await humanMouseDriver.click(clickOptions)
+        },
+        hover: async (moveOptions: HumanMoveOptions) => {
+          refuseHumanMouseLocator('hover', moveOptions)
+          return await humanMouseDriver.hover(moveOptions)
+        },
+        enable: async (enableOptions) => {
+          if (self.policy === 'human') {
+            throw new ActError(
+              'Refused (human mode): humanMouse.enable() routes locator.click/dblclick/hover through human motion, and those locator ' +
+                "actions run Playwright's script in the page, which Playwright runs as a user gesture (the page then counts as clicked: " +
+                'navigator.userActivation). Click and hover like a person with a ref from observe() or find(): act.click(12), ' +
+                'act.hover(12). Nothing from this call was run.',
+            )
+          }
+          return await humanMouseDriver.enable(enableOptions)
+        },
+        disable: humanMouseDriver.disable,
+        isEnabled: humanMouseDriver.isEnabled,
+        position: humanMouseDriver.position,
+        defaults: humanMouseDriver.defaults,
+      }
 
       // ---- observe / find / explain / act: the "browse like a human" layer ----------------
       // They act on the sandbox's CURRENT `page`, read at call time (user code may reassign it).
@@ -2829,6 +3062,19 @@ export class PlaywrightExecutor {
         run.probeOutput.push(`${head}\n${renderExplanation(explanation)}`)
         return quietInspect(explanation, `[explanation of ${head} — printed above]`)
       }
+
+      /**
+       * Read the page with a function run in the page under V8's side-effect check, in the frame of
+       * `ref` (read-page.ts): nothing it calls can change the page, and no user gesture is involved.
+       * The function's console.* lines print with the call's console output.
+       */
+      const readPageFn = async (fn: unknown, options?: unknown): Promise<unknown> =>
+        await readPage(fn, options, {
+          probes: self.probes,
+          context,
+          currentPage,
+          log: (level, text) => consoleLogs.push({ method: level, args: [`[readPage] ${text}`] }),
+        })
 
       /**
        * Ask the human to point at the element they mean: Chrome's element picker turns on in the tab
@@ -2946,7 +3192,7 @@ export class PlaywrightExecutor {
           pageOf: (targetId) => self.probes.pageOf(targetId),
           registry: self.probes.registry,
           getProbe: (target) => self.probes.get(target),
-          humanMouse,
+          humanMouse: humanMouseDriver,
           mode: self.policy,
           signal: run.signal,
           deadlineAt: run.deadlineAt,
@@ -3246,27 +3492,39 @@ export class PlaywrightExecutor {
        * arrows look identical to `fiberDiff`.
        */
       const fiberSnapshotFn = async (options: {
-        locator: Locator | ElementHandle
+        locator?: Locator | ElementHandle
+        /** A ref from observe()/find(): read over CDP, no Playwright script in the page. */
+        ref?: number | string
         identity?: boolean
         maxKeys?: number
         maxDepth?: number
       }) => {
-        const targetPage = await (async (): Promise<Page | null> => {
-          if ('page' in options.locator) return options.locator.page()
-          return (await options.locator.ownerFrame())?.page() ?? null
-        })()
-        if (!targetPage) throw new Error('Could not get page from locator')
-        const cdp = await getCDPSession({ page: targetPage })
+        let target: ElementTarget
+        let cdp: ICDPSession
+        if (options.ref !== undefined) {
+          ;({ target, cdp } = await elementOfRef(options.ref))
+        } else {
+          if (!options.locator) throw new ModelFacingError('fiberSnapshot needs { ref } (a ref from observe() or find()) or { locator }.')
+          refuseScriptForm('fiberSnapshot({ locator })', 'the locator', 'fiberSnapshot({ ref: 12 })')
+          const locator = options.locator
+          const targetPage = await (async (): Promise<Page | null> => {
+            if ('page' in locator) return locator.page()
+            return (await locator.ownerFrame())?.page() ?? null
+          })()
+          if (!targetPage) throw new Error('Could not get page from locator')
+          target = locator
+          cdp = await getCDPSession({ page: targetPage })
+        }
         if (options.identity) {
           return fiberSnapshot({
-            locator: options.locator,
+            locator: target,
             cdp,
             identity: true,
             maxKeys: options.maxKeys,
             maxDepth: options.maxDepth,
           })
         }
-        return fiberSnapshot({ locator: options.locator, cdp })
+        return fiberSnapshot({ locator: target, cdp })
       }
 
       // ---- static-analysis lane -------------------------------------------
@@ -3316,7 +3574,17 @@ export class PlaywrightExecutor {
       // leaves), NEVER the live TraceHop tree. The lossless result is retained in
       // the closure so `expand(hopId)` / `runProbe(hopId)` drill without re-tracing.
       const traceValueFn = async (options: any = {}) => {
-        const targetPage = options.page || page
+        if (options.ref !== undefined && (options.locator || options.selector)) {
+          throw new ModelFacingError('traceValue: anchor with one of `ref`, `locator` or `selector`, not several.')
+        }
+        if (options.locator || options.selector) {
+          refuseScriptForm(`traceValue({ ${options.locator ? 'locator' : 'selector'} })`, options.locator ? 'the locator' : 'the selector', 'traceValue({ ref: 12 })')
+        }
+        const anchor = options.ref === undefined ? null : await elementOfRef(options.ref)
+        if (anchor && options.page && options.page !== anchor.page) {
+          throw new ModelFacingError(`traceValue: [${options.ref}] is in another tab than the \`page\` passed. Leave \`page\` out: a ref names its tab.`)
+        }
+        const targetPage = anchor?.page ?? (options.page || page)
         const cdp = targetPage ? await getCDPSession({ page: targetPage }) : undefined
         const dbg = targetPage ? await getDebuggerForPage(targetPage) : undefined
         const deps: TraceDeps = {
@@ -3331,7 +3599,7 @@ export class PlaywrightExecutor {
         }
         // Default `root` HERE, not in trace.ts: its own fallback is `process.cwd()`, the
         // relay server's directory, which would parse a module graph over the wrong tree.
-        const result = await traceValue({ ...options, root: options.root ?? defaultGraphRoot(), deps })
+        const result = await traceValue({ ...options, locator: anchor ? anchor.target : options.locator, root: options.root ?? defaultGraphRoot(), deps })
         return {
           /**
            * A METHOD, not a precomputed string — `render({ maxLines, codeFrames })`
@@ -3516,6 +3784,7 @@ export class PlaywrightExecutor {
         observe,
         find,
         explain,
+        readPage: readPageFn,
         act,
         docs,
         getCDPSession: sandboxGetCDPSession,
@@ -3749,11 +4018,18 @@ export class PlaywrightExecutor {
 
     const instrumentation = clientInstrumentationOf(page)
     const outgoing = outgoingCallsOf(page)
-    if (!instrumentation || !outgoing) {
+    const guards = outgoingGuardsOf(page)
+    if (!instrumentation || !outgoing || !guards) {
       throw new Error(
         `This Playwright client exposes no ${instrumentation ? 'outgoing-call hook (Connection.sendMessageToServer)' : 'client instrumentation'}, ` +
           'so input and navigations made by the code could not be seen, counted or reported. Nothing from this call was run.',
       )
+    }
+    // Installed once per connection and never removed: it guards every call made in a human-mode
+    // run's async context, the ones the code leaves running after the call returns included.
+    if (this.policy === 'human') {
+      run.humanGuard = { context, browser: this.browser }
+      guards.add(guardHumanRun)
     }
     const inFlight = new Map<object, { label: string; startedAt: number }>()
     /** The tab each in-flight raw call went out to. */
@@ -3765,6 +4041,8 @@ export class PlaywrightExecutor {
     const tap = {
       onApiCallBegin: (apiCall: object, channel: PlaywrightChannelCall): void => {
         if (executeContext.getStore() !== run || insideAct.getStore()) return
+        // Refused by the guard as it goes out: never an action of this call.
+        if (this.policy === 'human' && refusedInHumanMode(channel.type, channel.method, channel.params)) return
         const input = playwrightChannelToInputAction(channel)
         const navigation = input ? null : playwrightChannelToNavigation(channel)
         if (!input && !navigation) return

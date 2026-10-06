@@ -1,16 +1,25 @@
-import { Page, Locator } from '@xmorse/playwright-core'
+import type { Page, Locator } from '@xmorse/playwright-core'
 import { formatHtmlForPrompt } from './htmlrewrite.js'
 import { createSmartDiff } from './diff-utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
 import { withDeadline } from './isolated-world.js'
+import type { ResolvedElement } from './element-resolve.js'
+import { ModelFacingError } from './probe-types.js'
 
 const CDP_TIMEOUT_MS = 5000
+
+/** The element's innerHTML, read in playwriter's isolated world (null when the node is gone). */
+const INNER_HTML_FN = 'function (_args, element) { return element ? element.innerHTML : null }'
 
 /** Page -> (snapshot key -> last HTML). The diff baseline for `showDiffSinceLastCall`. */
 export type HtmlDiffStore = WeakMap<Page, Map<string, string>>
 
 export interface GetCleanHTMLOptions {
-  locator: Locator | Page
+  /**
+   * What to read: the whole page, a Locator (read with Playwright's script in the page, which it
+   * runs as a user gesture — debug mode only), or an element resolved from a ref.
+   */
+  locator: Locator | Page | ResolvedElement
   search?: string | RegExp
   showDiffSinceLastCall?: boolean
   includeStyles?: boolean
@@ -41,9 +50,12 @@ function isRegExp(value: any): value is RegExp {
   )
 }
 
-function getSnapshotKey(locator: Locator | Page): string {
+function getSnapshotKey(locator: Locator | Page | ResolvedElement): string {
   if (isPage(locator)) {
     return 'page'
+  }
+  if ('backendNodeId' in locator) {
+    return `element:${locator.frameId}:${locator.backendNodeId}`
   }
   return `locator:${locator.selector()}`
 }
@@ -71,6 +83,15 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
     const cdp = await getCDPSessionForPage({ page })
     const { root } = await withDeadline(cdp.send('DOM.getDocument', { depth: 0 }), CDP_TIMEOUT_MS, 'reading the document (DOM.getDocument)')
     ;({ outerHTML: rawHtml } = await withDeadline(cdp.send('DOM.getOuterHTML', { nodeId: root.nodeId }), CDP_TIMEOUT_MS, "reading the page's HTML (DOM.getOuterHTML)"))
+  } else if ('backendNodeId' in locator) {
+    page = locator.frame.page()
+    const inner = await locator.world.callFunctionOnNodes<string | null>([locator.backendNodeId], INNER_HTML_FN, {
+      what: `reading the HTML of <${locator.node.localName}>`,
+    })
+    if (inner === null) {
+      throw new ModelFacingError(`getCleanHTML: <${locator.node.localName}> was removed from the page before its HTML could be read. observe() again for current refs.`)
+    }
+    rawHtml = inner
   } else {
     page = locator.page()
     rawHtml = await locator.innerHTML()

@@ -2,6 +2,7 @@ import type { Page, Frame, CDPSession as PlaywrightCDPSession } from '@xmorse/pl
 import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
 import { withDeadline } from './isolated-world.js'
 import { ModelFacingError } from './probe-types.js'
+import { openingOwnCdpSession } from './playwright-client-hooks.js'
 
 /** Borrowing a session is one Playwright protocol round trip; if it does not come back, say so rather than hang. */
 const BORROW_TIMEOUT_MS = 10_000
@@ -163,7 +164,7 @@ export function getCDPSessionForPage({ page }: { page: Page }): Promise<Playwrig
 
 async function borrowForPage(page: Page): Promise<PlaywrightCDPSessionAdapter> {
   const session = await withDeadline(
-    page.context().getExistingCDPSession(page),
+    openingOwnCdpSession.run(true, () => page.context().getExistingCDPSession(page)),
     BORROW_TIMEOUT_MS,
     "borrowing Playwright's CDP session for the page",
   )
@@ -238,7 +239,7 @@ async function borrowForFrame(frame: Frame): Promise<PlaywrightCDPSessionAdapter
   let playwrightSession: PlaywrightCDPSession
   try {
     playwrightSession = await withDeadline(
-      page.context().getExistingCDPSession(frame),
+      openingOwnCdpSession.run(true, () => page.context().getExistingCDPSession(frame)),
       BORROW_TIMEOUT_MS,
       "borrowing Playwright's CDP session for the frame",
     )

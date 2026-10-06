@@ -37,7 +37,7 @@ const FORM = `<!doctype html><html><head><meta charset="utf-8"><title>Newsletter
   document.getElementById('status').textContent = 'Subscribed: ' + document.getElementById('email').value
 })</script>${COUNT_MUTATIONS}</body></html>`
 
-const PAY = `<!doctype html><html><head><meta charset="utf-8"><title>Pay</title></head>
+const PAY = `<!doctype html><html><head><meta charset="utf-8"><title>Pay</title><style>#card { letter-spacing: 2px }</style></head>
 <body><p>Pay securely with your card.</p><label>Card number <input id="card" inputmode="numeric"></label> <button id="paybutton">Pay $12.00</button><p id="out"></p>
 <script>document.getElementById('paybutton').addEventListener('click', function payNow() {
   fetch('/api/pay', { method: 'POST', body: document.getElementById('card').value }).then(() => {
@@ -124,13 +124,16 @@ function refOf(text: string, pattern: RegExp): number {
   throw new Error(`no ref for ${pattern} in:\n${text}`)
 }
 
-/** Every frame's own view of itself: its global names, its element count, its mutation records. */
-const FOOTPRINT = `return await Promise.all(page.frames().map((frame) => frame.evaluate(() => ({
+/**
+ * Every frame's own view of itself: its global names, its element count, its mutation records — read
+ * with readPage in the main document and through a ref in each iframe (the frames' own documents).
+ */
+const footprint = (refs: number[]): string => `return await Promise.all([undefined, ${refs.join(', ')}].map((ref) => readPage(() => ({
   url: location.href,
   globals: Object.getOwnPropertyNames(window).length,
   elements: document.getElementsByTagName('*').length,
-  mutations: window.__takeMutations ? window.__takeMutations() : -1,
-}))))`
+  mutations: window.__mutations ?? -1,
+}), ref === undefined ? {} : { ref })))`
 
 describe('iframes in human mode', () => {
   const executor = newExecutor()
@@ -172,7 +175,7 @@ describe('iframes in human mode', () => {
     const filled = await executor.execute(`await act.fill(${card}, '4242424242424242')`, 60000)
     expect(filled.isError, filled.text).toBe(false)
     expect(filled.text).toMatch(/value read back: "4242424242424242"/)
-    const value = await executor.execute(`return await page.frames().find((frame) => frame.url().includes('/pay')).evaluate(() => document.getElementById('card').value)`, 30000)
+    const value = await executor.execute(`return await readPage((el) => el.value, { ref: ${card} })`, 30000)
     expect(value.text).toContain('4242424242424242')
   })
 
@@ -213,12 +216,24 @@ describe('iframes in human mode', () => {
     expect(result.text).toMatch(/payNow|fetch|\/api\/pay/)
   })
 
+  it("reads the out-of-process card field's cascade by ref, in that frame's own session", async () => {
+    const card = refOf(look, /textbox "Card number"/)
+    const cascade = await executor.execute(`return (await debugStyle({ ref: ${card}, property: 'letter-spacing' })).text`, 30000)
+    expect(cascade.isError, cascade.text).toBe(false)
+    expect(cascade.text).toMatch(/letter-spacing: 2px/)
+    expect(cascade.text).toMatch(/#card/)
+    const occlusion = await executor.execute(`await whyOccluded({ ref: ${card} })`, 30000)
+    expect(occlusion.isError).toBe(true)
+    expect(occlusion.text).toMatch(new RegExp(`whyOccluded: \\[${card}\\] is inside an out-of-process iframe`))
+  })
+
   it('reads every frame without changing any of them', async () => {
-    const before = await executor.execute(FOOTPRINT, 30000)
+    const probe = footprint([refOf(look, /textbox "Email"/), refOf(look, /textbox "Card number"/)])
+    const before = await executor.execute(probe, 30000)
     expect(before.isError, before.text).toBe(false)
     const observed = await executor.execute('await observe(); await getPageMarkdown({}); return "read"', 60000)
     expect(observed.isError, observed.text).toBe(false)
-    const after = await executor.execute(FOOTPRINT, 30000)
+    const after = await executor.execute(probe, 30000)
     expect(after.text).toBe(before.text)
     expect(before.text).toMatch(/mutations: 0/)
     expect(before.text).not.toMatch(/mutations: -1/)

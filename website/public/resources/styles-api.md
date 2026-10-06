@@ -6,7 +6,7 @@ The getStylesForLocator function inspects CSS styles applied to an element, simi
 
 ```ts
 import type { ICDPSession } from './cdp-session.js';
-import type { Locator } from '@xmorse/playwright-core';
+import type { ElementTarget } from './element-resolve.js';
 import type { Protocol } from 'devtools-protocol';
 import { type NormalizedRule } from './css-cascade.js';
 export interface StyleSource {
@@ -38,8 +38,16 @@ export interface StylesResult {
     rules: StyleRule[];
 }
 /**
- * Resolve a locator to the CDP node it actually points at, as a FRONTEND node id on the page
- * session (what `CSS.getMatchedStylesForNode` takes).
+ * What to read styles for: an element (Locator, ElementHandle, or resolved from a ref), or a node of
+ * `cdp`'s own document by backend id (a page-model node, which was read through that session).
+ */
+export type StylesTarget = ElementTarget | {
+    sessionBackendNodeId: number;
+};
+/**
+ * Resolve a style target to the CDP node it actually points at, as a FRONTEND node id on the page
+ * session (what `CSS.getMatchedStylesForNode` takes). A `sessionBackendNodeId` target is already
+ * that node: it is only described and pushed.
  *
  * Identity comes from `resolveElement` (element-resolve.ts): the element's own index path,
  * walked in an isolated world — never `DOM.getNodeForLocation`, which returns the TOPMOST node
@@ -55,7 +63,7 @@ export interface StylesResult {
  * which is why both style entry points share this helper rather than each remembering to prime.
  */
 export declare function resolveElementNode({ locator, cdp, }: {
-    locator: Locator;
+    locator: StylesTarget;
     cdp: ICDPSession;
 }): Promise<{
     nodeId: number;
@@ -63,7 +71,7 @@ export declare function resolveElementNode({ locator, cdp, }: {
     node: Protocol.DOM.Node;
 }>;
 export declare function getStylesForLocator({ locator, cdp: cdpSession, includeUserAgentStyles, }: {
-    locator: Locator;
+    locator: ElementTarget;
     cdp: ICDPSession;
     includeUserAgentStyles?: boolean;
 }): Promise<StylesResult>;
@@ -85,7 +93,7 @@ export declare function normalizeMatchedStyles(matchedStyles: any): NormalizedRu
  * Additive helper — does not affect `getStylesForLocator`.
  */
 export declare function fetchNormalizedStyles({ locator, cdp, }: {
-    locator: Locator;
+    locator: StylesTarget;
     cdp: ICDPSession;
 }): Promise<{
     backendNodeId: number;

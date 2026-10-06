@@ -71,11 +71,13 @@ function stubPage(): any {
   return { page, context }
 }
 
-function buildSandbox() {
+/** `policy` defaults to the executor's own default; the Playwright-locator forms of the element readers are debug mode only. */
+function buildSandbox(policy?: 'human' | 'debug') {
   const executor = new PlaywrightExecutor({
     cdpConfig: { headless: true },
     logger: { log: () => {}, error: () => {} },
     cwd: process.cwd(),
+    ...(policy ? { policy } : {}),
   })
   const { page, context } = stubPage()
   const { vmContextObj } = executor.buildSandboxContext({ page, context, consoleLogs: [] })
@@ -917,7 +919,7 @@ describe('wrappers do not re-introduce the failure modes the substrate removed',
     // `snapshot({ locator: state.page.locator('main') })` is exactly how the docs show a
     // scoped snapshot, and it used to resolve that locator against the DEFAULT page —
     // the silent-wrong-tab failure the `{ page: state.page }` rule exists to prevent.
-    const { vmContextObj: ctx } = buildSandbox()
+    const { vmContextObj: ctx } = buildSandbox('debug')
     const other = stubPage().page
     const ariaSnapshot = await import('./aria-snapshot.js')
     const spy = vi.spyOn(ariaSnapshot, 'getAriaSnapshot')
@@ -1002,7 +1004,7 @@ describe('traceValue summary shape', () => {
 
 describe('pm option threading', () => {
   it('threads rootSelector (and the deprecated scope alias) into buildPageModel', async () => {
-    const { vmContextObj, page } = buildSandbox()
+    const { vmContextObj, page } = buildSandbox('debug')
     const pageModel = await import('./page-model.js')
     const spy = vi.spyOn(pageModel, 'buildPageModel')
     // The stub page cannot actually be measured; we only assert what was REQUESTED,
@@ -1029,7 +1031,7 @@ describe('pm option threading', () => {
    * before the query sees it; `within` is how you scope a query.
    */
   it('applies `scope` at the BUILD layer only, never as a query `within`', async () => {
-    const { vmContextObj, page } = buildSandbox()
+    const { vmContextObj, page } = buildSandbox('debug')
     const pageModel = await import('./page-model.js')
     const spy = vi.spyOn(pageModel, 'buildPageModel')
     let queried: any = null
@@ -1064,7 +1066,7 @@ describe('pm option threading', () => {
 
 describe('getStylesForLocator wrapper fidelity', () => {
   it('threads includeUserAgentStyles and reuses a caller-supplied cdp', async () => {
-    const { vmContextObj, page } = buildSandbox()
+    const { vmContextObj, page } = buildSandbox('debug')
     const styles = await import('./styles.js')
     const spy = vi.spyOn(styles, 'getStylesForLocator')
     spy.mockResolvedValue({ element: 'div', rules: [], inlineStyle: null } as any)

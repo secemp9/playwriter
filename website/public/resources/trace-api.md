@@ -34,13 +34,14 @@ fabricate a value past a `blockedBy` — run the armed probe instead.
  * shaped so the verdict field does not exist unless a measurement happened, and
  * every cap / truncation / dropped record is named in the returned value.
  */
-import type { Page, Locator, ElementHandle } from '@xmorse/playwright-core';
+import type { Page } from '@xmorse/playwright-core';
 import type { ICDPSession } from './cdp-session.js';
 import type { Debugger } from './debugger.js';
 import type { ModuleGraph } from './module-graph.js';
 import type { TraceHop, Loc, Hazard, BlockedReason } from './static-analysis.js';
 import type { PageModelHandle } from './page-model.js';
 import { type ReactComponentInfo } from './react-source.js';
+import { type ElementTarget } from './element-resolve.js';
 /** How a value was cut to fit the token budget. Present ONLY when cut. */
 export interface LogpointTruncation {
     originalLength: number;
@@ -358,12 +359,12 @@ export interface FiberDiffInput {
  * playwriter holds through CDP (see `walkFiberIdentity`); nothing is stored on the page.
  */
 export declare function fiberSnapshot(opts: {
-    locator: Locator | ElementHandle;
+    locator: ElementTarget;
     cdp: ICDPSession;
     identity?: false;
 }): Promise<ReactComponentInfo | null>;
 export declare function fiberSnapshot(opts: {
-    locator: Locator | ElementHandle;
+    locator: ElementTarget;
     cdp: ICDPSession;
     identity: true;
     maxKeys?: number;
@@ -563,7 +564,7 @@ export interface TraceDeps {
 }
 export interface TraceValueOptions {
     node?: PageModelHandle;
-    locator?: Locator | ElementHandle;
+    locator?: ElementTarget;
     selector?: string;
     slot?: string;
     maxHops?: number;

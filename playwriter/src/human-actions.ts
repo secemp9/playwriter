@@ -373,14 +373,6 @@ export function isBlankUrl(url: string): boolean {
   return url === '' || url === 'about:blank' || url.startsWith('chrome://newtab') || url.startsWith('chrome://new-tab-page') || url.startsWith('edge://newtab')
 }
 
-function quadToRect(quad: number[]): Rect {
-  const xs = [quad[0], quad[2], quad[4], quad[6]]
-  const ys = [quad[1], quad[3], quad[5], quad[7]]
-  const x = Math.min(...xs)
-  const y = Math.min(...ys)
-  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y }
-}
-
 function intersectRects(a: Rect, b: Rect): Rect | null {
   const x = Math.max(a.x, b.x)
   const y = Math.max(a.y, b.y)
@@ -1090,14 +1082,7 @@ export function createActApi(deps: ActDeps): ActApi {
   async function quadsOf(probe: ActProbe, target: RefTarget): Promise<Rect[]> {
     const frame = await probe.frames.handle(target.frameId)
     try {
-      const { quads } = await send<Protocol.DOM.GetContentQuadsResponse>(
-        frame.cdp,
-        'DOM.getContentQuads',
-        { backendNodeId: target.backendNodeId },
-        `measuring ${describeTarget(target)}`,
-      )
-      const origin = await probe.frames.sessionBox(frame)
-      return quads.map((quad) => onScreen(quadToRect(quad), origin)).filter((r) => r.width > 0.5 && r.height > 0.5)
+      return await probe.frames.contentRects(frame, target.backendNodeId, `measuring ${describeTarget(target)}`)
     } catch (error) {
       if (isNodeGoneError(error)) throw goneError(target)
       if (!/Could not compute content quads/i.test(errorMessage(error))) throw error
@@ -1711,21 +1696,28 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /**
-   * The field the caret is in once `target` was clicked at `point`: `target` itself, or the
-   * element the page swapped in for it. Some pages replace a field on the click that focuses it
-   * (Wikipedia's search box becomes a new combobox): the node the model chose is gone and the
-   * caret blinks in its replacement, where the pointer is. A person types there, and so does act,
-   * when focus is in an enabled text field whose box holds the clicked point. The box, not a hit
-   * test: fields carry decorations drawn over them (Wikipedia's search icon is hit, not the input).
+   * The field the caret is in after `target` was clicked at `point`: `target` itself, or the element
+   * the page swapped in for it. Some pages replace a field on the click that focuses it, or while it
+   * is typed into (Wikipedia's search box becomes a new combobox once its app has loaded, taking the
+   * text so far and the caret): the node the model chose is gone and the caret blinks in its
+   * replacement, where the pointer is. A person types there, and so does act, when focus is in an
+   * enabled text field whose box holds the clicked point. The box, not a hit test: fields carry
+   * decorations drawn over them (Wikipedia's search icon is hit, not the input).
    */
-  async function fieldAfterClick(step: Step, target: RefTarget, point: Point): Promise<{ field: RefTarget; facts: FieldFacts }> {
+  async function fieldUnderCaret(
+    step: Step,
+    target: RefTarget,
+    point: Point,
+    when: 'when it was clicked' | 'while the text was typed',
+  ): Promise<{ field: RefTarget; facts: FieldFacts }> {
     const own = await (await worldOf(step.probe, target)).callFunctionOnNodes<FieldFacts | null>([target.backendNodeId], FIELD_FN, {
       what: `reading the field ${describeTarget(target)}`,
     })
     if (own) return { field: target, facts: own }
+    const typed = when === 'while the text was typed' ? 'The keys were typed, but the page replaced the field while they were. ' : ''
     const focused = await focusedNode(step.probe)
-    if (!focused) throw goneError(target)
-    const replaced = (why: string): ActError => new ActError(`${goneError(target).message} Keyboard focus is now in ${why}.`)
+    if (!focused) throw new ActError(`${typed}${goneError(target).message}`)
+    const replaced = (why: string): ActError => new ActError(`${typed}${goneError(target).message} Keyboard focus is now in ${why}.`)
     await deps.observeQuietly(step.page)
     const field = deps.registry.refFor(step.probe.targetId, focused.frameId, focused.backendNodeId)
     if (!field) throw replaced(`${await labelNode(step.probe, focused.frameId, focused.backendNodeId)}, which observe() does not list`)
@@ -1736,7 +1728,7 @@ export function createActApi(deps: ActDeps): ActApi {
     if (!quads.some((quad) => point.x >= quad.x && point.x <= quad.x + quad.width && point.y >= quad.y && point.y <= quad.y + quad.height)) {
       throw replaced(`${describeTarget(field)}, away from where the pointer clicked`)
     }
-    step.record.notes.push(`the page replaced [${target.ref}] when it was clicked; the caret is in ${describeTarget(field)} under the pointer, so the text went there`)
+    step.record.notes.push(`the page replaced [${target.ref}] ${when}; the caret is in ${describeTarget(field)} under the pointer, so the text went there`)
     return { field, facts }
   }
 
@@ -2081,7 +2073,7 @@ export function createActApi(deps: ActDeps): ActApi {
           refuseIfTooSlow(text.length, `Typing these ${text.length} characters`, ', or pass { paste: true } for text a person would paste rather than type')
         }
         const point = await clickTarget(step, target, 1, 'left')
-        const { field, facts: focused } = await fieldAfterClick(step, target, point)
+        const { field, facts: focused } = await fieldUnderCaret(step, target, point, 'when it was clicked')
         let typedSecret = secret
         if (field !== target) {
           // The field the page swapped in gets the clicked one's refusals before a key reaches it.
@@ -2113,7 +2105,12 @@ export function createActApi(deps: ActDeps): ActApi {
           if (typedSecret) record.notes.push('typed a secret (masked in this report)')
         }
         await sleep(randomBetween(80, 160))
-        const after = await readField(probe, field)
+        const { field: typedInto, facts: after } = await fieldUnderCaret(step, field, point, 'while the text was typed')
+        if (typedInto !== field && isSecret(after) && !typedSecret) {
+          // The keys ended in a secret field the page swapped in: the report must not show them.
+          typedSecret = true
+          record.detail = maskIfSecret(text, true)
+        }
         if (after.value !== null) {
           const expected = append ? `${focused.value ?? ''}${text}` : text
           if (after.value !== expected) {

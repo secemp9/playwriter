@@ -1,5 +1,5 @@
 import type { ICDPSession } from './cdp-session.js'
-import type { Locator } from '@xmorse/playwright-core'
+import type { ElementTarget } from './element-resolve.js'
 import type { Protocol } from 'devtools-protocol'
 import { computeSpecificity, compareSpecificity, type NormalizedRule, type Specificity } from './css-cascade.js'
 import { resolveElement } from './element-resolve.js'
@@ -156,8 +156,15 @@ async function enableCssCollectingHeaders(cdp: ICDPSession): Promise<CSSStyleShe
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a locator to the CDP node it actually points at, as a FRONTEND node id on the page
- * session (what `CSS.getMatchedStylesForNode` takes).
+ * What to read styles for: an element (Locator, ElementHandle, or resolved from a ref), or a node of
+ * `cdp`'s own document by backend id (a page-model node, which was read through that session).
+ */
+export type StylesTarget = ElementTarget | { sessionBackendNodeId: number }
+
+/**
+ * Resolve a style target to the CDP node it actually points at, as a FRONTEND node id on the page
+ * session (what `CSS.getMatchedStylesForNode` takes). A `sessionBackendNodeId` target is already
+ * that node: it is only described and pushed.
  *
  * Identity comes from `resolveElement` (element-resolve.ts): the element's own index path,
  * walked in an isolated world — never `DOM.getNodeForLocation`, which returns the TOPMOST node
@@ -176,25 +183,41 @@ export async function resolveElementNode({
   locator,
   cdp,
 }: {
-  locator: Locator
+  locator: StylesTarget
   cdp: ICDPSession
 }): Promise<{ nodeId: number; backendNodeId: number; node: Protocol.DOM.Node }> {
-  const resolved = await resolveElement({ target: locator, cdp })
-  if (resolved.ownSession) {
-    throw new Error(
-      `Could not read styles: <${resolved.node.localName}> is inside an out-of-process iframe (frame ${resolved.frameId}), ` +
-        "which this page's CDP session cannot inspect; it needs that frame's own session.",
+  let backendNodeId: number
+  let node: Protocol.DOM.Node
+  if ('sessionBackendNodeId' in locator) {
+    const described = await withDeadline(
+      cdp.send('DOM.describeNode', { backendNodeId: locator.sessionBackendNodeId }),
+      CDP_TIMEOUT_MS,
+      `describing node ${locator.sessionBackendNodeId}`,
     )
+    backendNodeId = locator.sessionBackendNodeId
+    node = described.node
+  } else {
+    const resolved = await resolveElement({ target: locator, cdp })
+    // An out-of-process iframe's element can only be read in that frame's own session: fine when
+    // `cdp` is that session (a ref's element carries it), refused when it is the page's.
+    if (resolved.ownSession && resolved.cdp !== cdp) {
+      throw new Error(
+        `Could not read styles: <${resolved.node.localName}> is inside an out-of-process iframe (frame ${resolved.frameId}), ` +
+          "which this page's CDP session cannot inspect; it needs that frame's own session (pass the element as a ref from observe()).",
+      )
+    }
+    backendNodeId = resolved.backendNodeId
+    node = resolved.node
   }
   await withDeadline(cdp.send('DOM.getDocument', { depth: 0 }), CDP_TIMEOUT_MS, 'requesting the document node')
   const pushed = await withDeadline(
-    cdp.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [resolved.backendNodeId] }),
+    cdp.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [backendNodeId] }),
     CDP_TIMEOUT_MS,
-    `getting a frontend node id for <${resolved.node.localName}>`,
+    `getting a frontend node id for <${node.localName}>`,
   )
   const nodeId = pushed.nodeIds[0]
-  if (!nodeId) throw new Error(`Could not resolve element: <${resolved.node.localName}> has no frontend nodeId`)
-  return { nodeId, backendNodeId: resolved.backendNodeId, node: resolved.node }
+  if (!nodeId) throw new Error(`Could not resolve element: <${node.localName}> has no frontend nodeId`)
+  return { nodeId, backendNodeId, node }
 }
 
 export async function getStylesForLocator({
@@ -202,7 +225,7 @@ export async function getStylesForLocator({
   cdp: cdpSession,
   includeUserAgentStyles = false,
 }: {
-  locator: Locator
+  locator: ElementTarget
   cdp: ICDPSession
   includeUserAgentStyles?: boolean
 }): Promise<StylesResult> {
@@ -398,7 +421,7 @@ export async function fetchNormalizedStyles({
   locator,
   cdp,
 }: {
-  locator: Locator
+  locator: StylesTarget
   cdp: ICDPSession
 }): Promise<{ backendNodeId: number; nodeId: number; rules: NormalizedRule[]; matchedStyles: any }> {
   // DOM before CSS — see the note in getStylesForLocator; CSS.enable is rejected outright

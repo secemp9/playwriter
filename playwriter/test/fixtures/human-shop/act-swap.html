@@ -20,6 +20,10 @@
   <!-- A field whose click is answered by moving the caret to another field, away from the pointer. -->
   <input id="coupon" aria-label="Coupon code">
   <input id="elsewhere" aria-label="Gift message">
+  <!-- Like Wikipedia's search once its app has loaded lazily: the replacement arrives while the text is typed, taking the value so far and the caret. -->
+  <div class="box">
+    <input id="notes" type="search" aria-label="Search the notes" placeholder="Search the notes">
+  </div>
   <script>
     document.getElementById('search').addEventListener('focus', () => {
       const next = document.createElement('input')
@@ -37,6 +41,21 @@
       next.setAttribute('aria-label', 'Coupon code')
       document.getElementById('coupon').replaceWith(next)
       document.getElementById('elsewhere').focus()
+    }, { once: true })
+    document.getElementById('notes').addEventListener('focus', () => {
+      setTimeout(() => {
+        const old = document.getElementById('notes')
+        const next = document.createElement('input')
+        next.id = 'notes-app'
+        next.type = 'search'
+        next.setAttribute('role', 'combobox')
+        next.setAttribute('aria-label', 'Search the notes')
+        next.placeholder = 'Search the notes'
+        next.value = old.value
+        old.replaceWith(next)
+        next.focus()
+        next.setSelectionRange(next.value.length, next.value.length)
+      }, 400)
     }, { once: true })
   </script>
 </body>
