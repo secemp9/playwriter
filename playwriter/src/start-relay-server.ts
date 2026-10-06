@@ -1,24 +1,29 @@
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
-import { waitForRelayVersion } from './relay-client.js'
+import { RELAY_PORT, waitForRelayVersion } from './relay-client.js'
 import { LOG_CDP_FILE_PATH } from './utils.js'
 
 process.title = 'playwriter-ws-server'
 
 const logger = createFileLogger()
 
-process.on('uncaughtException', async (err) => {
-  await logger.error('Uncaught Exception:', err)
-  process.exit(1)
+/**
+ * Logs a last line, writes the log, then exits. The logger writes on a 500 ms timer and process.exit
+ * runs no pending timer, so a line logged right before an exit never reached the file: the log of a
+ * daemon that exited on a taken port, or crashed, was empty.
+ */
+async function exitAfterLog(code: number, ...line: unknown[]): Promise<never> {
+  void logger.log(...line)
+  await logger.flush()
+  process.exit(code)
+}
+
+process.on('uncaughtException', (err) => {
+  void exitAfterLog(1, 'Uncaught Exception:', err)
 })
 
-process.on('unhandledRejection', async (reason) => {
-  await logger.error('Unhandled Rejection:', reason)
-  process.exit(1)
-})
-
-process.on('exit', async (code) => {
-  await logger.log(`Process exiting with code: ${code}`)
+process.on('unhandledRejection', (reason) => {
+  void exitAfterLog(1, 'Unhandled Rejection:', reason)
 })
 
 export async function startServer({
@@ -39,11 +44,9 @@ export async function startServer({
       // yet, so poll for up to 2 seconds before giving up.
       const version = await waitForRelayVersion({ port })
       if (version) {
-        await logger.log(`Another relay (v${version}) already bound to port ${port}, exiting gracefully`)
-        process.exit(0)
+        return exitAfterLog(0, `Another relay (v${version}) already bound to port ${port}, exiting gracefully`)
       }
-      await logger.error(`Port ${port} is in use by a non-relay process`)
-      process.exit(1)
+      return exitAfterLog(1, `Port ${port} is in use by a non-relay process`)
     }
     throw err
   }
@@ -54,20 +57,21 @@ export async function startServer({
 
   // close() is awaited before exit(): it closes the shared headless browser, and
   // process.exit(0) fired in the same tick would orphan that Chrome process.
-  const shutdown = async () => {
+  const shutdown = async (signal: NodeJS.Signals) => {
     console.log('\nShutting down...')
     await server.close()
-    process.exit(0)
+    await exitAfterLog(0, `Shut down on ${signal}`)
   }
 
   process.on('SIGINT', () => {
-    void shutdown()
+    void shutdown('SIGINT')
   })
 
   process.on('SIGTERM', () => {
-    void shutdown()
+    void shutdown('SIGTERM')
   })
 
   return server
 }
-startServer().catch(logger.error)
+// The port its clients look for (relay-client's RELAY_PORT, from PLAYWRITER_PORT).
+startServer({ port: RELAY_PORT }).catch((error: unknown) => exitAfterLog(1, 'The relay did not start:', error))
