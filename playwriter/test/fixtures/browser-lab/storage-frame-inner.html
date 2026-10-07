@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Inner frame · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<p id="inner-status" role="status">inner ready</p>
+<script>
+const who = new URLSearchParams(location.search).get('who') || 'unknown'
+localStorage.setItem(`inner-${who}`, `${who}-value`)
+sessionStorage.setItem(`inner-${who}-session`, `${who}-session-value`)
+</script>
+</body>
+</html>

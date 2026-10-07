@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clipboard witness · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<main>
+  <h1>Clipboard witness</h1>
+  <pre><code id="code">git clone https://example.com/lab.git</code></pre>
+  <button type="button" id="copy">Copy command</button>
+  <p id="copy-status" role="status"></p>
+  <!-- What the page itself can observe of a clipboard read: the clipboard-read permission, focus, visibility. -->
+  <ol id="log"></ol>
+</main>
+<script>
+const log = (text) => { const li = document.createElement('li'); li.textContent = text; document.getElementById('log').append(li) }
+navigator.permissions.query({ name: 'clipboard-read' }).then((status) => {
+  log(`permission ${status.state}`)
+  status.onchange = () => log(`permission changed to ${status.state}`)
+})
+addEventListener('blur', () => log('blur'))
+addEventListener('focus', () => log('focus'))
+document.addEventListener('visibilitychange', () => log(`visibility ${document.visibilityState}`))
+document.getElementById('copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(document.getElementById('code').textContent)
+    document.getElementById('copy-status').textContent = 'Copied'
+  } catch (error) {
+    document.getElementById('copy-status').textContent = `Copy failed: ${error.name}`
+  }
+})
+</script>
+</body>
+</html>

@@ -470,7 +470,7 @@ function buildPromptFromSkill() {
   const promptContent =
     `${guide}\n\n` +
     '### Browser\n\n' +
-    'Which browser this session drives is chosen with the `browser` tool: `list` shows the choices, `use` binds one of the user\'s Chrome profiles, `new` launches a fresh headless Chrome.\n\n' +
+    'Which browser this session drives is chosen with the `browser` tool: `list` shows the choices, `use` binds one of the user\'s Chrome profiles, `new` launches a fresh Chrome (headless unless `headed: true`; its options — viewport, device, locale, timezone, allowedDomains, downloads — are in that tool\'s description).\n\n' +
     '### Reference\n\n' +
     "Everything not in this guide is in the full reference, readable from inside a call: `await docs()` lists its headings, `await docs('recording')` prints the matching sections. " +
     'Read the matching section before using an API you have not used in this session.\n'

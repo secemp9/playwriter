@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Long read · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .sticky { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid var(--line); padding: 8px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .sticky nav a { margin-right: 10px; }
+  section.long { min-height: 700px; border-bottom: 1px dashed var(--line); padding-top: 10px; scroll-margin-top: 60px; }
+  .chat { height: 240px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 6px 12px; }
+  .chat p { margin: 6px 0; }
+  .carousel { display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x mandatory; width: 100%; max-width: 680px; padding-bottom: 8px; }
+  .slide { flex: 0 0 320px; height: 180px; scroll-snap-align: start; border-radius: 10px; color: #fff; display: flex; align-items: flex-end; padding: 12px; font-weight: 600; }
+  #back-to-top { position: fixed; right: 20px; bottom: 20px; z-index: 30; }
+  #back-to-top[hidden] { display: none; }
+  footer.end { padding: 40px 20px 80px; text-align: center; font-weight: 600; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Long read</span></header>
+<div class="sticky">
+  <strong>Field guide</strong>
+  <nav aria-label="Sections"><a href="#s1">1</a><a href="#s2">2</a><a href="#s3">3</a><a href="#s4">4</a><a href="#s5">5</a><a href="#s6">6</a><a href="#s7">7</a><a href="#s8">8</a></nav>
+  <span id="current-section" aria-live="off">Current section: 1</span>
+</div>
+<main>
+  <section class="long" id="s1" aria-labelledby="h1-s1"><h1 id="h1-s1">1. Getting started</h1><p>This long page has eight sections. The header above stays stuck to the top of the window while you scroll.</p></section>
+  <section class="long" id="s2" aria-labelledby="h-s2"><h2 id="h-s2">2. Background</h2><p>Section two is intentionally tall so that the following sections start below the fold.</p></section>
+  <section class="long" id="s3" aria-labelledby="h-s3"><h2 id="h-s3">3. Team chat</h2>
+    <p>The chat log below shows the newest message at the bottom. Scroll inside it to read older messages.</p>
+    <div class="chat" id="chat" role="log" aria-label="Team chat" tabindex="0"></div>
+  </section>
+  <section class="long" id="s4" aria-labelledby="h-s4"><h2 id="h-s4">4. Methods</h2><p>Section four has nothing interactive.</p></section>
+  <section class="long" id="s5" aria-labelledby="h-s5"><h2 id="h-s5">5. Gallery</h2>
+    <p>Scroll the gallery sideways, or use the buttons.</p>
+    <div class="row" style="margin-bottom:8px"><button type="button" id="prev-slide" aria-controls="carousel">Previous slide</button><button type="button" id="next-slide" aria-controls="carousel">Next slide</button></div>
+    <div class="carousel" id="carousel" role="region" aria-label="Gallery" tabindex="0"></div>
+  </section>
+  <section class="long" id="s6" aria-labelledby="h-s6"><h2 id="h-s6">6. Results</h2><p>Section six summarises the results.</p></section>
+  <section class="long" id="s7" aria-labelledby="h-s7"><h2 id="h-s7">7. Discussion</h2><p>Section seven discusses them.</p></section>
+  <section class="long" id="s8" aria-labelledby="h-s8"><h2 id="h-s8">8. Appendix</h2><p>The appendix is the last section.</p></section>
+</main>
+<footer class="end" id="the-end">You reached the end — code SCROLL-7731</footer>
+<button type="button" id="back-to-top" hidden>Back to top</button>
+<script type="module">
+import { $, $$, m, on, tagLinks } from '/lab/common.js';
+
+const SLIDES = ['Dunes', 'Harbor', 'Glacier', 'Canyon', 'Meadow', 'Aurora', 'Reef', 'Summit'];
+const COLORS = ['#a0522d', '#1e5a8a', '#4a8aa8', '#b5562a', '#3f7d3a', '#2a6b5f', '#1f7a8c', '#5b4a8a'];
+
+m(() => {
+  const chat = $('#chat');
+  for (let i = 1; i <= 40; i++) {
+    const p = document.createElement('p');
+    const who = ['Maya', 'Leo', 'Sam', 'Ines'][(i - 1) % 4];
+    p.id = `msg-${i}`;
+    p.textContent = i === 1 ? 'Message 1 — Maya: Welcome to #general! Please read the pinned rules.'
+      : i === 40 ? 'Message 40 — Ines: See you all tomorrow.'
+      : `Message ${i} — ${who}: status update number ${i}.`;
+    chat.append(p);
+  }
+  const carousel = $('#carousel');
+  SLIDES.forEach((name, i) => {
+    const s = document.createElement('div');
+    s.className = 'slide';
+    s.id = `slide-${i + 1}`;
+    s.style.background = COLORS[i];
+    s.setAttribute('role', 'group');
+    s.setAttribute('aria-roledescription', 'slide');
+    s.setAttribute('aria-label', `${i + 1} of 8`);
+    s.textContent = `Slide ${i + 1} — ${name}`;
+    carousel.append(s);
+  });
+});
+$('#chat').scrollTop = $('#chat').scrollHeight;
+
+const carousel = $('#carousel');
+on($('#prev-slide'), 'click', () => carousel.scrollBy({ left: -332, behavior: 'smooth' }));
+on($('#next-slide'), 'click', () => carousel.scrollBy({ left: 332, behavior: 'smooth' }));
+
+const back = $('#back-to-top');
+on(window, 'scroll', () => {
+  const show = window.scrollY > 400;
+  if (back.hidden === show) back.hidden = !show;
+}, { passive: true });
+on(back, 'click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  $('#h1-s1').setAttribute('tabindex', '-1');
+  $('#h1-s1').focus({ preventScroll: true });
+});
+
+const current = $('#current-section');
+const io = new IntersectionObserver((entries) => m(() => {
+  for (const e of entries) {
+    if (e.isIntersecting) {
+      const text = `Current section: ${e.target.id.slice(1)}`;
+      if (current.textContent !== text) current.textContent = text;
+    }
+  }
+}), { rootMargin: '-45% 0px -50% 0px' });
+for (const s of $$('section.long')) io.observe(s);
+
+tagLinks();
+</script>
+</body>
+</html>

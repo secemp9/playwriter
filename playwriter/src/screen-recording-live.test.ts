@@ -95,6 +95,10 @@ beforeAll(async () => {
         res.end(JSON.stringify({ success: true, tabId: 1, startedAt: relayState.startedAt }))
         return
       }
+      if (req.url?.startsWith('/recording/status')) {
+        res.end(JSON.stringify({ isRecording: false }))
+        return
+      }
       if (req.url === '/recording/stop') {
         fs.copyFileSync(syntheticVideo, relayState.outputPath)
         res.end(
@@ -122,7 +126,7 @@ afterAll(async () => {
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })
 
-function recordingApiFor(page: Page) {
+function recordingApiFor(page: Page, cdpRunning: { startedAt: number; frames: number } | null = null) {
   return createRecordingApi({
     context: page.context(),
     defaultPage: page,
@@ -139,6 +143,14 @@ function recordingApiFor(page: Page) {
       } finally {
         frames.dispose()
       }
+    },
+    tabCapture: true,
+    // These tests drive the extension's recorder; the CDP screencast is only ever reported as running.
+    cdp: {
+      start: () => Promise.reject(new Error('recording.start must not use the CDP recorder while tab capture exists')),
+      stop: () => Promise.reject(new Error('recording.stop must not use the CDP recorder while tab capture exists')),
+      cancel: () => Promise.reject(new Error('recording.cancel must not use the CDP recorder while tab capture exists')),
+      active: () => cdpRunning,
     },
   })
 }
@@ -256,6 +268,28 @@ describe('recording.start / stop (tabCapture recorder)', () => {
     expect(page.viewportSize()).toEqual({ width: 640, height: 360 })
     await recording.stop({ page })
     expect(page.viewportSize()).toEqual({ width: WIDTH, height: HEIGHT })
+    relayState.calls.length = 0
+    await context.close()
+  }, 60000)
+
+  it('names its recorder, and isRecording() reports a recording made with recording.startCdp', async () => {
+    const context = await browser.newContext({ viewport: { width: WIDTH, height: HEIGHT } })
+    const page = await context.newPage()
+    await page.goto(pageUrl)
+    const viaStartCdp = { startedAt: Date.now() - 1500, frames: 4 }
+    // The extension records nothing, while the session's CDP screencast does (ExistC: isRecording said false).
+    expect(await recordingApiFor(page, viaStartCdp).isRecording({ page })).toEqual({
+      isRecording: true,
+      startedAt: viaStartCdp.startedAt,
+      recorder: 'cdp-screencast',
+      frames: 4,
+    })
+    const recording = recordingApiFor(page)
+    expect(await recording.isRecording({ page })).toEqual({ isRecording: false })
+    const started = await recording.start({ page, outputPath: path.join(tmpRoot, 'named.mp4'), pointer: false })
+    expect(started.recorder).toBe('extension-tab-capture')
+    const stopped = await recording.stop({ page })
+    expect(stopped.recorder).toBe('extension-tab-capture')
     relayState.calls.length = 0
     await context.close()
   }, 60000)

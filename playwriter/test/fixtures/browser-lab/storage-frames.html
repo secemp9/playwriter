@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Storage in frames · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<main>
+  <h1>Storage in frames</h1>
+  <p id="top-status" role="status">top ready</p>
+  <!-- Same origin as this page: first-party storage. -->
+  <iframe id="same" name="same-origin-frame" title="Same origin" src="/storage-frame-inner.html?who=same"></iframe>
+  <!-- The cross-site frame's address is filled in from ?cross=<origin> (the test serves the inner page on a second host name). -->
+  <iframe id="cross" name="cross-site-frame" title="Cross site"></iframe>
+  <!-- Sandboxed without allow-same-origin: an opaque origin, which has no Web Storage. -->
+  <iframe id="sandboxed" name="sandboxed-frame" title="Sandboxed" sandbox="allow-scripts" src="/storage-frame-inner.html?who=sandboxed"></iframe>
+</main>
+<script>
+localStorage.setItem('top-key', 'top-value')
+sessionStorage.setItem('top-session', 'top-session-value')
+const cross = new URLSearchParams(location.search).get('cross')
+if (cross) document.getElementById('cross').src = `${cross}/storage-frame-inner.html?who=cross`
+</script>
+</body>
+</html>

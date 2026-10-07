@@ -625,9 +625,14 @@ export declare function buildPageModelFromRaw({ ariaTree, domByBackendId, frameI
  * box) is the only rectangle consumed here, and offset/scroll/client rects are in
  * element-relative coordinate spaces that would have to be re-based before they could
  * be mixed with it. Asking for three unused tables per node is not free.
+ *
+ * The four commands go out together: a session runs its commands in the order they were
+ * sent, so the domains are enabled before the capture and the metrics are read right after
+ * it, without a round trip between each. Each waits at most `timeoutMs`.
  */
-export declare function fetchPageGeometry({ cdp }: {
+export declare function fetchPageGeometry({ cdp, timeoutMs }: {
     cdp: ICDPSession;
+    timeoutMs: number;
 }): Promise<Map<string, FrameGeometry>>;
 /**
  * Build a PageModel for a page: fetch the aria snapshot, the flattened DOM and the

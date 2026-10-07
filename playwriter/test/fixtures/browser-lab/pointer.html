@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pointer · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .menubar, .sub { list-style: none; margin: 0; padding: 0; }
+  .menubar > li { position: relative; display: inline-block; }
+  .sub { display: none; position: absolute; top: 100%; left: 0; min-width: 170px; background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 20px rgba(0,0,0,.12); padding: 4px; z-index: 30; }
+  .sub .sub { top: -5px; left: 100%; }
+  .sub li { position: relative; }
+  .sub button { display: block; width: 100%; text-align: left; border: 0; }
+  .sub button:hover, .sub button:focus { background: #eef2ff; }
+  .has-sub:hover > .sub, .has-sub:focus-within > .sub { display: block; }
+  .tooltip-wrap { position: relative; display: inline-block; }
+  [role="tooltip"] { position: absolute; left: 0; top: calc(100% + 6px); background: #12172a; color: #fff; padding: 6px 10px; border-radius: 6px; white-space: nowrap; font-size: 0.9rem; z-index: 25; }
+  [role="tooltip"][hidden] { display: none; }
+  .sortable { list-style: none; padding: 0; max-width: 320px; }
+  .sortable li { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; cursor: grab; user-select: none; }
+  .sortable li.dragging { opacity: 0.4; }
+  .sortable li.over { border-color: var(--accent); }
+  .slider { position: relative; width: 300px; height: 28px; touch-action: none; cursor: pointer; }
+  .slider .track { position: absolute; left: 0; right: 0; top: 12px; height: 4px; background: #c8cfe0; border-radius: 2px; }
+  .slider .fill { position: absolute; left: 0; top: 12px; height: 4px; background: var(--accent); border-radius: 2px; }
+  .slider .thumb { position: absolute; top: 4px; width: 20px; height: 20px; margin-left: -10px; border-radius: 50%; background: #fff; border: 2px solid var(--accent); }
+  canvas { background: #fff; border: 1px solid var(--line); border-radius: 8px; touch-action: none; cursor: crosshair; }
+  .ctx-card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 18px; max-width: 360px; }
+  .ctx-menu { position: fixed; z-index: 60; background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 20px rgba(0,0,0,.18); padding: 4px; list-style: none; margin: 0; min-width: 150px; }
+  .ctx-menu[hidden] { display: none; }
+  .ctx-menu button { display: block; width: 100%; text-align: left; border: 0; }
+  .ctx-menu button:hover, .ctx-menu button:focus { background: #eef2ff; }
+  .archived { color: var(--muted); }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Pointer</span></header>
+<main>
+  <h1>Pointer interactions</h1>
+  <p id="status" class="status" role="status">Nothing selected</p>
+
+  <section class="card" aria-labelledby="h-menu">
+    <h2 id="h-menu">Hover menu</h2>
+    <nav aria-label="Shop">
+      <ul class="menubar">
+        <li class="has-sub" id="menu-products"><button type="button" aria-haspopup="true" aria-expanded="false">Products ▾</button>
+          <ul class="sub">
+            <li class="has-sub" id="menu-laptops"><button type="button" aria-haspopup="true" aria-expanded="false">Laptops ›</button>
+              <ul class="sub">
+                <li><button type="button" data-pick="Laptops › Ultrabooks">Ultrabooks</button></li>
+                <li><button type="button" data-pick="Laptops › Gaming">Gaming</button></li>
+              </ul>
+            </li>
+            <li><button type="button" data-pick="Phones">Phones</button></li>
+            <li><button type="button" data-pick="Tablets">Tablets</button></li>
+          </ul>
+        </li>
+      </ul>
+    </nav>
+  </section>
+
+  <section class="card" aria-labelledby="h-tooltip">
+    <h2 id="h-tooltip">Tooltip</h2>
+    <span class="tooltip-wrap"><button type="button" id="shipping-info" aria-describedby="shipping-tip">Shipping info</button><span role="tooltip" id="shipping-tip" hidden>Free shipping on orders over $50</span></span>
+  </section>
+
+  <section class="card" aria-labelledby="h-sort">
+    <h2 id="h-sort">Sortable list</h2>
+    <p class="muted" id="sort-help">Drag items to reorder. Keyboard: focus an item and press Alt+Arrow Up / Alt+Arrow Down.</p>
+    <ul class="sortable" id="sortable" aria-describedby="sort-help">
+      <li draggable="true" tabindex="0" data-name="Alpha">Alpha</li>
+      <li draggable="true" tabindex="0" data-name="Bravo">Bravo</li>
+      <li draggable="true" tabindex="0" data-name="Charlie">Charlie</li>
+      <li draggable="true" tabindex="0" data-name="Delta">Delta</li>
+      <li draggable="true" tabindex="0" data-name="Echo">Echo</li>
+    </ul>
+    <p id="order">Order: Alpha, Bravo, Charlie, Delta, Echo</p>
+  </section>
+
+  <section class="card" aria-labelledby="h-slider">
+    <h2 id="h-slider">Custom slider</h2>
+    <div class="slider" id="slider">
+      <div class="track"></div><div class="fill" id="slider-fill"></div>
+      <div class="thumb" id="slider-thumb" role="slider" tabindex="0" aria-label="Brightness" aria-valuemin="0" aria-valuemax="100" aria-valuenow="20"></div>
+    </div>
+    <p id="slider-value">Brightness: 20</p>
+  </section>
+
+  <section class="card" aria-labelledby="h-sketch">
+    <h2 id="h-sketch">Sketch pad</h2>
+    <canvas id="sketch" width="400" height="200" aria-label="Sketch pad" role="img"></canvas>
+    <div class="row"><span id="sketch-stats">Strokes: 0 · Length: 0 px</span><button type="button" id="sketch-clear">Clear</button></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-rename">
+    <h2 id="h-rename">Double-click to rename</h2>
+    <p class="muted">Double-click the project name (or focus it and press Enter) to rename it.</p>
+    <p id="title-wrap"><span id="project-title" tabindex="0" role="button" aria-label="Project name: Project Apollo. Double-click to rename">Project Apollo</span></p>
+  </section>
+
+  <section class="card" aria-labelledby="h-ctx">
+    <h2 id="h-ctx">Context menu</h2>
+    <div class="ctx-card" id="ctx-card" tabindex="0" aria-describedby="ctx-help"><strong>Quarterly report</strong> <span id="ctx-state"></span><div class="muted" id="ctx-help">Right-click this card (or press the Menu key / Shift+F10) for actions.</div></div>
+    <ul class="ctx-menu" id="ctx-menu" role="menu" aria-label="Card actions" hidden>
+      <li role="none"><button type="button" role="menuitem" tabindex="-1" data-act="Open">Open</button></li>
+      <li role="none"><button type="button" role="menuitem" tabindex="-1" data-act="Duplicate">Duplicate</button></li>
+      <li role="none"><button type="button" role="menuitem" tabindex="-1" data-act="Archive">Archive</button></li>
+    </ul>
+  </section>
+</main>
+<script type="module">
+import { $, $$, m, on, later, setText, tagLinks } from '/lab/common.js';
+
+const status = $('#status');
+
+// ---- hover menu ----
+for (const li of $$('.has-sub')) {
+  const btn = li.querySelector(':scope > button');
+  const set = (v) => { if (btn.getAttribute('aria-expanded') !== v) btn.setAttribute('aria-expanded', v); };
+  on(li, 'mouseenter', () => set('true'));
+  on(li, 'mouseleave', () => { if (!li.contains(document.activeElement)) set('false'); });
+  on(li, 'focusin', () => set('true'));
+  on(li, 'focusout', (e) => { if (!li.contains(e.relatedTarget)) set('false'); });
+}
+on($('.menubar'), 'click', (e) => {
+  const pick = e.target.closest('[data-pick]');
+  if (!pick) return;
+  setText(status, `Selected: ${pick.dataset.pick}`);
+  pick.blur();
+});
+
+// ---- tooltip ----
+const tipBtn = $('#shipping-info');
+const tip = $('#shipping-tip');
+let tipTimer = null;
+const showTip = () => { clearTimeout(tipTimer); tipTimer = later(500, () => { tip.hidden = false; }); };
+const hideTip = () => { clearTimeout(tipTimer); if (!tip.hidden) tip.hidden = true; };
+on(tipBtn, 'mouseenter', showTip);
+on(tipBtn, 'focus', showTip);
+on(tipBtn, 'mouseleave', hideTip);
+on(tipBtn, 'blur', hideTip);
+on(tipBtn, 'keydown', (e) => { if (e.key === 'Escape') hideTip(); });
+
+// ---- sortable ----
+const list = $('#sortable');
+let dragged = null;
+const updateOrder = () => setText($('#order'), 'Order: ' + $$('li', list).map((li) => li.dataset.name).join(', '));
+function moveRelative(item, target) {
+  const items = $$('li', list);
+  if (items.indexOf(item) > items.indexOf(target)) target.before(item); else target.after(item);
+}
+on(list, 'dragstart', (e) => {
+  dragged = e.target.closest('li');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragged.dataset.name);
+  dragged.classList.add('dragging');
+});
+list.addEventListener('dragover', (e) => { if (dragged && e.target.closest('li')) e.preventDefault(); });
+on(list, 'dragenter', (e) => { const li = e.target.closest('li'); if (dragged && li && li !== dragged && !li.classList.contains('over')) li.classList.add('over'); });
+on(list, 'dragleave', (e) => { const li = e.target.closest('li'); if (li && !li.contains(e.relatedTarget) && li.classList.contains('over')) li.classList.remove('over'); });
+on(list, 'drop', (e) => {
+  e.preventDefault();
+  const target = e.target.closest('li');
+  if (dragged && target && target !== dragged) moveRelative(dragged, target);
+  updateOrder();
+});
+on(list, 'dragend', () => {
+  for (const li of $$('li', list)) li.classList.remove('dragging', 'over');
+  dragged = null;
+});
+on(list, 'keydown', (e) => {
+  const li = e.target.closest('li');
+  if (!li || !e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+  e.preventDefault();
+  const sib = e.key === 'ArrowUp' ? li.previousElementSibling : li.nextElementSibling;
+  if (!sib) return;
+  moveRelative(li, sib);
+  li.focus();
+  updateOrder();
+});
+
+// ---- slider ----
+const slider = $('#slider');
+const thumb = $('#slider-thumb');
+let value = 20;
+function setValue(v) {
+  v = Math.max(0, Math.min(100, Math.round(v)));
+  if (v === value && thumb.style.left) return;
+  value = v;
+  thumb.style.left = v + '%';
+  $('#slider-fill').style.width = v + '%';
+  thumb.setAttribute('aria-valuenow', String(v));
+  setText($('#slider-value'), `Brightness: ${v}`);
+}
+const fromPointer = (e) => { const r = slider.getBoundingClientRect(); setValue(((e.clientX - r.left) / r.width) * 100); };
+let sliding = false;
+on(slider, 'pointerdown', (e) => { sliding = true; slider.setPointerCapture(e.pointerId); thumb.focus(); fromPointer(e); });
+// Keep keyboard focus on the thumb: the track itself is not focusable, so the default
+// mousedown action would otherwise move focus to <body>.
+slider.addEventListener('mousedown', (e) => e.preventDefault());
+on(slider, 'pointermove', (e) => { if (sliding) fromPointer(e); });
+on(slider, 'pointerup', () => { sliding = false; });
+on(slider, 'pointercancel', () => { sliding = false; });
+on(thumb, 'keydown', (e) => {
+  const step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1, PageUp: 10, PageDown: -10 }[e.key];
+  if (step !== undefined) { e.preventDefault(); setValue(value + step); }
+  else if (e.key === 'Home') { e.preventDefault(); setValue(0); }
+  else if (e.key === 'End') { e.preventDefault(); setValue(100); }
+});
+m(() => setValue(20));
+
+// ---- sketch pad ----
+const canvas = $('#sketch');
+const ctx = canvas.getContext('2d');
+let strokes = 0;
+let length = 0;
+let drawing = null;
+const point = (e) => {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left - canvas.clientLeft) * (canvas.width / canvas.clientWidth),
+    y: (e.clientY - r.top - canvas.clientTop) * (canvas.height / canvas.clientHeight),
+  };
+};
+const updateStats = () => setText($('#sketch-stats'), `Strokes: ${strokes} · Length: ${Math.round(length)} px`);
+on(canvas, 'pointerdown', (e) => { canvas.setPointerCapture(e.pointerId); drawing = { last: point(e), len: 0 }; });
+on(canvas, 'pointermove', (e) => {
+  if (!drawing) return;
+  const p = point(e);
+  ctx.strokeStyle = '#2f5bea'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(drawing.last.x, drawing.last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+  drawing.len += Math.hypot(p.x - drawing.last.x, p.y - drawing.last.y);
+  drawing.last = p;
+});
+const endStroke = () => {
+  if (!drawing) return;
+  if (drawing.len > 0) { strokes++; length += drawing.len; updateStats(); }
+  drawing = null;
+};
+on(canvas, 'pointerup', endStroke);
+on(canvas, 'pointercancel', endStroke);
+on($('#sketch-clear'), 'click', () => { ctx.clearRect(0, 0, canvas.width, canvas.height); strokes = 0; length = 0; updateStats(); });
+
+// ---- double-click to rename ----
+const titleWrap = $('#title-wrap');
+let titleText = 'Project Apollo';
+function renderTitle() {
+  const span = document.createElement('span');
+  span.id = 'project-title';
+  span.tabIndex = 0;
+  span.setAttribute('role', 'button');
+  span.setAttribute('aria-label', `Project name: ${titleText}. Double-click to rename`);
+  span.textContent = titleText;
+  titleWrap.replaceChildren(span);
+  return span;
+}
+function startEdit() {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.id = 'project-title-input';
+  input.value = titleText;
+  input.setAttribute('aria-label', 'Project name');
+  titleWrap.replaceChildren(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const v = input.value.trim();
+    if (save && v && v !== titleText) { titleText = v; setText(status, `Renamed to ${v}`); }
+    renderTitle().focus();
+  };
+  on(input, 'keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  on(input, 'blur', () => finish(true));
+}
+on(titleWrap, 'dblclick', (e) => { if (e.target.id === 'project-title') startEdit(); });
+on(titleWrap, 'keydown', (e) => { if (e.target.id === 'project-title' && (e.key === 'Enter' || e.key === 'F2')) { e.preventDefault(); startEdit(); } });
+
+// ---- context menu ----
+const card = $('#ctx-card');
+const menu = $('#ctx-menu');
+function closeMenu(refocus) {
+  if (menu.hidden) return;
+  menu.hidden = true;
+  if (refocus) card.focus();
+}
+on(card, 'contextmenu', (e) => {
+  e.preventDefault();
+  let x = e.clientX;
+  let y = e.clientY;
+  if (!x && !y) { const r = card.getBoundingClientRect(); x = r.left + 20; y = r.top + 20; }
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  menu.hidden = false;
+  menu.querySelector('[role="menuitem"]').focus();
+});
+on(menu, 'click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act === 'Archive') { $('#ctx-state').textContent = '(Archived)'; card.classList.add('archived'); setText(status, 'Archived: Quarterly report'); }
+  else if (act === 'Duplicate') setText(status, 'Duplicated: Quarterly report');
+  else setText(status, 'Opened: Quarterly report');
+  closeMenu(true);
+});
+on(menu, 'keydown', (e) => {
+  const items = $$('[role="menuitem"]', menu);
+  const i = items.indexOf(document.activeElement);
+  if (e.key === 'Escape') { e.preventDefault(); closeMenu(true); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i + items.length - 1) % items.length].focus(); }
+});
+on(document, 'pointerdown', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(false); });
+
+tagLinks();
+</script>
+</body>
+</html>

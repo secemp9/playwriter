@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keyboard · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .palette-backdrop { position: fixed; inset: 0; background: rgba(10,14,30,.45); z-index: 100; }
+  .palette { position: fixed; z-index: 101; top: 12vh; left: 50%; transform: translateX(-50%); width: min(520px, 92vw); background: #fff; border-radius: 12px; box-shadow: 0 20px 50px rgba(0,0,0,.35); padding: 12px; }
+  .palette[hidden], .palette-backdrop[hidden] { display: none; }
+  .palette input { width: 100%; font-size: 1.05rem; }
+  .palette ul { list-style: none; padding: 0; margin: 8px 0 0; max-height: 300px; overflow: auto; }
+  .palette li { padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+  .palette li[aria-selected="true"] { background: #e3e9ff; }
+  .palette .empty { color: var(--muted); padding: 8px 10px; }
+  kbd { border: 1px solid #aab2c5; border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; font-size: 0.85rem; background: #fff; }
+  .messages { list-style: none; padding: 0; }
+  .messages li { white-space: pre-wrap; background: #eef2ff; border-radius: 10px; padding: 8px 12px; margin-bottom: 6px; max-width: 460px; }
+  .editor { background: #fff; border: 1px solid #aab2c5; border-radius: 8px; padding: 6px 14px; min-height: 120px; }
+  .focus-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Keyboard</span></header>
+<main>
+  <h1>Keyboard workflows</h1>
+  <p>Press <kbd>Ctrl</kbd>+<kbd>K</kbd> (or <kbd>⌘</kbd>+<kbd>K</kbd>) anywhere to open the command palette. <button type="button" id="open-palette">Open command palette</button></p>
+  <p id="status" class="status" role="status">No command run yet</p>
+
+  <section class="card" aria-labelledby="h-focus">
+    <h2 id="h-focus">Focus order</h2>
+    <p class="muted">Expected Tab order: 1. First name → 2. Last name → 3. Role → 4. Save profile → 5. Cancel</p>
+    <div class="focus-grid" id="focus-area">
+      <div class="field"><label for="first-name">First name</label><input id="first-name" type="text"></div>
+      <div class="field"><label for="last-name">Last name</label><input id="last-name" type="text"></div>
+      <div class="field"><label for="role">Role</label><select id="role"><option>Engineer</option><option>Designer</option><option>Manager</option></select></div>
+      <div class="field"><button type="button" id="save-profile" class="primary">Save profile</button></div>
+      <div class="field"><button type="button" id="cancel-profile">Cancel</button></div>
+    </div>
+    <p id="focused">Focused: nothing</p>
+    <p id="focus-history">Focus history: (empty)</p>
+  </section>
+
+  <section class="card" aria-labelledby="h-chat">
+    <h2 id="h-chat">Chat</h2>
+    <ul class="messages" id="messages" aria-live="polite" aria-label="Sent messages"></ul>
+    <div class="field">
+      <label for="composer">Message</label>
+      <textarea id="composer" rows="3" aria-describedby="composer-help"></textarea>
+      <span id="composer-help" class="muted">Enter sends · Shift+Enter inserts a new line</span>
+    </div>
+    <div class="row"><button type="button" id="send">Send</button><span id="sent-count" class="muted">0 messages sent</span></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-editor">
+    <h2 id="h-editor">Document editor</h2>
+    <div class="row" role="toolbar" aria-label="Formatting" style="margin-bottom:8px">
+      <button type="button" id="bold" aria-label="Bold"><strong>B</strong></button>
+      <button type="button" id="italic" aria-label="Italic"><em>I</em></button>
+    </div>
+    <div class="editor" id="editor" contenteditable="true" data-lab-editable role="textbox" aria-multiline="true" aria-label="Document">
+      <p>The quick brown fox jumps over the lazy dog.</p>
+      <p>Rich text editors keep their state in the DOM.</p>
+      <p>Press Ctrl+B to toggle bold.</p>
+    </div>
+    <p id="word-count" class="muted">Words: 23</p>
+  </section>
+</main>
+
+<div class="palette-backdrop" id="palette-backdrop" hidden></div>
+<div class="palette" id="palette" role="dialog" aria-modal="true" aria-label="Command palette" hidden>
+  <input id="palette-input" type="text" role="combobox" aria-expanded="false" aria-controls="palette-list" aria-autocomplete="list" aria-label="Type a command" autocomplete="off">
+  <ul id="palette-list" role="listbox" aria-label="Commands"></ul>
+</div>
+
+<script type="module">
+import { $, $$, m, on, setText, tagLinks } from '/lab/common.js';
+
+// ---- command palette ----
+const COMMANDS = ['Go to Dashboard', 'Go to Settings', 'Create new project', 'Invite teammate', 'Toggle dark mode', 'Sign out'];
+const palette = $('#palette');
+const backdrop = $('#palette-backdrop');
+const input = $('#palette-input');
+const listbox = $('#palette-list');
+let matches = [];
+let active = 0;
+let returnFocus = null;
+
+function renderList() {
+  const q = input.value.trim().toLowerCase();
+  matches = COMMANDS.filter((c) => c.toLowerCase().includes(q));
+  active = Math.min(active, Math.max(0, matches.length - 1));
+  listbox.replaceChildren(...matches.map((c, i) => {
+    const li = document.createElement('li');
+    li.id = `cmd-${COMMANDS.indexOf(c)}`;
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(i === active));
+    li.textContent = c;
+    return li;
+  }));
+  if (!matches.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'No matching commands';
+    listbox.append(li);
+    input.removeAttribute('aria-activedescendant');
+  } else {
+    input.setAttribute('aria-activedescendant', `cmd-${COMMANDS.indexOf(matches[active])}`);
+  }
+}
+function openPalette() {
+  if (!palette.hidden) return;
+  returnFocus = document.activeElement;
+  input.value = '';
+  active = 0;
+  renderList();
+  palette.hidden = false;
+  backdrop.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+  input.focus();
+}
+function closePalette() {
+  if (palette.hidden) return;
+  palette.hidden = true;
+  backdrop.hidden = true;
+  input.setAttribute('aria-expanded', 'false');
+  if (returnFocus && document.contains(returnFocus)) returnFocus.focus();
+}
+function runCommand(name) {
+  setText($('#status'), `Ran: ${name}`);
+  closePalette();
+}
+on(document, 'keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    if (palette.hidden) openPalette(); else closePalette();
+  }
+});
+on($('#open-palette'), 'click', openPalette);
+on(input, 'input', () => { active = 0; renderList(); });
+on(input, 'keydown', (e) => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!matches.length) return;
+    active = (active + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+    renderList();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (matches.length) runCommand(matches[active]);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closePalette();
+  } else if (e.key === 'Tab') {
+    e.preventDefault();
+  }
+});
+on(listbox, 'click', (e) => {
+  const opt = e.target.closest('[role="option"]');
+  if (opt) runCommand(opt.textContent);
+});
+on(backdrop, 'click', closePalette);
+
+// ---- focus order ----
+const focusArea = $('#focus-area');
+const history = [];
+const nameOf = (el) => (el.labels && el.labels[0] ? el.labels[0].textContent : el.textContent).trim();
+on(focusArea, 'focusin', (e) => {
+  const name = nameOf(e.target);
+  history.push(name);
+  if (history.length > 8) history.shift();
+  setText($('#focused'), `Focused: ${name}`);
+  setText($('#focus-history'), `Focus history: ${history.join(' → ')}`);
+});
+on($('#save-profile'), 'click', () => {
+  const name = [$('#first-name').value.trim(), $('#last-name').value.trim()].filter(Boolean).join(' ') || '(no name)';
+  setText($('#status'), `Profile saved: ${name} (${$('#role').value})`);
+});
+on($('#cancel-profile'), 'click', () => setText($('#status'), 'Profile edit cancelled'));
+
+// ---- chat composer ----
+const composer = $('#composer');
+let sent = 0;
+function send() {
+  const text = composer.value.replace(/^\s+|\s+$/g, '');
+  if (!text) return;
+  const li = document.createElement('li');
+  li.textContent = text;
+  $('#messages').append(li);
+  composer.value = '';
+  sent++;
+  setText($('#sent-count'), `${sent} ${sent === 1 ? 'message' : 'messages'} sent`);
+}
+on(composer, 'keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    send();
+  }
+});
+on($('#send'), 'click', () => { send(); composer.focus(); });
+
+// ---- rich editor ----
+const editor = $('#editor');
+const countWords = () => setText($('#word-count'), `Words: ${editor.innerText.split(/\s+/).filter(Boolean).length}`);
+on(editor, 'input', countWords);
+for (const [id, cmd] of [['bold', 'bold'], ['italic', 'italic']]) {
+  on($('#' + id), 'mousedown', (e) => e.preventDefault());
+  on($('#' + id), 'click', () => { editor.focus(); document.execCommand(cmd); countWords(); });
+}
+countWords();
+
+tagLinks();
+</script>
+</body>
+</html>

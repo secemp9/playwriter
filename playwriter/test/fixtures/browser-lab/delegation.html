@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Delegation · Browser Lab</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  .pick { list-style: none; padding: 0; max-width: 240px; }
+  .pick li { padding: 8px; border: 1px solid #ccc; margin-bottom: 4px; cursor: pointer; }
+  .card { border: 1px solid #ccc; padding: 12px; max-width: 320px; margin: 12px 0; cursor: pointer; }
+  .fake-button { display: inline-block; padding: 7px 14px; background: #2563eb; color: #fff; cursor: pointer; }
+  x-chip { display: inline-block; padding: 4px 10px; border-radius: 12px; background: #eee; cursor: pointer; }
+  ul.items { list-style: none; padding: 0; max-width: 360px; }
+  ul.items li { padding: 6px; border-bottom: 1px solid #eee; position: relative; }
+  .menu { position: absolute; left: 0; top: 100%; z-index: 5; background: #fff; border: 1px solid #ccc; padding: 4px; list-style: none; margin: 0; }
+  .menu[hidden], [role=tooltip][hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>Delegation</h1>
+<p id="status">Nothing picked</p>
+<!-- One click listener on the list serves its items. -->
+<ul class="pick" id="fruits">
+  <li class="fruit">Apple</li>
+  <li class="fruit">Banana</li>
+  <li class="fruit">Cherry</li>
+  <li class="fruit">Damson</li>
+</ul>
+<!-- A clickable card around a button: the card's listener is a container's. -->
+<div class="card" id="card"><strong>Weekly digest</strong> <button type="button" id="card-save">Save</button></div>
+<!-- Real non-semantic controls: a div button and a custom element. -->
+<div class="fake-button" id="subscribe">Subscribe</div>
+<x-chip id="beta">Beta</x-chip>
+<!-- Orders whose rows have a tooltip and a menu that open inside them. -->
+<ul class="items" id="orders">
+  <li>Order 1001 <button type="button" id="info-1001" aria-describedby="tip-1001">Info</button><span role="tooltip" id="tip-1001" hidden>Ships tomorrow</span> <button type="button">Cancel</button></li>
+  <li>Order 1002 <button type="button" id="more-1002" aria-haspopup="menu">More</button><ul class="menu" role="menu" aria-label="Actions for order 1002" id="menu-1002" hidden><li role="none"><button type="button" role="menuitem">Refund</button></li></ul> <button type="button">Cancel</button></li>
+</ul>
+<script>
+  const status = document.getElementById('status');
+  document.getElementById('fruits').addEventListener('click', (e) => {
+    const item = e.target.closest('li');
+    if (item) status.textContent = `Picked ${item.textContent}`;
+  });
+  document.getElementById('card').addEventListener('click', () => { status.textContent = 'Opened the digest'; });
+  document.getElementById('subscribe').addEventListener('click', () => { status.textContent = 'Subscribed'; });
+  customElements.define('x-chip', class extends HTMLElement {});
+  document.getElementById('beta').addEventListener('click', () => { status.textContent = 'Beta on'; });
+  document.getElementById('info-1001').addEventListener('click', () => { document.getElementById('tip-1001').hidden = false; });
+  document.getElementById('more-1002').addEventListener('click', () => { document.getElementById('menu-1002').hidden = false; });
+</script>
+</body>
+</html>

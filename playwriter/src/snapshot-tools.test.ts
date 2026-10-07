@@ -6,6 +6,7 @@ import type { AriaSnapshotNode } from './aria-snapshot.js'
 import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { imageSize } from 'image-size'
 import { getCdpUrl } from './utils.js'
 import { getCDPSessionForPage } from './cdp-session.js'
@@ -129,6 +130,32 @@ describe('Snapshot & Screenshot Tests', () => {
   const getBrowserContext = () => {
     if (!testCtx?.browserContext) throw new Error('Browser not initialized')
     return testCtx.browserContext
+  }
+
+  /**
+   * Wait until the MCP server's own Playwright lists the tab whose HTML contains `marker`. A tab the
+   * extension has just attached reaches that already-connected client only once the relay has its
+   * attach and Playwright has initialized the page over the relay. MEASURED in the relay's wire log
+   * (attach in → that client's Runtime.enable answered): 158 ms on an idle machine. With the
+   * extension's frames held 250 ms, as a loaded full run holds them, the page was listed 563 ms after
+   * the toggle, and the fixed 400 ms sleep this replaces failed with "Test page not found".
+   */
+  const waitForMcpPage = async (marker: string): Promise<void> => {
+    const deadline = Date.now() + 10_000
+    for (;;) {
+      const probe = await client.callTool({
+        name: 'execute',
+        arguments: {
+          code: js`for (const p of context.pages()) if ((await p.content()).includes(${JSON.stringify(marker)})) return true; return false`,
+          timeout: 5000,
+        },
+      })
+      const parts = Array.isArray(probe.content) ? probe.content : []
+      if (parts.some((part) => part && typeof part === 'object' && 'text' in part && String(part.text).includes('[return value] true'))) return
+      if (Date.now() > deadline) throw new Error(`The MCP server's Playwright did not list the tab containing ${marker} within 10 s of its attach`)
+      // Real time on purpose: the page lives in the MCP server's process; nothing there signals this one.
+      await sleep(100)
+    }
   }
 
   it('should capture screenshot correctly', async () => {
@@ -532,7 +559,7 @@ describe('Snapshot & Screenshot Tests', () => {
       [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
 
-    await new Promise((r) => setTimeout(r, 400))
+    await waitForMcpPage('main-btn')
 
     const stylesResult = await client.callTool({
       name: 'execute',
@@ -1197,7 +1224,7 @@ describe('Snapshot & Screenshot Tests', () => {
       },
       [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
-    await new Promise((r) => setTimeout(r, 400))
+    await waitForMcpPage('submit-btn')
 
     const result = await client.callTool({
       name: 'execute',

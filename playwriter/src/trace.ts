@@ -194,7 +194,8 @@ export async function readLogpoints({
   const unparsableLines: string[] = []
 
   for (let i = 0; i < logs.length; i++) {
-    const line = logs[i]
+    // A log entry's first line is the message; the lines after it say where it was logged (`    at url:line:col`).
+    const line = logs[i].split('\n', 1)[0]!
     if (!line.includes('[[logpoint:')) continue
     const m = line.match(re)
     if (!m) {

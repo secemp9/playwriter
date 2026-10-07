@@ -35,6 +35,8 @@ import { appendSessionToWsUrl } from './chrome-discovery.js'
 import * as relayState from './relay-state.js'
 import { deriveWorkspace, type Workspace } from './workspace-key.js'
 import { RelayDownloads } from './download-file.js'
+import { RelayDebuggerCuts, REATTACH_CUT_TAB } from './debugger-cut.js'
+import { RelayTabVisibility, READ_TAB_VISIBILITY } from './tab-visibility.js'
 import type { DownloadFileReport } from './protocol.js'
 
 /**
@@ -45,8 +47,12 @@ import type { DownloadFileReport } from './protocol.js'
 function isRestrictedTarget(targetInfo: Protocol.Target.TargetInfo): boolean {
   const { url, type } = targetInfo
 
-  // Filter by type - allow pages and iframe targets (OOPIFs)
-  if (type !== 'page' && type !== 'iframe') {
+  // Filter by type - allow pages, iframe targets (OOPIFs) and dedicated workers. A dedicated worker
+  // ('worker') is attached by its page's (or iframe's, or parent worker's) auto-attach and its console,
+  // exceptions and requests are reported only on its own session. Shared and service workers
+  // ('shared_worker', 'service_worker') belong to the browser, not to a tab: chrome.debugger never
+  // attaches them through a tab, so they stay out.
+  if (type !== 'page' && type !== 'iframe' && type !== 'worker') {
     return true
   }
 
@@ -150,16 +156,32 @@ export async function startPlayWriterCDPRelayServer({
   const clientDownloadBehavior = new Map<string, Protocol.Browser.SetDownloadBehaviorRequest>()
   /** Every extension download's file and outcome, for `GET /downloads/:guid` (download-file.ts). */
   const relayDownloads = new RelayDownloads()
+  /** Tabs Chrome took the extension's debugger off while they stayed open, for `GET /debugger-cuts/:targetId` (debugger-cut.ts). */
+  const debuggerCuts = new RelayDebuggerCuts()
+  /** Whether the user can see each attached tab, for `GET /tab-visibility/:targetId` (tab-visibility.ts). */
+  const tabVisibility = new RelayTabVisibility()
   /**
-   * `${extensionId}:${child sessionId}` → the session an out-of-process iframe's
-   * Target.attachedToTarget was routed on (the page, or the iframe, that owns its frame). A client
-   * that connects later is told about the iframe on that same session: Playwright drops an iframe
-   * attach that arrives on its root session (crBrowser answers it with Target.detachFromTarget,
-   * which tears the iframe's session down for every client).
+   * `${extensionId}:${child sessionId}` → the session an out-of-process iframe's or a dedicated
+   * worker's Target.attachedToTarget was routed on (for an iframe the page, or the iframe, that owns
+   * its frame; for a worker the page, iframe or worker that started it). A client that connects later
+   * is told about the child on that same session: Playwright drops an iframe or worker attach that
+   * arrives on its root session (crBrowser answers it with Target.detachFromTarget, which tears the
+   * child's session down for every client). A worker's detach is routed there too.
    */
-  const iframeOwnerSessions = new Map<string, string>()
+  const childOwnerSessions = new Map<string, string>()
   /** Sessions whose Page.setFontFamilies the relay declined and logged, so it logs each tab once. */
   const fontOverrideDeclined = new Set<string>()
+  /**
+   * clientId → the target sessions that client was told of with Target.attachedToTarget and not told,
+   * since, were detached. A client hears of a session once. A tab whose attach reaches the relay while
+   * a client's sessionless Target.setAutoAttach is in flight would otherwise reach that client twice:
+   * live, then again in that call's replay. Playwright's crBrowser hands the sessionId to a new
+   * CRSession before it asserts "Duplicate target", so the page it already had stops answering.
+   * An iframe or worker attach routed on a session the client has not been told of yet is not
+   * counted: Playwright drops a message on a session it does not know (iframes-relay: the iframe's
+   * live attach on the tab's session came before that call's replay announced the tab).
+   */
+  const announcedSessions = new Map<string, Set<string>>()
 
   const resolvedCdpLogger = cdpLogger || createCdpLogger()
   const logCdpJson = (entry: CdpLogEntry) => {
@@ -674,6 +696,20 @@ export async function startPlayWriterCDPRelayServer({
     // This can cause "Assertion error" in Playwright's crConnection.js if a response
     // arrives after callbacks were cleared. We wrap in try-catch to handle this gracefully.
     const safeSend = (client: relayState.PlaywrightClient) => {
+      if ('method' in message && message.method === 'Target.attachedToTarget') {
+        const { sessionId: announcedSessionId } = message.params as Protocol.Target.AttachedToTargetEvent
+        const announced = announcedSessions.get(client.id) ?? new Set<string>()
+        if (announced.has(announcedSessionId)) {
+          logger?.log(pc.gray(`[Relay] Not announcing session ${announcedSessionId} to client ${client.id} again: it was told of it already`))
+          return
+        }
+        if (!message.sessionId || announced.has(message.sessionId)) {
+          announced.add(announcedSessionId)
+          announcedSessions.set(client.id, announced)
+        }
+      } else if ('method' in message && message.method === 'Target.detachedFromTarget') {
+        announcedSessions.get(client.id)?.delete((message.params as Protocol.Target.DetachedFromTargetEvent).sessionId)
+      }
       // CDP ordering (see the Runtime.enable fence above): a client whose page session is
       // mid-initialization must not see this session's execution-context events before the
       // responses to the commands it sent earlier on that session. When such a fence is
@@ -1249,10 +1285,18 @@ export async function startPlayWriterCDPRelayServer({
         }
 
         if (sessionId) {
+          // A session's own target, or nothing: answering with another tab's info (the
+          // sessionless fallback below) made every tab of a session report the FIRST tab's
+          // targetId, which the ref registry and the tab tracking key on.
           const target = connectedTargets.get(sessionId)
-          if (target && workspaceKey !== null && visibleToWorkspace(target, workspaceKey)) {
-            return { targetInfo: target.targetInfo }
+          if (target) {
+            if (workspaceKey !== null && visibleToWorkspace(target, workspaceKey)) {
+              return { targetInfo: target.targetInfo }
+            }
+            throw new Error(`Target of session ${sessionId} not found in connected targets`)
           }
+          // Not a tab session (an iframe or worker child session): Chrome answers for it.
+          break
         }
 
         // The old fallback returned Array.from(connectedTargets.values())[0] — an ARBITRARY
@@ -1307,6 +1351,13 @@ export async function startPlayWriterCDPRelayServer({
         })
       }
 
+      // The sandbox's clipboard.read() (page-storage.ts): the extension reads the clipboard's
+      // text in its offscreen document. Not a Chrome command: the tab's debugger has no
+      // clipboard read that leaves the page untouched.
+      case 'Playwriter.readClipboard': {
+        return await sendToExtension({ extensionId: resolvedExtensionId, method: 'readClipboard' })
+      }
+
       // Ghost Browser API - forward to extension for chrome.ghostPublicAPI/ghostProxies/projects
       case 'ghost-browser': {
         return await sendToExtension({
@@ -1317,7 +1368,10 @@ export async function startPlayWriterCDPRelayServer({
       }
 
       case 'Runtime.enable': {
-        if (!sessionId) {
+        // A dedicated worker has no frame: its context carries no auxData (measured, Chromium 145 through
+        // the extension), so waiting for an isDefault one would always run to the deadline. Playwright's
+        // Worker listens for its context before it sends Runtime.enable, so no ordering is needed.
+        if (!sessionId || connectedTargets.get(sessionId)?.targetInfo.type === 'worker') {
           break
         }
 
@@ -1527,6 +1581,49 @@ export async function startPlayWriterCDPRelayServer({
   app.get('/downloads/:guid', (c) => {
     const status = relayDownloads.status(c.req.param('guid'))
     return status ? c.json(status) : c.json({ error: `no download ${c.req.param('guid')} is known to this relay` }, 404)
+  })
+
+  /**
+   * A tab Chrome took the extension's debugger off while it stayed open (debugger-cut.ts): the latest
+   * report of its extension, aged on this relay's clock. `?retry=1` first asks the extension to try to
+   * re-attach now; `?waitMs=N` (0–30000) answers as soon as the tab is back or ended, or after N ms.
+   * 404: this relay knows no cut of that tab.
+   */
+  app.get('/debugger-cuts/:targetId', async (c) => {
+    const targetId = c.req.param('targetId')
+    const waitMs = Number(c.req.query('waitMs') ?? '0')
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 30_000) {
+      return c.json({ error: `waitMs must be a whole number of milliseconds from 0 to 30000, got ${c.req.query('waitMs')}` }, 400)
+    }
+    const extensionId = debuggerCuts.extensionOf(targetId)
+    if (c.req.query('retry') === '1' && extensionId) {
+      // Answered after the attempt; the attempt's report reached us first, on the same socket.
+      await sendToExtension({ extensionId, method: REATTACH_CUT_TAB, params: { targetId }, timeout: 5000 }).catch((error: unknown) => {
+        logger?.log(pc.yellow(`[Server] re-attach request for cut tab ${targetId} failed: ${error instanceof Error ? error.message : String(error)}`))
+      })
+    }
+    const status = await debuggerCuts.settled(targetId, waitMs)
+    return status ? c.json(status) : c.json({ error: `this relay knows no debugger cut of target ${targetId}` }, 404)
+  })
+
+  /**
+   * Whether the user can see an attached tab (tab-visibility.ts), as its extension reported it. The
+   * extension re-reads the tab first — minimising a window fires no event it could have reported — and
+   * that report reaches us before its answer, on the same socket; when it does not answer in time the
+   * previous report is served, aged (`ageMs`). 404: no extension reported that tab.
+   */
+  app.get('/tab-visibility/:targetId', async (c) => {
+    const targetId = c.req.param('targetId')
+    const owner = [...store.getState().extensions].find(([, extension]) =>
+      [...extension.connectedTargets.values()].some((target) => target.targetId === targetId),
+    )
+    if (owner) {
+      await sendToExtension({ extensionId: owner[0], method: READ_TAB_VISIBILITY, params: { targetId }, timeout: 1000 }).catch((error: unknown) => {
+        logger?.log(pc.yellow(`[Server] visibility read for tab ${targetId} failed: ${error instanceof Error ? error.message : String(error)}`))
+      })
+    }
+    const status = tabVisibility.status(targetId)
+    return status ? c.json(status) : c.json({ error: `this relay has no visibility report of target ${targetId}` }, 404)
   })
 
   // CDP Discovery Endpoints - Standard Chrome DevTools Protocol HTTP API
@@ -1816,8 +1913,9 @@ export async function startPlayWriterCDPRelayServer({
               // Re-read state after async routeCdpCommand — targets may have changed
               const freshExt = store.getState().extensions.get(extensionConn.id)
               const freshTargets: Map<string, relayState.ConnectedTarget> = freshExt?.connectedTargets || new Map()
-              // Pages first, then each iframe once the session that owns it has been announced
-              // (a nested OOPIF is owned by another iframe's session).
+              // Pages first, then each iframe and dedicated worker once the session that owns it has
+              // been announced (a nested OOPIF is owned by another iframe's session, a nested worker
+              // by its parent worker's).
               const announced = new Set<string>()
               const pending = [...freshTargets.values()].filter(
                 // Skip restricted targets (extensions, chrome:// URLs, non-page types)
@@ -1829,9 +1927,9 @@ export async function startPlayWriterCDPRelayServer({
               for (let progressed = true; progressed && pending.length > 0; ) {
                 progressed = false
                 for (const target of [...pending]) {
-                  const ownerSessionId =
-                    target.targetInfo.type === 'iframe' ? iframeOwnerSessions.get(`${extensionConn.id}:${target.sessionId}`) : undefined
-                  if (target.targetInfo.type === 'iframe' && (ownerSessionId === undefined || !announced.has(ownerSessionId))) continue
+                  const isChild = target.targetInfo.type === 'iframe' || target.targetInfo.type === 'worker'
+                  const ownerSessionId = isChild ? childOwnerSessions.get(`${extensionConn.id}:${target.sessionId}`) : undefined
+                  if (isChild && (ownerSessionId === undefined || !announced.has(ownerSessionId))) continue
                   pending.splice(pending.indexOf(target), 1)
                   announced.add(target.sessionId)
                   progressed = true
@@ -1864,11 +1962,11 @@ export async function startPlayWriterCDPRelayServer({
                   })
                 }
               }
-              // An iframe whose owning session is unknown (or not visible to this client) cannot be
-              // routed: on the root session Playwright would detach it for everyone. Said, not sent.
+              // An iframe or worker whose owning session is unknown (or not visible to this client)
+              // cannot be routed: on the root session Playwright would detach it for everyone. Said, not sent.
               for (const target of pending) {
                 logger?.error(
-                  pc.red('[Server] Not replaying an iframe attach: the session that owns its frame is not known to this client'),
+                  pc.red(`[Server] Not replaying an ${target.targetInfo.type} attach: the session that owns it is not known to this client`),
                   target.sessionId,
                   target.targetInfo.url,
                 )
@@ -2011,6 +2109,7 @@ export async function startPlayWriterCDPRelayServer({
           clientDownloadBehavior.delete(clientId)
           relayDownloads.forgetClient(clientId)
           dropClientOrdering(clientId)
+          announcedSessions.delete(clientId)
           logger?.log(pc.yellow(`Playwright client disconnected: ${clientId} (${store.getState().playwrightClients.size} remaining)`))
         },
 
@@ -2188,6 +2287,16 @@ export async function startPlayWriterCDPRelayServer({
             const { guid, asking } = message.params
             relayDownloads.asking(guid, asking)
             logger?.log(pc.gray(`[Server] download ${guid}: ${asking ? 'Chrome waits for the user to choose where to save it' : 'Chrome no longer waits for the user'}`))
+          } else if (message.method === 'debuggerCut') {
+            const report = message.params
+            debuggerCuts.report(connectionId, report)
+            logger?.log(
+              pc.yellow(
+                `[Server] debugger cut tab ${report.tabId} (target ${report.targetId}): ${report.state}, cause ${JSON.stringify(report.cause)}, ${report.attempts} attempts${report.lastError ? `, last: ${report.lastError}` : ''}`,
+              ),
+            )
+          } else if (message.method === 'tabVisibility') {
+            tabVisibility.report(connectionId, message.params)
           } else {
             const extensionEvent = message as ExtensionEventMessage
 
@@ -2244,27 +2353,48 @@ export async function startPlayWriterCDPRelayServer({
                   ? getPageTargetForFrameId({ extensionState: currentExtState, frameId: iframeParentFrameId })?.sessionId
                   : undefined
 
+              // Resume a target no Playwright client will hear of: Chrome holds it paused at its first
+              // statement until a debugger runs it (Playwright's waitForDebuggerOnStart auto-attach).
+              const resumeUnannounced = (why: string): void => {
+                if (!targetParams.waitingForDebugger || !targetParams.sessionId) return
+                void sendToExtension({
+                  extensionId: connectionId,
+                  method: 'forwardCDPCommand',
+                  params: {
+                    sessionId: targetParams.sessionId,
+                    method: 'Runtime.runIfWaitingForDebugger',
+                    params: {},
+                    source: 'server',
+                  },
+                }).catch((error) => {
+                  const msg = error instanceof Error ? error.message : String(error)
+                  logger?.log(pc.yellow(`[Server] Failed to resume ${why}:`), msg)
+                })
+              }
+
               // Filter out restricted targets (unsupported types, extension pages, chrome:// URLs, etc.)
               if (isRestrictedTarget(targetParams.targetInfo)) {
-                if (targetParams.waitingForDebugger && targetParams.sessionId) {
-                  void sendToExtension({
-                    extensionId: connectionId,
-                    method: 'forwardCDPCommand',
-                    params: {
-                      sessionId: targetParams.sessionId,
-                      method: 'Runtime.runIfWaitingForDebugger',
-                      params: {},
-                      source: 'server',
-                    },
-                  }).catch((error) => {
-                    const msg = error instanceof Error ? error.message : String(error)
-                    logger?.log(pc.yellow('[Server] Failed to resume restricted target:'), msg)
-                  })
-                }
+                resumeUnannounced('restricted target')
                 logger?.log(
                   pc.gray(
                     `[Server] Ignoring restricted target: ${targetParams.targetInfo.type} (${targetParams.targetInfo.url})`,
                   ),
+                )
+                return
+              }
+
+              // An out-of-process iframe or a dedicated worker reaches Playwright only on the session that
+              // owns it (crPage's _onAttachedToTarget builds its FrameSession or Worker and resumes it); on
+              // the root session crBrowser answers either with Target.detachFromTarget, ending its session
+              // for every client. Without an owning session it is resumed and not announced.
+              const isWorker = targetParams.targetInfo.type === 'worker'
+              const isChildTarget = isWorker || targetParams.targetInfo.type === 'iframe'
+              const childOwnerSession = targetParams.targetInfo.type === 'iframe' ? (iframeOwnerSessionId ?? incomingSessionId) : incomingSessionId
+              if (isChildTarget && !childOwnerSession) {
+                resumeUnannounced(`an ${targetParams.targetInfo.type} with no owning session`)
+                logger?.error(
+                  pc.red(`[Server] Not announcing an ${targetParams.targetInfo.type} attach that names no owning session:`),
+                  JSON.stringify({ method, params: targetParams }),
                 )
                 return
               }
@@ -2303,9 +2433,8 @@ export async function startPlayWriterCDPRelayServer({
               )
 
               // Only forward to Playwright if this is a new target to avoid duplicates
-              const iframeOwnerSession = targetParams.targetInfo.type === 'iframe' ? (iframeOwnerSessionId ?? incomingSessionId) : incomingSessionId
-              if (targetParams.targetInfo.type === 'iframe' && iframeOwnerSession) {
-                iframeOwnerSessions.set(`${connectionId}:${targetParams.sessionId}`, iframeOwnerSession)
+              if (isChildTarget && childOwnerSession) {
+                childOwnerSessions.set(`${connectionId}:${targetParams.sessionId}`, childOwnerSession)
               }
               if (!alreadyConnected) {
                 sendToPlaywright({
@@ -2366,24 +2495,50 @@ export async function startPlayWriterCDPRelayServer({
                     // the A56D… row cannot recur; the fallback below still carries the F526…/11F7… rows.
                     // relay-oopif-attach.test.ts pins the A56D… row (it reproduces that shape without a
                     // race and fails on every run with the background.ts change reverted, 5/5).
-                    sessionId: iframeOwnerSession,
+                    // A dedicated worker's attach goes, as Chrome sent it, on the session that started it.
+                    sessionId: childOwnerSession,
                     method: 'Target.attachedToTarget',
                     params: targetParams,
                   } as CDPEventBase,
                   source: 'extension',
                   extensionId: connectionId,
                 })
+                // Nobody to resume it: no client of the workspace that owns its tab is connected. The
+                // auto-attach an earlier client asked for stays on the tab, so Chrome holds every new
+                // iframe and worker of it until a debugger resumes it — the user's page would be broken.
+                const workspaceKey = extensionEvent.params.workspaceKey ?? null
+                const heard = [...store.getState().playwrightClients.values()].some(
+                  (client) => client.extensionId === connectionId && workspaceKey !== null && client.workspaceKey === workspaceKey,
+                )
+                if (isChildTarget && !heard) {
+                  resumeUnannounced(`an ${targetParams.targetInfo.type} no client hears of`)
+                }
               }
             } else if (method === 'Target.detachedFromTarget') {
               const detachParams = params as Protocol.Target.DetachedFromTargetEvent
+              const childKey = `${connectionId}:${detachParams.sessionId}`
+              const detachedType = store.getState().extensions.get(connectionId)?.connectedTargets.get(detachParams.sessionId)?.targetInfo.type
+              const workerOwner = detachedType === 'worker' ? childOwnerSessions.get(childKey) : undefined
               store.setState((s) =>
                 relayState.removeTarget(s, { extensionId: connectionId, sessionId: detachParams.sessionId }),
               )
-              iframeOwnerSessions.delete(`${connectionId}:${detachParams.sessionId}`)
+              // The session a cut tab's re-attach announced left with no cut reported first: no cut (debugger-cut.ts).
+              debuggerCuts.sessionDetached(detachParams.sessionId)
+              childOwnerSessions.delete(childKey)
               fontOverrideDeclined.delete(detachParams.sessionId)
 
+              // A worker's detach goes on the session that started it: Playwright ends the Worker
+              // (page.workers(), its 'close') and playwriter's session tap its script request only from
+              // there (crPage's _onDetachedFromTarget listens on that session; crBrowser's root handler
+              // knows only pages and service workers). When that session is gone too (a detached tab's
+              // page detach comes first), Playwright already closed everything under it.
+              const routedOn =
+                workerOwner !== undefined && store.getState().extensions.get(connectionId)?.connectedTargets.has(workerOwner)
+                  ? workerOwner
+                  : undefined
               sendToPlaywright({
                 message: {
+                  ...(routedOn !== undefined ? { sessionId: routedOn } : {}),
                   method: 'Target.detachedFromTarget',
                   params: detachParams,
                 } as CDPEventBase,
@@ -2578,6 +2733,8 @@ export async function startPlayWriterCDPRelayServer({
 
           // State transition: remove extension + its bound clients atomically
           store.setState((s) => relayState.removeExtension(s, { extensionId: connectionId }))
+          debuggerCuts.forgetExtension(connectionId)
+          tabVisibility.forgetExtension(connectionId)
         },
 
         onError(event) {

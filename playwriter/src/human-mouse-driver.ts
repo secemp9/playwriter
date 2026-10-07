@@ -63,6 +63,7 @@ import {
 } from './human-mouse.js'
 import { playGhostCursorPath, cancelGhostCursorPath, isGhostCursorShown } from './ghost-cursor.js'
 import { pointerTrackFor, type PointerPathSample } from './pointer-track.js'
+import { HIDDEN_TAB_EFFECT } from './tab-state.js'
 
 /** Above this, the renderer is not acking within a frame and the model's timing is fiction. */
 const THROTTLED_RENDERER_PROBE_MS = 100
@@ -162,6 +163,12 @@ export interface HumanClickOptions extends HumanMoveOptions {
   button?: 'left' | 'right' | 'middle'
   clickCount?: number
   delayMs?: number
+  /**
+   * Told when the press goes out (`sent`) and when Chrome confirms the page got it
+   * (`acknowledged`), so a caller whose release fails can tell a press the page received from one
+   * that never reached it. Bare-coordinate and ref presses only: a locator click is one Playwright call.
+   */
+  onPress?: (stage: 'sent' | 'acknowledged') => void
 }
 
 interface ResolvedTarget {
@@ -575,11 +582,11 @@ export function createHumanMouseApi(options: {
     const probeDispatchMs = await probeDispatchLatency({ cdp, at: from, heldButton: moveOptions.heldButton })
     const rendererThrottled = Number.isFinite(probeDispatchMs) && probeDispatchMs > THROTTLED_RENDERER_PROBE_MS
     if (rendererThrottled) {
+      // The same effect and fix as the HIDDEN line (tab-state.ts): a throttled renderer is almost always a hidden tab.
       warnings.push(
         `Renderer is throttled: a single Input.dispatchMouseEvent acked in ${Math.round(probeDispatchMs)}ms ` +
-          `(a responsive foreground tab acks in ~16ms). The modelled ${Math.round(trajectory.plannedDurationMs)}ms ` +
-          'move cannot be delivered at that rate. Bring the tab to the foreground (page.bringToFront()) ' +
-          'or accept that this move will run far slower than the model asked for.',
+          `(a tab the user can see acks in ~16ms), so the modelled ${Math.round(trajectory.plannedDurationMs)}ms move will run far slower. ` +
+          `The tab is probably not visible to the user: ${HIDDEN_TAB_EFFECT}`,
       )
     }
 
@@ -688,7 +695,9 @@ export function createHumanMouseApi(options: {
 
     // Bare coordinates, or a ref (located over CDP, so no Playwright actionability runs in the
     // page): this path presses where the pointer now is.
+    clickOptions.onPress?.('sent')
     await page.mouse.down({ button: clickOptions.button, clickCount: clickOptions.clickCount ?? 1 })
+    clickOptions.onPress?.('acknowledged')
     if (clickOptions.delayMs) {
       await new Promise((resolve) => setTimeout(resolve, clickOptions.delayMs))
     }

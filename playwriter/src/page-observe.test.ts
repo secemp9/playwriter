@@ -115,7 +115,7 @@ describe('renderObservation', () => {
     expect(rendered).toBe(
       [
         'PAGE  Shop — Home · http://localhost:3030/',
-        'TABS  0: "Shop — Home" (controlled) · 1: "Docs" — act.switchTab(n) works in another',
+        'TABS  0: "Shop — Home" (controlled) · 1: "Docs" — act.switchTab(n or text of its title/URL) works in another',
         '      viewport 1280×720 · top of page, 2.3 screens below',
         'BUSY  progressbar "Uploading" (wait before acting)',
         'FOCUS [2] searchbox "Search products" [focused] = "wireless mouse"',
@@ -606,13 +606,15 @@ describe('diffObservations / renderObservationDiff', () => {
 describe('findInObservation', () => {
   it('searches names, values, hrefs, context and text, and says where each match is', () => {
     const obs = shop()
-    expect(findInObservation(obs, 'add cart')).toBe(
+    expect(findInObservation(obs, 'add to cart')).toBe(
       [
-        '2 matches for "add cart":',
+        '2 matches for "add to cart":',
         '  [12] button "Add to cart" (in listitem "Logitech M185") — in view · main',
         '  [13] button "Add to cart" (in listitem "MX Master") — in view · main',
       ].join('\n'),
     )
+    // Words that are not one phrase on the page are found as approximate matches.
+    expect(findInObservation(obs, 'add cart').split('\n')[0]).toBe('No exact match for "add cart". 2 approximate matches (every word found, not as one phrase):')
     expect(findInObservation(obs, 'privacy')).toBe('1 match for "privacy":\n  [31] link "Privacy" — below, 2.4 screens down (scroll down) · contentinfo')
     expect(findInObservation(obs, 'reviews')).toContain('heading: "Reviews" — below, 1.2 screens down (scroll down) · main')
     expect(findInObservation(obs, 'wireless')).toContain('[2] searchbox "Search products" [focused] = "wireless mouse" — in view · banner')

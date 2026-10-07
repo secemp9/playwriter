@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Watched page</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  header { height: 120px; background: #1565c0; color: #fff; }
+  .band { height: 400px; }
+  .band:nth-child(odd) { background: #e3f2fd; }
+  .band:nth-child(even) { background: #fff3e0; }
+  #below { width: 300px; height: 150px; background: #2e7d32; color: #fff; }
+  #caret-field { width: 200px; }
+</style>
+</head>
+<body>
+<header><h1>Watched page</h1><input id="caret-field" value="caret here" aria-label="Caret field"></header>
+<section id="bands">
+  <div class="band">Band 1</div>
+  <div class="band">Band 2</div>
+  <div class="band">Band 3</div>
+  <div class="band">Band 4</div>
+</section>
+<div id="below">Below the fold <button id="far-button">Far button</button></div>
+<div class="band">Band 5</div>
+<script>
+  // Every way a page can notice its viewport, scroll, layout or DOM changing. Read by the
+  // tests through readPage(() => window.__seen).
+  window.__seen = []
+  const note = (what) => window.__seen.push(what)
+  // Ready once the page has rendered (its first ResizeObserver callback) and 300 ms have passed; the
+  // notes made until then are dropped. Under load Chrome 149 renders the first frame after those
+  // 300 ms (measured: up to 2 s), and does not hold the page's timers for it as Chromium 133 did.
+  let pending = 2
+  const loaded = () => { if (--pending === 0) { window.__seen.length = 0; window.__ready = true } }
+  addEventListener('resize', () => note('resize ' + innerWidth + 'x' + innerHeight))
+  addEventListener('scroll', () => note('scroll ' + scrollY))
+  visualViewport.addEventListener('resize', () => note('visualViewport.resize'))
+  visualViewport.addEventListener('scroll', () => note('visualViewport.scroll'))
+  matchMedia('(max-width: 900px)').addEventListener('change', () => note('matchMedia'))
+  // Its first callback reports the initial size at the first rendering: the initial state, not a change.
+  let firstSize = true
+  new ResizeObserver(() => {
+    if (firstSize) { firstSize = false; loaded(); return }
+    note('ResizeObserver')
+  }).observe(document.documentElement)
+  new MutationObserver((records) => note('MutationObserver ' + records.length)).observe(document, {
+    subtree: true, childList: true, attributes: true, characterData: true,
+  })
+  let first = true
+  new IntersectionObserver((entries) => {
+    // The first callback reports the initial state; only later ones are changes.
+    if (first) { first = false; return }
+    note('IntersectionObserver ' + entries.map((e) => e.isIntersecting).join(','))
+  }).observe(document.getElementById('below'))
+  document.addEventListener('visibilitychange', () => note('visibilitychange'))
+  setTimeout(loaded, 300)
+</script>
+</body>
+</html>

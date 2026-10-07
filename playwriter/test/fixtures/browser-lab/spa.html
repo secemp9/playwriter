@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home · Lab Store</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .store-nav { display: flex; gap: 18px; padding: 10px 20px; background: #fff; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  .store-nav a { text-decoration: none; font-weight: 600; }
+  .store-nav a[aria-current="page"] { text-decoration: underline; text-underline-offset: 6px; }
+  .cart-badge { display: inline-block; min-width: 22px; padding: 0 6px; margin-left: 4px; border-radius: 11px; background: var(--accent); color: #fff; text-align: center; font-size: 0.85rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
+  .product { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .product.skeleton { height: 128px; border: 0; }
+  .feed { list-style: none; padding: 0; margin: 0; }
+  .feed li { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 10px; min-height: 64px; }
+  #sentinel { height: 1px; }
+  .cart-line { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Lab Store (SPA)</span></header>
+<nav class="store-nav" aria-label="Store">
+  <a href="/spa/" data-route="home">Home</a>
+  <a href="/spa/products" data-route="products">Products</a>
+  <a href="/spa/cart" data-route="cart" id="cart-link" aria-label="Cart, 0 items">Cart<span class="cart-badge" id="cart-badge" aria-hidden="true">0</span></a>
+</nav>
+<main id="view" tabindex="-1"></main>
+<div id="toasts" role="status" aria-live="polite"></div>
+<script type="module">
+import { $, m, on, toast, money, withTag, tagLinks } from '/lab/common.js';
+
+const view = $('#view');
+const cart = new Map();
+let products = null;
+let productsRequest = null;
+let feed = null;
+let feedObserver = null;
+let renderId = 0;
+
+const ROUTES = { '/spa': 'home', '/spa/': 'home', '/spa.html': 'home', '/spa/products': 'products', '/spa/cart': 'cart' };
+const PATHS = { home: '/spa/', products: '/spa/products', cart: '/spa/cart' };
+const TITLES = { home: 'Home · Lab Store', products: 'Products · Lab Store', cart: 'Cart · Lab Store' };
+const routeOf = () => ROUTES[location.pathname] || 'home';
+
+function cartCount() { let n = 0; for (const q of cart.values()) n += q; return n; }
+function updateBadge() {
+  const n = cartCount();
+  $('#cart-badge').textContent = String(n);
+  $('#cart-link').setAttribute('aria-label', `Cart, ${n} ${n === 1 ? 'item' : 'items'}`);
+}
+
+function render() {
+  const route = routeOf();
+  const id = ++renderId;
+  if (feedObserver) { feedObserver.disconnect(); feedObserver = null; }
+  document.title = TITLES[route];
+  for (const a of document.querySelectorAll('[data-route]')) {
+    if (a.dataset.route === route) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  }
+  if (route === 'home') renderHome();
+  else if (route === 'products') renderProducts(id);
+  else renderCart();
+  tagLinks(view);
+}
+
+function renderHome() {
+  view.innerHTML = `
+    <h1>Welcome to Lab Store</h1>
+    <p>Browse <a href="/spa/products" data-route="products">our products</a> or catch up on recent activity.</p>
+    <h2 id="feed-title">Activity feed</h2>
+    <ul class="feed" id="feed" aria-labelledby="feed-title" aria-busy="false"></ul>
+    <div id="sentinel"></div>
+    <p id="feed-status" class="muted" role="status"></p>`;
+  if (!feed) feed = { items: [], nextOffset: 0, loading: false };
+  const list = $('#feed');
+  for (const it of feed.items) list.append(feedItem(it));
+  updateFeedStatus();
+  feedObserver = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) loadMore();
+  });
+  feedObserver.observe($('#sentinel'));
+}
+function feedItem(it) {
+  const li = document.createElement('li');
+  li.id = `item-${it.id}`;
+  li.innerHTML = `<strong></strong><div class="muted"></div>`;
+  li.firstChild.textContent = it.title;
+  li.lastChild.textContent = it.text;
+  return li;
+}
+function updateFeedStatus() {
+  const st = $('#feed-status');
+  if (!st) return;
+  st.textContent = feed.loading ? 'Loading more…' : feed.nextOffset === null ? `End of feed (${feed.items.length} items)` : `${feed.items.length} items loaded`;
+}
+async function loadMore() {
+  if (!feed || feed.loading || feed.nextOffset === null) return;
+  m(() => {
+    feed.loading = true;
+    $('#feed')?.setAttribute('aria-busy', 'true');
+    updateFeedStatus();
+  });
+  const res = await fetch(`/api/items?offset=${feed.nextOffset}&limit=10`);
+  const data = await res.json();
+  m(() => {
+    feed.loading = false;
+    feed.items.push(...data.items);
+    feed.nextOffset = data.nextOffset;
+    const list = $('#feed');
+    if (list) {
+      for (const it of data.items) list.append(feedItem(it));
+      list.setAttribute('aria-busy', 'false');
+    }
+    updateFeedStatus();
+  });
+  // Keep filling while the sentinel is still on screen.
+  const s = $('#sentinel');
+  if (s && feed.nextOffset !== null && s.getBoundingClientRect().top < innerHeight) loadMore();
+}
+
+function renderProducts(id) {
+  view.innerHTML = `<h1>Products</h1><div class="grid" id="products" aria-busy="true" aria-label="Products"></div>`;
+  const grid = $('#products');
+  if (products) { fillProducts(grid); return; }
+  for (let i = 0; i < 6; i++) {
+    const s = document.createElement('div');
+    s.className = 'product skeleton';
+    s.setAttribute('aria-hidden', 'true');
+    grid.append(s);
+  }
+  productsRequest ||= fetch('/api/products').then((r) => r.json()).then((d) => (products = d.products));
+  productsRequest.then(() => m(() => {
+    if (id !== renderId) return;
+    fillProducts($('#products'));
+  }));
+}
+function fillProducts(grid) {
+  grid.replaceChildren(...products.map((p) => {
+    const card = document.createElement('article');
+    card.className = 'product';
+    card.dataset.id = p.id;
+    card.setAttribute('aria-labelledby', `name-${p.id}`);
+    card.innerHTML = `<h2 id="name-${p.id}" style="margin:0;font-size:1.05rem"></h2><div class="price"></div><button type="button" class="primary">Add to cart</button>`;
+    card.querySelector('h2').textContent = p.name;
+    card.querySelector('.price').textContent = money(p.price);
+    return card;
+  }));
+  grid.setAttribute('aria-busy', 'false');
+}
+
+function renderCart() {
+  if (!cart.size) {
+    view.innerHTML = '<h1>Cart</h1><p id="cart-empty">Your cart is empty.</p>';
+    return;
+  }
+  view.innerHTML = '<h1>Cart</h1><div id="cart-lines"></div><p id="cart-total" class="status"></p>';
+  let total = 0;
+  const lines = $('#cart-lines');
+  for (const [pid, qty] of cart) {
+    const p = products.find((x) => x.id === pid);
+    total += p.price * qty;
+    const row = document.createElement('div');
+    row.className = 'cart-line';
+    row.dataset.id = pid;
+    row.innerHTML = '<span></span><button type="button">Remove</button>';
+    row.firstChild.textContent = `${p.name} × ${qty} — ${money(p.price * qty)}`;
+    row.lastChild.setAttribute('aria-label', `Remove ${p.name}`);
+    lines.append(row);
+  }
+  $('#cart-total').textContent = `Total: ${money(total)}`;
+}
+
+on(view, 'click', (e) => {
+  const add = e.target.closest('.product button');
+  if (add) {
+    const pid = add.closest('.product').dataset.id;
+    const p = products.find((x) => x.id === pid);
+    cart.set(pid, (cart.get(pid) || 0) + 1);
+    updateBadge();
+    toast(`Added ${p.name} to cart`, 2000);
+    return;
+  }
+  const remove = e.target.closest('.cart-line button');
+  if (remove) {
+    cart.delete(remove.closest('.cart-line').dataset.id);
+    updateBadge();
+    renderCart();
+  }
+});
+
+on(document, 'click', (e) => {
+  const a = e.target.closest('a[data-route]');
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  e.preventDefault();
+  const target = withTag(PATHS[a.dataset.route]);
+  if (location.pathname + location.search !== target) history.pushState({ route: a.dataset.route }, '', target);
+  render();
+  view.focus();
+});
+on(window, 'popstate', () => render());
+
+m(() => {
+  updateBadge();
+  render();
+});
+tagLinks();
+</script>
+</body>
+</html>

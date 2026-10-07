@@ -27,14 +27,17 @@ const TEST_PORT = testRelayPort(import.meta.url)
 
 /**
  * The action report in front of a raw call's output carries what changes from run to run: the
- * fixture server's port, the settle time, and the tab index (it depends on which earlier tests of
- * the file ran and left tabs open). Everything else in it is snapshotted as the model reads it.
+ * fixture server's port, the settle time, the tab index (it depends on which earlier tests of
+ * the file ran and left tabs open), and a SHIFT line when the page's own layout shift happens to
+ * land inside the action's window (shadcn-ui shifts about 0.7 s after load; under load that falls
+ * inside the goto's window, otherwise after it). Everything else in it is snapshotted as the model reads it.
  */
 function stableReport(text: string): string {
   return text
     .replace(/http:\/\/127\.0\.0\.1:\d+/g, 'http://127.0.0.1:<port>')
     .replace(/SETTLED \d+ms/g, 'SETTLED <ms>ms')
     .replace(/ on tab \d+ "/g, ' on tab <n> "')
+    .replace(/^SHIFT {3}.*\n/gm, '')
 }
 
 describe('Relay Core Tests', () => {
@@ -490,6 +493,7 @@ describe('Relay Core Tests', () => {
           "text": "ACTION  (raw Playwright) goto https://example.com on tab <n> "Example Domain" — no human pointer path, busy check or cover check; prefer act.* with refs from observe()
       SETTLED <ms>ms — page content and network went quiet
       NAV     NEW DOCUMENT → https://example.com/ (full load: client-side caches and in-memory app state were reset)
+      HIDDEN  this tab is not visible to the user: the tab "about:blank" is in front of it in its window. Chrome throttles a hidden tab's timers and animations and slows its answers to input, and colour and file choosers may not open there — page.bringToFront() brings it to the front.
 
       Console output:
       [log] Page title: Example Domain
@@ -1434,13 +1438,13 @@ describe('Relay Core Tests', () => {
 
     // Inline snapshot of cleaned HTML
     expect(text).toMatchInlineSnapshot(`
-          "[return value] <div data-testid="main">
-           <h1>Hello World</h1>
-           <button aria-label="Click me">Submit</button>
-           <a href="/about" title="About page">About</a>
-           <input type="text" placeholder="Enter name">
-          </div>"
-        `)
+      "[return value] <div class="container" data-testid="main">
+       <h1>Hello World</h1>
+       <button id="btn" aria-label="Click me">Submit</button>
+       <a href="/about" title="About page">About</a>
+       <input type="text" placeholder="Enter name">
+      </div>"
+    `)
 
     // Should NOT contain script/style tags (they're removed)
     expect(text).not.toContain('<script')

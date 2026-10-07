@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  td.empty { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Storage</span></header>
+<main>
+  <h1>Cookies and storage</h1>
+  <p id="auth-status" class="status" role="status">Not logged in</p>
+  <section class="card" aria-labelledby="h-login">
+    <h2 id="h-login">Fake login</h2>
+    <form id="login" class="row" novalidate>
+      <label for="username">Username</label><input id="username" type="text" autocomplete="username">
+      <label for="password">Password</label><input id="password" type="password" autocomplete="current-password">
+      <button type="submit" class="primary">Log in</button>
+      <button type="button" id="logout">Log out</button>
+    </form>
+  </section>
+  <section class="card" aria-labelledby="h-actions">
+    <h2 id="h-actions">Actions</h2>
+    <div class="row">
+      <button type="button" id="set-cookie">Set cookie</button>
+      <button type="button" id="set-local">Set localStorage</button>
+      <button type="button" id="set-session">Set sessionStorage</button>
+      <button type="button" id="clear-all" class="danger">Clear all</button>
+    </div>
+  </section>
+  <div class="tables">
+    <table aria-labelledby="h-cookies"><caption id="h-cookies" style="caption-side:top;text-align:left;font-weight:600">Cookies</caption><thead><tr><th scope="col">Name</th><th scope="col">Value</th></tr></thead><tbody id="cookies"></tbody></table>
+    <table aria-labelledby="h-local"><caption id="h-local" style="caption-side:top;text-align:left;font-weight:600">localStorage</caption><thead><tr><th scope="col">Key</th><th scope="col">Value</th></tr></thead><tbody id="local"></tbody></table>
+    <table aria-labelledby="h-session"><caption id="h-session" style="caption-side:top;text-align:left;font-weight:600">sessionStorage</caption><thead><tr><th scope="col">Key</th><th scope="col">Value</th></tr></thead><tbody id="session"></tbody></table>
+  </div>
+</main>
+<script type="module">
+import { $, m, on, tagLinks } from '/lab/common.js';
+
+const EXPIRE = 'expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+const cookies = () => document.cookie.split(';').map((s) => s.trim()).filter(Boolean).map((s) => {
+  const i = s.indexOf('=');
+  return i === -1 ? ['', s] : [decodeURIComponent(s.slice(0, i)), decodeURIComponent(s.slice(i + 1))];
+}).sort((a, b) => a[0].localeCompare(b[0]));
+const entries = (store) => Object.keys(store).sort().map((k) => [k, store.getItem(k)]);
+
+function fill(tbody, rows) {
+  tbody.replaceChildren(...(rows.length ? rows : [null]).map((r) => {
+    const tr = document.createElement('tr');
+    if (!r) {
+      const td = document.createElement('td');
+      td.colSpan = 2;
+      td.className = 'empty';
+      td.textContent = '(empty)';
+      tr.append(td);
+      return tr;
+    }
+    for (const v of r) { const td = document.createElement('td'); td.textContent = v; tr.append(td); }
+    return tr;
+  }));
+}
+function renderAll() {
+  m(() => {
+    fill($('#cookies'), cookies());
+    fill($('#local'), entries(localStorage));
+    fill($('#session'), entries(sessionStorage));
+    const token = localStorage.getItem('auth-token');
+    const user = cookies().find(([k]) => k === 'session')?.[1];
+    const text = token ? `Logged in as ${user || '(unknown)'} — token ${token}` : 'Not logged in';
+    if ($('#auth-status').textContent !== text) $('#auth-status').textContent = text;
+  });
+}
+
+on($('#set-cookie'), 'click', () => { document.cookie = 'theme=dark; path=/; SameSite=Lax'; renderAll(); });
+on($('#set-local'), 'click', () => { localStorage.setItem('lab-pref', 'compact'); renderAll(); });
+on($('#set-session'), 'click', () => { sessionStorage.setItem('lab-step', '2'); renderAll(); });
+on($('#clear-all'), 'click', () => {
+  for (const [name] of cookies()) document.cookie = `${encodeURIComponent(name)}=; ${EXPIRE}`;
+  localStorage.clear();
+  sessionStorage.clear();
+  renderAll();
+});
+on($('#login'), 'submit', (e) => {
+  e.preventDefault();
+  const user = $('#username').value.trim();
+  if (!user || !$('#password').value) {
+    $('#auth-status').textContent = 'Enter username and password';
+    return;
+  }
+  localStorage.setItem('auth-token', `tok_${user}_2026`);
+  sessionStorage.setItem('auth-user', user);
+  document.cookie = `session=${encodeURIComponent(user)}; path=/; SameSite=Lax`;
+  renderAll();
+});
+on($('#logout'), 'click', () => {
+  localStorage.removeItem('auth-token');
+  sessionStorage.removeItem('auth-user');
+  document.cookie = `session=; ${EXPIRE}`;
+  renderAll();
+});
+window.addEventListener('storage', renderAll);
+
+renderAll();
+tagLinks();
+</script>
+</body>
+</html>

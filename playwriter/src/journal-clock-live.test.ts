@@ -347,8 +347,12 @@ describe('requests of dedicated workers', () => {
     // A search returns its matches with the lines around them (here the favicon's 404).
     const logs = await executor.execute('return JSON.stringify(await getLatestLogs({ search: /parser worker/ }))', 30000)
     expect(logs.isError, logs.text).toBe(false)
+    // Each entry keeps where it was logged on its following lines; an exception keeps its stack frames.
     expect(JSON.parse(logs.text.replace(/^\[return value\] /, ''))).toEqual(
-      expect.arrayContaining(['[error] parser worker: bad row 7 in rows.csv', '[pageerror] parser worker crashed on row 7']),
+      expect.arrayContaining([
+        `[error] parser worker: bad row 7 in rows.csv\n    at http://localhost:${port}/parse-worker.js:2:11`,
+        expect.stringMatching(new RegExp(`^\\[pageerror\\] parser worker crashed on row 7\\n    at .*parse-worker\\.js:3:\\d+`)),
+      ]),
     )
   })
 })

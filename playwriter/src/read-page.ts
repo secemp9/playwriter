@@ -8,10 +8,16 @@
  *   - The function runs in the page's own JavaScript world, in the frame of the element it reads, as
  *     `fn(el, arg)` — `el` is the element of `ref`, or the page's `document` without one — through
  *     `Runtime.evaluate` without `userGesture`: measured, `navigator.userActivation` stays false.
- *     `Runtime.evaluate` because it is the only call V8 bounds in time itself (see below); it receives
- *     the element of a ref as `$_`, the console helper Chrome sets to the result of a call made in the
- *     console group, so a read with a ref runs with Chrome's console helpers defined, as a DevTools
- *     console expression does ($, $$, keys…; they are gone when it returns).
+ *     `Runtime.evaluate` because it is the only call V8 bounds in time itself (see below). An
+ *     evaluated expression receives no object, so the element of a ref is reached from its frame's
+ *     `document` by its path — child positions, and `shadowRoot` for an open shadow root — measured in
+ *     playwriter's isolated world just before; after the read, the element the function got is
+ *     checked to be the ref's node. An element inside a closed shadow root has no such path: it is
+ *     handed over as `$_`, the console helper Chrome sets to the result of a call made in the console
+ *     group, so that read runs with Chrome's console helpers defined, as a DevTools console
+ *     expression does ($, $$, keys…; gone when it returns). Chrome gives those helpers only to fully
+ *     trusted debugger clients — not to an extension's chrome.debugger — so through the extension
+ *     such an element cannot be read with a function.
  *   - Under V8's side-effect check (`throwOnSideEffect`, the check DevTools' eager evaluation uses):
  *     V8 aborts the call before anything with an effect runs — a DOM or style write, a storage write, an
  *     event, focus, scrolling, a request, a global write, a write into a page object, a timer, a
@@ -68,8 +74,40 @@ const STOP_AFTER_BUDGET_MS = 1000
 const CONSOLE_GROUP = 'console'
 /** Thrown by the expression when `$_` is not the element this read handed over. */
 const CARRIER_MARK = '__playwriterReadCarrier__'
+/** Thrown by the expression when Chrome defined no console helpers for it (a client it does not fully trust). */
+const NO_HELPERS_MARK = '__playwriterReadNoConsoleHelpers__'
+/** Thrown by the expression when the path of the ref's element leads nowhere: the page moved it. */
+const PATH_MARK = '__playwriterReadPath__'
 /** Called on the element of a ref, in the console group: `$_` becomes `{ element, nonce }` in its page world. */
 const CARRIER_FN = 'function (nonce) { return { element: this, nonce: nonce } }'
+/**
+ * Run in playwriter's isolated world on the element of a ref: its path from its frame's document —
+ * for each step down, its position among the element children (`-1`: into the open shadow root of the
+ * element reached) — or `{ closed: true }` inside a closed shadow root, or null when it is in no document.
+ */
+const PATH_FN = `function (_args, element) {
+  if (!element) return null
+  const steps = []
+  let node = element
+  while (node.parentNode) {
+    const parent = node.parentNode
+    let index = 0
+    for (let sibling = parent.firstElementChild; sibling && sibling !== node; sibling = sibling.nextElementSibling) index++
+    steps.push(index)
+    if (parent.nodeType === Node.DOCUMENT_NODE) return { steps: steps.reverse() }
+    if (parent.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+      if (!parent.host) return null
+      if (parent.mode !== 'open') return { closed: true }
+      steps.push(-1)
+      node = parent.host
+      continue
+    }
+    node = parent
+  }
+  return null
+}`
+/** Read from the wrapper's result: the element (or document) the function was called with. */
+const TARGET_FN = 'function () { return this.target }'
 
 const HELPER = '__playwriterRead'
 const BUDGET_MARK = '__playwriterReadBudget__'
@@ -82,9 +120,14 @@ const LOCATE_BUDGET_MS = 3000
 export interface ReadPageOptions {
   /** A ref from observe()/find(): the function gets that element, and runs in its frame. */
   ref?: number | string
+  /**
+   * A query in find()'s handler grammar (`role/button[name="Save"]`, `label/Email`, `text/…`, `pierce/…`):
+   * the function gets the one element it matches.
+   */
+  query?: string
   /** Data for the function's second parameter: JSON (strings, numbers, booleans, null, arrays, plain objects). */
   arg?: unknown
-  /** The tab to read without a ref (default: the current page). */
+  /** The tab to read (or search, with `query`) without a ref (default: the current page). */
   page?: Page
 }
 
@@ -95,6 +138,8 @@ export interface ReadPageDeps {
   currentPage: () => Page
   /** Prints one `console.*` call the function made. */
   log: (level: string, text: string) => void
+  /** The ref of the one element `query` matches on `page` (page-query.ts); throws the model-facing error otherwise. */
+  resolveQuery: (query: string, page: Page) => Promise<number>
 }
 
 /** One element a read returned: its ref when observe() lists it (or an element containing it), and the line observe() would print. */
@@ -337,9 +382,9 @@ const PRELUDE = `(function (target, budgetMs, stopAt) {
     finish: function (value) {
       stop('r')
       var nodes = nodeList(value)
-      if (nodes) return { kind: 'nodes', nodes: nodes.list, single: nodes.single, logs: logs, targetDocument: targetDocument }
+      if (nodes) return { kind: 'nodes', nodes: nodes.list, single: nodes.single, logs: logs, targetDocument: targetDocument, target: target }
       check(value, 'the result', [])
-      return { kind: 'value', json: value === undefined ? undefined : JSON.stringify(value), logs: logs }
+      return { kind: 'value', json: value === undefined ? undefined : JSON.stringify(value), logs: logs, target: target }
     },
   }
 })`
@@ -806,18 +851,30 @@ interface ReadPayload {
   stopAt: number
 }
 
+/** How the expression gets the function's target: the document, the element at a path from it, or the element in `$_`. */
+type Handover = { kind: 'document' } | { kind: 'path'; steps: number[] } | { kind: 'carrier'; nonce: string }
+
 /**
- * The expression readPage evaluates: the wrapper applied to the page's `document`, or to the element
- * handed over in `$_` when `nonce` is set (checked, so a `$_` the page defines itself is never read as
- * the element). The wrapper starts on the expression's first line, so its line numbers stay its own.
+ * The expression readPage evaluates: the wrapper applied to the page's `document`, to the element at
+ * the handover's path from it, or to the element handed over in `$_` (checked against the nonce, so a
+ * `$_` the page defines itself is never read as the element). The wrapper starts on the expression's
+ * first line, so its line numbers stay its own.
  */
-function expressionFor(prepared: PreparedRead, payload: ReadPayload, nonce: string | null): string {
+function expressionFor(prepared: PreparedRead, payload: ReadPayload, handover: Handover): string {
   const { declaration } = wrapperFor(prepared)
   const data = JSON.stringify(payload)
-  if (nonce === null) return `(${declaration}).call(document, ${data})`
+  if (handover.kind === 'document') return `(${declaration}).call(document, ${data})`
+  if (handover.kind === 'path') {
+    return (
+      `(function (steps) { var node = document; for (var i = 0; i < steps.length && node; i++) { if (steps[i] === -1) { node = node.shadowRoot; continue } ` +
+      `node = node.firstElementChild; for (var k = 0; k < steps[i] && node; k++) node = node.nextElementSibling } ` +
+      `if (!node) throw new TypeError(${JSON.stringify(PATH_MARK)}); return (${declaration}).call(node, ${data}) })(${JSON.stringify(handover.steps)})`
+    )
+  }
   return (
-    `(function (carrier) { if (carrier === null || typeof carrier !== 'object' || carrier.nonce !== ${JSON.stringify(nonce)}) ` +
-    `throw new TypeError(${JSON.stringify(CARRIER_MARK)}); return (${declaration}).call(carrier.element, ${data}) })($_)`
+    `(function (carrier) { if (carrier === ${JSON.stringify(NO_HELPERS_MARK)}) throw new TypeError(carrier); ` +
+    `if (carrier === null || typeof carrier !== 'object' || carrier.nonce !== ${JSON.stringify(handover.nonce)}) ` +
+    `throw new TypeError(${JSON.stringify(CARRIER_MARK)}); return (${declaration}).call(carrier.element, ${data}) })(typeof $_ === 'undefined' ? ${JSON.stringify(NO_HELPERS_MARK)} : $_)`
   )
 }
 
@@ -857,18 +914,21 @@ function isPage(value: unknown): value is Page {
 function checkOptions(options: unknown): ReadPageOptions {
   if (options === undefined) return {}
   if (typeof options !== 'object' || options === null || Array.isArray(options)) {
-    throw readError('its second argument is an options object: { ref, arg, page }.')
+    throw readError('its second argument is an options object: { ref, query, arg, page }.')
   }
-  const unknown = Object.keys(options).filter((key) => key !== 'ref' && key !== 'arg' && key !== 'page')
-  if (unknown.length > 0) throw readError(`unknown option${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')}; the options are { ref, arg, page }.`)
+  const unknown = Object.keys(options).filter((key) => key !== 'ref' && key !== 'query' && key !== 'arg' && key !== 'page')
+  if (unknown.length > 0) throw readError(`unknown option${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')}; the options are { ref, query, arg, page }.`)
   const ref: unknown = Reflect.get(options, 'ref')
+  const query: unknown = Reflect.get(options, 'query')
   const page: unknown = Reflect.get(options, 'page')
   const arg: unknown = Reflect.get(options, 'arg')
   if (ref !== undefined && !isRef(ref)) throw readError('ref is the number observe() or find() printed in brackets, like { ref: 12 }.')
+  if (query !== undefined && typeof query !== 'string') throw readError('query is a string in find()\'s grammar, like { query: \'role/button[name="Save"]\' }.')
   if (page !== undefined && !isPage(page)) throw readError('page must be a Playwright page (a tab), like state.page.')
   if (ref !== undefined && page !== undefined) throw readError('pass either ref (refs know their tab) or page, not both.')
+  if (ref !== undefined && query !== undefined) throw readError('pass either ref or query (the element it matches), not both.')
   checkArg(arg, 'arg', new Set())
-  return { ...(ref !== undefined ? { ref } : {}), ...(page !== undefined ? { page } : {}), arg }
+  return { ...(ref !== undefined ? { ref } : {}), ...(query !== undefined ? { query } : {}), ...(page !== undefined ? { page } : {}), arg }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -926,6 +986,16 @@ function failureOf(details: Protocol.Runtime.ExceptionDetails, prepared: Prepare
       "the element could not be handed to the function: this page defines its own $_, which hides Chrome's console helper " +
         'readPage hands the element over with. Read without a ref, starting from the document (document.querySelector(…)).',
     )
+  }
+  if (head.includes(NO_HELPERS_MARK)) {
+    return readError(
+      "the element is inside a closed shadow root, which the page's own JavaScript cannot reach, and Chrome gives this connection (the " +
+        "Playwriter extension's debugger) none of the console helpers it would be handed over with. Read it without a function: " +
+        'getCleanHTML({ ref }) for its markup, snapshot({ ref }) for its accessibility tree, explain(ref) for what it does.',
+    )
+  }
+  if (head.includes(PATH_MARK)) {
+    return readError('the page moved the element while it was being read, so its place in the document changed. Call readPage again.')
   }
   if (head.includes(BUDGET_MARK)) {
     return readError(
@@ -1096,14 +1166,28 @@ interface ReadTarget {
   frame: FrameHandle
   /** The page world of a same-process iframe, by id; undefined for the session's own top document (its default context). */
   contextId: number | undefined
-  /** The element of a ref, resolved in its frame's page world; null to read the document. */
-  element: { ref: number; objectId: string } | null
+  /**
+   * The element of a ref (null to read the document): reached by its path from its frame's document, or —
+   * inside a closed shadow root — handed over as `$_` from its object in the frame's page world.
+   */
+  element: { ref: number; backendNodeId: number; handover: { kind: 'path'; steps: number[] } | { kind: 'carrier'; objectId: string } } | null
 }
 
 async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGroup: string): Promise<ReadTarget> {
   if (options.ref !== undefined) {
     const element = await deps.probes.element(options.ref)
     const { frame } = element
+    const placed = await frame.world.callFunctionOnNodes<{ steps: number[] } | { closed: true } | null>([element.target.backendNodeId], PATH_FN, {
+      what: `finding where [${element.target.ref}] is in its document`,
+    })
+    if (placed === null) throw readError(`[${element.target.ref}] is no longer in the page. Call observe() again.`)
+    // The top document of a session is its default context; an iframe in the same process is reached by id.
+    const contextId =
+      frame.sessionRootId === frame.frameId
+        ? undefined
+        : await withDeadline(pageWorldContextId(frame.frame), CDP_TIMEOUT_MS, `finding the page world of the frame of [${element.target.ref}]`)
+    const base = { page: element.page, cdp: frame.cdp, frame, contextId }
+    if ('steps' in placed) return { ...base, element: { ref: element.target.ref, backendNodeId: element.target.backendNodeId, handover: { kind: 'path', steps: placed.steps } } }
     await withDeadline(frame.cdp.send('DOM.enable'), CDP_TIMEOUT_MS, 'enabling the DOM domain')
     const resolved = await withDeadline(
       frame.cdp.send('DOM.resolveNode', { backendNodeId: element.target.backendNodeId, objectGroup }),
@@ -1111,12 +1195,7 @@ async function targetOf(options: ReadPageOptions, deps: ReadPageDeps, objectGrou
       `resolving [${element.target.ref}] in the page`,
     )
     if (!resolved.object.objectId) throw readError(`[${element.target.ref}] is no longer in the page. Call observe() again.`)
-    // The top document of a session is its default context; an iframe in the same process is reached by id.
-    const contextId =
-      frame.sessionRootId === frame.frameId
-        ? undefined
-        : await withDeadline(pageWorldContextId(frame.frame), CDP_TIMEOUT_MS, `finding the page world of the frame of [${element.target.ref}]`)
-    return { page: element.page, cdp: frame.cdp, frame, contextId, element: { ref: element.target.ref, objectId: resolved.object.objectId } }
+    return { ...base, element: { ref: element.target.ref, backendNodeId: element.target.backendNodeId, handover: { kind: 'carrier', objectId: resolved.object.objectId } } }
   }
   const page = options.page ?? deps.currentPage()
   const probe = await deps.probes.get(page)
@@ -1149,15 +1228,20 @@ async function inTurn<T>(cdp: ICDPSession, read: () => Promise<T>): Promise<T> {
 
 /**
  * Evaluate the read — and, when Chrome's check stops it, run it again to find where — with the element of
- * a ref handed over in `$_`. Resolves with the evaluation that returned; throws the model-facing error.
+ * a ref reached by its path, or handed over in `$_`. Resolves with the evaluation that returned; throws the
+ * model-facing error.
  */
 async function evaluateRead(fn: unknown, prepared: PreparedRead, options: ReadPageOptions, target: ReadTarget, objectGroup: string): Promise<Protocol.Runtime.EvaluateResponse> {
   const { cdp, element } = target
-  const nonce = element === null ? null : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  if (element !== null) {
+  let handover: Handover = { kind: 'document' }
+  if (element?.handover.kind === 'path') handover = { kind: 'path', steps: element.handover.steps }
+  const carrier = element?.handover.kind === 'carrier' ? element.handover.objectId : null
+  if (element !== null && carrier !== null) {
+    const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    handover = { kind: 'carrier', nonce }
     await withDeadline(
       cdp.send('Runtime.callFunctionOn', {
-        objectId: element.objectId,
+        objectId: carrier,
         functionDeclaration: CARRIER_FN,
         arguments: [{ value: nonce }],
         objectGroup: CONSOLE_GROUP,
@@ -1172,9 +1256,9 @@ async function evaluateRead(fn: unknown, prepared: PreparedRead, options: ReadPa
     const run = async (code: PreparedRead, stopAt: number): Promise<Protocol.Runtime.EvaluateResponse> =>
       await withDeadline(
         cdp.send('Runtime.evaluate', {
-          expression: expressionFor(code, { has: options.arg !== undefined, value: options.arg ?? null, stopAt }, nonce),
+          expression: expressionFor(code, { has: options.arg !== undefined, value: options.arg ?? null, stopAt }, handover),
           ...(target.contextId === undefined ? {} : { contextId: target.contextId }),
-          includeCommandLineAPI: element !== null,
+          includeCommandLineAPI: handover.kind === 'carrier',
           throwOnSideEffect: true,
           timeout: READ_BUDGET_MS + STOP_AFTER_BUDGET_MS,
           returnByValue: false,
@@ -1199,16 +1283,40 @@ async function evaluateRead(fn: unknown, prepared: PreparedRead, options: ReadPa
     return called
   } finally {
     // Releasing the console group also clears `$_`.
-    if (element !== null) {
+    if (carrier !== null) {
       await withDeadline(cdp.send('Runtime.releaseObjectGroup', { objectGroup: CONSOLE_GROUP }), CDP_TIMEOUT_MS, 'releasing the element handed to the function').catch(() => {})
     }
   }
 }
 
-/** `readPage(fn, { ref, arg, page })` — see the module comment. */
+/**
+ * The element a path led to is the ref's node: the page can move elements between the path being measured
+ * and the read (its own code runs in between), and a read of another element must not pass as the ref's.
+ */
+async function checkPathTarget(target: ReadTarget, resultId: string, objectGroup: string): Promise<void> {
+  const { element, cdp } = target
+  if (element === null || element.handover.kind !== 'path') return
+  const reached = await withDeadline(
+    cdp.send('Runtime.callFunctionOn', { functionDeclaration: TARGET_FN, objectId: resultId, returnByValue: false, throwOnSideEffect: true, objectGroup }),
+    CDP_TIMEOUT_MS,
+    `checking the function read [${element.ref}]`,
+  )
+  const objectId = reached.result.objectId
+  const { node } = objectId
+    ? await withDeadline(cdp.send('DOM.describeNode', { objectId }), CDP_TIMEOUT_MS, `checking the function read [${element.ref}]`)
+    : { node: null }
+  if (node?.backendNodeId !== element.backendNodeId) {
+    throw readError(`the page moved [${element.ref}] while it was being read, so the function read another element. Call readPage again.`)
+  }
+}
+
+/** `readPage(fn, { ref, query, arg, page })` — see the module comment. */
 export async function readPage(fn: unknown, rawOptions: unknown, deps: ReadPageDeps): Promise<unknown> {
   const prepared = prepareRead(fn)
-  const options = checkOptions(rawOptions)
+  const checked = checkOptions(rawOptions)
+  // A query is resolved to the ref of the one element it matches (page-query.ts).
+  const options: ReadPageOptions =
+    checked.query === undefined ? checked : { ref: await deps.resolveQuery(checked.query, checked.page ?? deps.currentPage()), arg: checked.arg }
   const objectGroup = `playwriter-read-${Date.now()}-${Math.random().toString(36).slice(2)}`
   const target = await targetOf(options, deps, objectGroup)
   const { cdp } = target
@@ -1216,6 +1324,7 @@ export async function readPage(fn: unknown, rawOptions: unknown, deps: ReadPageD
     const called = await inTurn(cdp, () => evaluateRead(fn, prepared, options, target, objectGroup))
     const resultId = called.result.objectId
     if (!resultId) throw readError('the page returned no result object.')
+    await checkPathTarget(target, resultId, objectGroup)
     const summarized = await withDeadline(
       cdp.send('Runtime.callFunctionOn', { functionDeclaration: RESULT_SUMMARY_FN, objectId: resultId, returnByValue: true, throwOnSideEffect: true, objectGroup }),
       CDP_TIMEOUT_MS,

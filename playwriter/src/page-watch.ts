@@ -22,8 +22,9 @@
  *    streaming before reading it.
  *
  * Ground truth only. "Busy" comes from what the page states (the accessibility tree's
- * `busy`, a progressbar's value and whether it moved, endlessly repeating animations that
- * are actually on screen and on top) and from measurements (content still changing,
+ * `busy`, a progressbar's value and whether it moves, endlessly repeating animations on
+ * elements that show nothing to read — spinners, and skeleton placeholders — that are
+ * actually on screen and on top) and from measurements (content still changing,
  * response bytes still arriving). Which requests matter comes from CDP request facts
  * (resource type, ad tagging) and from causality: only requests that started after the
  * action began can hold its settle. No host lists, no words, no class names.
@@ -89,6 +90,7 @@ import {
   type WebSocketFrameRecord,
 } from './probe-types.js'
 import { PageSessionTap, type SessionTap, type TapListener, type TappedEvent, type TappedSession, type TappedWorker } from './session-tap.js'
+import { failureText, headerValue, originOf, type RequestFacts, type RequestView } from './network-detail.js'
 
 const REQUEST_CAP = 500
 const CONSOLE_CAP = 500
@@ -111,6 +113,11 @@ const STREAM_RECENT_MS = 500
 const HELD_REQUEST_MS = 2000
 /** Image/Font/Media requests that received nothing for this long stop holding quiet (a stalled asset, not the action's effect). */
 const STALLED_ASSET_MS = 3000
+/**
+ * Without an action to measure from, a determinate progressbar whose value changed within this
+ * window is moving (the journal's churn gap: an element still changing changed within 2 s).
+ */
+const PROGRESS_MOVING_MS = 2000
 const SETUP_NAME = 'page-watch'
 const READER = '__playwriterWatch'
 
@@ -497,12 +504,40 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     watched.forEach(function (role, el) { recordLive(el, role, now, seenTexts); });
   }
 
-  /** Endlessly repeating animations on screen: candidates for "a spinner a person sees". The host hit-tests them. */
-  function spinners() {
+  // What an endless animation is, from what the animated element shows and how it moves. One on an
+  // element that shows text or holds a control or media (a pulsing "LIVE" badge, a glowing button)
+  // is an attention effect on content a person reads anyway, not a loading indicator. One on an
+  // element that shows nothing and stays in place — it shimmers or pulses (background, opacity,
+  // colour), no transform, no image of its own — stands in for content still loading when the page
+  // says so (inside an aria-busy element) or when its siblings run the same animation (a list of
+  // placeholder cards): a skeleton. Every other one (a turning ring, an animated icon) is a spinner.
+  var MOVING_PROPS = { transform: 1, rotate: 1, scale: 1, translate: 1, offsetDistance: 1, offsetRotate: 1, offsetPath: 1, offsetPosition: 1, offsetAnchor: 1, left: 1, top: 1, right: 1, bottom: 1, strokeDashoffset: 1, strokeDasharray: 1 };
+  var CONTENT_SEL = 'input,select,textarea,button,video,audio,canvas,iframe,embed,object,meter,progress';
+  var IMAGE_SEL = 'img,svg,picture';
+  function movesItself(effect) {
+    var frames = effect.getKeyframes();
+    for (var i = 0; i < frames.length; i++) for (var p in frames[i]) if (MOVING_PROPS[p]) return true;
+    return false;
+  }
+  /** \`role "name"\` of the nearest ancestor with a role or a name: where a placeholder stands. */
+  function containerLabel(el) {
+    for (var e = parentOf(el); e && e !== document.body && e !== document.documentElement; e = parentOf(e)) {
+      var r = roleOf(e), n = nameOf(e);
+      if (r || n) return (r || 'area') + (n ? ' "' + n + '"' : '');
+    }
+    return '';
+  }
+  /** An aria-busy element as the host's accessibility-tree label reads it: role (area for none), then its name or text. */
+  function busyLabel(el) {
+    var n = nameOf(el) || textOf(el, 60);
+    return (roleOf(el) || 'area') + (n ? ' "' + n + '"' : '') + ' [aria-busy]';
+  }
+  /** Endlessly repeating animations on screen that may be loading indicators, classified (see above); \`kind\` spinner or skeleton. */
+  function indicators() {
     var now = Date.now();
     var anims = document.getAnimations();
     liveRoots().forEach(function (root) { anims = anims.concat(root.getAnimations()); });
-    var seen = new Set(), els = [], out = [];
+    var seen = new Set(), found = [];
     var vw = innerWidth, vh = innerHeight;
     for (var i = 0; i < anims.length; i++) {
       var a = anims[i];
@@ -513,20 +548,61 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
       if (seen.has(el)) continue;
       seen.add(el);
       if (!el.isConnected || !el.checkVisibility({ opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true })) continue;
+      if (textOf(el, 1) !== '' || el.matches(CONTENT_SEL) || el.querySelector(CONTENT_SEL)) continue;
       var r = el.getBoundingClientRect();
       var x1 = Math.max(r.left, 0), y1 = Math.max(r.top, 0), x2 = Math.min(r.right, vw), y2 = Math.min(r.bottom, vh);
       if (x2 - x1 < 1 || y2 - y1 < 1) continue;
-      out.push({
-        label: describe(el, 40) + (a.animationName ? ' (animation ' + a.animationName + ')' : ''),
+      found.push({
+        el: el, animation: a.animationName || '', still: !movesItself(effect) && !el.matches(IMAGE_SEL) && !el.querySelector(IMAGE_SEL),
         startedAt: a.startTime === null ? now : Math.round(performance.timeOrigin + a.startTime),
         x: Math.round((x1 + x2) / 2), y: Math.round((y1 + y2) / 2)
       });
-      els.push(el);
     }
-    var id = nextSpinnerSet++;
-    spinnerSets[id] = els;
+    var siblings = new Map();
+    found.forEach(function (f) {
+      if (!f.still) return;
+      var parent = parentOf(f.el), byName = siblings.get(parent) || {};
+      byName[f.animation] = (byName[f.animation] || 0) + 1;
+      siblings.set(parent, byName);
+    });
+    found.forEach(function (f) {
+      var placeholder = f.still && (closestFlat(f.el, '[aria-busy=true]') !== null || siblings.get(parentOf(f.el))[f.animation] >= 2);
+      f.kind = placeholder ? 'skeleton' : 'spinner';
+      f.label = describe(f.el, 40) + (f.animation ? ' (animation ' + f.animation + ')' : '');
+      f.container = placeholder ? containerLabel(f.el) : '';
+    });
+    return found;
+  }
+  /** The host hit-tests these against every frame boundary; \`set\` names their elements for it. */
+  function spinners() {
+    var found = indicators(), id = nextSpinnerSet++;
+    spinnerSets[id] = found.map(function (f) { return f.el; });
     delete spinnerSets[id - SPINNER_SETS_KEPT];
-    return { set: id, list: out };
+    return {
+      set: id,
+      list: found.map(function (f) { return { kind: f.kind, label: f.label, animation: f.animation, container: f.container, startedAt: f.startedAt, x: f.x, y: f.y }; })
+    };
+  }
+  /**
+   * Loading indicators shown now, cheaply, for the settle loop to note what it waited through:
+   * aria-busy elements that are rendered, and spinners and skeletons on screen whose centre this
+   * document's own hit test lands on (what covers the frame itself is not checked here). \`key\`
+   * stays the same while a skeleton list grows or shrinks; \`label\` says how many there are now.
+   */
+  function loading() {
+    var out = [], groups = new Map();
+    var busyEls = Array.prototype.slice.call(document.querySelectorAll('[aria-busy=true]'));
+    liveRoots().forEach(function (root) { busyEls = busyEls.concat(Array.prototype.slice.call(root.querySelectorAll('[aria-busy=true]'))); });
+    busyEls.forEach(function (el) { if (shown(el, false)) { var l = busyLabel(el); out.push({ key: l, label: l }); } });
+    indicators().forEach(function (f) {
+      var hit = f.el.getRootNode().elementFromPoint(f.x, f.y);
+      if (!hit || !(hit === f.el || f.el.contains(hit))) return;
+      if (f.kind === 'spinner') { out.push({ key: f.label, label: f.label }); return; }
+      var tail = (f.animation ? ' (animation ' + f.animation + ')' : '') + (f.container ? ' in ' + f.container : '');
+      groups.set(tail, (groups.get(tail) || 0) + 1);
+    });
+    groups.forEach(function (n, tail) { out.push({ key: 'skeleton placeholders' + tail, label: n + ' skeleton placeholder' + (n === 1 ? '' : 's') + tail }); });
+    return out;
   }
 
   function busy(arg) {
@@ -568,7 +644,8 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
         token: token, now: Date.now(), installedAt: installedAt, lastContentAt: last.at,
         hot: arg.labels ? placeOf(last.el) : null,
         ambient: arg.labels && arg.from !== null ? ambientSince(arg.cutoff, arg.from) : [],
-        content: totals.content, cosmetic: totals.cosmetic
+        content: totals.content, cosmetic: totals.cosmetic,
+        loading: arg.loading ? loading() : null
       };
     },
     read: function (sinceAt) {
@@ -660,6 +737,15 @@ interface ContentState {
   ambient: string[]
   content: number
   cosmetic: number
+  /** Loading indicators shown now, every frame's (labels name the iframe); null when not asked for. */
+  loading: LoadingIndicator[] | null
+}
+
+/** An aria-busy element, a spinner or a skeleton group shown at one read (see the journal's `loading()`). */
+interface LoadingIndicator {
+  /** The same while it is shown, even when a skeleton list changes size. */
+  key: string
+  label: string
 }
 
 /** One frame journal's state. */
@@ -689,7 +775,13 @@ interface WorldRead {
 }
 
 interface WorldSpinner {
+  /** A skeleton placeholder stands in for content still loading; anything else animated endlessly with nothing to read is a spinner. */
+  kind: 'spinner' | 'skeleton'
   label: string
+  /** CSS animation name, '' for a script-made animation. */
+  animation: string
+  /** A skeleton's nearest ancestor with a role or name (`area "Products"`), '' for a spinner or none. */
+  container: string
   /** When the animation started, page clock. */
   startedAt: number
   /** Centre of its on-screen part, viewport CSS pixels. */
@@ -765,6 +857,15 @@ interface RequestEntry extends Omit<NetworkRecord, 'startedAt'> {
   redirectedTo?: string
   /** The frame Chrome said it is for (a navigation's: the frame navigating). */
   frameId?: string
+  /**
+   * A worker's main script (`new Worker(url)`, `serviceWorker.register(url)`) fetched for the worker:
+   * Chrome announces it on the page's session (measured, Chrome 149: type Script, `loaderId` "",
+   * `documentURL` the script's own address) and reports its response and end on the worker's own
+   * target, which a service worker's never reaches this module. It never holds quiet.
+   */
+  workerScript?: true
+  /** Headers, body, timings, sizes and failure as Chrome reported them (net.request, net.har). */
+  facts: RequestFacts
 }
 
 /** The page's dialog state machine (DialogController); PageWatch only reads it. */
@@ -811,11 +912,28 @@ export interface IdleOptions {
 
 export interface BusyOptions {
   /**
-   * The last dispatched action's checkpoint. With it, an endless animation already running
-   * before it is weak and a determinate progressbar is strong only if it advanced after it.
-   * Without it, every endless animation on screen is a strong spinner and determinate bars are weak.
+   * The last dispatched action's checkpoint. With it, a spinner or skeleton already shown before
+   * it is weak and a determinate progressbar is strong only if it advanced after it. Without it,
+   * every spinner and skeleton on screen is strong, and a determinate bar is strong only if its
+   * value changed within the last PROGRESS_MOVING_MS. A bar standing still is no signal either way.
    */
   since?: WatchCheckpoint
+}
+
+/** A frame's accessibility tree as one busy read got it, for its document `loaderId`. */
+export interface FrameAxTree {
+  loaderId: string
+  nodes: Protocol.Accessibility.AXNode[]
+}
+
+/**
+ * A busy read: its signals, and each frame's accessibility tree it was computed from (by frame id).
+ * An observation taken right after reuses the trees instead of reading them again; each is only
+ * good for the document it was read from (`loaderId`).
+ */
+export interface BusyRead {
+  signals: BusySignal[]
+  axTrees: Map<string, FrameAxTree>
 }
 
 interface QuietGoal {
@@ -882,6 +1000,7 @@ function publicRecord(entry: RequestEntry, clock: BrowserClock): NetworkRecord {
     lastDataAt: _lastDataAt,
     redirectedTo: _redirectedTo,
     frameId: _frameId,
+    facts: _facts,
     ...record
   } = entry
   return { ...record, startedAt: Math.round(clock.toLocal(issuedAt)) }
@@ -891,29 +1010,19 @@ function isFailed(entry: Pick<NetworkRecord, 'failed' | 'status'>): boolean {
   return entry.failed !== undefined || (entry.status !== undefined && entry.status >= 400)
 }
 
-/**
- * Why Chrome says a request failed. Its `errorText` is empty for a request it blocked (measured:
- * GitHub's fetch whose cross-origin redirect the page's CSP refused came with `errorText: ""` and
- * `blockedReason: "csp"`); the block or CORS reason it gave is the reason then.
- */
-function failureOf(e: Protocol.Network.LoadingFailedEvent): string {
-  if (e.canceled) return 'canceled'
-  if (e.errorText) return e.errorText
-  if (e.blockedReason) return `blocked: ${e.blockedReason}`
-  if (e.corsErrorStatus) return `CORS error: ${e.corsErrorStatus.corsError}${e.corsErrorStatus.failedParameter ? ` (${e.corsErrorStatus.failedParameter})` : ''}`
-  return 'failed; Chrome gave no reason'
-}
-
 function axProperty(node: Protocol.Accessibility.AXNode, name: string): unknown {
   return node.properties?.find((property) => property.name === name)?.value?.value
 }
+
+/** Chrome role names that mean nothing to a reader, in the words a person uses: a div or span with no role, the document. */
+const READER_ROLE: Record<string, string> = { generic: 'area', RootWebArea: 'page' }
 
 /**
  * `role "name"`; a node without a name (a status, a region) is labelled by the text it shows,
  * gathered from its StaticText descendants, which is what a person reads there.
  */
 function axLabel(node: Protocol.Accessibility.AXNode, byId: Map<string, Protocol.Accessibility.AXNode>): string {
-  const role = typeof node.role?.value === 'string' ? node.role.value : 'element'
+  const role = typeof node.role?.value === 'string' ? (READER_ROLE[node.role.value] ?? node.role.value) : 'element'
   let text = typeof node.name?.value === 'string' ? node.name.value.trim() : ''
   const pending = text ? [] : [...(node.childIds ?? [])].reverse()
   while (pending.length > 0 && text.length <= 60) {
@@ -974,6 +1083,12 @@ export class PageWatch {
    * on the iframe's own session once the new renderer commits it (measured).
    */
   private readonly requestsById = new Map<string, RequestEntry>()
+  /**
+   * Wire headers Chrome reported for a request id before its hop was journaled
+   * (`requestWillBeSentExtraInfo` can arrive before `requestWillBeSent` — measured, Chrome 145), taken
+   * by the hop when it is. Bounded like the journal: ids whose hop never comes are dropped oldest first.
+   */
+  private readonly earlyWireHeaders = new Map<string, { sent: Protocol.Network.Headers[]; received: Array<{ statusCode: number; headers: Protocol.Network.Headers }> }>()
   private readonly consoleLog: ConsoleEntry[] = []
   private readonly navigationLog: NavigationRecord[] = []
   private readonly dialogLog: DialogEntry[] = []
@@ -1171,13 +1286,18 @@ export class PageWatch {
    * the frozen page cannot be read, and pretending it shows nothing busy would be a lie.
    */
   async busySignals(options: BusyOptions = {}): Promise<BusySignal[]> {
+    return (await this.readBusy(options)).signals
+  }
+
+  /** busySignals, with the accessibility trees they were read from: the next observation needs them too. */
+  async readBusy(options: BusyOptions = {}): Promise<BusyRead> {
     await this.waitOutAutoDialog('reading busy signals')
     // Compared in the page with the journal's stamps: on the browser's clock.
     const sinceAt = options.since ? await this.onBrowserClock(options.since.at) : null
     const perFrame = await this.eachFrame(await this.readableFrames(), (entry) => this.frameBusySignals(entry, sinceAt))
-    const out = perFrame.flatMap(({ value }) => value)
-    out.push(...this.networkBusy())
-    return out
+    const signals = perFrame.flatMap(({ value }) => value.signals)
+    signals.push(...this.networkBusy())
+    return { signals, axTrees: new Map(perFrame.map(({ handle, value }) => [handle.frameId, { loaderId: handle.loaderId, nodes: value.nodes }])) }
   }
 
   /**
@@ -1232,6 +1352,50 @@ export class PageWatch {
     )
     const limited = filter.limit !== undefined && filter.limit >= 0 ? matches.slice(Math.max(0, matches.length - filter.limit)) : matches
     return limited.map((r) => publicRecord(r, this.clock))
+  }
+
+  /** Journaled hop `id` with everything Chrome reported about it (net.request, net.har). */
+  requestView(id: string): RequestView {
+    const entry = this.requestLog.find((r) => r.id === id)
+    if (!entry) {
+      throw new ModelFacingError(`No request ${id} in the journal. Ids come from net.requests() and the report; the journal keeps the last ${REQUEST_CAP} requests of this page.`)
+    }
+    return this.viewOf(entry)
+  }
+
+  /** Every journaled hop whose URL contains `urlIncludes` (all of them without it), oldest first. */
+  requestViews(filter: { urlIncludes?: string } = {}): RequestView[] {
+    return this.requestLog.filter((r) => !filter.urlIncludes || r.url.includes(filter.urlIncludes)).map((r) => this.viewOf(r))
+  }
+
+  private viewOf(entry: RequestEntry): RequestView {
+    const next = entry.redirectedTo === undefined ? undefined : this.requestLog.find((r) => r.id === entry.redirectedTo)
+    return {
+      record: publicRecord(entry, this.clock),
+      facts: entry.facts,
+      ...(entry.mimeType !== undefined ? { mimeType: entry.mimeType } : {}),
+      ...(entry.redirectedTo !== undefined ? { redirectedTo: entry.redirectedTo } : {}),
+      ...(next !== undefined ? { redirectedToUrl: next.url } : {}),
+    }
+  }
+
+  /**
+   * The body of request `id`: the one Chrome sent with `requestWillBeSent`, or — when it said there is
+   * one but left it out (a large body) — the one it still holds (`Network.getRequestPostData` on the
+   * session that reported the request). null when the request has no body.
+   */
+  async requestBody(id: string): Promise<Buffer | { unavailable: string } | null> {
+    const entry = this.requestLog.find((r) => r.id === id)
+    if (!entry) throw new ModelFacingError(`No request ${id} in the journal. Ids come from net.requests() and the report.`)
+    if (entry.facts.postData) return entry.facts.postData
+    if (!entry.facts.hasPostData) return null
+    try {
+      const result = await withDeadline(entry.session.cdp.send('Network.getRequestPostData', { requestId: entry.requestId }), PROBE_TIMEOUT_MS, `reading the request body of ${id}`)
+      return Buffer.from(result.postData, result.base64Encoded ? 'base64' : 'utf8')
+    } catch (error) {
+      if (error instanceof PageUnresponsiveError) throw error
+      return { unavailable: `Chrome no longer holds it (${errorMessage(error)})` }
+    }
   }
 
   /** Response body of a journaled request (Network.getResponseBody on the session that reported it), textual bodies decoded, capped at 64K chars. */
@@ -1327,6 +1491,12 @@ export class PageWatch {
     let rootsLookedAt = 0
     // A busy read walks the whole accessibility tree; the next poll waits at least as long as it took.
     let busyReadMs = 0
+    // Loading indicators the polls saw (key → latest label, first and last poll that showed it) and
+    // the keys the latest poll showed: what was shown while waiting and is gone at the end is reported.
+    const loadingSeen = new Map<string, { label: string; first: number; last: number }>()
+    let loadingNow = new Set<string>()
+    const goneLoading = (): Array<{ label: string; seenMs: number }> =>
+      [...loadingSeen].filter(([key]) => !loadingNow.has(key)).map(([, seen]) => ({ label: seen.label, seenMs: seen.last - seen.first }))
     for (;;) {
       const blocked = this.blockedResult(startedAt, goal, openAtStart)
       if (blocked) return blocked
@@ -1343,9 +1513,16 @@ export class PageWatch {
             if ('dialog' in discovered) continue
             rootsLookedAt = Date.now()
           }
-          const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, null, PROBE_TIMEOUT_MS))
+          const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, null, PROBE_TIMEOUT_MS, false, true))
           if ('dialog' in raced) continue
           state = raced.value
+          const sampledAt = Date.now()
+          loadingNow = new Set((state.loading ?? []).map(({ key }) => key))
+          for (const { key, label } of state.loading ?? []) {
+            const seen = loadingSeen.get(key)
+            if (seen) Object.assign(seen, { label, last: sampledAt })
+            else loadingSeen.set(key, { label, first: sampledAt, last: sampledAt })
+          }
         } catch (error) {
           const ended = this.endedResult(startedAt, error)
           if (ended) return ended
@@ -1356,14 +1533,21 @@ export class PageWatch {
           const now = Date.now()
           const domQuietFor = Math.min(now - origin, msSinceContent(state))
           if (domQuietFor >= goal.domQuietMs && this.networkQuietFor(now, origin, goal.causalFrom, openAtStart) >= goal.networkQuietMs) {
-            const busyReadStart = Date.now()
-            const busy = await this.unlessDialog(this.busySignals({ since: goal.since }))
-            if ('dialog' in busy) continue
-            busyReadMs = Date.now() - busyReadStart
-            if (!goal.needIdle || !busy.value.some((s) => s.strength === 'strong')) {
+            // Only waiting for idle needs the busy signals (a strong one keeps it waiting). After settle,
+            // the report reads them from the after-picture it takes next, so settle does not read them.
+            let busy: BusySignal[] | undefined
+            if (goal.needIdle) {
+              const busyReadStart = Date.now()
+              const read = await this.unlessDialog(this.busySignals({ since: goal.since }))
+              if ('dialog' in read) continue
+              busyReadMs = Date.now() - busyReadStart
+              busy = read.value
+            }
+            if (!busy?.some((s) => s.strength === 'strong')) {
               const ambient = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS))
               if ('dialog' in ambient) continue
               const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
+              const gone = goneLoading()
               return {
                 settled: true,
                 waitedMs: Date.now() - startedAt,
@@ -1372,32 +1556,36 @@ export class PageWatch {
                 ...(uncaused.length ? { uncaused } : {}),
                 ...(ambient.value.ambient.length ? { ambient: ambient.value.ambient } : {}),
                 ...(state.lastContentAt !== null ? { msSinceLastContentMutation: state.now - state.lastContentAt } : {}),
-                busy: busy.value,
+                ...(busy ? { busy } : {}),
+                ...(gone.length ? { busyWhileSettling: gone } : {}),
               }
             }
           }
         }
       }
-      if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart)
+      if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, goneLoading())
       await this.pause(Math.min(Math.max(POLL_MS, busyReadMs), Math.max(0, deadline - Date.now())))
       busyReadMs = 0
     }
   }
 
-  private async timeoutResult(startedAt: number, goal: QuietGoal, origin: number, openAtStart: Set<string>): Promise<SettleResult> {
+  private async timeoutResult(startedAt: number, goal: QuietGoal, origin: number, openAtStart: Set<string>, gone: Array<{ label: string; seenMs: number }>): Promise<SettleResult> {
     let state: ContentState | undefined
-    let busy: BusySignal[]
+    // As in waitQuiet: only waiting for idle reads busy signals; settle leaves them to the after-picture.
+    let busy: BusySignal[] | undefined
     try {
       if (this.mainFrameLoading || this.dialogs.current()) {
         // The old document is being replaced, or a dialog the policy answers froze it: only the network side is readable.
-        busy = this.networkBusy()
+        if (goal.needIdle) busy = this.networkBusy()
       } else {
         const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS, true))
-        if ('dialog' in raced) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart))
+        if ('dialog' in raced) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
         state = raced.value
-        const signals = await this.unlessDialog(this.busySignals({ since: goal.since }))
-        if ('dialog' in signals) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart))
-        busy = signals.value
+        if (goal.needIdle) {
+          const signals = await this.unlessDialog(this.busySignals({ since: goal.since }))
+          if ('dialog' in signals) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
+          busy = signals.value
+        }
       }
     } catch (error) {
       const ended = this.endedResult(startedAt, error)
@@ -1417,7 +1605,8 @@ export class PageWatch {
       ...(state && state.ambient.length ? { ambient: state.ambient } : {}),
       ...(stillChanging && state?.hot ? { domChangingIn: state.hot } : {}),
       ...(msSince !== undefined ? { msSinceLastContentMutation: msSince } : {}),
-      busy,
+      ...(busy ? { busy } : {}),
+      ...(gone.length ? { busyWhileSettling: gone } : {}),
     }
   }
 
@@ -1463,6 +1652,7 @@ export class PageWatch {
 
   /** Whether an open request is one a person would wait on, from Chrome's own facts about it. */
   private holdsQuiet(entry: RequestEntry, now: number): boolean {
+    if (entry.workerScript) return false
     if (entry.endedAt !== undefined || entry.isAdRelated) return false
     const type = entry.resourceType
     if (type !== undefined && NEVER_HOLDS[type]) return false
@@ -1514,8 +1704,13 @@ export class PageWatch {
     return out
   }
 
-  /** One frame's busy signals: its accessibility tree, its journal's busy read and its spinners. `sinceAt` is on the browser's clock. */
-  private async frameBusySignals(entry: FrameHandle, sinceAt: number | null): Promise<BusySignal[]> {
+  /**
+   * One frame's busy signals: its accessibility tree, its journal's busy read and its spinners and
+   * skeletons. `sinceAt` is on the browser's clock. A determinate progressbar is busy only while
+   * its value moves (since the action, or within PROGRESS_MOVING_MS without one): a bar standing
+   * still — a chart, GitHub's language bar, a finished upload — tells a person nothing is working.
+   */
+  private async frameBusySignals(entry: FrameHandle, sinceAt: number | null): Promise<{ signals: BusySignal[]; nodes: Protocol.Accessibility.AXNode[] }> {
     const where = this.inFrame(entry)
     // A session answers for the frame it is rooted at by default; its same-process iframes are named.
     const scope = entry.frameId === entry.sessionRootId ? {} : { frameId: entry.frameId }
@@ -1531,7 +1726,7 @@ export class PageWatch {
       // AX booleans arrive as `true`, `1` or `"true"` depending on the property.
       const busy = axProperty(node, 'busy')
       if (busy === true || busy === 1 || busy === 'true') {
-        out.push({ strength: 'strong', kind: 'aria-busy', label: `${axLabel(node, byId)} is marked busy${where}` })
+        out.push({ strength: 'strong', kind: 'aria-busy', label: `${axLabel(node, byId)} [aria-busy]${where}` })
       }
       if (node.role?.value !== 'progressbar') continue
       const value = node.value?.value
@@ -1540,31 +1735,30 @@ export class PageWatch {
       } else if (node.backendDOMNodeId !== undefined) {
         determinate.push({ node, value, backendNodeId: node.backendDOMNodeId })
       } else {
-        out.push({ strength: 'weak', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where}` })
+        // No DOM node to watch: whether it moves cannot be read, so it is reported, never waited on.
+        out.push({ strength: 'weak', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where} (whether it moves is not readable)` })
       }
     }
     if (determinate.length > 0) {
-      const changedAt =
-        sinceAt === null
-          ? determinate.map(() => null)
-          : await entry.world.callFunctionOnNodes<Array<number | null>>(
-              determinate.map((d) => d.backendNodeId),
-              VALUE_CHANGED_FN,
-              { timeoutMs: PROBE_TIMEOUT_MS, what: `reading when progressbars last moved${where}` },
-            )
+      const movedSince = sinceAt ?? (await this.onBrowserClock(Date.now() - PROGRESS_MOVING_MS))
+      const changedAt = await entry.world.callFunctionOnNodes<Array<number | null>>(
+        determinate.map((d) => d.backendNodeId),
+        VALUE_CHANGED_FN,
+        { timeoutMs: PROBE_TIMEOUT_MS, what: `reading when progressbars last moved${where}` },
+      )
       determinate.forEach(({ node, value }, index) => {
         const moved = changedAt[index]
         const max = axProperty(node, 'valuemax')
         const unfinished = typeof max !== 'number' || value < max
-        const advancing = sinceAt !== null && moved !== null && moved !== undefined && moved >= sinceAt && unfinished
-        const state = advancing ? ' (advanced since the action)' : !unfinished ? ' (complete)' : sinceAt !== null ? ' (not moved since the action)' : ''
-        out.push({ strength: advancing ? 'strong' : 'weak', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where}${state}` })
+        if (moved === null || moved === undefined || moved < movedSince || !unfinished) return
+        const how = sinceAt !== null ? ' (advanced since the action)' : ' (moving)'
+        out.push({ strength: 'strong', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where}${how}` })
       })
     }
     out.push(...(await this.spinnerSignals(entry, page.spinners, sinceAt)))
     if (page.streaming) out.push({ strength: 'strong', kind: 'dom-streaming', label: `${page.streaming}${where}` })
     for (const text of page.announced) out.push({ strength: 'weak', kind: 'status-text', label: `${text}${where} (announced since the action)` })
-    return out
+    return { signals: out, nodes: ax.nodes }
   }
 
   /**
@@ -1606,13 +1800,32 @@ export class PageWatch {
       what: `checking which animated elements are on top${where}`,
     })
     const out: BusySignal[] = []
+    // Skeleton placeholders are one signal per container and animation: six grey cards are one thing a person sees loading.
+    const skeletons = new Map<string, { animation: string; container: string; count: number; fresh: boolean }>()
     for (const { spinner, pair, x, y } of candidates) {
       if (!inside[pair] || !(await this.shownThroughFrames(entry, x, y, spinner.label))) continue
       const fresh = sinceAt === null || spinner.startedAt >= sinceAt
+      if (spinner.kind === 'skeleton') {
+        const key = `${spinner.animation}\u0000${spinner.container}`
+        const group = skeletons.get(key) ?? { animation: spinner.animation, container: spinner.container, count: 0, fresh: false }
+        group.count++
+        group.fresh ||= fresh
+        skeletons.set(key, group)
+        continue
+      }
       out.push({
         strength: fresh ? 'strong' : 'weak',
         kind: 'spinner',
         label: `${spinner.label} repeating endlessly${where}${fresh ? '' : ' (already running before the action)'}`,
+      })
+    }
+    for (const { animation, container, count, fresh } of skeletons.values()) {
+      out.push({
+        strength: fresh ? 'strong' : 'weak',
+        kind: 'skeleton',
+        label:
+          `${count} skeleton placeholder${count === 1 ? '' : 's'}${animation ? ` (animation ${animation})` : ''}${container ? ` in ${container}` : ''}${where}` +
+          (fresh ? '' : ' (already shown before the action)'),
       })
     }
     return out
@@ -1723,20 +1936,22 @@ export class PageWatch {
    * Content state of every frame, combined: counts summed, the newest change and journal install
    * of any frame, the ambient elements of all. `cutoff`: churn that predates it does not count as
    * content; `from` with `labels`: also name the ambient elements that changed since then. Both are
-   * on this process's clock; the state's times are on the browser's.
+   * on this process's clock; the state's times are on the browser's. `loading`: also list the
+   * loading indicators each frame shows now (the settle loop notes what it waits through).
    */
-  private async readState(cutoff: number | null, from: number | null, timeoutMs: number, labels = from !== null): Promise<ContentState> {
+  private async readState(cutoff: number | null, from: number | null, timeoutMs: number, labels = from !== null, loading = false): Promise<ContentState> {
     const arg = JSON.stringify({
       cutoff: cutoff === null ? null : await this.onBrowserClock(cutoff),
       from: from === null ? null : await this.onBrowserClock(from),
       labels,
+      loading,
     })
     const reads = await this.eachFrame(await this.readableFrames(), async (entry) => {
       const state = await this.callReader<WorldState>(entry.world, `state(${arg})`, timeoutMs, `reading the page journal state${this.inFrame(entry)}`)
       this.noteDocument(entry, state.token)
       return state
     })
-    const combined: ContentState = { now: 0, installedAt: 0, lastContentAt: null, hot: null, ambient: [], content: 0, cosmetic: 0 }
+    const combined: ContentState = { now: 0, installedAt: 0, lastContentAt: null, hot: null, ambient: [], content: 0, cosmetic: 0, loading: loading ? [] : null }
     let newest = -Infinity
     for (const { handle, value } of reads) {
       const where = this.inFrame(handle)
@@ -1746,6 +1961,7 @@ export class PageWatch {
       combined.content += value.content
       combined.cosmetic += value.cosmetic
       combined.ambient.push(...value.ambient.map((label) => `${label}${where}`))
+      if (combined.loading && value.loading) combined.loading.push(...value.loading.map(({ key, label }) => ({ key: `${key}${where}`, label: `${label}${where}` })))
       // The place named as still changing is in the frame that changed last.
       const changedAt = Math.max(value.lastContentAt ?? 0, value.installedAt)
       if (changedAt > newest) {
@@ -1999,11 +2215,20 @@ export class PageWatch {
   /**
    * Journal a dedicated worker's requests (nested workers too), from its session's first event; the
    * tap hands it over as Playwright creates the session. The requests it still had open when it ended
-   * end as `lost`.
+   * end as `lost` — its own script's request too, which Chrome announces on the parent's session (its
+   * request id is the worker's target id) and may never end there once the worker is gone.
    */
   private followWorker(worker: TappedWorker): void {
     const session = this.watchSession(worker.cdp, null, worker.session, worker.url)
-    worker.session.onClose(() => this.retireSession(session, `the worker ${worker.url} that sent it ended`))
+    worker.session.onClose(() => {
+      const reason = `the worker ${worker.url} that sent it ended`
+      this.retireSession(session, reason)
+      const script = worker.targetId === null ? undefined : this.requestsById.get(worker.targetId)
+      if (script && script.endedAt === undefined) {
+        script.endedAt = Date.now()
+        script.lost = reason
+      }
+    })
     worker.session.start()
   }
 
@@ -2042,10 +2267,14 @@ export class PageWatch {
     this.listen(session, 'Network.responseReceived', (e, at) => this.onResponseReceived(session, e, at))
     this.listen(session, 'Network.dataReceived', (e, at) => {
       const entry = this.reportedBy(session, e.requestId)
-      if (entry && entry.endedAt === undefined) entry.lastDataAt = at
+      if (!entry || entry.endedAt !== undefined) return
+      entry.lastDataAt = at
+      entry.facts.bodyBytes = (entry.facts.bodyBytes ?? 0) + e.dataLength
     })
-    this.listen(session, 'Network.loadingFinished', (e, at) => this.onRequestEnded(session, e.requestId, at))
-    this.listen(session, 'Network.loadingFailed', (e, at) => this.onRequestEnded(session, e.requestId, at, failureOf(e), e.type))
+    this.listen(session, 'Network.loadingFinished', (e, at) => this.onRequestEnded(session, e, at))
+    this.listen(session, 'Network.loadingFailed', (e, at) => this.onRequestEnded(session, e, at))
+    this.listen(session, 'Network.requestWillBeSentExtraInfo', (e) => this.onWireHeaders(e.requestId, { sent: e.headers }))
+    this.listen(session, 'Network.responseReceivedExtraInfo', (e) => this.onWireHeaders(e.requestId, { received: { statusCode: e.statusCode, headers: e.headers } }))
     this.listen(session, 'Network.requestServedFromCache', (e) => {
       const entry = this.reportedBy(session, e.requestId)
       if (entry) entry.fromCache = true
@@ -2127,10 +2356,22 @@ export class PageWatch {
         : e.frameId !== undefined && e.frameId !== this.frames.mainFrameId()
           ? { frame: e.documentURL }
           : {}),
+      ...(e.loaderId === '' && e.documentURL === e.request.url ? { workerScript: true as const } : {}),
       ...(e.type !== undefined ? { resourceType: e.type } : {}),
       issuedAt,
       chainIssuedAt: previous?.chainIssuedAt ?? issuedAt,
       ...(e.request.isAdRelated ? { isAdRelated: true } : {}),
+      facts: {
+        requestHeaders: e.request.headers,
+        ...(e.request.postDataEntries?.length
+          ? { postData: Buffer.concat(e.request.postDataEntries.map((part) => Buffer.from(part.bytes ?? '', 'base64'))) }
+          : e.request.postData !== undefined
+            ? { postData: Buffer.from(e.request.postData, 'utf8') }
+            : {}),
+        ...(e.request.hasPostData ? { hasPostData: true } : {}),
+        ...(originOf(e.documentURL) !== undefined ? { initiatorOrigin: originOf(e.documentURL) } : {}),
+        ...(e.timestamp !== undefined ? { issuedTs: e.timestamp } : {}),
+      },
     }
     if (previous) {
       // A redirect keeps Chrome's requestId; each hop is its own record, so a POST answered
@@ -2139,10 +2380,20 @@ export class PageWatch {
         previous.status = e.redirectResponse.status
         previous.mimeType = e.redirectResponse.mimeType
         previous.headersAt ??= arrivedAt
+        this.noteResponse(previous, e.redirectResponse)
       }
-      previous.endedAt ??= arrivedAt
+      if (previous.endedAt === undefined) {
+        previous.endedAt = arrivedAt
+        this.noteEnd(previous, e.timestamp)
+      }
       previous.redirectedTo = entry.id
       entry.redirectedFrom = previous.id
+    }
+    const early = this.earlyWireHeaders.get(e.requestId)
+    if (early) {
+      const sent = early.sent.shift()
+      if (sent) entry.facts.sentHeaders = sent
+      if (early.sent.length === 0 && early.received.length === 0) this.earlyWireHeaders.delete(e.requestId)
     }
     this.requestLog.push(entry)
     this.requestsById.set(e.requestId, entry)
@@ -2168,14 +2419,97 @@ export class PageWatch {
     entry.resourceType = e.type
     entry.headersAt = arrivedAt
     if (e.response.fromDiskCache || e.response.fromPrefetchCache) entry.fromCache = true
+    this.noteResponse(entry, e.response)
   }
 
-  private onRequestEnded(session: SessionWatch, requestId: string, arrivedAt: number, failed?: string, type?: Protocol.Network.ResourceType): void {
-    const entry = this.reportedBy(session, requestId)
+  /** What a response (the final one, or a redirect's) says about its hop: status text, headers, protocol, server, timing. */
+  private noteResponse(entry: RequestEntry, response: Protocol.Network.Response): void {
+    if (response.statusText) entry.statusText = response.statusText
+    const facts = entry.facts
+    facts.responseHeaders = response.headers
+    if (response.statusText) facts.statusText = response.statusText
+    if (response.protocol) facts.protocol = response.protocol
+    if (response.remoteIPAddress) facts.remoteAddress = response.remotePort !== undefined ? `${response.remoteIPAddress}:${response.remotePort}` : response.remoteIPAddress
+    if (response.timing) facts.timing = response.timing
+    // Wire headers that came before the response was known.
+    const early = this.earlyWireHeaders.get(entry.requestId)
+    const index = early?.received.findIndex((received) => received.statusCode === response.status) ?? -1
+    if (early && index >= 0 && facts.receivedHeaders === undefined) {
+      facts.receivedHeaders = early.received.splice(index, 1)[0]!.headers
+      if (early.sent.length === 0 && early.received.length === 0) this.earlyWireHeaders.delete(entry.requestId)
+    }
+  }
+
+  /** The hop ended at Chrome's monotonic `timestamp` (seconds): its duration from Chrome's own stamps. */
+  private noteEnd(entry: RequestEntry, timestamp: number | undefined): void {
+    if (timestamp === undefined) return
+    entry.facts.endedTs = timestamp
+    if (entry.facts.issuedTs !== undefined) entry.durationMs = Math.max(0, Math.round((timestamp - entry.facts.issuedTs) * 1000))
+  }
+
+  /**
+   * A request ended: finished, or failed. A response with an error status whose body Chrome then
+   * stopped reading — measured for a `<script>` that answered 404: `responseReceived` 404, then
+   * `loadingFailed` net::ERR_ABORTED, canceled, Chrome 145 and 149 — is the HTTP error it answered,
+   * not a canceled request. So is a response that has no body by definition (204, 205, 304) —
+   * measured for a `fetch` POST answered 204: `responseReceived` 204, then `loadingFailed`
+   * net::ERR_ABORTED, canceled, Chrome 149 — whose server did get and answer it.
+   */
+  private onRequestEnded(session: SessionWatch, e: Protocol.Network.LoadingFinishedEvent | Protocol.Network.LoadingFailedEvent, arrivedAt: number): void {
+    const entry = this.reportedBy(session, e.requestId)
     if (!entry || entry.endedAt !== undefined) return
     entry.endedAt = arrivedAt
-    if (failed !== undefined) entry.failed = failed
-    if (type !== undefined) entry.resourceType = type
+    this.noteEnd(entry, e.timestamp)
+    if (!('errorText' in e)) {
+      entry.facts.encodedBytes = e.encodedDataLength
+      entry.bytes = e.encodedDataLength
+      return
+    }
+    entry.resourceType = e.type
+    entry.facts.failure = {
+      errorText: e.errorText,
+      canceled: e.canceled === true,
+      ...(e.blockedReason !== undefined ? { blockedReason: e.blockedReason } : {}),
+      ...(e.corsErrorStatus !== undefined ? { cors: e.corsErrorStatus } : {}),
+    }
+    const answeredWithoutBody = entry.status !== undefined && (entry.status >= 400 || entry.status === 204 || entry.status === 205 || entry.status === 304)
+    if (e.canceled && answeredWithoutBody && e.corsErrorStatus === undefined && e.blockedReason === undefined) return
+    entry.failed = failureText({
+      event: e,
+      url: entry.url,
+      resourceType: entry.resourceType,
+      origin: headerValue(entry.facts.sentHeaders, 'origin') ?? entry.facts.initiatorOrigin,
+    })
+  }
+
+  /**
+   * Headers exactly as Chrome sent or received them for request `requestId` (the ExtraInfo events). They
+   * belong to the earliest hop of the request that has none yet (a response's: whose status matches);
+   * when that hop is not journaled yet they wait for it.
+   */
+  private onWireHeaders(requestId: string, wire: { sent: Protocol.Network.Headers } | { received: { statusCode: number; headers: Protocol.Network.Headers } }): void {
+    const hops = this.requestLog.filter((entry) => entry.requestId === requestId)
+    if ('sent' in wire) {
+      const hop = hops.find((entry) => entry.facts.sentHeaders === undefined)
+      if (hop) {
+        hop.facts.sentHeaders = wire.sent
+        return
+      }
+    } else {
+      const hop = hops.find((entry) => entry.facts.receivedHeaders === undefined && entry.status !== undefined && entry.status === wire.received.statusCode)
+      if (hop) {
+        hop.facts.receivedHeaders = wire.received.headers
+        return
+      }
+    }
+    let early = this.earlyWireHeaders.get(requestId)
+    if (!early) {
+      early = { sent: [], received: [] }
+      this.earlyWireHeaders.set(requestId, early)
+      if (this.earlyWireHeaders.size > REQUEST_CAP) this.earlyWireHeaders.delete(this.earlyWireHeaders.keys().next().value!)
+    }
+    if ('sent' in wire) early.sent.push(wire.sent)
+    else early.received.push(wire.received)
   }
 
   /**

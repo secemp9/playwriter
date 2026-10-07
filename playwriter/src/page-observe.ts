@@ -33,7 +33,7 @@ import { ModelFacingError, type BusySignal, type JsDialogState } from './probe-t
 import { isNodeGoneError, withDeadline, type IsolatedWorld } from './isolated-world.js'
 import type { FrameBox, FrameEntry, PageFrames, UnreadableFrame } from './page-frames.js'
 import { formatAxStates, type AxStates } from './ax-states.js'
-import { getAriaSnapshot, isSecretField } from './aria-snapshot.js'
+import { getAriaSnapshot, isSecretField, UNSEEN_IMAGE_MAX_SIDE } from './aria-snapshot.js'
 import {
   buildPageModelFromRaw,
   computeFrameOcclusion,
@@ -53,6 +53,8 @@ import {
 import type { RefRegistry } from './ref-registry.js'
 import { decodePng } from './png-pixels.js'
 import { LABEL_CONTROLS_FN, LABEL_FACTS_FN, roleOfControl, type LabeledControlFacts } from './label-control.js'
+import { readPointerListeners } from './pointer-listeners.js'
+import type { FrameAxTree } from './page-watch.js'
 
 // ---------------------------------------------------------------------------
 // Public shapes
@@ -76,7 +78,11 @@ export interface ObservedElement {
   backendNodeId: number
   /** The frame the element is in (the main frame's id, or an iframe's). */
   frameId: string
-  /** AX role, or 'clickable' for a non-semantic element with a click listener */
+  /**
+   * AX role; 'clickable' for an element with no control role a person can act on (a click listener,
+   * `draggable`, `tabindex` ≥ 0, a context-menu or pointer listener — see `actionable`); 'backdrop'
+   * for a modal's backdrop (see `backdropOf`).
+   */
   role: string
   name: string
   tag: string
@@ -98,10 +104,33 @@ export interface ObservedElement {
   /** document CSS px (PageModel Box) */
   box?: Box
   image?: { loaded: boolean; broken: boolean; naturalWidth: number; naturalHeight: number; src?: string }
+  /**
+   * An `<img>` without an `alt` attribute: it has no name, so its address (`src` attribute) is what
+   * tells it apart. An `alt=""` image is decoration by the page's own statement and is not listed
+   * (`Observation.decorativeImages` counts them).
+   */
+  noAlt?: { src: string }
   /** The model has not been shown this element yet, while it was shown this document before. */
   isNew?: boolean
   /** `tag#id.class` of a non-semantic clickable — the only handle a person has on it. */
   cssLabel?: string
+  /**
+   * Of a `clickable` (role 'clickable': an element with no control role a person can still act on):
+   * what it answers to, as measured. `clicks`: DOMSnapshot's `isClickable` (a click listener, or
+   * natively clickable); `draggable`: `draggable="true"`; `focusable`: `tabindex` ≥ 0 (Tab reaches
+   * it, keys go to it); `listens`: the pointer events it has listeners for besides click
+   * (`contextmenu`, `dblclick`, `pointerdown`…), read with DOMDebugger.getEventListeners;
+   * `clickHandledBy`: an item of a click delegation container (`ul#fruits.list`, whose one click
+   * listener serves all its items): a click on the item reaches that container's listener.
+   */
+  actionable?: { clicks?: true; draggable?: true; focusable?: true; listens?: string[]; clickHandledBy?: string }
+  /** Of a `clickable`: its own AX role when that names what it is (`listitem`, `article`, `row`). */
+  itemRole?: string
+  /**
+   * Role 'backdrop': the layer a modal spreads over the page behind it, and the modal it belongs to
+   * (`dialog "Get 10% off" [9]`). A click on it lands on the backdrop, not on what it covers.
+   */
+  backdropOf?: string
   /**
    * The control itself is fully transparent but laid out and clickable, with its look drawn by
    * styling around it — the custom checkbox/radio/file input pattern (TodoMVC's `.toggle` is
@@ -150,6 +179,8 @@ export interface ObservedElement {
   inside?: number[]
   /** Inside the modal layer that currently takes the input (see `Observation.modal`). */
   inModal?: true
+  /** The nearest semantic container around it (see `SemanticContainer`). */
+  container?: SemanticContainer
   /** Document-order position, shared with `TextBlock.order`, so the two lists can be interleaved. */
   order: number
 }
@@ -235,10 +266,25 @@ export interface AbsentItem {
   why: string
 }
 
+/**
+ * The nearest ancestor with a meaning of its own — a table, a list, a log, an article, a landmark
+ * — skipping the structure between (generic wrappers, paragraphs, a table's row groups). `key`
+ * tells two such containers apart (three tables, each with an "(empty)" row); `label`
+ * (`table "Cookies"`) is what it means, which a re-render keeps while it replaces the nodes.
+ */
+export interface SemanticContainer {
+  key: NodeKey
+  label: string
+}
+
 export interface TextBlock {
   key: NodeKey
   /** The frame the text is in (the main frame's id, or an iframe's). */
   frameId: string
+  /**
+   * `text`, `heading`, `paragraph`, `listitem`, `row`, `caption`…; `tooltip` for a shown
+   * `role=tooltip`; `table`/`grid`/`treegrid`/`list`/`tree` for such a container's own name.
+   */
   role: string
   /** The block's whole text; renderers cut it, with a "(+N chars)" marker. */
   text: string
@@ -252,6 +298,10 @@ export interface TextBlock {
   live?: string
   /** Ref of the scroll area that brings it into view (as `ObservedElement.scroller`). */
   scroller?: number
+  /** A tooltip: ref of the listed element whose `aria-describedby` names it. */
+  describes?: number
+  /** The nearest semantic container around it (see `SemanticContainer`). */
+  container?: SemanticContainer
   order: number
   box?: Box
 }
@@ -289,9 +339,23 @@ export interface Observation {
   /** Listed in this document before, still in its DOM, not usable now (see `AbsentItem`). */
   absent: AbsentItem[]
   counts: { interactive: number; inView: number; above: number; below: number }
-  tabs?: Array<{ index: number; title: string; url: string; controlled: boolean }>
+  /** `popup`: Chrome opened it as a popup window (window.open with window features), not as a tab. */
+  tabs?: Array<{ index: number; title: string; url: string; controlled: boolean; popup?: true }>
+  /** Lines about the controlled tab itself (it is hidden and throttled), shown under PAGE/TABS (tab-state.ts). */
+  tabNotes?: string[]
   /** Every frame of the tab, the main one included, and how many had their content read. */
   frames: { total: number; observed: number }
+  /**
+   * Visible `<img alt="">` images (the main document and every iframe read): decoration by the
+   * page's own statement, not listed.
+   */
+  decorativeImages?: number
+  /**
+   * Visible images with no name and no address (an inline `<svg>` without `<title>`, a canvas or
+   * `role=img` without a label; not an `<img>`, which is listed by its `src`): nothing says what they
+   * show, so they are counted, not listed.
+   */
+  unnamedGraphics?: number
 }
 
 export interface ObserveOptions {
@@ -377,6 +441,13 @@ const CELL_ROLES: Record<string, true> = {
 }
 
 /**
+ * Popups a control opens inside its row or item (a row's "More actions" menu, a listbox, a
+ * popover dialog, a tooltip): not the item's own words. They are left out of a row's or item's
+ * text and context, and their own text is read as a block of its own.
+ */
+const POPUP_ROLES: Record<string, true> = { menu: true, listbox: true, dialog: true, alertdialog: true, tooltip: true }
+
+/**
  * Regions whose changes the page announces (ARIA live regions by role; `aria-live` on any
  * element is the other way to make one). Their text stays body text like any other — a chat
  * transcript in a `log` is the page's content — and the region is listed on its own LIVE line.
@@ -391,6 +462,50 @@ const BLOCK_TEXT_ROLES: Record<string, true> = {
   layouttablerow: true,
   blockquote: true,
   caption: true,
+}
+
+/** Containers listed by their own name (`table "Cookies"`): it tells one from another of its kind. */
+const NAMED_GROUP_ROLES: Record<string, true> = { table: true, grid: true, treegrid: true, list: true, tree: true }
+
+/**
+ * AX roles of an element that is a region of the page, not a target, even when Tab reaches it or it
+ * has a listener: a focusable scroll area or log, a dialog, a landmark, a tab panel.
+ */
+const REGION_ROLES: Record<string, true> = {
+  ...LIVE_ROLES,
+  dialog: true,
+  alertdialog: true,
+  tabpanel: true,
+  document: true,
+  application: true,
+  region: true,
+  banner: true,
+  navigation: true,
+  main: true,
+  complementary: true,
+  contentinfo: true,
+  search: true,
+  form: true,
+  rootwebarea: true,
+}
+
+/** AX roles that say what a `clickable` is better than its tag (`draggable listitem "Echo"`). */
+const ITEM_LIKE_ROLES: Record<string, true> = {
+  listitem: true,
+  row: true,
+  article: true,
+  comment: true,
+  figure: true,
+  cell: true,
+  gridcell: true,
+  img: true,
+  image: true,
+  heading: true,
+  paragraph: true,
+  note: true,
+  term: true,
+  definition: true,
+  blockquote: true,
 }
 
 /** Characters of a text block, live region or value printed before the cut; the full text is kept and searched. */
@@ -410,6 +525,11 @@ export const MIN_CLICKABLE_SIDE = 8
  * "click outside to close" backdrop looks the same.
  */
 const DELEGATION_ROOT_VIEWPORT_SHARE = 0.5
+/**
+ * Children of one kind (tag and first class) under a click listener that make it a delegation
+ * container (a `<ul>` whose one listener serves its `<li>` items): its items are listed instead.
+ */
+const DELEGATED_ITEMS_MIN = 3
 /** How much text around a find() match is printed on each side. */
 const FIND_CONTEXT_CHARS = 60
 /** Times observe() rebuilds when the document changes while it is being read. */
@@ -451,6 +571,10 @@ interface Candidate {
   value?: string
   href?: string
   cssLabel?: string
+  noAlt?: { src: string }
+  actionable?: { clicks?: true; draggable?: true; focusable?: true; listens?: string[]; clickHandledBy?: string }
+  itemRole?: string
+  backdropOf?: string
   order: number
   nodeIndex?: number
   measured: Measured
@@ -528,6 +652,41 @@ function modelName(node: PageModelNode): string {
   return node.axName ?? node.name ?? ''
 }
 
+/** Roles that only structure what is in them: `semanticContainer` looks above them. */
+const STRUCTURAL_ROLES: Record<string, true> = {
+  generic: true,
+  none: true,
+  presentation: true,
+  paragraph: true,
+  rowgroup: true,
+  cell: true,
+  gridcell: true,
+  layouttable: true,
+  layouttablerow: true,
+  layouttablecell: true,
+  strong: true,
+  emphasis: true,
+  time: true,
+  mark: true,
+  code: true,
+}
+
+/**
+ * The nearest model ancestor of `anchor` (from the anchor itself when it is an ancestor standing in
+ * for the element, `fromParent` false) whose role has a meaning of its own: `{ container }`, or
+ * nothing at the document.
+ */
+function semanticContainer(model: PageModel | undefined, anchor: PageModelNode | undefined, fromParent: boolean): { container?: SemanticContainer } {
+  if (!model || !anchor) return {}
+  for (let key = fromParent ? model.parentByKey.get(anchor.key) : anchor.key; key !== undefined; key = model.parentByKey.get(key)) {
+    const node = model.byKey.get(key)
+    if (!node || node.type !== 'element' || !node.role || STRUCTURAL_ROLES[node.role]) continue
+    const name = modelName(node)
+    return { container: { key, label: `${node.role}${name ? ` "${truncate(name, CONTEXT_MAX_CHARS)}"` : ''}` } }
+  }
+  return {}
+}
+
 /** Containers that hold blocks of their own: a row or list item that contains one is a layout wrapper, not one line of text. */
 const NESTED_BLOCK_ROLES: Record<string, true> = {
   ...BLOCK_TEXT_ROLES,
@@ -554,12 +713,18 @@ function containsBlock(node: PageModelNode): boolean {
   return false
 }
 
+/** Whether a subtree holds a control or an image (its Chromium name then includes their names). */
+function containsControl(node: PageModelNode): boolean {
+  return node.children.some((child) => INTERACTIVE_ROLES[child.role ?? ''] || IMAGE_ROLES[child.role ?? ''] || containsControl(child))
+}
+
 /**
  * Text of a model subtree as a person reads it: static text and the names of inline
  * links (prose links are part of the sentence), skipping other controls and images,
  * whose labels are listed as elements in their own right, and the text of a control's
  * `<label>` (or `aria-labelledby` target), which is that control's name on its own line. With
  * `includeLinks: false` the link names are left out too — what is left is the block's own words.
+ * A popup open inside it (see `POPUP_ROLES`) is not its text.
  */
 function gatherText(node: PageModelNode, max: number, includeLinks = true): string {
   const pieces: string[] = []
@@ -577,11 +742,33 @@ function gatherText(node: PageModelNode, max: number, includeLinks = true): stri
       }
       if (role !== 'heading' || text) return
     }
-    if (current !== node && (INTERACTIVE_ROLES[role] || IMAGE_ROLES[role])) return
+    if (current !== node && (INTERACTIVE_ROLES[role] || IMAGE_ROLES[role] || POPUP_ROLES[role])) return
     for (const child of current.children) visit(child)
   }
   visit(node)
   return truncate(pieces.join(' '), max)
+}
+
+/**
+ * A node's name as Chromium makes it from its content (a cell named "Edit Delete More actions"
+ * after its buttons), without the popups open inside it: Chromium names a cell after an open menu
+ * in it too ("Edit Delete More actions Actions for INV-1003").
+ */
+function nameWithoutPopups(node: PageModelNode): string {
+  const hasPopup = (current: PageModelNode): boolean => current.children.some((child) => POPUP_ROLES[child.role ?? ''] || hasPopup(child))
+  if (!hasPopup(node)) return modelName(node)
+  const pieces: string[] = []
+  const visit = (current: PageModelNode): void => {
+    for (const child of current.children) {
+      const role = child.role ?? ''
+      if (POPUP_ROLES[role]) continue
+      const name = modelName(child)
+      if (name && (role === 'text' || role === 'link' || role === 'heading' || INTERACTIVE_ROLES[role] || IMAGE_ROLES[role])) pieces.push(name)
+      else visit(child)
+    }
+  }
+  visit(node)
+  return pieces.join(' ')
 }
 
 /** The choices of a native drop-down, from its accessibility subtree (the popup's options), in order. */
@@ -957,6 +1144,12 @@ export interface ObservePageOptions {
   /** The latest observation of this tab, shown or not: what it listed and this one does not is classified (hidden, inert or gone). */
   previous?: Observation | null
   busy?: BusySignal[]
+  /**
+   * Frames' accessibility trees read moments ago by the busy read whose signals are `busy`, by frame
+   * id: a frame still showing the document a tree was read from is not read again. They are taken
+   * over (getAriaSnapshot adjusts them in place).
+   */
+  axTrees?: ReadonlyMap<string, FrameAxTree>
   jsDialog?: JsDialogState | null
   tabs?: Observation['tabs']
   options?: ObserveOptions
@@ -986,9 +1179,32 @@ interface FrameNotRead {
 /** What one renderer session holds: one layout snapshot and one DOM read cover every document it hosts. */
 interface SessionRead {
   raw: Map<string, FrameGeometry>
+  /** The pierced DOM tree (`DOM.getDocument`), shared with each of its frames' accessibility snapshots. */
+  root: Protocol.DOM.Node
   dom: Map<number, ModelDomInfo>
   /** The documents of this session that are observed, placed in main-document coordinates; what its models are built from. */
   placed: Map<string, FrameGeometry>
+}
+
+/**
+ * The nodes of a pierced `DOM.getDocument` tree that `DOM.getFlattenedDocument` lists, in no
+ * particular order: the document and every descendant, through shadow roots, iframe documents and
+ * template contents, without those containers themselves (shadow roots, iframe `#document`s,
+ * template fragments) and without pseudo-elements. One `DOM.getDocument` read then serves both the
+ * page model and the accessibility snapshot (the flattened read is the same work done again).
+ */
+export function flattenedDomNodes(root: Protocol.DOM.Node): Protocol.DOM.Node[] {
+  const nodes: Protocol.DOM.Node[] = []
+  const pending: Array<{ node: Protocol.DOM.Node; listed: boolean }> = [{ node: root, listed: true }]
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    const { node, listed } = next
+    if (listed) nodes.push(node)
+    for (const child of node.children ?? []) pending.push({ node: child, listed: true })
+    for (const shadowRoot of node.shadowRoots ?? []) pending.push({ node: shadowRoot, listed: false })
+    if (node.contentDocument) pending.push({ node: node.contentDocument, listed: false })
+    if (node.templateContent) pending.push({ node: node.templateContent, listed: false })
+  }
+  return nodes
 }
 
 /** `frameId` and `backendNodeId` of a model key (`${frameId}:${backendNodeId}`). */
@@ -1058,11 +1274,13 @@ async function readFrames({
   frames,
   listing,
   mainScroll,
+  axTrees,
 }: {
   page: Page
   frames: PageFrames
   listing: { frames: FrameEntry[]; unreadable: UnreadableFrame[] }
   mainScroll: { x: number; y: number }
+  axTrees?: ReadonlyMap<string, FrameAxTree>
 }): Promise<{ reads: Map<string, FrameRead>; notRead: FrameNotRead[] }> {
   const notRead: FrameNotRead[] = listing.unreadable
     .filter((frame) => !frame.sealed)
@@ -1072,16 +1290,16 @@ async function readFrames({
     let reading = sessions.get(cdp)
     if (!reading) {
       reading = Promise.all([
-        fetchPageGeometry({ cdp }),
-        withDeadline(cdp.send('DOM.getFlattenedDocument', { depth: -1, pierce: true }), PROBE_TIMEOUT_MS, 'reading the DOM (DOM.getFlattenedDocument)'),
-      ]).then(([raw, { nodes }]) => {
+        fetchPageGeometry({ cdp, timeoutMs: MODEL_TIMEOUT_MS }),
+        withDeadline(cdp.send('DOM.getDocument', { depth: -1, pierce: true }), PROBE_TIMEOUT_MS, 'reading the DOM (DOM.getDocument)'),
+      ]).then(([raw, { root }]) => {
         const dom = new Map<number, ModelDomInfo>()
-        for (const node of nodes) {
+        for (const node of flattenedDomNodes(root)) {
           const attributes: Record<string, string> = {}
           for (let i = 0; i + 1 < (node.attributes?.length ?? 0); i += 2) attributes[node.attributes![i]] = node.attributes![i + 1]
           dom.set(node.backendNodeId, { nodeName: node.nodeName, attributes })
         }
-        return { raw, dom, placed: new Map<string, FrameGeometry>() }
+        return { raw, root, dom, placed: new Map<string, FrameGeometry>() }
       })
       sessions.set(cdp, reading)
     }
@@ -1161,7 +1379,14 @@ async function readFrames({
       const { entry } = item
       try {
         const session = await sessionRead(entry.cdp)
-        const aria = await getAriaSnapshot({ page, ...(entry.parentId === null ? {} : { frame: entry.frame }), cdp: entry.cdp })
+        const tree = axTrees?.get(entry.frameId)
+        const aria = await getAriaSnapshot({
+          page,
+          ...(entry.parentId === null ? {} : { frame: entry.frame }),
+          cdp: entry.cdp,
+          // The frame's own layout, as placed in the page: its images are measured from it (no read per image).
+          prefetched: { domRoot: session.root, layout: [item.frame], ...(tree?.loaderId === entry.loaderId ? { axNodes: tree.nodes } : {}) },
+        })
         const model = buildPageModelFromRaw({ ariaTree: aria.tree, domByBackendId: session.dom, frameId: entry.frameId, geometry: session.placed, deps: { page, cdp: entry.cdp } })
         reads.set(entry.frameId, { ...item, model })
       } catch (error) {
@@ -1313,7 +1538,14 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       throw new ModelFacingError(`The page cannot be read: ${problem?.reason ?? 'its main frame is not attached'}.`)
     }
     const { reads, notRead } = await withDeadline(
-      readFrames({ page, frames, listing, mainScroll: { x: metrics.cssLayoutViewport.pageX, y: metrics.cssLayoutViewport.pageY } }),
+      readFrames({
+        page,
+        frames,
+        listing,
+        mainScroll: { x: metrics.cssLayoutViewport.pageX, y: metrics.cssLayoutViewport.pageY },
+        // A read again after a document changed reads every tree afresh: the trees given were adjusted by the first read.
+        ...(attempt === 1 && options.axTrees ? { axTrees: options.axTrees } : {}),
+      }),
       MODEL_TIMEOUT_MS,
       'reading the page and its iframes (Accessibility.getFullAXTree + DOMSnapshot.captureSnapshot per frame)',
     )
@@ -1365,8 +1597,24 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
   const liveRegions: LiveRegionCandidate[] = []
   const nodeIndexes = new Map<string, Map<number, number>>()
   let modalDialog: PageModelNode | undefined
+  let decorativeImages = 0
+  let unnamedGraphics = 0
   for (const frameRead of reads.values()) {
-    const collected = collectCandidates({ model: frameRead.model, frame: frameRead.frame, viewport: frameRead.frame.viewport })
+    const documentBackendId = frameRead.frame.nodeBackendIds?.[0]
+    const listeners =
+      documentBackendId === undefined
+        ? undefined
+        : await readPointerListeners({ cdp: frameRead.entry.cdp, documentBackendId, timeoutMs: PROBE_TIMEOUT_MS })
+    const collected = collectCandidates({ model: frameRead.model, frame: frameRead.frame, viewport: frameRead.frame.viewport, listeners })
+    // `alt=""` says "decoration": such images are not listed, only counted, so the model knows they
+    // are there. A spacer or tracking pixel nobody sees is not counted (see UNSEEN_IMAGE_MAX_SIDE).
+    const visibility = new Map<number, boolean>()
+    for (const record of frameRead.frame.byNodeIndex.values()) {
+      if (record.nodeName !== 'IMG' || record.attributes?.alt !== '') continue
+      if (record.box.width <= UNSEEN_IMAGE_MAX_SIDE || record.box.height <= UNSEEN_IMAGE_MAX_SIDE) continue
+      if (measureLaidOutRecord(record, frameRead.frame, visibility).visible) decorativeImages++
+    }
+    unnamedGraphics += collected.unnamedGraphics
     nodeIndexes.set(frameRead.entry.frameId, collected.nodeIndexByBackendId)
     // A modal dialog inside an iframe blocks that iframe's document, not the page around it.
     if (frameRead === mainRead && collected.modalDialog) modalDialog = collected.modalDialog
@@ -1530,6 +1778,61 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     }
   }
 
+  // A modal dialog's backdrop: the layer outside the dialog that tops most covered elements and
+  // spans most of the viewport. A person clicks it ("click outside to close"); it is listed with a
+  // ref of its own and named after the dialog, not as one more thing behind the modal.
+  if (modal?.key && viewport) {
+    const dialogKey = modal.key
+    const tally = new Map<NodeKey, number>()
+    for (const candidate of candidates) {
+      const visibility = visibilityOf.get(candidate.key)
+      const top = candidate.measured.occludedBy?.[0]
+      if (top && (visibility === 'covered' || visibility === 'partly-covered')) tally.set(top, (tally.get(top) ?? 0) + 1)
+    }
+    const backdrop = [...tally]
+      .sort((a, b) => b[1] - a[1])
+      .map(([key]) => ({ key, record: recordOf(key) }))
+      .find(({ key, record }) => record && key !== dialogKey && !ancestorsOf(splitKey(key).frameId, record.nodeIndex, undefined, true).includes(dialogKey))
+    const existing = backdrop ? candidates.find((candidate) => candidate.key === backdrop.key) : undefined
+    const record = backdrop?.record
+    if (backdrop && record && !existing?.frame && record.box.width * record.box.height >= BACKDROP_VIEWPORT_SHARE * viewport.width * viewport.height) {
+      const backdropOf = `${modal.role}${modal.name ? ` "${truncate(modal.name, CONTEXT_MAX_CHARS)}"` : ''}`
+      const { frameId, backendNodeId } = splitKey(backdrop.key)
+      if (existing) {
+        existing.role = 'backdrop'
+        existing.name = ''
+        existing.backdropOf = backdropOf
+      } else {
+        const frame = reads.get(frameId)!.frame
+        const covered = computeFrameOcclusion({ frame, targets: [record] }).get(backendNodeId)
+        const anchor = nodeOf(backdrop.key)
+        const measured: Measured = {
+          ...measureLaidOutRecord(record, frame, new Map()),
+          box: { ...record.box },
+          ...(covered ? { occluded: covered.state, occludedFraction: covered.coveredFraction, occludedBy: covered.by, occludedByLabels: covered.labels } : {}),
+        }
+        candidates.push({
+          key: backdrop.key,
+          frameId,
+          backendNodeId,
+          role: 'backdrop',
+          name: '',
+          tag: record.nodeName.toLowerCase(),
+          cssLabel: cssLabelOf(record),
+          backdropOf,
+          // After everything: it is printed with the modal, not in reading order.
+          order: candidates.length + texts.length,
+          nodeIndex: record.nodeIndex,
+          measured,
+          ...(anchor ? { anchor } : {}),
+          anchorIsSelf: anchor !== undefined,
+          contextBasis: {},
+        })
+        visibilityOf.set(backdrop.key, classifyVisibility(measured, viewport))
+      }
+    }
+  }
+
   const regionCache = new Map<NodeKey, string | undefined>()
   /** The nearest landmark around the node within its own document. */
   const regionOf = (node: PageModelNode | undefined): string | undefined => {
@@ -1667,6 +1970,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
   const coverLabel = (key: NodeKey, fallback: string | undefined): string | undefined => {
     const frameCover = candidateByKey.get(key)
     if (frameCover?.frame) return `iframe ${quote(frameCover.name, CONTEXT_MAX_CHARS)} [${refByKey.get(key)}]`
+    if (frameCover?.role === 'backdrop') return `the backdrop [${refByKey.get(key)}] of ${frameCover.backdropOf}`
     const coverNode = nodeOf(key)
     const coverName = coverNode ? modelName(coverNode) : ''
     return coverNode?.role && coverName ? `${coverNode.role} "${truncate(coverName, CONTEXT_MAX_CHARS)}"` : fallback
@@ -1711,9 +2015,14 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       ...(activeRef !== undefined ? { activeRef } : {}),
       ...(documentShown && !registry.wasShown(targetId, documentId, candidate.key) ? { isNew: true } : {}),
       ...(candidate.cssLabel ? { cssLabel: candidate.cssLabel } : {}),
+      ...(candidate.actionable ? { actionable: candidate.actionable } : {}),
+      ...(candidate.itemRole ? { itemRole: candidate.itemRole } : {}),
+      ...(candidate.noAlt ? { noAlt: candidate.noAlt } : {}),
+      ...(candidate.backdropOf ? { backdropOf: candidate.backdropOf } : {}),
       ...(scroller !== undefined && scroller !== ref ? { scroller } : {}),
       ...(inside.length ? { inside } : {}),
       ...(modal && modal.contains(ancestors, candidate.key) ? { inModal: true as const } : {}),
+      ...semanticContainer(reads.get(candidate.frameId)?.model, candidate.anchor, candidate.anchorIsSelf),
       order: candidate.order,
     }
   })
@@ -1760,7 +2069,8 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
   const text: TextBlock[] = []
   for (const block of texts) {
     const ancestors = ancestorsOf(block.frameId, block.nodeIndex, block.anchor, true)
-    if (ancestors.some((key) => clickableFullyNamed.has(key))) continue
+    // A clickable whose whole text is its name already says it (a draggable list item is the item).
+    if (clickableFullyNamed.has(block.key) || ancestors.some((key) => clickableFullyNamed.has(key))) continue
     const inside = ancestors.map((key) => refByKey.get(key)).filter((ref): ref is number => ref !== undefined)
     const region = regionOf(block.anchor)
     const liveKey = [block.anchor.key, ...ancestors].find((key) => liveByKey.has(key))
@@ -1768,6 +2078,14 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     if (liveKey !== undefined) liveTexts.set(liveKey, [...(liveTexts.get(liveKey) ?? []), block.text])
     const visibility = classifyVisibility(block.measured, viewport)
     const scroller = scrollerOf(ancestors, visibility)
+    // A tooltip says which element it describes through that element's aria-describedby.
+    const tipId = block.role === 'tooltip' ? block.anchor.attributes.id : undefined
+    const describes = tipId
+      ? elements.find((element) => {
+          const owner = candidateByKey.get(element.key)
+          return element.frameId === block.frameId && owner?.anchorIsSelf && owner.anchor?.attributes['aria-describedby']?.split(/\s+/).includes(tipId)
+        })?.ref
+      : undefined
     text.push({
       key: block.key,
       frameId: block.frameId,
@@ -1781,6 +2099,8 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       ...(modal && modal.contains(ancestors, block.key) ? { inModal: true as const } : {}),
       ...(liveRegion ? { live: `${liveRegion.role}${liveRegion.name ? ` "${truncate(liveRegion.name, CONTEXT_MAX_CHARS)}"` : ''}` } : {}),
       ...(scroller !== undefined ? { scroller } : {}),
+      ...(describes !== undefined ? { describes } : {}),
+      ...semanticContainer(reads.get(block.frameId)?.model, block.anchor, true),
       order: block.order,
       ...(block.measured.box ? { box: block.measured.box } : {}),
     })
@@ -1860,6 +2180,8 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     text,
     absent,
     counts,
+    ...(decorativeImages > 0 ? { decorativeImages } : {}),
+    ...(unnamedGraphics > 0 ? { unnamedGraphics } : {}),
     ...(options.tabs ? { tabs: options.tabs } : {}),
     frames: { total: listing.frames.length + listing.unreadable.length, observed: reads.size },
   }
@@ -2028,6 +2350,26 @@ interface LiveRegionCandidate {
 }
 
 /**
+ * Blocks of a rich text editor (a contenteditable textbox) listed as elements of their own, right
+ * after the editor's line, so act.type(ref, text) can put the caret at the end of one: the
+ * editor's own line shows only its whole value, and Ctrl+End reaches only the end of the editor.
+ */
+const EDITOR_BLOCK_TAGS: Record<string, string> = {
+  p: 'paragraph',
+  li: 'listitem',
+  h1: 'heading',
+  h2: 'heading',
+  h3: 'heading',
+  h4: 'heading',
+  h5: 'heading',
+  h6: 'heading',
+  blockquote: 'blockquote',
+  pre: 'code',
+  td: 'cell',
+  th: 'columnheader',
+}
+
+/**
  * Walk the PageModel once and collect: interactive AX elements and images, text blocks (whole —
  * renderers cut them), live regions and the topmost open modal dialog; then add the non-semantic
  * click targets and `aria-live` containers from the layout snapshot. Everything comes out in
@@ -2037,16 +2379,21 @@ function collectCandidates({
   model,
   frame,
   viewport,
+  listeners,
 }: {
   model: PageModel
   frame: FrameGeometry | undefined
   viewport: Box | undefined
+  /** Pointer listener types other than click, by backend node id (see `readPointerListeners`). */
+  listeners?: Map<number, string[]>
 }): {
   elements: Candidate[]
   texts: TextCandidate[]
   liveRegions: LiveRegionCandidate[]
   modalDialog?: PageModelNode
   nodeIndexByBackendId: Map<number, number>
+  /** Visible images with neither a name nor an address (see `Observation.unnamedGraphics`). */
+  unnamedGraphics: number
 } {
   const nodeIndexByBackendId = new Map<number, number>()
   frame?.nodeBackendIds?.forEach((id, index) => {
@@ -2058,6 +2405,7 @@ function collectCandidates({
   const liveRegions: LiveRegionCandidate[] = []
   const listedIds = new Set<number>()
   let modalDialog: PageModelNode | undefined
+  let unnamedGraphics = 0
   // Nodes the snapshot could not place get an order just after the previous one, so
   // they stay where the AX tree put them.
   let lastOrder = -1
@@ -2114,7 +2462,12 @@ function collectCandidates({
 
     const isInteractive = INTERACTIVE_ROLES[role] === true
     const isImage = IMAGE_ROLES[role] === true
-    if (real && placed && (isInteractive || isImage)) {
+    // An image is listed by its name, or (an <img> without alt) by its address. A nameless graphic
+    // (an inline <svg> without <title>, a canvas or role=img without a label) has neither: it is
+    // counted, not listed.
+    const unnamedGraphic = isImage && !modelName(node) && !(node.tag === 'img' && node.attributes.alt === undefined)
+    if (real && unnamedGraphic && node.runtime.visible === true) unnamedGraphics++
+    if (real && placed && (isInteractive || (isImage && !unnamedGraphic))) {
       flushText()
       listedIds.add(node.backendNodeId)
       const nativeDropDown = role === 'combobox' && node.tag === 'select'
@@ -2131,6 +2484,7 @@ function collectCandidates({
         ...(role === 'link' && node.attributes.href !== undefined ? { href: node.attributes.href } : {}),
         ...(nativeDropDown ? { options: nativeSelectOptions(node) } : {}),
         ...(widget ? { widget } : {}),
+        ...(isImage && node.tag === 'img' && node.attributes.alt === undefined ? { noAlt: { src: node.attributes.src ?? '' } } : {}),
         order: placed.order,
         ...(placed.nodeIndex !== undefined ? { nodeIndex: placed.nodeIndex } : {}),
         measured: measuredFromRuntime(node),
@@ -2138,15 +2492,47 @@ function collectCandidates({
         anchorIsSelf: true,
         contextBasis: {},
       })
+      // A rich editor's blocks: ref'd lines of their own (see EDITOR_BLOCK_TAGS).
+      const contentEditable = node.attributes.contenteditable
+      if (role === 'textbox' && contentEditable !== undefined && contentEditable !== 'false') {
+        const walk = (parent: PageModelNode): void => {
+          for (const child of parent.children) {
+            const kind = EDITOR_BLOCK_TAGS[child.tag]
+            if (kind && model.byKey.has(child.key) && child.runtime.visible === true) {
+              const at = orderOf(child.backendNodeId)
+              listedIds.add(child.backendNodeId)
+              elements.push({
+                key: child.key,
+                frameId: child.frameId,
+                backendNodeId: child.backendNodeId,
+                role: child.role && child.role !== 'generic' ? child.role : kind,
+                name: gatherText(child, Number.POSITIVE_INFINITY).replace(/\s+/g, ' ').trim(),
+                tag: child.tag,
+                order: at.order,
+                ...(at.nodeIndex !== undefined ? { nodeIndex: at.nodeIndex } : {}),
+                measured: measuredFromRuntime(child),
+                anchor: child,
+                anchorIsSelf: true,
+                contextBasis: {},
+              })
+            }
+            walk(child)
+          }
+        }
+        walk(node)
+      }
       // Its popup options are part of it, not controls of their own.
       if (nativeDropDown) return
     }
 
-    const childFlags = {
+    // A popup open inside a block (a row's "More actions" menu) is not the block's text: its own
+    // text is read on its own.
+    const inBlock = flags.inBlock && !POPUP_ROLES[role]
+    const childFlags: { inControl: boolean; inBlock: boolean } = {
       inControl: flags.inControl || isInteractive || isImage,
-      inBlock: flags.inBlock,
+      inBlock,
     }
-    if (real && placed && !childFlags.inControl && !flags.inBlock) {
+    if (real && placed && !childFlags.inControl && !inBlock) {
       if (role === 'heading') {
         flushText()
         const headingText = modelName(node) || gatherText(node, Number.POSITIVE_INFINITY)
@@ -2164,6 +2550,40 @@ function collectCandidates({
           })
         }
         childFlags.inBlock = true
+      } else if (role === 'tooltip') {
+        // Its words are its name: Chromium names a tooltip after its content and drops the text
+        // inside as a repeat of that name.
+        flushText()
+        const tip = gatherText(node, Number.POSITIVE_INFINITY) || modelName(node)
+        if (tip) {
+          texts.push({
+            key: node.key,
+            frameId: node.frameId,
+            role,
+            text: tip.replace(/\s+/g, ' ').trim(),
+            order: placed.order,
+            ...(placed.nodeIndex !== undefined ? { nodeIndex: placed.nodeIndex } : {}),
+            measured: measuredFromRuntime(node),
+            anchor: node,
+          })
+        }
+        childFlags.inBlock = true
+      } else if (NAMED_GROUP_ROLES[role] && modelName(node)) {
+        // A table, grid or list's own name (its <caption>, aria-labelledby or aria-label) is what
+        // tells it from the others ("Cookies", "localStorage"). A caption that names its table is
+        // left out of the AX text as a repeat of that name, so this is where it is read. The rows
+        // and items inside are read as usual.
+        flushText()
+        texts.push({
+          key: node.key,
+          frameId: node.frameId,
+          role,
+          text: modelName(node).replace(/\s+/g, ' ').trim(),
+          order: placed.order,
+          ...(placed.nodeIndex !== undefined ? { nodeIndex: placed.nodeIndex } : {}),
+          measured: measuredFromRuntime(node),
+          anchor: node,
+        })
       } else if (BLOCK_TEXT_ROLES[role] && !containsBlock(node)) {
         flushText()
         const isRow = role === 'row' || role === 'layouttablerow'
@@ -2172,7 +2592,7 @@ function collectCandidates({
               .filter((child) => CELL_ROLES[child.role ?? ''])
               // gatherText first: Chromium's own cell name glues inline runs together
               // ("Hacker Newsnew | past"), the gathered text keeps them apart.
-              .map((cell) => gatherText(cell, Number.POSITIVE_INFINITY) || modelName(cell))
+              .map((cell) => gatherText(cell, Number.POSITIVE_INFINITY) || nameWithoutPopups(cell))
               .filter(Boolean)
               .join(' | ')
           : // A block whose only words are its links' names ("All", "Active" in a filter list)
@@ -2225,10 +2645,10 @@ function collectCandidates({
   flushText()
 
   if (frame) {
-    collectClickables({ model, frame, viewport, listedIds, elements, liveRegions })
+    collectClickables({ model, frame, viewport, listedIds, elements, liveRegions, listeners })
     elements.sort((a, b) => a.order - b.order)
   }
-  return { elements, texts, liveRegions, nodeIndexByBackendId, ...(modalDialog ? { modalDialog } : {}) }
+  return { elements, texts, liveRegions, nodeIndexByBackendId, unnamedGraphics, ...(modalDialog ? { modalDialog } : {}) }
 }
 
 /**
@@ -2343,15 +2763,20 @@ async function addLabelOperatedControls({
 }
 
 /**
- * Non-semantic click targets: laid-out, visible elements of at least 8×8 px that
- * DOMSnapshot reports `isClickable` and the AX tree does not already list — the
- * `<div onClick>` cards a React app is full of and a text-only model otherwise cannot
- * find. Also the live regions made with `aria-live` on an element the AX filter drops as an
- * unnamed `generic` (their text is collected as body text like any other).
+ * Things a person acts on that have no control role: laid-out, visible elements of at least 8×8 px
+ * the AX tree does not already list, that DOMSnapshot reports `isClickable` (the `<div onClick>`
+ * cards a React app is full of), that are `draggable="true"` (a sortable list's items), that Tab
+ * reaches (`tabindex` ≥ 0: a focusable card), or that listen for a pointer event other than click
+ * (`contextmenu`, `dblclick`, `pointerdown`… — `listeners`, from DOMDebugger.getEventListeners). A
+ * text-only model otherwise cannot find, drag or right-click them. Also the live regions made with
+ * `aria-live` on an element the AX filter drops as an unnamed `generic` (their text is collected
+ * as body text like any other).
  *
- * Skipped: `html`/`body`; `<label>` (a click there is forwarded to its control, which
- * is listed); delegation roots (large, and containing other controls); and anything
- * inside an element already listed — the click target is the outer one.
+ * Skipped: `html`/`body`; `<label>` (a click there is forwarded to its control, which is listed);
+ * click delegation roots (large, and containing other controls); an element that is only focusable
+ * or only listens, around other controls (a listener or tabindex on a container is for what is
+ * inside it), or whose role makes it a region of the page (a focusable scroll area, a dialog, a
+ * landmark); and anything inside an element already listed — the target is the outer one.
  */
 function collectClickables({
   model,
@@ -2360,6 +2785,7 @@ function collectClickables({
   listedIds,
   elements,
   liveRegions,
+  listeners,
 }: {
   model: PageModel
   frame: FrameGeometry
@@ -2367,6 +2793,7 @@ function collectClickables({
   listedIds: Set<number>
   elements: Candidate[]
   liveRegions: LiveRegionCandidate[]
+  listeners: Map<number, string[]> | undefined
 }): void {
   const cache = new Map<number, boolean>()
   const nodeBackendIds = frame.nodeBackendIds ?? []
@@ -2374,10 +2801,12 @@ function collectClickables({
 
   const liveIds = new Set(liveRegions.map((region) => region.backendNodeId))
   const candidates: SnapshotNodeGeometry[] = []
+  const actionableOf = new Map<number, NonNullable<Candidate['actionable']>>()
   const records = [...frame.byNodeIndex.values()].sort((a, b) => a.nodeIndex - b.nodeIndex)
   for (const record of records) {
     if (record.nodeType !== 1) continue
-    const live = record.attributes?.['aria-live']
+    const attributes = record.attributes ?? {}
+    const live = attributes['aria-live']
     if (live && live !== 'off' && !liveIds.has(record.backendNodeId) && measureLaidOutRecord(record, frame, cache).visible) {
       liveIds.add(record.backendNodeId)
       const key = `${frame.frameId}:${record.backendNodeId}` as NodeKey
@@ -2385,16 +2814,26 @@ function collectClickables({
       liveRegions.push({
         key,
         backendNodeId: record.backendNodeId,
-        role: record.attributes?.role || `aria-live=${live}`,
-        name: (node && modelName(node)) || record.attributes?.['aria-label'] || '',
+        role: attributes.role || `aria-live=${live}`,
+        name: (node && modelName(node)) || attributes['aria-label'] || '',
       })
     }
-    if (!record.isClickable) continue
+    const draggable = attributes.draggable === 'true'
+    const focusable = attributes.tabindex !== undefined && Number.parseInt(attributes.tabindex, 10) >= 0
+    const listens = listeners?.get(record.backendNodeId)
+    if (!record.isClickable && !draggable && !focusable && !listens) continue
     const tag = record.nodeName.toLowerCase()
     if (tag === 'html' || tag === 'body' || tag === 'label') continue
     if (listedIds.has(record.backendNodeId)) continue
     if (record.box.width < MIN_CLICKABLE_SIDE || record.box.height < MIN_CLICKABLE_SIDE) continue
     if (!measureLaidOutRecord(record, frame, cache).visible) continue
+    if (!record.isClickable && !draggable && REGION_ROLES[model.byKey.get(`${frame.frameId}:${record.backendNodeId}` as NodeKey)?.role ?? '']) continue
+    actionableOf.set(record.backendNodeId, {
+      ...(record.isClickable ? { clicks: true as const } : {}),
+      ...(draggable ? { draggable: true as const } : {}),
+      ...(focusable ? { focusable: true as const } : {}),
+      ...(listens ? { listens } : {}),
+    })
     candidates.push(record)
   }
   if (candidates.length === 0) return
@@ -2410,16 +2849,70 @@ function collectClickables({
   const listedNodeIndexes: number[] = []
   for (const element of elements) if (element.nodeIndex !== undefined) listedNodeIndexes.push(element.nodeIndex)
 
+  // Element children by parent node index, built the first time a delegation container needs its items.
+  let elementChildren: Map<number, SnapshotNodeGeometry[]> | undefined
+  const shownChildren = (nodeIndex: number): SnapshotNodeGeometry[] => {
+    if (!elementChildren) {
+      elementChildren = new Map()
+      for (const record of records) {
+        const parent = frame.parentIndex[record.nodeIndex] ?? -1
+        if (record.nodeType !== 1 || parent < 0) continue
+        const siblings = elementChildren.get(parent)
+        if (siblings) siblings.push(record)
+        else elementChildren.set(parent, [record])
+      }
+    }
+    return (elementChildren.get(nodeIndex) ?? []).filter(
+      (child) => child.box.width >= MIN_CLICKABLE_SIDE && child.box.height >= MIN_CLICKABLE_SIDE && measureLaidOutRecord(child, frame, cache).visible,
+    )
+  }
+  /**
+   * The items a click delegation container serves: the largest group of its shown element
+   * children of one kind (tag and first class), looking through single-child wrappers, when there
+   * are at least DELEGATED_ITEMS_MIN of them; else none.
+   */
+  const delegatedItems = (container: SnapshotNodeGeometry): SnapshotNodeGeometry[] => {
+    let children = shownChildren(container.nodeIndex)
+    while (children.length === 1) children = shownChildren(children[0].nodeIndex)
+    const kinds = new Map<string, SnapshotNodeGeometry[]>()
+    for (const child of children) {
+      const kind = `${child.nodeName} ${(child.attributes?.class ?? '').trim().split(/\s+/)[0]}`
+      const group = kinds.get(kind)
+      if (group) group.push(child)
+      else kinds.set(kind, [child])
+    }
+    let items: SnapshotNodeGeometry[] = []
+    for (const group of kinds.values()) if (group.length > items.length) items = group
+    return items.length >= DELEGATED_ITEMS_MIN ? items : []
+  }
+
   const kept = new Set<number>()
   const keptRecords: SnapshotNodeGeometry[] = []
   for (const record of candidates) {
+    // Already listed as an item of the delegation container around it.
+    if (kept.has(record.nodeIndex)) continue
+    const actionable = actionableOf.get(record.backendNodeId)
+    const containsControls = (): boolean =>
+      listedNodeIndexes.some((index) => isAncestorOf(record.nodeIndex, index)) ||
+      candidates.some((other) => other !== record && isAncestorOf(record.nodeIndex, other.nodeIndex))
     const area = record.box.width * record.box.height
-    if (area >= DELEGATION_ROOT_VIEWPORT_SHARE * viewportArea) {
-      const containsControls =
-        listedNodeIndexes.some((index) => isAncestorOf(record.nodeIndex, index)) ||
-        candidates.some((other) => other !== record && isAncestorOf(record.nodeIndex, other.nodeIndex))
-      if (containsControls) continue
-    }
+    if (area >= DELEGATION_ROOT_VIEWPORT_SHARE * viewportArea && containsControls()) continue
+    // Only focusable or only listening, around controls: a container (a menu, a toolbar, a list
+    // that delegates its items' events), not a target.
+    if (!actionable?.clicks && !actionable?.draggable && containsControls()) continue
+    // One click listener for many targets, whatever its size — a <tbody> serving every row's
+    // buttons, a pager <nav> serving its page buttons, a list serving its items — is a delegation
+    // container, not one control: clicking its middle hits whichever item is there. A draggable or
+    // focusable element is one target its author made, and stays. So does a press surface around a
+    // single control — a custom slider's track around its thumb, which listens for the press itself
+    // (pointerdown/mousedown/touchstart) and moves the thumb to where it lands.
+    const delegates = actionable?.clicks === true && !actionable.draggable && !actionable.focusable
+    const pressSurface = actionable?.listens?.some((type) => type === 'pointerdown' || type === 'mousedown' || type === 'touchstart') === true
+    const controlsInside = (): number =>
+      listedNodeIndexes.filter((index) => isAncestorOf(record.nodeIndex, index)).length +
+      candidates.filter((other) => other !== record && isAncestorOf(record.nodeIndex, other.nodeIndex)).length
+    if (delegates && containsControls() && !(pressSurface && controlsInside() === 1)) continue
+    const items = delegates ? delegatedItems(record) : []
     let current = frame.parentIndex[record.nodeIndex] ?? -1
     let nested = false
     while (current >= 0) {
@@ -2431,6 +2924,16 @@ function collectClickables({
       current = frame.parentIndex[current] ?? -1
     }
     if (nested) continue
+    if (items.length > 0) {
+      // Its items are the targets: a click on one reaches the container's listener.
+      const clickHandledBy = cssLabelOf(record)
+      for (const item of items) {
+        actionableOf.set(item.backendNodeId, { ...actionableOf.get(item.backendNodeId), clickHandledBy })
+        kept.add(item.nodeIndex)
+        keptRecords.push(item)
+      }
+      continue
+    }
     kept.add(record.nodeIndex)
     keptRecords.push(record)
   }
@@ -2449,6 +2952,9 @@ function collectClickables({
     const attributes = record.attributes ?? {}
     const visibleText = nodeVisibleText(frame, record.nodeIndex, Number.POSITIVE_INFINITY)
     const name = visibleText || attributes['aria-label'] || attributes.title || ''
+    const anchorIsSelf = anchor?.backendNodeId === record.backendNodeId
+    const itemRole = anchorIsSelf && anchor?.role && ITEM_LIKE_ROLES[anchor.role] ? anchor.role : undefined
+    const actionable = actionableOf.get(record.backendNodeId)
     elements.push({
       key: `${model.frameId}:${record.backendNodeId}` as NodeKey,
       frameId: model.frameId,
@@ -2456,7 +2962,11 @@ function collectClickables({
       role: 'clickable',
       name: name.replace(/\s+/g, ' ').trim(),
       tag: record.nodeName.toLowerCase(),
+      // Its own AX states (focused, expanded…) when the AX tree has the element itself.
+      ...(anchorIsSelf && anchor?.states ? { states: anchor.states } : {}),
       cssLabel: cssLabelOf(record),
+      ...(actionable ? { actionable } : {}),
+      ...(itemRole ? { itemRole } : {}),
       order: record.nodeIndex,
       nodeIndex: record.nodeIndex,
       measured: {
@@ -2468,7 +2978,7 @@ function collectClickables({
           : {}),
       },
       ...(anchor ? { anchor } : {}),
-      anchorIsSelf: anchor?.backendNodeId === record.backendNodeId,
+      anchorIsSelf,
       fullyNamed: visibleText.length <= NAME_MAX_CHARS,
       contextBasis: {},
     })
@@ -2514,21 +3024,31 @@ function assignContexts({
   }
 
   /**
-   * What names `container` for `element`: its own name, a row's first other cell, else the first
-   * readable text inside, or the name of a control of another kind (a todo row's checkbox "Buy
-   * milk" for its Delete button). A peer's words are skipped there: they name that peer, not the
-   * container (the "Small" label of the radio beside "Standard", the "Edit" of the button beside
-   * "Delete"). A link stays readable: a title or author link is what identifies its item.
+   * What names `container` for `element`: its own name, a row's words (each cell's own text, in
+   * order: `INV-1003 Initech 2026-01-19 $2,400.00 Overdue`), else the first readable text inside, or
+   * the name of a control of another kind (a todo row's checkbox "Buy milk" for its Delete button).
+   * A peer's words are skipped there: they name that peer, not the container (the "Small" label of
+   * the radio beside "Standard", the "Edit" of the button beside "Delete"). A link stays readable: a
+   * title or author link is what identifies its item.
    */
   const containerLabel = (container: PageModelNode, candidate: Candidate): string | undefined => {
     const element = candidate.anchorIsSelf ? candidate.anchor : undefined
     const role = container.role ?? ''
-    const own = (CELL_ROLES[role] && gatherText(container, CONTEXT_MAX_CHARS)) || modelName(container)
+    // A cell's own words: Chromium names a cell after its controls too ("Edit Delete More actions").
+    const own = CELL_ROLES[role] ? gatherText(container, CONTEXT_MAX_CHARS) : modelName(container)
     if (role === 'row' || role === 'layouttablerow') {
-      // Chromium names a row after ALL its cells ("Alice Edit"): the first cell that is
-      // not the control itself identifies the row better.
+      // Chromium names a row after ALL its cells, controls included ("Alice Edit"): the row reads
+      // as the words of its cells, the controls' names left out.
+      // A plain cell's text can be its name only (Chromium drops a text that repeats its cell's
+      // name), so a cell without controls reads as its name.
+      const words = container.children
+        .map((cell) => gatherText(cell, CONTEXT_MAX_CHARS) || (containsControl(cell) ? '' : nameWithoutPopups(cell)))
+        .filter((text) => text && text !== candidate.name)
+      if (words.length > 0) return truncate(words.join(' '), CONTEXT_MAX_CHARS)
+      // A row of controls only (a todo row's checkbox and Delete): the first cell that is not the
+      // control itself.
       for (const cell of container.children) {
-        const cellName = gatherText(cell, CONTEXT_MAX_CHARS) || modelName(cell)
+        const cellName = nameWithoutPopups(cell)
         if (cellName && cellName !== candidate.name) return truncate(cellName, CONTEXT_MAX_CHARS)
       }
     }
@@ -2539,8 +3059,9 @@ function assignContexts({
     const visit = (node: PageModelNode): void => {
       if (found || node === element) return
       const nodeRole = node.role ?? ''
-      if (node !== container && (node.labels === candidate.role || (nodeRole === candidate.role && nodeRole !== 'link'))) return
-      const name = modelName(node)
+      // A popup open in it (a row's menu) is not its words.
+      if (node !== container && (node.labels === candidate.role || (nodeRole === candidate.role && nodeRole !== 'link') || POPUP_ROLES[nodeRole])) return
+      const name = CELL_ROLES[nodeRole] ? nameWithoutPopups(node) : modelName(node)
       if (name && name !== candidate.name && (nodeRole === 'text' || nodeRole === 'heading' || CELL_ROLES[nodeRole] || INTERACTIVE_ROLES[nodeRole])) {
         found = truncate(name, CONTEXT_MAX_CHARS)
         return
@@ -2551,13 +3072,22 @@ function assignContexts({
     return found
   }
 
+  /** Rows and list items: each is one item, identified by its own words. */
+  const ITEM_ROLES: Record<string, true> = { row: true, layouttablerow: true, listitem: true }
+
   // Visible texts in reading order: the caption before an element is the last of them that
-  // precedes it in its own document and is not a block it sits in.
+  // precedes it in its own document and is not a block it sits in. For an element in a row or list
+  // item, another row or item is no caption: it is the item before its own (the previous invoice's
+  // row), which names another item, not this one.
   const shownTexts = texts.filter((text) => text.measured.visible === true)
   const captionBefore = (candidate: Candidate): string | undefined => {
     const model = models.get(candidate.frameId)
     const around = new Set<NodeKey>()
-    for (let key: NodeKey | undefined = candidate.anchor?.key; key !== undefined; key = model?.parentByKey.get(key)) around.add(key)
+    let inItem = false
+    for (let key: NodeKey | undefined = candidate.anchor?.key; key !== undefined; key = model?.parentByKey.get(key)) {
+      if (ITEM_ROLES[model?.byKey.get(key)?.role ?? '']) inItem = true
+      around.add(key)
+    }
     let low = 0
     let high = shownTexts.length
     while (low < high) {
@@ -2567,7 +3097,7 @@ function assignContexts({
     }
     for (let index = low - 1; index >= 0; index--) {
       const text = shownTexts[index]
-      if (text.frameId === candidate.frameId && !around.has(text.anchor.key)) return text.text
+      if (text.frameId === candidate.frameId && !around.has(text.anchor.key)) return inItem && ITEM_ROLES[text.role] ? undefined : text.text
     }
     return undefined
   }
@@ -2577,7 +3107,9 @@ function assignContexts({
     let key: NodeKey | undefined = !candidate.anchor || !model ? undefined : candidate.anchorIsSelf ? model.parentByKey.get(candidate.anchor.key) : candidate.anchor.key
     while (key && model) {
       const node = model.byKey.get(key)
-      if (node && CONTEXT_ROLES[node.role ?? '']) {
+      // A cell in a row: the row is what a person names ("the Initech row"), not the cell.
+      const cellInRow = node && CELL_ROLES[node.role ?? ''] && ITEM_ROLES[model.byKey.get(model.parentByKey.get(key) ?? key)?.role ?? '']
+      if (node && !cellInRow && CONTEXT_ROLES[node.role ?? '']) {
         const label = containerLabel(node, candidate)
         // Chromium's layout-table roles read as plain rows/cells to a person.
         if (label) return `in ${(node.role ?? '').replace(/^layouttable/, '')} "${label}"`
@@ -2700,23 +3232,50 @@ function shortHref(href: string, pageUrl: string): string {
   }
 }
 
-function describeElement(element: ObservedElement, obs: Observation): string {
-  const role = element.role === 'clickable' ? `clickable ${element.cssLabel ?? element.tag}` : element.role
-  let line = `${element.isNew ? '*' : ''}[${element.ref}] ${role}`
+/**
+ * What an element is, as its line says it: its role (`button`); for a `clickable`, what it answers
+ * to and its AX role or `tag#id.class` (`draggable focusable listitem`, `clickable div#card.card`,
+ * `focusable div#ctx-card.ctx-card`); for a backdrop, the modal it belongs to.
+ */
+function elementKind(element: ObservedElement): string {
+  if (element.role === 'backdrop') return `backdrop of ${element.backdropOf ?? 'the modal'}`
+  if (element.role !== 'clickable') return element.role
+  const actionable = element.actionable
+  const clicks = actionable?.clicks || actionable?.clickHandledBy !== undefined
+  const words = actionable ? [clicks ? 'clickable' : '', actionable.draggable ? 'draggable' : '', actionable.focusable ? 'focusable' : ''].filter(Boolean) : ['clickable']
+  return [...words, element.itemRole ?? element.cssLabel ?? element.tag].join(' ')
+}
+
+/** How a person works the pointer events a `clickable` listens for, besides a plain click. */
+const LISTENER_HINTS: Record<string, (ref: number) => string> = {
+  contextmenu: (ref) => `right-click: act.click(${ref}, { button: 'right' })`,
+  dblclick: (ref) => `double-click: act.dblclick(${ref})`,
+}
+
+export function describeElement(element: ObservedElement, obs: Observation): string {
+  let line = `${element.isNew ? '*' : ''}[${element.ref}] ${elementKind(element)}`
   if (element.name) line += ` ${quote(element.name)}`
   line += formatAxStates(element.states, element.role)
   if (element.value !== undefined) line += ` = ${quote(element.value, 60)}`
   line = describeField(element, line)
+  // Relative links and image addresses resolve against the element's own document: an iframe's, when it is in one.
+  const base = obs.elements.find((candidate) => candidate.frame?.frameId === element.frameId)?.frame?.url ?? obs.url
   if (element.href !== undefined) {
-    // Relative links resolve against the element's own document: an iframe's, when it is in one.
-    const base = obs.elements.find((candidate) => candidate.frame?.frameId === element.frameId)?.frame?.url ?? obs.url
     const href = shortHref(element.href, base)
     if (href) line += ` → ${href}`
   }
+  if (element.noAlt) line += ` (no alt)${element.noAlt.src ? ` ${shortHref(element.noAlt.src, base) || quote(element.noAlt.src, 80)}` : ' (no src)'}`
   if (element.frame) {
     const { controls, unread } = element.frame
     line += unread ? ` — not read: ${unread}` : ` — ${controls} control${controls === 1 ? '' : 's'}`
   }
+  const listens = element.actionable?.listens
+  if (listens) {
+    const hints = listens.flatMap((type) => LISTENER_HINTS[type]?.(element.ref) ?? [])
+    line += ` (listens for ${listens.join(', ')}${hints.length ? ` — ${hints.join('; ')}` : ''})`
+  }
+  const handledBy = element.actionable?.clickHandledBy
+  if (handledBy) line += ` (its click reaches the click listener of ${handledBy})`
   if (element.context) line += ` (${element.context})`
   if (element.image) {
     if (element.image.broken) line += ' BROKEN (did not load)'
@@ -2762,7 +3321,7 @@ function inScroller(item: { visibility: Visibility; scroller?: number }): boolea
 }
 
 /** Where an element is, in words a person would use, with what to do about it. */
-function describeWhere(item: { visibility: Visibility; box?: Box; coveredBy?: string; scroller?: number }, obs: Observation): string {
+export function describeWhere(item: { visibility: Visibility; box?: Box; coveredBy?: string; scroller?: number }, obs: Observation): string {
   const distance = screensFromTop(item.box, obs)
   if (item.scroller !== undefined && inScroller(item)) {
     return `inside ${scrollerLabel(obs, item.scroller)}, scrolled out of sight (act.scrollTo(ref), or act.scroll(dir, { ref: ${item.scroller} }))`
@@ -2794,6 +3353,8 @@ function describeWhere(item: { visibility: Visibility; box?: Box; coveredBy?: st
 function describeText(block: TextBlock): string {
   const prefix = block.isNew ? '*' : ''
   if (block.role === 'heading') return `${prefix}heading ${quote(block.text, TEXT_SHOWN_CHARS)}${block.level !== undefined ? ` [level=${block.level}]` : ''}`
+  if (block.role === 'tooltip') return `${prefix}tooltip ${quote(block.text, TEXT_SHOWN_CHARS)}${block.describes !== undefined ? ` (describes [${block.describes}])` : ''}`
+  if (NAMED_GROUP_ROLES[block.role]) return `${prefix}${block.role} ${quote(block.text, TEXT_SHOWN_CHARS)}`
   const label = block.role === 'listitem' ? 'item' : block.role === 'row' || block.role === 'layouttablerow' ? 'row' : 'text'
   return `${prefix}${label}: ${quote(block.text, TEXT_SHOWN_CHARS)}`
 }
@@ -2893,9 +3454,10 @@ function pageHeader(obs: Observation): string[] {
   const lines = [`PAGE  ${parts.join(' · ')}`]
   const tabs = obs.tabs
   if (tabs && tabs.length > 1) {
-    const list = tabs.map((tab) => `${tab.index}: ${quote(tab.title, 40)}${tab.controlled ? ' (controlled)' : ''}`)
-    lines.push(`TABS  ${list.join(' · ')} — act.switchTab(n) works in another`)
+    const list = tabs.map((tab) => `${tab.index}: ${quote(tab.title, 40)}${tab.popup ? ' (popup window)' : ''}${tab.controlled ? ' (controlled)' : ''}`)
+    lines.push(`TABS  ${list.join(' · ')} — act.switchTab(n or text of its title/URL) works in another`)
   }
+  lines.push(...(obs.tabNotes ?? []))
   if (!obs.scroll || !obs.viewport) {
     lines.push('      viewport and scroll position not readable while the dialog is open')
   } else {
@@ -2991,7 +3553,7 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
     elements = elements.filter((e) => e.ref === scope || e.inside?.includes(scope))
     texts = texts.filter((t) => t.inside?.includes(scope))
     const what = root
-      ? `${root.role === 'clickable' ? `clickable ${root.cssLabel ?? root.tag}` : root.role}${root.name ? ` ${quote(root.name)}` : ''}`
+      ? `${elementKind(root)}${root.name ? ` ${quote(root.name)}` : ''}`
       : area
         ? `${area.role} ${quote(area.name)}`
         : `${obs.modal?.role} ${quote(obs.modal?.name ?? '')}`
@@ -3026,6 +3588,10 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
     body.push(`MODAL ${modal.role}${modal.name ? ` ${quote(modal.name)}` : ''}${modal.ref !== undefined ? ` [${modal.ref}]` : ''} — only its controls work right now:`)
     if (!elements.some((e) => e.inModal)) body.push('  (no controls listed inside it)')
     for (const item of modalItems) body.push(item.line)
+    // Its backdrop, outside it: what a click beside the dialog lands on.
+    for (const backdrop of elements.filter((e) => e.role === 'backdrop' && ON_SCREEN[e.visibility])) {
+      body.push(`  ${describeElement(backdrop, obs)} — a click outside the dialog lands on it, not on what it covers`)
+    }
   }
   const focused = obs.focused !== undefined ? elements.find((e) => e.ref === obs.focused) : undefined
   if (focused) body.push(`FOCUS ${describeElement(focused, obs)}`)
@@ -3038,7 +3604,7 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
   type Item = { order: number; region?: string; indent: number; line: string }
   const items: Item[] = []
   for (const element of elements) {
-    if (!ON_SCREEN[element.visibility] || (modal && element.inModal)) continue
+    if (!ON_SCREEN[element.visibility] || (modal && (element.inModal || element.role === 'backdrop'))) continue
     const behind = modal && !element.inModal ? ' (behind the modal)' : coverNote(element)
     items.push({ order: element.order, region: element.region, indent: indentOf(element.frameId), line: `${describeElement(element, obs)}${behind}` })
   }
@@ -3154,6 +3720,14 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
   }
   const anyNew = elements.some((e) => e.isNew) || texts.some((t) => t.isNew)
   if (anyNew) tail.push('* = new since your last observe')
+  if (obs.decorativeImages && scope === undefined) {
+    const n = obs.decorativeImages
+    tail.push(`IMAGES ${n} decorative image${n === 1 ? '' : 's'} (alt="") not listed: the page marks ${n === 1 ? 'it' : 'them'} as decoration`)
+  }
+  if (obs.unnamedGraphics && scope === undefined) {
+    const n = obs.unnamedGraphics
+    tail.push(`IMAGES ${n} unnamed graphic${n === 1 ? '' : 's'} (inline <svg>/canvas/role=img with no title or label) not listed: nothing in the page says what ${n === 1 ? 'it shows' : 'they show'}`)
+  }
   return fitToBudget(head, body, tail, maxChars, 'use observe({ scope: ref }) or find("text")')
 }
 
@@ -3198,8 +3772,34 @@ export interface ObservationDiff {
   behindModal?: number
   /** This many controls and text blocks came back from being inert or behind a backdrop. */
   backFromModal?: number
+  /**
+   * Items the page re-rendered with the same content: their nodes were replaced (new keys), but
+   * they read the same (role, name or text, value and state, context, container). Not listed as
+   * gone and new; `text` counts the text blocks, `elements` pairs each control's old and new ref.
+   */
+  rerendered?: { text: number; elements: Array<{ from: ObservedElement; to: ObservedElement }> }
   /** The observation after — for headers (title, url, counts) when rendering. */
   after: Observation
+}
+
+/**
+ * Items that went and came back reading the same (`meaning`), in document order: each removed one
+ * paired with the first added one of the same meaning not paired yet.
+ */
+function pairByMeaning<T>(removed: T[], added: T[], meaning: (item: T) => string): Array<{ from: T; to: T }> {
+  const waiting = new Map<string, T[]>()
+  for (const item of removed) {
+    const key = meaning(item)
+    const list = waiting.get(key)
+    if (list) list.push(item)
+    else waiting.set(key, [item])
+  }
+  const pairs: Array<{ from: T; to: T }> = []
+  for (const item of added) {
+    const from = waiting.get(meaning(item))?.shift()
+    if (from !== undefined) pairs.push({ from, to: item })
+  }
+  return pairs
 }
 
 /** The visibility distinctions a diff reports: hidden↔shown and covered↔uncovered, not scrolling. */
@@ -3324,6 +3924,23 @@ export function diffObservations(before: Observation, after: Observation): Obser
     else diff.textRemoved.push(block)
   }
 
+  // Meaning, not node identity: a page that re-renders a table or a list replaces its nodes, so the
+  // keys of rows that read the same change. A removed and an added item that read the same — role,
+  // name or text, value and state, context, container, region — are that one item re-rendered.
+  const elementMeaning = (e: ObservedElement): string =>
+    [e.frameId, e.role, e.name, e.value ?? '', e.href ?? '', statesWithoutFocus(e), e.context ?? '', e.region ?? '', e.container?.label ?? '', visibilityClass(e.visibility), e.inModal ? 'modal' : ''].join('\u0000')
+  const textMeaning = (t: TextBlock): string =>
+    [t.frameId, t.role, t.text, t.level ?? '', t.region ?? '', t.live ?? '', t.container?.label ?? '', t.inModal ? 'modal' : ''].join('\u0000')
+  const rerenderedElements = pairByMeaning(diff.removed, diff.added, elementMeaning)
+  const rerenderedText = pairByMeaning(diff.textRemoved, diff.textAdded, textMeaning)
+  if (rerenderedElements.length > 0 || rerenderedText.length > 0) {
+    diff.removed = diff.removed.filter((e) => !rerenderedElements.some((pair) => pair.from === e))
+    diff.added = diff.added.filter((e) => !rerenderedElements.some((pair) => pair.to === e))
+    diff.textRemoved = diff.textRemoved.filter((t) => !rerenderedText.some((pair) => pair.from === t))
+    diff.textAdded = diff.textAdded.filter((t) => !rerenderedText.some((pair) => pair.to === t))
+    diff.rerendered = { text: rerenderedText.length, elements: rerenderedElements }
+  }
+
   if (before.focused !== after.focused) {
     const from = before.focused !== undefined ? before.elements.find((e) => e.ref === before.focused) : undefined
     const to = after.focused !== undefined ? after.elements.find((e) => e.ref === after.focused) : undefined
@@ -3334,9 +3951,9 @@ export function diffObservations(before: Observation, after: Observation): Obser
   return diff
 }
 
-function shortElement(element: ObservedElement): string {
-  const role = element.role === 'clickable' ? `clickable ${element.cssLabel ?? element.tag}` : element.role
-  return `[${element.ref}] ${role}${element.name ? ` ${quote(element.name)}` : ''}${element.context ? ` (${element.context})` : ''}`
+/** `[4] button "Delete" (in row "Alice")`: an element the way observe names it in one line (also audit's element lines). */
+export function shortElement(element: ObservedElement): string {
+  return `[${element.ref}] ${elementKind(element)}${element.name ? ` ${quote(element.name)}` : ''}${element.context ? ` (${element.context})` : ''}`
 }
 
 /** A text block that changed in place: how it grew (a streamed reply), or what it was. */
@@ -3426,6 +4043,19 @@ export function renderObservationDiff(diff: ObservationDiff, options: { maxChars
   }
   lines.sort((a, b) => a.order - b.order)
   for (const { line } of lines) body.push(line)
+  // A re-render that only replaced text nodes looks the same: nothing to report on its own. Controls
+  // that got new refs are reported (their old refs are gone); re-rendered text is counted next to
+  // other changes, so what is left out is said.
+  const rerendered = diff.rerendered
+  if (rerendered && (rerendered.elements.length > 0 || head.length > 0 || body.length > 0)) {
+    const parts: string[] = []
+    if (rerendered.text > 0) parts.push(`${rerendered.text} text block${rerendered.text === 1 ? '' : 's'} (not listed)`)
+    if (rerendered.elements.length > 0) {
+      const refs = rerendered.elements.map(({ from, to }) => `[${from.ref}]→${shortElement(to)}`).join(', ')
+      parts.push(`${rerendered.elements.length} control${rerendered.elements.length === 1 ? ' under a new ref' : 's under new refs'}: ${refs}`)
+    }
+    body.push(`~ re-rendered with the same content: ${parts.join('; ')}`)
+  }
 
   if (head.length === 0 && body.length === 0) return ''
   return fitToBudget(head, body, [], maxChars, 'call observe() for the full page')
@@ -3462,52 +4092,73 @@ function contextWords(context: string | undefined): string | undefined {
   return open !== -1 && close > open ? context.slice(open + 1, close) : undefined
 }
 
+/**
+ * Exact matches first: what contains the query as one phrase (case and runs of whitespace
+ * ignored). Only when nothing does, what contains every word of it anywhere — said to be
+ * approximate, since "Message 1 —" is in "Message 10 — …" word by word but not as a phrase.
+ */
 export function findInObservation(obs: Observation, query: string, options: { limit?: number } = {}): string {
   const limit = options.limit ?? 20
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
-  if (terms.length === 0) return 'find(): the query is empty — pass the words you are looking for, e.g. find("checkout").'
-  const matches = (haystack: Array<string | undefined>): boolean => {
-    const text = haystack.filter(Boolean).join(' ').replace(/\s+/g, ' ').toLowerCase()
-    return terms.every((term) => text.includes(term))
-  }
-  const lines: string[] = []
-  let total = 0
+  const phrase = query.replace(/\s+/g, ' ').trim().toLowerCase()
+  if (phrase === '') return 'find(): the query is empty — pass the words you are looking for, e.g. find("checkout").'
+  const terms = phrase.split(' ')
   const iframeRefOf = new Map(obs.elements.flatMap((e) => (e.frame ? [[e.frame.frameId, e.ref] as const] : [])))
   const inIframe = (item: { frameId: string }): string => (iframeRefOf.has(item.frameId) ? ` · in iframe [${iframeRefOf.get(item.frameId)}]` : '')
-  for (const element of obs.elements) {
-    const role = element.role === 'clickable' ? `clickable ${element.cssLabel ?? element.tag}` : element.role
-    const behind = obs.modal && !element.inModal ? ' (behind the modal)' : ''
-    if (matches([role, element.name, element.value, element.href, contextWords(element.context), element.region])) {
-      total++
-      if (lines.length < limit) {
-        const nameExcerpt = element.name.length > NAME_MAX_CHARS && matches([element.name]) ? ` — name ${excerpt(element.name, terms)}` : ''
-        lines.push(`  ${describeElement({ ...element, isNew: false }, obs)}${nameExcerpt} — ${describeWhere(element, obs)}${behind}${element.region ? ` · ${element.region}` : ''}${inIframe(element)}`)
-      }
-      continue
+  const search = (exact: boolean): { lines: string[]; total: number } => {
+    // The excerpt of a long text is centred on the phrase, or on the first word of it.
+    const focus = exact ? [phrase] : terms
+    const matches = (haystack: Array<string | undefined>): boolean => {
+      const text = haystack.filter(Boolean).join(' ').replace(/\s+/g, ' ').toLowerCase()
+      return exact ? text.includes(phrase) : terms.every((term) => text.includes(term))
     }
-    // A drop-down's choices are searched as what they are: options of that control.
-    const options = (element.options ?? []).filter((option) => matches([option.label]))
-    if (options.length === 0) continue
-    total += options.length
-    for (const option of options) {
-      if (lines.length >= limit) break
+    const lines: string[] = []
+    let total = 0
+    for (const element of obs.elements) {
+      const role = elementKind(element)
+      const behind = obs.modal && !element.inModal && element.role !== 'backdrop' ? ' (behind the modal)' : ''
+      const extra = [element.noAlt ? `no alt ${element.noAlt.src}` : undefined, element.actionable?.listens?.join(' ')]
+      if (matches([role, element.name, element.value, element.href, contextWords(element.context), element.region, ...extra])) {
+        total++
+        if (lines.length < limit) {
+          const nameExcerpt = element.name.length > NAME_MAX_CHARS && matches([element.name]) ? ` — name ${excerpt(element.name, focus)}` : ''
+          lines.push(`  ${describeElement({ ...element, isNew: false }, obs)}${nameExcerpt} — ${describeWhere(element, obs)}${behind}${element.region ? ` · ${element.region}` : ''}${inIframe(element)}`)
+        }
+        continue
+      }
+      // A drop-down's choices are searched as what they are: options of that control.
+      const choices = (element.options ?? []).filter((option) => matches([option.label]))
+      if (choices.length === 0) continue
+      total += choices.length
+      for (const option of choices) {
+        if (lines.length >= limit) break
+        lines.push(
+          `  option ${quote(option.label)}${option.disabled ? ' (disabled)' : ''} of [${element.ref}] ${element.role}${element.name ? ` ${quote(element.name)}` : ''} — ` +
+            `act.select(${element.ref}, ${quote(option.label)}) · ${describeWhere(element, obs)}${behind}`,
+        )
+      }
+    }
+    for (const block of obs.text) {
+      // A tooltip or a table/list name is found by its kind too (find("tooltip"), find("table Cookies")).
+      const named = block.role === 'tooltip' || NAMED_GROUP_ROLES[block.role] === true
+      if (!matches([named ? block.role : undefined, block.text])) continue
+      total++
+      if (lines.length >= limit) continue
+      const label = named ? block.role : block.role === 'heading' ? 'heading' : block.role === 'listitem' ? 'item' : block.role === 'row' || block.role === 'layouttablerow' ? 'row' : 'text'
+      const describes = block.describes !== undefined ? ` (describes [${block.describes}])` : ''
       lines.push(
-        `  option ${quote(option.label)}${option.disabled ? ' (disabled)' : ''} of [${element.ref}] ${element.role}${element.name ? ` ${quote(element.name)}` : ''} — ` +
-          `act.select(${element.ref}, ${quote(option.label)}) · ${describeWhere(element, obs)}${behind}`,
+        `  ${label}${named ? ' ' : ': '}${excerpt(block.text, focus)}${describes} — ${describeWhere(block, obs)}${block.region ? ` · ${block.region}` : ''}${block.live ? ` · live region ${block.live}` : ''}${inIframe(block)}`,
       )
     }
+    return { lines, total }
   }
-  for (const block of obs.text) {
-    if (!matches([block.text])) continue
-    total++
-    if (lines.length >= limit) continue
-    const label = block.role === 'heading' ? 'heading' : block.role === 'listitem' ? 'item' : block.role === 'row' || block.role === 'layouttablerow' ? 'row' : 'text'
-    lines.push(`  ${label}: ${excerpt(block.text, terms)} — ${describeWhere(block, obs)}${block.region ? ` · ${block.region}` : ''}${block.live ? ` · live region ${block.live}` : ''}${inIframe(block)}`)
-  }
-  if (total === 0) {
+  const exact = search(true)
+  // One word is a phrase of its own: the word-by-word search would find the same things.
+  const found = exact.total > 0 || terms.length === 1 ? exact : search(false)
+  if (found.total === 0) {
     return `No match for ${quote(query)} among the ${obs.elements.length} controls and ${obs.text.length} text blocks observe() lists on this page (off-screen ones included; whole texts searched).`
   }
-  const header = `${total} match${total === 1 ? '' : 'es'} for ${quote(query)}:`
-  const more = total > lines.length ? [`  … ${total - lines.length} more not shown (find(query, { limit }) to see more)`] : []
-  return [header, ...lines, ...more].join('\n')
+  const count = `${found.total} ${found === exact ? '' : 'approximate '}match${found.total === 1 ? '' : 'es'}`
+  const header = found === exact ? `${count} for ${quote(query)}:` : `No exact match for ${quote(query)}. ${count} (every word found, not as one phrase):`
+  const more = found.total > found.lines.length ? [`  … ${found.total - found.lines.length} more not shown (find(query, { limit }) to see more)`] : []
+  return [header, ...found.lines, ...more].join('\n')
 }

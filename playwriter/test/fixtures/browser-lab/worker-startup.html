@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Worker startup · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<!-- Not a lab page: a worker that fails while its script first runs, so its error and exception come
+     right after Chrome resumes it. -->
+<main>
+  <h1>Sync</h1>
+  <button type="button" id="sync">Start sync</button>
+  <p id="status" role="status"></p>
+</main>
+<script>
+document.getElementById('sync').addEventListener('click', () => {
+  const worker = new Worker('/lab/startup-worker.js')
+  worker.onerror = () => { document.getElementById('status').textContent = 'Sync failed' }
+})
+</script>
+</body>
+</html>

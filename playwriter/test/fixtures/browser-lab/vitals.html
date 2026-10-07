@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  #hero { display: block; width: 100%; height: auto; border-radius: 10px; }
+  .promo { height: 120px; background: #fff4d6; border: 1px solid #f0d58a; border-radius: 10px; display: flex; align-items: center; padding: 0 18px; font-weight: 600; margin-bottom: 14px; }
+  .metrics { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Performance</span></header>
+<main id="main">
+  <h1>Performance playground</h1>
+  <div id="promo-slot"></div>
+  <img id="hero" src="/lab/hero.png" width="1200" height="500" alt="Gradient hero banner">
+  <p>The hero image above is the largest element on the page. Shortly after load a promotional banner is inserted above it, pushing the content down.</p>
+  <div class="card">
+    <button type="button" id="heavy">Run heavy task (300 ms)</button>
+    <p id="heavy-status" role="status">Heavy task: not run</p>
+  </div>
+  <div class="card metrics" aria-live="polite">
+    <div id="m-lcp">LCP: pending</div>
+    <div id="m-cls">CLS: 0.000</div>
+    <div id="m-long">Long tasks: 0</div>
+  </div>
+</main>
+<script type="module">
+import { $, on, later, setText, tagLinks } from '/lab/common.js';
+
+let cls = 0;
+let longTasks = 0;
+let longest = 0;
+
+new PerformanceObserver((list) => {
+  const entries = list.getEntries();
+  const last = entries[entries.length - 1];
+  const el = last.element;
+  const name = el ? el.localName + (el.id ? '#' + el.id : '') : '(unknown)';
+  setText($('#m-lcp'), `LCP: ${Math.round(last.startTime)} ms (${name})`);
+}).observe({ type: 'largest-contentful-paint', buffered: true });
+
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) if (!e.hadRecentInput) cls += e.value;
+  setText($('#m-cls'), `CLS: ${cls.toFixed(3)}`);
+}).observe({ type: 'layout-shift', buffered: true });
+
+new PerformanceObserver((list) => {
+  for (const e of list.getEntries()) { longTasks++; longest = Math.max(longest, e.duration); }
+  setText($('#m-long'), `Long tasks: ${longTasks} (longest ${Math.round(longest)} ms)`);
+}).observe({ type: 'longtask', buffered: true });
+
+function insertPromo() {
+  const promo = document.createElement('div');
+  promo.className = 'promo';
+  promo.id = 'promo';
+  promo.textContent = 'Limited offer: free shipping this week only!';
+  $('#promo-slot').append(promo);
+}
+if (document.readyState === 'complete') later(600, insertPromo);
+else on(window, 'load', () => later(600, insertPromo));
+
+on($('#heavy'), 'click', () => {
+  const start = performance.now();
+  while (performance.now() - start < 300) { /* deliberate 300 ms busy loop (long task) */ }
+  setText($('#heavy-status'), `Heavy task finished in ${Math.round(performance.now() - start)} ms`);
+});
+
+tagLinks();
+</script>
+</body>
+</html>

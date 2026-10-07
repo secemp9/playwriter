@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Editors</title>
+<style>
+  body { font: 15px sans-serif; margin: 20px; }
+  .editor { border: 1px solid #999; padding: 8px 12px; margin: 12px 0; max-width: 520px; }
+</style>
+</head>
+<body>
+<h1>Editors</h1>
+<button id="elsewhere">Elsewhere</button>
+
+<h2>Notes</h2>
+<div id="notes" class="editor" contenteditable="true" aria-label="Notes">
+  <p>Buy milk.</p>
+  <ul><li>First item</li><li>Second item</li></ul>
+  <p>Last line.</p>
+</div>
+
+<h2>Story</h2>
+<!-- Like ProseMirror: the editor handles beforeinput itself, keeps its own model, and re-renders the blocks. -->
+<div id="story" class="editor ProseMirror" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Story"></div>
+
+<script>
+  const story = document.getElementById('story')
+  const model = [{ tag: 'h3', text: 'Chapter one' }, { tag: 'p', text: 'It was a dark night.' }, { tag: 'p', text: 'The end.' }]
+  const render = () => {
+    story.replaceChildren(...model.map((block) => { const el = document.createElement(block.tag); el.textContent = block.text; return el }))
+  }
+  render()
+  story.addEventListener('beforeinput', (event) => {
+    event.preventDefault()
+    const selection = getSelection()
+    if (!selection.rangeCount || event.inputType !== 'insertText') return
+    const node = selection.focusNode
+    const blockEl = node.nodeType === 1 ? node : node.parentElement
+    const index = Array.prototype.indexOf.call(story.children, blockEl.closest('#story > *'))
+    if (index < 0) return
+    const offset = node.nodeType === 3 ? selection.focusOffset : model[index].text.length
+    model[index].text = model[index].text.slice(0, offset) + event.data + model[index].text.slice(offset)
+    render()
+    const text = story.children[index].firstChild
+    selection.collapse(text, offset + event.data.length)
+  })
+</script>
+</body>
+</html>

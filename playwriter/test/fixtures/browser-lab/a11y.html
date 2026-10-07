@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newsletter preferences · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .faint { color: #c4c4c4; background: #ffffff; }
+  .fake-button { display: inline-block; padding: 7px 14px; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; user-select: none; }
+  .item { display: flex; align-items: center; gap: 10px; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Newsletter preferences</span></header>
+<main>
+  <h1>Newsletter preferences</h1>
+  <h4>Monthly digest</h4>
+  <img src="/lab/chart.svg" width="320" height="120">
+  <p id="promo">Spring sale: 20% off all plans.</p>
+  <p class="faint">Offer ends at midnight.</p>
+  <div class="card">
+    <div class="row">
+      <input type="email" id="newsletter-email" placeholder="Email">
+      <div class="fake-button" id="subscribe">Subscribe</div>
+    </div>
+    <p id="promo">Unsubscribe at any time.</p>
+  </div>
+  <div class="card item" id="saved-item">
+    <span id="item-text">Saved article: “Ten tips for faster builds”</span>
+    <button type="button" class="icon" id="delete-item"><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 3h6l1 2h4v2H4V5h4zm-3 6h12l-1 12H7z" fill="currentColor"/></svg></button>
+  </div>
+  <p id="status" class="status" role="status"></p>
+</main>
+<script type="module">
+import { $, on, setText, tagLinks } from '/lab/common.js';
+on($('#subscribe'), 'click', () => {
+  const v = $('#newsletter-email').value.trim();
+  setText($('#status'), v ? `Subscribed: ${v}` : 'Enter an email first');
+});
+on($('#delete-item'), 'click', () => {
+  $('#item-text').textContent = 'No saved articles';
+  $('#delete-item').disabled = true;
+  setText($('#status'), 'Item deleted');
+});
+tagLinks();
+</script>
+</body>
+</html>

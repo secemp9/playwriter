@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shop</title>
+<style>
+  body { font: 15px sans-serif; margin: 0; }
+  nav { display: flex; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #ccc; }
+  main { padding: 16px; }
+</style>
+</head>
+<body>
+<nav aria-label="Shop">
+  <a href="/shop/?tag=lab">Home</a>
+  <a href="/shop/products?tag=lab">Products</a>
+  <a href="/shop/cart?tag=lab">Cart</a>
+</nav>
+<main id="view"></main>
+<script>
+  // An app router: links carry the page's ?tag, clicks are routed with pushState, no reload.
+  const view = document.getElementById('view')
+  const routes = {
+    '/shop/': () => '<h1>Welcome</h1><p>Browse <a href="/shop/products?tag=lab">our products</a>.</p>' +
+      '<p>Help: <a href="/shop/help#faq">FAQ</a> · <a href="/shop/help#contact">Contact us</a></p>',
+    '/shop/products': () => '<h1>Products' + (new URLSearchParams(location.search).get('sort') === 'price' ? ' by price' : '') + '</h1>' +
+      '<p><a href="/shop/products?sort=price&tag=lab">Sort by price</a></p><p><a href="/shop/cart?step=checkout&tag=lab">Checkout</a></p>',
+    '/shop/cart': () => '<h1>Cart' + (new URLSearchParams(location.search).get('step') === 'checkout' ? ' — checkout' : '') + '</h1>',
+    '/shop/help': () => '<h1>Help</h1><h2 id="faq">FAQ</h2><h2 id="contact">Contact</h2>',
+  }
+  const render = () => {
+    view.innerHTML = (routes[location.pathname] ?? (() => '<h1>Not found</h1>'))()
+    document.title = view.querySelector('h1').textContent + ' · Shop'
+  }
+  document.addEventListener('click', (event) => {
+    const link = event.target.closest('a')
+    if (!link || link.origin !== location.origin) return
+    event.preventDefault()
+    history.pushState({}, '', link.href)
+    render()
+  })
+  addEventListener('popstate', render)
+  render()
+</script>
+</body>
+</html>

@@ -1,9 +1,12 @@
 /**
- * Screen recording utility for playwriter using chrome.tabCapture.
- * Recording happens in the extension context, so it survives page navigation.
+ * The `recording.start/stop/isRecording/cancel` API.
  *
- * This module communicates with the relay server which forwards commands to the extension.
- * sessionId (pw-tab-* format) is used to identify which tab to record.
+ * With the Playwriter extension, recording uses chrome.tabCapture in the extension, so it
+ * survives page navigation; the relay forwards the commands and sessionId (pw-tab-* format)
+ * names the tab. A browser without the extension (a headless Chrome this process launched, a
+ * direct CDP connection) has no tabCapture: there the same calls drive the session's CDP
+ * screencast recorder (`recording.startCdp`, cdp-screencast.ts), and every result names the
+ * recorder it used.
  */
 
 import fs from 'node:fs'
@@ -19,6 +22,7 @@ import { GhostCursorController } from './ghost-cursor-controller.js'
 import {
   burnPointerIntoVideo,
   validatePointerOptions,
+  type CdpScreencastResult,
   type PointerBurnResult,
   type PointerOverlayOptions,
 } from './cdp-screencast.js'
@@ -41,6 +45,30 @@ function recordingHeaders(): Record<string, string> {
 
 /** Default max recording duration: 15 minutes in milliseconds */
 const DEFAULT_MAX_DURATION_MS = 15 * 60 * 1000
+
+/** The longest delay a Node.js timer takes (2^31-1 ms, 24.8 days): a disabled duration limit. */
+const MAX_TIMER_MS = 2_147_483_647
+
+/** Which recorder made a recording. */
+export type RecorderKind = 'extension-tab-capture' | 'cdp-screencast'
+
+const CDP_RECORDER_NOTE =
+  'Recording with the CDP screencast recorder: this browser has no Playwriter extension, so tab capture is unavailable. ' +
+  'Frames arrive when the page repaints and are held in between; it keeps recording across navigations of this tab; ' +
+  'no audio; it keeps at most 5000 frames (recording.stop() says if it dropped any). recording.stop() writes the MP4.'
+
+/**
+ * The session's CDP screencast recorder (`recording.startCdp`), as `recording.*` drives it in a
+ * browser without the extension. The handle lives on the executor, so a recording started with
+ * `recording.startCdp` is the same one `active()` reports.
+ */
+export interface CdpRecorder {
+  start(options: { page: Page; outputPath: string; fps: number; maxDurationMs: number; pointer?: boolean | PointerOverlayOptions }): Promise<{ startedAt: number }>
+  stop(): Promise<CdpScreencastResult>
+  cancel(): Promise<void>
+  /** The CDP screencast running in this session — started by recording.start or recording.startCdp — or null. */
+  active(): { startedAt: number; frames: number } | null
+}
 
 /**
  * Compute the largest viewport that fits inside `current` at the target aspect ratio.
@@ -125,6 +153,12 @@ export interface RecordingState {
   isRecording: boolean
   startedAt?: number
   tabId?: number
+  /** The recorder of the running recording: the extension's tab capture or the CDP screencast. */
+  recorder?: RecorderKind
+  /** Frames the CDP screencast has captured so far (CDP screencast only). */
+  frames?: number
+  /** What the recorder that started does differently (CDP screencast only). */
+  note?: string
 }
 
 export interface ExecutionTimestamp {
@@ -150,6 +184,12 @@ interface CreateRecordingApiOptions {
    * `page.evaluate` runs as a user gesture and gives the page user activation.
    */
   viewportOf: (page: Page) => Promise<{ width: number; height: number }>
+  /**
+   * Whether the browser has the extension's tab capture: false for a headless Chrome this process
+   * launched and for a direct CDP connection, which then record with `cdp`.
+   */
+  tabCapture: boolean
+  cdp: CdpRecorder
 }
 
 interface StartRecordingWithDefaultsOptions extends Omit<StartRecordingOptions, 'relayPort'> {}
@@ -191,12 +231,18 @@ function withRecordingDefaults<T extends { page?: Page; sessionId?: string }, R>
 
 /** What `recording.stop()` returns. */
 export interface RecordingStopResult {
+  recorder: RecorderKind
   path: string
+  /** Milliseconds. */
   duration: number
   size: number
   executionTimestamps: ExecutionTimestamp[]
   /** What the pointer layer drew. Present unless the recording was started with `pointer: false`. */
   pointer?: PointerBurnResult
+  /** Frames captured (CDP screencast only). */
+  frames?: number
+  /** What the CDP screencast recorder adjusted or dropped (frame cap, late first frame). */
+  note?: string
 }
 
 /** What `start()` captured so `stop()` can burn the pointer on the recording's own clock. */
@@ -214,7 +260,7 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
   isRecording: (opts?: IsRecordingWithDefaultsOptions) => Promise<RecordingState>
   cancel: (opts?: CancelRecordingWithDefaultsOptions) => Promise<void>
 } {
-  const { context, defaultPage, relayPort, ghostCursorController, onStart, onFinish, getExecutionTimestamps, viewportOf } = options
+  const { context, defaultPage, relayPort, ghostCursorController, onStart, onFinish, getExecutionTimestamps, viewportOf, tabCapture, cdp } = options
 
   // Stores the original viewport before an explicit aspect-ratio resize so we can restore on stop/cancel
   let preRecordingViewport: { width: number; height: number } | null = null
@@ -234,9 +280,15 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     fn: stopRecording,
   })
   const isRecordingWithDefaults = async (opts: IsRecordingWithDefaultsOptions = {}): Promise<RecordingState> => {
-    const targetPage = opts.page || defaultPage
-    const sessionId = opts.sessionId || targetPage.sessionId() || undefined
-    return isRecording({ page: targetPage, sessionId, relayPort })
+    if (tabCapture) {
+      const targetPage = opts.page || defaultPage
+      const sessionId = opts.sessionId || targetPage.sessionId() || undefined
+      const state = await isRecording({ page: targetPage, sessionId, relayPort })
+      if (state.isRecording) return { ...state, recorder: 'extension-tab-capture' }
+    }
+    // Also a recording made with recording.startCdp: it is this session's, whoever started it.
+    const running = cdp.active()
+    return running ? { isRecording: true, startedAt: running.startedAt, recorder: 'cdp-screencast', frames: running.frames } : { isRecording: false }
   }
 
   const cancelWithDefaults = async (opts: CancelRecordingWithDefaultsOptions = {}): Promise<void> => {
@@ -245,9 +297,39 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     await cancelRecording({ page: targetPage, sessionId, relayPort })
   }
 
+  /** Recording options only the extension's tab capture has: refused, not ignored, when the CDP screencast records. */
+  const refuseForCdpRecorder = (opts: StartRecordingWithDefaultsOptions | undefined): string => {
+    const prefix =
+      'recording.start: this browser has no Playwriter extension, so recording.start records with the CDP screencast recorder'
+    const outputPath = opts?.outputPath
+    if (!outputPath) throw new Error(`${prefix}, and it needs outputPath: recording.start({ outputPath: '/abs/path/clip.mp4' }). Nothing was recorded.`)
+    if (path.extname(outputPath).toLowerCase() !== '.mp4') {
+      throw new Error(`${prefix}, which writes an H.264 MP4: give outputPath a .mp4 name (got ${JSON.stringify(outputPath)}). Nothing was recorded.`)
+    }
+    if (opts.audio) throw new Error(`${prefix}, which records no audio: omit audio. Nothing was recorded.`)
+    if (opts.videoBitsPerSecond !== undefined || opts.audioBitsPerSecond !== undefined) {
+      throw new Error(
+        `${prefix}, which has no bitrate setting: omit videoBitsPerSecond/audioBitsPerSecond, or call ` +
+          'recording.startCdp({ outputPath, quality }) to set the JPEG quality of its frames. Nothing was recorded.',
+      )
+    }
+    return outputPath
+  }
+
+  /** Stop on its own after maxDurationMs (default 15 min) so a forgotten recording cannot fill the disk; 0 or Infinity disables it. */
+  const scheduleAutoStop = (maxMs: number, opts: StartRecordingWithDefaultsOptions | undefined): void => {
+    if (maxMs > 0 && maxMs < Infinity) {
+      maxDurationTimer = setTimeout(() => {
+        maxDurationTimer = null
+        stop(opts ? { page: opts.page, sessionId: opts.sessionId } : undefined).catch(() => {})
+      }, maxMs)
+    }
+  }
+
   const start = async (opts?: StartRecordingWithDefaultsOptions): Promise<RecordingState> => {
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
-
+    const cdpOutputPath = tabCapture ? null : refuseForCdpRecorder(opts)
+    const maxMs = opts?.maxDurationMs ?? DEFAULT_MAX_DURATION_MS
     // Only on explicit request: resizing fires `resize` and media-query changes in the page.
     // Only shrinks — never increases width or height beyond current values.
     if (opts?.aspectRatio) {
@@ -268,6 +350,20 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     const pointer = opts?.pointer ?? true
     // Refused now rather than after the recording has been made.
     validatePointerOptions(typeof pointer === 'object' ? pointer : undefined)
+    if (cdpOutputPath !== null) {
+      const { startedAt } = await cdp.start({
+        page: targetPage,
+        outputPath: cdpOutputPath,
+        fps: opts?.frameRate ?? 30,
+        // The recorder's own hard stop; the auto-stop below is what encodes the file at that point.
+        maxDurationMs: maxMs > 0 && maxMs < Infinity ? maxMs : MAX_TIMER_MS,
+        // Passed through as given: the recorder draws the pointer itself, and an explicit value makes a missing libass an error.
+        pointer: opts?.pointer,
+      })
+      onStart()
+      scheduleAutoStop(maxMs, opts)
+      return { isRecording: true, startedAt, recorder: 'cdp-screencast', note: CDP_RECORDER_NOTE }
+    }
     // The CSS viewport the pointer track's coordinates live in, which `stop()` scales onto the
     // captured video. Measured after any resize above.
     const cssViewport = pointer === false ? undefined : await viewportOf(targetPage)
@@ -288,17 +384,8 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
       })
     }
 
-    // Schedule auto-stop to prevent unbounded recordings filling disk.
-    // Default 15 min. Set maxDurationMs to 0 or Infinity to disable.
-    const maxMs = opts?.maxDurationMs ?? DEFAULT_MAX_DURATION_MS
-    if (maxMs > 0 && maxMs < Infinity) {
-      maxDurationTimer = setTimeout(() => {
-        maxDurationTimer = null
-        stop(opts ? { page: opts.page, sessionId: opts.sessionId } : undefined).catch(() => {})
-      }, maxMs)
-    }
-
-    return result
+    scheduleAutoStop(maxMs, opts)
+    return { ...result, recorder: 'extension-tab-capture' }
   }
 
   const clearMaxDurationTimer = (): void => {
@@ -320,6 +407,30 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
   const stop = async (opts?: StopRecordingWithDefaultsOptions): Promise<RecordingStopResult> => {
     clearMaxDurationTimer()
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
+    if (!tabCapture) {
+      if (!cdp.active()) {
+        throw new Error(
+          'recording.stop: no recording is running. This browser has no Playwriter extension: recording.start({ outputPath }) ' +
+            'records with the CDP screencast recorder.',
+        )
+      }
+      const recorded = await cdp.stop()
+      const executionTimestamps = [...getExecutionTimestamps()]
+      onFinish()
+      await restoreViewport(targetPage)
+      if (!recorded.wrote) throw new Error(`recording.stop: no video was written. ${recorded.note ?? ''}`.trim())
+      const written = path.resolve(recorded.outputPath)
+      return {
+        recorder: 'cdp-screencast',
+        path: written,
+        duration: recorded.durationMs,
+        size: fs.statSync(written).size,
+        frames: recorded.frames,
+        executionTimestamps,
+        ...(recorded.pointer ? { pointer: recorded.pointer } : {}),
+        ...(recorded.note ? { note: recorded.note } : {}),
+      }
+    }
     const result = await stopWithDefaults(opts)
     const recordingEndedAt = Date.now()
     const executionTimestamps = [...getExecutionTimestamps()]
@@ -327,7 +438,7 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     await restoreViewport(targetPage)
     const plan = pointerPlans.get(targetPage)
     pointerPlans.delete(targetPage)
-    if (!plan) return { ...result, executionTimestamps }
+    if (!plan) return { recorder: 'extension-tab-capture', ...result, executionTimestamps }
     const pointer = await burnPointerIntoVideo({
       videoPath: result.path,
       timeline: pointerTrackFor(targetPage),
@@ -340,13 +451,14 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     }).catch((error: Error) => {
       throw new Error(`${error.message} The recording itself was saved, without the pointer, at ${result.path}.`)
     })
-    return { ...result, size: fs.statSync(result.path).size, executionTimestamps, pointer }
+    return { recorder: 'extension-tab-capture', ...result, size: fs.statSync(result.path).size, executionTimestamps, pointer }
   }
 
   const cancel = async (opts?: CancelRecordingWithDefaultsOptions): Promise<void> => {
     clearMaxDurationTimer()
     const targetPage = resolveRecordingTargetPage({ context, defaultPage, ghostCursorController, target: opts })
-    await cancelWithDefaults(opts)
+    if (tabCapture) await cancelWithDefaults(opts)
+    else await cdp.cancel()
     pointerPlans.delete(targetPage)
     onFinish()
     await restoreViewport(targetPage)

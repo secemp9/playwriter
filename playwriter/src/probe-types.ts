@@ -34,16 +34,18 @@ export type PolicyMode = 'human' | 'debug'
 export interface BusySignal {
   /**
    * `strong` — the page itself says it is working: an element the accessibility tree marks
-   * busy (aria-busy), an indeterminate progressbar or one that advanced since the action, an
-   * endlessly repeating animation on screen (a spinner) that started since the action,
+   * busy (aria-busy), an indeterminate progressbar or one whose value is moving (since the
+   * action, or within the last 2 s without one), an endlessly repeating animation on screen that
+   * started since the action and stands for loading — a spinner, or skeleton placeholders —,
    * content still streaming in, a response body still arriving. `weak` — worth reporting,
-   * never a reason to wait or refuse: a determinate progressbar standing still, a spinner
-   * that was already running before the action, a status text announced since the action,
-   * a request the server holds open without answering.
+   * never a reason to wait or refuse: a spinner or skeleton that was already running before the
+   * action, a status text announced since the action, a request the server holds open without
+   * answering. A determinate progressbar standing still (a chart, a language bar, a finished
+   * upload) is no busy signal at all.
    */
   strength: 'strong' | 'weak'
-  kind: 'aria-busy' | 'progressbar' | 'status-text' | 'spinner' | 'dom-streaming' | 'network-streaming' | 'network-waiting'
-  /** What a person would notice, e.g. `region "Search results" is marked busy` or `progressbar "Upload" (indeterminate)`. */
+  kind: 'aria-busy' | 'progressbar' | 'status-text' | 'spinner' | 'skeleton' | 'dom-streaming' | 'network-streaming' | 'network-waiting'
+  /** What a person would notice, e.g. `region "Search results" [aria-busy]`, `progressbar "Upload" (indeterminate)` or `6 skeleton placeholders (animation shimmer) in area "Products"`. */
   label: string
 }
 
@@ -54,13 +56,18 @@ export interface JsDialogState {
   defaultValue?: string
   openedAt: number
   /**
-   * Who answers it: `auto` = the dialog policy does, at once (an alert under `pending`,
-   * everything under `accept`/`dismiss`); `agent` = it stays open until
-   * `act.dialog.accept()`/`dismiss()` (confirm, prompt, beforeunload under `pending`).
+   * Who answers it: `auto` = answered at once without the agent (an alert always; a confirm or
+   * prompt under the session policy `accept`/`dismiss`; a beforeunload only under an explicit
+   * `beforeunload: 'leave' | 'stay'`); `agent` = it stays open until
+   * `act.dialog.accept()`/`dismiss()`.
    */
   handling: 'agent' | 'auto'
-  /** Set once the dialog is gone. `auto-accepted` = the policy accepted it (an alert under `pending`, anything under `accept`). */
+  /** Set once the dialog is gone. `auto-accepted` = an alert acknowledged automatically (it has only one button). */
   outcome?: 'accepted' | 'dismissed' | 'auto-accepted'
+  /** Answered by the session dialog policy (`act.dialog.policy`) as it opened, not by the agent. */
+  answeredBy?: 'policy'
+  /** The text a prompt was accepted with (its default when the answer gave none). */
+  promptText?: string
   closedAt?: number
 }
 
@@ -86,9 +93,17 @@ export interface NetworkRecord {
   /** When this process learned it ended (epoch ms, this process's clock). */
   endedAt?: number
   status?: number
+  /** The status line's text (`OK`, `Not Found`) Chrome reported with the status. */
+  statusText?: string
+  /** How long it took, from Chrome's own monotonic stamps: issued → last byte (or failure, or the redirect). */
+  durationMs?: number
+  /** Bytes received for it, headers included (Chrome's `encodedDataLength` when it finished). */
+  bytes?: number
   /**
-   * Why it failed: CDP's errorText (`net::ERR_…`), `canceled`, `blocked: <Chrome's reason>` (`csp`,
-   * `mixed-content`, …) or `CORS error: <Chrome's reason>`. Absent when the request did not fail.
+   * Why it failed: `CORS: <Chrome's reason> (<fetch|XMLHttpRequest|…> from <origin> to <url>)`,
+   * `canceled`, CDP's errorText (`net::ERR_…`) or `blocked: <Chrome's reason>` (`csp`,
+   * `mixed-content`, …). Absent when the request did not fail — also for a response with an error
+   * status whose body Chrome stopped reading (a script that answered 404): that is `status` 404.
    */
   failed?: string
   /**
@@ -226,7 +241,19 @@ export interface SettleResult {
   /** Label of the element whose content was still changing when the cap hit. */
   domChangingIn?: string
   msSinceLastContentMutation?: number
-  busy: BusySignal[]
+  /**
+   * The busy signals when the wait ended. Read only when waiting for idle (a strong one keeps it
+   * waiting) and empty when the page was closed or a dialog blocks it; a plain settle does not read
+   * them (the action report takes them from the picture it takes right after).
+   */
+  busy?: BusySignal[]
+  /**
+   * Loading indicators the settle step saw while it waited that were gone when it ended — an
+   * aria-busy element, skeleton placeholders, a spinner — with how long they were seen (from the
+   * first to the last poll that saw them: a lower bound). Ones still shown are in the busy signals
+   * of the page now.
+   */
+  busyWhileSettling?: Array<{ label: string; seenMs: number }>
   /** The open dialog when reason is js-dialog. */
   dialog?: JsDialogState
 }

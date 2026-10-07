@@ -142,6 +142,7 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
   // that records every command sent to it.
   const workerEvents = new EventEmitter()
   const workerCommands: string[] = []
+  const workerClosers: Array<() => void> = []
   const worker: TappedWorker = {
     url: 'http://app.test/parser.js',
     session: {
@@ -152,7 +153,9 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
         workerEvents.off(event, listener)
       },
       start() {},
-      onClose() {},
+      onClose(listener) {
+        workerClosers.push(listener)
+      },
     },
     cdp: {
       send: async (method: string) => {
@@ -163,6 +166,7 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
       off: () => {},
       detach: async () => {},
     } as unknown as ICDPSession,
+    targetId: 'WORKER_TARGET',
   }
   const watch = new PageWatch({
     frames: new PageFrames({ page, cdp }),
@@ -199,7 +203,11 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
   const announce = (text: string): void => {
     live.push({ id: live.length + 1, at: browserNow(), updatedAt: null, role: 'status', text, transient: false })
   }
-  return { emit, emitWorker, workerCommands, request, finish, announce, watch, probes, errors, dialog: fake }
+  /** The worker's target detaches (it ended, or the page terminated it). */
+  const closeWorker = (): void => {
+    for (const listener of workerClosers.splice(0)) listener()
+  }
+  return { emit, emitWorker, closeWorker, workerCommands, request, finish, announce, watch, probes, errors, dialog: fake }
 }
 
 beforeEach(() => {
@@ -673,5 +681,114 @@ describe('a link that redirects to a download', () => {
     expect((await watch.since(cp)).failedRequests.map(({ url, failed, download }) => ({ url, failed, download }))).toEqual([
       { url: 'http://app.test/next', failed: 'canceled', download: undefined },
     ])
+  })
+})
+
+// Event sequences measured in Chrome 145 and 149 headless on the Browser Lab's errors and network pages.
+describe('what Chrome reported about a request (net.request, net.har)', () => {
+  it('a script that answered 404 and whose body Chrome then canceled is the HTTP 404, not a canceled request', async () => {
+    const { emit, request, watch } = setup()
+    const cp = watch.checkpoint()
+    const script = request('http://app.test/lab/missing-script.js', 'Script')
+    emit('Network.responseReceived', { requestId: script, type: 'Script', response: { status: 404, statusText: 'Not Found', mimeType: 'text/plain', headers: {} } })
+    emit('Network.loadingFailed', { requestId: script, type: 'Script', errorText: 'net::ERR_ABORTED', canceled: true })
+    const events = await watch.since(cp)
+    expect(events.failedRequests.map(({ url, status, statusText, failed }) => ({ url, status, statusText, failed }))).toEqual([
+      { url: 'http://app.test/lab/missing-script.js', status: 404, statusText: 'Not Found', failed: undefined },
+    ])
+    expect(watch.requestView('r1').facts.failure).toEqual({ errorText: 'net::ERR_ABORTED', canceled: true })
+  })
+
+  it('a request canceled after a success answer stays canceled', () => {
+    const { emit, request, watch } = setup()
+    const search = request('http://app.test/api/search')
+    emit('Network.responseReceived', { requestId: search, type: 'Fetch', response: { status: 200, mimeType: 'application/json', headers: {} } })
+    emit('Network.loadingFailed', { requestId: search, type: 'Fetch', errorText: 'net::ERR_ABORTED', canceled: true })
+    expect(watch.requests().map(({ status, failed }) => ({ status, failed }))).toEqual([{ status: 200, failed: 'canceled' }])
+  })
+
+  it("a CORS block names Chrome's reason, the origin it was sent from and the address — not net::ERR_FAILED", () => {
+    const { emit, watch } = setup()
+    emit('Network.requestWillBeSent', {
+      requestId: 'C1',
+      loaderId: 'LOADER_0',
+      wallTime: Date.now() / 1000,
+      type: 'Fetch',
+      frameId: MAIN,
+      documentURL: 'http://app.test/network.html',
+      request: { url: 'http://api.test/cors-fail', method: 'GET', headers: {} },
+    })
+    emit('Network.loadingFailed', { requestId: 'C1', type: 'Fetch', errorText: 'net::ERR_FAILED', canceled: false, corsErrorStatus: { corsError: 'MissingAllowOriginHeader', failedParameter: '' } })
+    emit('Network.requestWillBeSent', {
+      requestId: 'C2',
+      loaderId: 'LOADER_0',
+      wallTime: Date.now() / 1000,
+      type: 'XHR',
+      frameId: MAIN,
+      documentURL: 'http://app.test/network.html',
+      request: { url: 'http://api.test/strict', method: 'PUT', headers: {} },
+    })
+    emit('Network.loadingFailed', { requestId: 'C2', type: 'XHR', errorText: 'net::ERR_FAILED', canceled: false, corsErrorStatus: { corsError: 'AllowOriginMismatch', failedParameter: 'http://other.test' } })
+    expect(watch.requests().map((r) => r.failed)).toEqual([
+      'CORS: no Access-Control-Allow-Origin header (fetch from http://app.test to http://api.test/cors-fail)',
+      'CORS: Access-Control-Allow-Origin names another origin (http://other.test) (XMLHttpRequest from http://app.test to http://api.test/strict)',
+    ])
+  })
+
+  it('keeps the headers as sent and received on the wire, whichever comes first, per redirect hop, with status text, duration and size', () => {
+    const { emit, watch } = setup()
+    const base = { requestId: 'H1', loaderId: 'LOADER_0', type: 'Document', frameId: MAIN, documentURL: 'http://app.test/' }
+    // Chrome 145 sends the wire headers before requestWillBeSent.
+    emit('Network.requestWillBeSentExtraInfo', { requestId: 'H1', associatedCookies: [], headers: { Host: 'app.test', Cookie: 'sid=1' } })
+    emit('Network.requestWillBeSent', { ...base, wallTime: Date.now() / 1000, timestamp: 100, request: { url: 'http://app.test/login', method: 'POST', headers: { 'Content-Type': 'text/plain' }, postData: 'user=ada', hasPostData: true } })
+    emit('Network.responseReceivedExtraInfo', { requestId: 'H1', blockedCookies: [], headers: { Location: '/home', 'Set-Cookie': 'sid=2' }, resourceIPAddressSpace: 'Loopback', statusCode: 303 })
+    emit('Network.requestWillBeSent', {
+      ...base,
+      wallTime: Date.now() / 1000,
+      timestamp: 100.25,
+      request: { url: 'http://app.test/home', method: 'GET', headers: {} },
+      redirectResponse: { status: 303, statusText: 'See Other', mimeType: 'text/html', headers: { Location: '/home' } },
+    })
+    emit('Network.requestWillBeSentExtraInfo', { requestId: 'H1', associatedCookies: [], headers: { Host: 'app.test', Cookie: 'sid=2' } })
+    emit('Network.responseReceived', { requestId: 'H1', type: 'Document', response: { status: 200, statusText: 'OK', mimeType: 'text/html', headers: { 'Content-Type': 'text/html' }, protocol: 'http/1.1', remoteIPAddress: '127.0.0.1', remotePort: 80 } })
+    emit('Network.responseReceivedExtraInfo', { requestId: 'H1', blockedCookies: [], headers: { 'Content-Type': 'text/html', 'Content-Length': '12' }, resourceIPAddressSpace: 'Loopback', statusCode: 200 })
+    emit('Network.dataReceived', { requestId: 'H1', dataLength: 12, encodedDataLength: 0 })
+    emit('Network.loadingFinished', { requestId: 'H1', timestamp: 100.5, encodedDataLength: 230 })
+
+    const [login, home] = [watch.requestView('r1'), watch.requestView('r2')]
+    expect(login.record).toMatchObject({ status: 303, statusText: 'See Other', durationMs: 250 })
+    expect(login.facts).toMatchObject({
+      sentHeaders: { Host: 'app.test', Cookie: 'sid=1' },
+      receivedHeaders: { Location: '/home', 'Set-Cookie': 'sid=2' },
+      postData: Buffer.from('user=ada'),
+      initiatorOrigin: 'http://app.test',
+    })
+    expect(login.redirectedToUrl).toBe('http://app.test/home')
+    expect(home.record).toMatchObject({ status: 200, statusText: 'OK', durationMs: 250, bytes: 230 })
+    expect(home.facts).toMatchObject({
+      sentHeaders: { Host: 'app.test', Cookie: 'sid=2' },
+      receivedHeaders: { 'Content-Type': 'text/html', 'Content-Length': '12' },
+      bodyBytes: 12,
+      encodedBytes: 230,
+      protocol: 'http/1.1',
+      remoteAddress: '127.0.0.1:80',
+    })
+  })
+
+  it("ends the worker's script request when the worker ends, though Chrome announced it on the page's session", async () => {
+    const { emit, closeWorker, watch } = setup()
+    const cp = watch.checkpoint()
+    // Chrome gives the worker's script request the worker's target id.
+    emit('Network.requestWillBeSent', {
+      requestId: 'WORKER_TARGET',
+      loaderId: '',
+      wallTime: Date.now() / 1000,
+      documentURL: 'http://app.test/parser.js',
+      request: { url: 'http://app.test/parser.js', method: 'GET', headers: {} },
+    })
+    closeWorker()
+    const result = await settled(watch.settle({ since: cp, timeoutMs: 2000 }), 2100)
+    expect(result).toMatchObject({ settled: true, pendingRequests: [] })
+    expect(watch.requests()).toEqual([expect.objectContaining({ url: 'http://app.test/parser.js', lost: 'the worker http://app.test/parser.js that sent it ended', endedAt: expect.any(Number) })])
   })
 })

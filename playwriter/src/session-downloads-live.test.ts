@@ -16,7 +16,7 @@
  *     extension are driven by download-file-relay.test.ts and extension-downloads.test.ts).
  */
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawnDebuggableChrome, type SpawnedChrome } from './test-utils.js'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -38,7 +38,7 @@ const PAGE =
 let server: http.Server
 let baseUrl = ''
 let cwd = ''
-const chromes: Array<{ process: ChildProcess; exited: Promise<void> }> = []
+const chromes: SpawnedChrome[] = []
 /** The slow export's response, held open until a test ends it. */
 let slowExport: http.ServerResponse | null = null
 
@@ -69,9 +69,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   slowExport?.end()
-  // Chrome writes to its profile while it shuts down: the profiles go only once every Chrome has exited.
-  for (const chrome of chromes) chrome.process.kill()
-  await Promise.all(chromes.map((chrome) => chrome.exited))
+  // Chrome writes to its profile while it shuts down: the profiles go only once every Chrome and its helpers exited.
+  await Promise.all(chromes.map((chrome) => chrome.stop()))
   const closed = Promise.withResolvers<void>()
   server.close(() => closed.resolve())
   server.closeAllConnections()
@@ -81,22 +80,9 @@ afterAll(async () => {
 
 /** A headless Chrome of its own, the way a user or a cloud provider runs one: its CDP WebSocket URL. */
 async function startChrome(): Promise<string> {
-  const profile = fs.mkdtempSync(path.join(cwd, 'profile-'))
-  const chrome = spawn(resolveBrowserExecutablePath(), ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-  })
-  const exited = Promise.withResolvers<void>()
-  chrome.once('exit', () => exited.resolve())
-  chromes.push({ process: chrome, exited: exited.promise })
-  const endpoint = Promise.withResolvers<string>()
-  let output = ''
-  chrome.stderr?.on('data', (chunk: Buffer) => {
-    output += chunk.toString()
-    const match = /DevTools listening on (ws:\/\/\S+)/.exec(output)
-    if (match) endpoint.resolve(match[1]!)
-  })
-  chrome.once('exit', (code) => endpoint.reject(new Error(`Chrome exited (${code}) before listening:\n${output}`)))
-  return await endpoint.promise
+  const chrome = await spawnDebuggableChrome({ executable: resolveBrowserExecutablePath(), profileDir: fs.mkdtempSync(path.join(cwd, 'profile-')) })
+  chromes.push(chrome)
+  return chrome.wsEndpoint
 }
 
 /** A session on `endpoint` showing the fixture page, with what the model saw on it. */

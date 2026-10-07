@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Icons · Browser Lab</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  button, a { display: inline-flex; align-items: center; gap: 4px; }
+  svg { width: 16px; height: 16px; }
+</style>
+</head>
+<body>
+<h1>Repository</h1>
+<!-- GitHub-like icon buttons: an aria-hidden octicon with an aria-label on the button, an SVG named
+     by its <title>, a role=img SVG named by aria-label, and an icon next to the button's words. -->
+<div class="toolbar">
+  <button type="button" id="star" aria-label="Star this repository"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 0l2 5h6l-5 4 2 6-5-4-5 4 2-6-5-4h6z"/></svg></button>
+  <button type="button" id="more"><svg viewBox="0 0 16 16"><title>More actions</title><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg></button>
+  <button type="button" id="bell"><svg role="img" aria-label="Notifications" viewBox="0 0 16 16"><path d="M8 1a5 5 0 015 5v4l2 2H1l2-2V6a5 5 0 015-5z"/></svg></button>
+  <button type="button" id="fork"><svg viewBox="0 0 16 16"><title>Fork</title><circle cx="8" cy="8" r="6"/></svg> Fork 12</button>
+  <div role="tablist" aria-label="Views">
+    <button type="button" role="tab" aria-selected="true"><svg viewBox="0 0 16 16"><title>Code</title><rect width="16" height="16"/></svg></button>
+  </div>
+</div>
+<!-- Images inside links: an avatar whose alt is the link's name, a logo whose alt differs from the link's aria-label. -->
+<p>
+  <a href="/users/ada" id="avatar-link"><img src="/lab/chart.svg" alt="Ada Lovelace" width="32" height="32"></a>
+  <a href="/" id="home-link" aria-label="Home"><img src="/lab/chart.svg" alt="Company logo" width="64" height="24"></a>
+</p>
+<!-- An image inside the label of a radio. -->
+<fieldset>
+  <legend>Pay with</legend>
+  <label><input type="radio" name="card" value="visa"> <img src="/lab/chart.svg" alt="Visa" width="40" height="20"> card ending 4242</label>
+</fieldset>
+<!-- Decorative images: never listed. -->
+<p>
+  <img src="/lab/chart.svg" alt="" width="40" height="20" id="deco-empty-alt">
+  <img src="/lab/chart.svg" aria-hidden="true" width="40" height="20" id="deco-hidden">
+  <img src="/lab/chart.svg" role="presentation" width="40" height="20" id="deco-presentation">
+  <img src="/lab/chart.svg" role="none" width="40" height="20" id="deco-none">
+  <svg role="presentation" viewBox="0 0 16 16" id="deco-svg"><title>Swirl</title><circle cx="8" cy="8" r="6"/></svg>
+</p>
+<!-- Content images: listed. -->
+<img src="/lab/chart.svg" width="320" height="120" id="chart-no-alt">
+<img src="/lab/chart.svg" alt="Quarterly sales chart" width="320" height="120" id="chart-alt">
+<!-- A nameless inline SVG: nothing says what it shows. -->
+<svg viewBox="0 0 16 16" width="48" height="48" id="blob"><circle cx="8" cy="8" r="6"/></svg>
+</body>
+</html>

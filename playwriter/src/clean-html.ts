@@ -103,6 +103,8 @@ export async function getCleanHTML(options: GetCleanHTMLOptions): Promise<string
   const cleanedHtml = await formatHtmlForPrompt({
     html: rawHtml,
     keepStyles: includeStyles,
+    // One element: its classes are the hooks a selector needs. A whole page: mostly utility-CSS noise.
+    keepClass: !isPage(locator),
     maxAttrLen,
     maxContentLen,
   })

@@ -727,7 +727,7 @@ describe('act across history, tabs and scroll areas', () => {
     const carousel = refOf(look, /^SCROLL \[\d+\] region "Featured products"/)
     const toEnd = await executor.execute(`await act.scroll('right', { ref: ${carousel}, screens: 10 })`, 30000)
     expect(toEnd.isError, toEnd.text).toBe(false)
-    expect(toEnd.text).toMatch(/0\.0 screens to the right/)
+    expect(toEnd.text).toMatch(/reached the right end of \[\d+\] region "Featured products" after \d+px/)
     for (let attempt = 0; attempt < 2; attempt++) {
       const idle = await executor.execute(`await act.scroll('right', { ref: ${carousel} })`, 30000)
       expect(idle.isError, idle.text).toBe(false)
@@ -807,7 +807,8 @@ describe('act across history, tabs and scroll areas', () => {
     expect(look).toMatch(new RegExp(`INSIDE \\[${reader}\\] region "Reader" .*out of sight — act\\.scroll\\('left', \\{ ref: ${reader} \\}\\)`))
     const moved = await executor.execute(`await act.scroll('left', { ref: ${reader} })`, 30000)
     expect(moved.isError, moved.text).toBe(false)
-    expect(moved.text).toMatch(/scrolled \[\d+\] region "Reader" \d+px to the left/)
+    // Less than a screen is left that way: the wheel turns only that far and the report says it reached the end.
+    expect(moved.text).toMatch(/reached the left end of \[\d+\] region "Reader" after \d+px/)
     // A right-to-left carousel starts at its right edge: the way it can move is left.
     const arrivals = refOf(look, /^SCROLL \[\d+\] region "New arrivals"/)
     const down = await executor.execute(`await act.scroll('down', { ref: ${arrivals} })`, 30000)

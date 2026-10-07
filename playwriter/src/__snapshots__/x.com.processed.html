@@ -1,1003 +1,1019 @@
 <html data-theme="dark">
  <body>
-  <div>
-   <h2 role="heading">
-    <span>Per visualizzare i tasti di scelta rapida, premi il pulsante ?</span>
-    <a href="/i/keyboard_shortcuts" role="link">
-     <span>Visualizza i tasti di scelta rapida</span>
-    </a>
-   </h2>
-   <div data-at-shortcutkeys="{&quot;n&quot;:&quot;Nuovo post&quot;,&quot;⌘ Enter&quot;:&quot;Invia post&quot;,&quot;m&quot;:&quot;Silenzia il video&quot;,&quot;/&quot;:&quot;Cerca&quot;,&quot;l&quot;:&quot;Mi piace&quot;,&quot;r&quot;:&quot;Rispondi&quot;,&quot;t&quot;:&quot;Repost&quot;,&quot;s&quot;:&quot;Condividi post&quot;,&quot;b&quot;:&quot;Salva nei segnalibri&quot;,&quot;u&quot;:&quot;Silenzia account&quot;,&quot;x&quot;:&quot;Bloc...745 more characters" aria-hidden="false">
-    <button aria-label="Passa alla cronologia principale" role="button" type="button"></button>
-    <button aria-label="Passa alle tendenze" role="button" type="button"></button>
-    <header role="banner">
-     <div>
+  <div id="react-root">
+   <div>
+    <h2 aria-level="2" role="heading">
+     <span>Per visualizzare i tasti di scelta rapida, premi il pulsante ?</span>
+     <a href="/i/keyboard_shortcuts" role="link">
+      <span>Visualizza i tasti di scelta rapida</span>
+     </a>
+    </h2>
+    <div data-at-shortcutkeys="{&quot;n&quot;:&quot;Nuovo post&quot;,&quot;⌘ Enter&quot;:&quot;Invia post&quot;,&quot;m&quot;:&quot;Silenzia il video&quot;,&quot;/&quot;:&quot;Cerca&quot;,&quot;l&quot;:&quot;Mi piace&quot;,&quot;r&quot;:&quot;Rispondi&quot;,&quot;t&quot;:&quot;Repost&quot;,&quot;s&quot;:&quot;Condividi post&quot;,&quot;b&quot;:&quot;Salva nei segnalibri&quot;,&quot;u&quot;:&quot;Silenzia account&quot;,&quot;x&quot;:&quot;Bloc...745 more characters" aria-hidden="false">
+     <button aria-label="Passa alla cronologia principale" role="button" type="button"></button>
+     <button aria-label="Passa alle tendenze" role="button" type="button"></button>
+     <header role="banner">
       <div>
-       <h1 role="heading">
-        <a href="/home" aria-label="X" role="link"></a>
-       </h1>
-       <nav aria-label="Principale" role="navigation">
-        <a href="/home" aria-label="Home (nuovi post da leggere)" role="link" data-testid="AppTabBar_Home_Link"></a>
-        <a href="/explore" aria-label="Cerca ed esplora" role="link" data-testid="AppTabBar_Explore_Link"></a>
-        <a href="/notifications" aria-label="Notifiche" role="link" data-testid="AppTabBar_Notifications_Link"></a>
-        <a href="/i/chat" aria-label="Messaggi Diretti" role="link" data-testid="AppTabBar_DirectMessage_Link"></a>
-        <a href="/i/grok" aria-label="SuperGrok" role="link"></a>
-        <a href="/i/premium" aria-label="Premium" role="link" data-testid="premium-hub-tab"></a>
-        <a href="/__morse/lists" aria-label="Liste" role="link"></a>
-        <a href="/i/bookmarks" aria-label="Segnalibri" role="link"></a>
-        <a href="/__morse/communities" aria-label="Community" role="link"></a>
-        <a href="/__morse" aria-label="Profilo" role="link" data-testid="AppTabBar_Profile_Link"></a>
-        <button aria-expanded="false" aria-label="Altri elementi del menu" role="button" data-testid="AppTabBar_More_Menu" type="button"></button>
-       </nav>
-       <a href="/compose/post" aria-label="Posta" role="link" data-testid="SideNav_NewTweet_Button"></a>
-      </div>
-      <button aria-label="Menu Account" role="button" data-testid="SideNav_AccountSwitcher_Button" type="button">
-       <div data-testid="UserAvatar-Container-__morse">
-        <div role="presentation">
-         <div aria-label="Tommy D. Rossi">
-          <img alt="Tommy D. Rossi">
-         </div>
-        </div>
-       </div>
-      </button>
-     </div>
-    </header>
-    <main role="main">
-     <div data-testid="primaryColumn">
-      <div aria-label="Cronologia principale">
-       <nav role="navigation">
-        <div>
-         <div data-testid="ScrollSnap-prevButtonWrapper">
-          <button aria-disabled="true" aria-label="Precedente" role="button" type="button"></button>
-         </div>
-         <div data-testid="ScrollSnap-SwipeableList">
-          <div role="tablist" data-testid="ScrollSnap-List">
-           <div role="presentation">
-            <div role="tab" aria-selected="true">
-             <span>Per te</span>
-            </div>
-           </div>
-           <div role="presentation">
-            <div role="tab" aria-selected="false">
-             <span>Following</span>
-            </div>
-           </div>
-           <div role="presentation">
-            <div role="tab" aria-selected="false">
-             <span>Creators</span>
-            </div>
-           </div>
-           <div role="presentation">
-            <div role="tab" aria-selected="false">
-             <span>AI SDK</span>
-            </div>
-           </div>
-          </div>
-         </div>
-         <div data-testid="ScrollSnap-nextButtonWrapper">
-          <button aria-disabled="true" aria-label="Avanti" role="button" type="button"></button>
-         </div>
-        </div>
-       </nav>
        <div>
+        <h1 role="heading">
+         <a href="/home" aria-label="X" role="link"></a>
+        </h1>
+        <nav aria-label="Principale" role="navigation">
+         <a href="/home" aria-label="Home (nuovi post da leggere)" role="link" data-testid="AppTabBar_Home_Link"></a>
+         <a href="/explore" aria-label="Cerca ed esplora" role="link" data-testid="AppTabBar_Explore_Link"></a>
+         <a href="/notifications" aria-label="Notifiche" role="link" data-testid="AppTabBar_Notifications_Link"></a>
+         <a href="/i/chat" aria-label="Messaggi Diretti" role="link" data-testid="AppTabBar_DirectMessage_Link"></a>
+         <a href="/i/grok" aria-label="SuperGrok" role="link"></a>
+         <a href="/i/premium" aria-label="Premium" role="link" data-testid="premium-hub-tab"></a>
+         <a href="/__morse/lists" aria-label="Liste" role="link"></a>
+         <a href="/i/bookmarks" aria-label="Segnalibri" role="link"></a>
+         <a href="/__morse/communities" aria-label="Community" role="link"></a>
+         <a href="/__morse" aria-label="Profilo" role="link" data-testid="AppTabBar_Profile_Link"></a>
+         <button aria-expanded="false" aria-haspopup="menu" aria-label="Altri elementi del menu" role="button" data-testid="AppTabBar_More_Menu" type="button"></button>
+        </nav>
+        <a href="/compose/post" aria-label="Posta" role="link" data-testid="SideNav_NewTweet_Button"></a>
+       </div>
+       <button aria-label="Menu Account" role="button" data-testid="SideNav_AccountSwitcher_Button" type="button">
         <div data-testid="UserAvatar-Container-__morse">
-         <a href="/__morse" role="link">
+         <div role="presentation">
           <div aria-label="Tommy D. Rossi">
-           <img alt="Tommy D. Rossi">
-          </div>
-         </a>
-        </div>
-        <div>
-         <div data-rbd-droppable-id="composer-1" data-rbd-droppable-context-id="14">
-          <div data-testid="tweetTextarea_0_label">
-           <div data-testid="tweetTextarea_0RichTextInputContainer">
-            <div>Che c'è di nuovo?</div>
-           </div>
+           <img alt="Tommy D. Rossi" src="https://pbs.twimg.com/profile_images/1870480870567514112/Y0D-zTEY_normal.jpg">
           </div>
          </div>
-         <div data-testid="toolBar">
-          <nav role="navigation">
-           <div>
-            <div data-testid="ScrollSnap-prevButtonWrapper">
-             <button aria-disabled="true" aria-label="Precedente" role="button" type="button"></button>
-            </div>
-            <div data-testid="ScrollSnap-SwipeableList">
-             <div role="tablist" data-testid="ScrollSnap-List">
-              <div role="presentation">
-               <div>
-                <button aria-label="Aggiungi foto o video" role="button" type="button"></button>
-                <input type="file" data-testid="fileInput">
-               </div>
-              </div>
-              <div role="presentation">
-               <button aria-label="Aggiungi una GIF" role="button" data-testid="gifSearchButton" type="button"></button>
-              </div>
-              <div role="presentation">
-               <button aria-label="Genera immagine" role="button" data-testid="grokImgGen" type="button"></button>
-              </div>
-              <div role="presentation">
-               <button aria-label="Aggiungi emoji" role="button" type="button"></button>
-              </div>
-              <div role="presentation">
-               <button aria-disabled="true" aria-label="Tagga la posizione" role="button" data-testid="geoButton" type="button"></button>
-              </div>
-              <div role="presentation">
-               <button aria-label="Grassetto e (⌘+B)" role="button" type="button"></button>
-              </div>
-              <div role="presentation">
-               <button aria-label="Corsivo e (⌘+I)" role="button" type="button"></button>
-              </div>
+        </div>
+       </button>
+      </div>
+     </header>
+     <main role="main">
+      <div data-testid="primaryColumn">
+       <div aria-label="Cronologia principale">
+        <nav aria-live="polite" role="navigation">
+         <div>
+          <div data-testid="ScrollSnap-prevButtonWrapper">
+           <button aria-disabled="true" disabled aria-label="Precedente" role="button" type="button"></button>
+          </div>
+          <div data-testid="ScrollSnap-SwipeableList">
+           <div role="tablist" data-testid="ScrollSnap-List">
+            <div role="presentation">
+             <div role="tab" aria-selected="true">
+              <span>Per te</span>
              </div>
             </div>
-            <div data-testid="ScrollSnap-nextButtonWrapper">
-             <button aria-disabled="true" aria-label="Avanti" role="button" type="button"></button>
+            <div role="presentation">
+             <div role="tab" aria-selected="false">
+              <span>Following</span>
+             </div>
+            </div>
+            <div role="presentation">
+             <div role="tab" aria-selected="false">
+              <span>Creators</span>
+             </div>
+            </div>
+            <div role="presentation">
+             <div role="tab" aria-selected="false">
+              <span>AI SDK</span>
+             </div>
             </div>
            </div>
-          </nav>
-          <button aria-disabled="true" role="button" data-testid="tweetButtonInline" type="button">
-           <span>Posta</span>
-          </button>
+          </div>
+          <div data-testid="ScrollSnap-nextButtonWrapper">
+           <button aria-disabled="true" disabled aria-label="Avanti" role="button" type="button"></button>
+          </div>
          </div>
-        </div>
-       </div>
-       <section role="region">
-        <h1 role="heading">La tua cronologia principale</h1>
-        <div aria-label="Cronologia: La tua cronologia principale">
+        </nav>
+        <div>
+         <div data-testid="UserAvatar-Container-__morse">
+          <a href="/__morse" role="link">
+           <div aria-label="Tommy D. Rossi">
+            <img alt="Tommy D. Rossi" src="https://pbs.twimg.com/profile_images/1870480870567514112/Y0D-zTEY_normal.jpg">
+           </div>
+          </a>
+         </div>
          <div>
-          <div data-testid="cellInnerDiv">
-           <button role="button" type="button">
-            <span>Mostra 34 nuovi post</span>
+          <div data-rbd-droppable-id="composer-1" data-rbd-droppable-context-id="14">
+           <div data-testid="tweetTextarea_0_label">
+            <div data-testid="tweetTextarea_0RichTextInputContainer">
+             <div id="placeholder-fkd1a">Che c'è di nuovo?</div>
+            </div>
+           </div>
+          </div>
+          <div data-testid="toolBar">
+           <nav aria-live="polite" role="navigation">
+            <div>
+             <div data-testid="ScrollSnap-prevButtonWrapper">
+              <button aria-disabled="true" disabled aria-label="Precedente" role="button" type="button"></button>
+             </div>
+             <div data-testid="ScrollSnap-SwipeableList">
+              <div role="tablist" data-testid="ScrollSnap-List">
+               <div role="presentation">
+                <div>
+                 <button aria-label="Aggiungi foto o video" role="button" type="button"></button>
+                 <input type="file" data-testid="fileInput">
+                </div>
+               </div>
+               <div role="presentation">
+                <button aria-label="Aggiungi una GIF" role="button" data-testid="gifSearchButton" type="button"></button>
+               </div>
+               <div role="presentation">
+                <button aria-label="Genera immagine" role="button" data-testid="grokImgGen" type="button"></button>
+               </div>
+               <div role="presentation">
+                <button aria-haspopup="menu" aria-label="Aggiungi emoji" role="button" type="button"></button>
+               </div>
+               <div role="presentation">
+                <button aria-disabled="true" disabled aria-label="Tagga la posizione" role="button" data-testid="geoButton" type="button"></button>
+               </div>
+               <div role="presentation">
+                <button aria-label="Grassetto e (⌘+B)" role="button" type="button"></button>
+               </div>
+               <div role="presentation">
+                <button aria-label="Corsivo e (⌘+I)" role="button" type="button"></button>
+               </div>
+              </div>
+             </div>
+             <div data-testid="ScrollSnap-nextButtonWrapper">
+              <button aria-disabled="true" disabled aria-label="Avanti" role="button" type="button"></button>
+             </div>
+            </div>
+           </nav>
+           <button aria-disabled="true" disabled role="button" data-testid="tweetButtonInline" type="button">
+            <span>Posta</span>
            </button>
           </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
+         </div>
+        </div>
+        <section aria-labelledby="accessible-list-1" role="region">
+         <h1 aria-level="1" role="heading" id="accessible-list-1">La tua cronologia principale</h1>
+         <div aria-label="Cronologia: La tua cronologia principale">
+          <div>
+           <div data-testid="cellInnerDiv">
+            <button role="button" type="button">
+             <span>Mostra 34 nuovi post</span>
+            </button>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__zlwrk747fkl id__69tu215vrks id__1z6s2cr3cb2 id__32d3ldjf2bm id__v8gqaf3qdd7 id__tqlwiler5u9 id__ly3ec5frolk id__5to15vijhh4 id__u6m6vfu0xam id__hqcjtxzb01i id__bnshii2390i id__34xeyhgy29e id__6r1p...117 more characters" role="article" data-testid="tweet">
              <div>
-              <div data-testid="User-Name">
-               <a href="/HSVSphere" role="link">
-                <span>HSVSphere</span>
-               </a>
-               <div>
+              <div>
+               <div id="id__v8gqaf3qdd7" data-testid="User-Name">
                 <a href="/HSVSphere" role="link">
-                 <span>@HSVSphere</span>
+                 <span>HSVSphere</span>
                 </a>
-                <a href="/HSVSphere/status/2010045312900145493" aria-label="1 ora fa" role="link">
-                 <time>1h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>lmao</span>
-             </div>
-             <a href="/HSVSphere/status/2010045312900145493/photo/1" role="link">
-              <div aria-label="Immagine" data-testid="tweetPhoto">
-               <img alt="Immagine">
-              </div>
-             </a>
-             <div aria-label="1 risposta e 3 repost e 30 Mi piace e 6 segnalibri e 1502 visualizzazioni" role="group">
-              <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="3 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>3</span>
-               </span>
-              </button>
-              <button aria-label="30 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>30</span>
-               </span>
-              </button>
-              <a href="/HSVSphere/status/2010045312900145493/analytics" aria-label="1502 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>1.502</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/ryanvogel" role="link">
-                <span>ryan vogel</span>
-               </a>
-               <div>
-                <a href="/ryanvogel" role="link">
-                 <span>@ryanvogel</span>
-                </a>
-                <a href="/ryanvogel/status/2010018790445334600" aria-label="2 ore fa" role="link">
-                 <time>2h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>i'm running my own</span>
-              <a href="/MrBeast" role="link">@MrBeast</a>
-              <span>games with opencode zen AI models</span>
-             </div>
-             <a href="/ryanvogel/status/2010018790445334600/photo/1" role="link">
-              <div aria-label="Immagine" data-testid="tweetPhoto">
-               <img alt="Immagine">
-              </div>
-             </a>
-             <div aria-label="1 repost e 267 visualizzazioni" role="group">
-              <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
-              <button aria-expanded="false" aria-label="1 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <button aria-label="0 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button"></button>
-              <a href="/ryanvogel/status/2010018790445334600/analytics" aria-label="267 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>267</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/1Bexly" role="link">
-                <span>Bexly</span>
-               </a>
-               <div>
-                <a href="/1Bexly" role="link">
-                 <span>@1Bexly</span>
-                </a>
-                <a href="/1Bexly/status/2010052146658721879" aria-label="34 minuti fa" role="link">
-                 <time>34min</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>This is revisionist history bruhh. Everyone shat on them for
-                                                      weeks until 2 days ago lmaooo People will say anything for money</span>
-              <img alt="😆" title="Faccina che sorride a bocca aperta e strizza gli occhi">
-             </div>
-             <div>
-              <span>Citazione</span>
-              <div role="link">
-               <div>
-                <div data-testid="User-Name">
-                 <span>0xSero</span>
-                 <div>
-                  <span>@0xSero</span>
-                  <div aria-label="12 ore fa">
-                   <time>12h</time>
-                  </div>
-                 </div>
+                <div>
+                 <a href="/HSVSphere" role="link">
+                  <span>@HSVSphere</span>
+                 </a>
+                 <a href="/HSVSphere/status/2010045312900145493" aria-label="1 ora fa" role="link">
+                  <time>1h</time>
+                 </a>
                 </div>
-                <div data-testid="tweetText">
-                 <span>It’s strange how OAI has continuously been a good faith
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__bnshii2390i" data-testid="tweetText">
+               <span>lmao</span>
+              </div>
+              <div aria-labelledby="id__rj2j84pm63 id__v7kshn9wnt" id="id__6r1p7ad2ppe">
+               <a href="/HSVSphere/status/2010045312900145493/photo/1" role="link">
+                <div aria-label="Immagine" data-testid="tweetPhoto">
+                 <img alt="Immagine" src="https://pbs.twimg.com/media/G-UdjHlWoAAE9Nk?format=jpg&amp;name=small">
+                </div>
+               </a>
+              </div>
+              <div aria-label="1 risposta e 3 repost e 30 Mi piace e 6 segnalibri e 1502 visualizzazioni" role="group" id="id__x9gh9w8kos9">
+               <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="3 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>3</span>
+                </span>
+               </button>
+               <button aria-label="30 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>30</span>
+                </span>
+               </button>
+               <a href="/HSVSphere/status/2010045312900145493/analytics" aria-label="1502 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>1.502</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__0dc9rdnufv0e id__713n8nr8ba id__5lby55m061v id__09mpmrz9fonc id__md2arzf5evg id__oitagjnqcbe id__re7wdz5htg id__n9sbxdqiz4 id__fflahzp9pvv id__h5q4053gu1 id__5u91g3f5qij id__bofb487zizi id__qoein2...114 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__md2arzf5evg" data-testid="User-Name">
+                <a href="/ryanvogel" role="link">
+                 <span>ryan vogel</span>
+                </a>
+                <div>
+                 <a href="/ryanvogel" role="link">
+                  <span>@ryanvogel</span>
+                 </a>
+                 <a href="/ryanvogel/status/2010018790445334600" aria-label="2 ore fa" role="link">
+                  <time>2h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__5u91g3f5qij" data-testid="tweetText">
+               <span>i'm running my own</span>
+               <a href="/MrBeast" role="link">@MrBeast</a>
+               <span>games with opencode zen AI models</span>
+              </div>
+              <div aria-labelledby="id__0q6pypti9z5f id__ye7jghvm2ol" id="id__qoein2y046">
+               <a href="/ryanvogel/status/2010018790445334600/photo/1" role="link">
+                <div aria-label="Immagine" data-testid="tweetPhoto">
+                 <img alt="Immagine" src="https://pbs.twimg.com/media/G-UFb4jWgAA5h3E?format=png&amp;name=small">
+                </div>
+               </a>
+              </div>
+              <div aria-label="1 repost e 267 visualizzazioni" role="group" id="id__5klxmhg5b72">
+               <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="1 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <button aria-label="0 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button"></button>
+               <a href="/ryanvogel/status/2010018790445334600/analytics" aria-label="267 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>267</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__oi12pdh6xl id__m2byltulkz7 id__9lu217r3edm id__tnwjx2vvkl id__grcq8bxkldp id__vlsebicxroa id__c1ixeqtndqe id__4iki0savb3l id__kfbol0b67ve id__zsjxh3num4 id__02zd0wggg4hj id__pxr78m0ubk id__iw3oawg...115 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__grcq8bxkldp" data-testid="User-Name">
+                <a href="/1Bexly" role="link">
+                 <span>Bexly</span>
+                </a>
+                <div>
+                 <a href="/1Bexly" role="link">
+                  <span>@1Bexly</span>
+                 </a>
+                 <a href="/1Bexly/status/2010052146658721879" aria-label="34 minuti fa" role="link">
+                  <time>34min</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__02zd0wggg4hj" data-testid="tweetText">
+               <span>This is revisionist history bruhh. Everyone shat on them for
+                                                      weeks until 2 days ago lmaooo People will say anything for money</span>
+               <img alt="😆" src="https://abs-0.twimg.com/emoji/v2/svg/1f606.svg" title="Faccina che sorride a bocca aperta e strizza gli occhi">
+              </div>
+              <div aria-labelledby="id__0uq0jfsgauxk id__cl9x2831z8u" id="id__iw3oawgl75">
+               <div id="id__0uq0jfsgauxk">
+                <span>Citazione</span>
+                <div role="link">
+                 <div>
+                  <div data-testid="User-Name">
+                   <span>0xSero</span>
+                   <div>
+                    <span>@0xSero</span>
+                    <div aria-label="12 ore fa">
+                     <time>12h</time>
+                    </div>
+                   </div>
+                  </div>
+                  <div data-testid="tweetText">
+                   <span>It’s strange how OAI has continuously been a good faith
                                                               actor in regards to how they treat their users and
                                                               ecosystems x.com/thdxr/status/2…</span>
-                </div>
-               </div>
-              </div>
-             </div>
-             <div aria-label="1 risposta e 1 Mi piace e 36 visualizzazioni" role="group">
-              <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="1 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <a href="/1Bexly/status/2010052146658721879/analytics" aria-label="36 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>36</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/0xSero" role="link">
-                <span>0xSero</span>
-               </a>
-               <div>
-                <a href="/0xSero" role="link">
-                 <span>@0xSero</span>
-                </a>
-                <a href="/0xSero/status/2010055150891872769" aria-label="22 minuti fa" role="link">
-                 <time>22min</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>Not true</span>
-             </div>
-             <div aria-label="1 Mi piace e 18 visualizzazioni" role="group">
-              <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="1 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <a href="/0xSero/status/2010055150891872769/analytics" aria-label="18 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>18</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/elonmusk" role="link">
-                <span>Elon Musk</span>
-               </a>
-               <div>
-                <a href="/elonmusk" role="link">
-                 <span>@elonmusk</span>
-                </a>
-                <a href="/elonmusk/status/2009790829624226099" aria-label="17 ore fa" role="link">
-                 <time>17h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>Starmer literally has a lower approval rating than Maduro</span>
-              <img alt="😂" title="Faccina con lacrime di gioia">
-             </div>
-             <div>
-              <span>Citazione</span>
-              <div role="link">
-               <div>
-                <div data-testid="User-Name">
-                 <span>Basil the Great</span>
-                 <div>
-                  <span>@BasilTheGreat</span>
-                  <div aria-label="9 gen">
-                   <time>9 gen</time>
                   </div>
                  </div>
                 </div>
-                <div data-testid="tweetText">
-                 <img alt="🚨" title="Lampeggiante dell'auto della polizia">
-                 <span>ASMONGOLD SAYS AMERICANS SHOULD CAPTURE KEIR STARMER This
+               </div>
+              </div>
+              <div aria-label="1 risposta e 1 Mi piace e 36 visualizzazioni" role="group" id="id__r81yp9butg8">
+               <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="1 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <a href="/1Bexly/status/2010052146658721879/analytics" aria-label="36 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>36</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__wooti2csjoj id__men0v92bp4 id__es36iepqzpp id__6pjns6mqlga id__7k3n7eaz53a id__whgk6d4vmsr id__z63dymftuuc id__c5j2xg8kllk id__0egui60bfva id__yxzz5y8xo6 id__m0vryrfux4 id__kh9yg0gf6qm id__d5ty9cc...114 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__7k3n7eaz53a" data-testid="User-Name">
+                <a href="/0xSero" role="link">
+                 <span>0xSero</span>
+                </a>
+                <div>
+                 <a href="/0xSero" role="link">
+                  <span>@0xSero</span>
+                 </a>
+                 <a href="/0xSero/status/2010055150891872769" aria-label="22 minuti fa" role="link">
+                  <time>22min</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__m0vryrfux4" data-testid="tweetText">
+               <span>Not true</span>
+              </div>
+              <div aria-label="1 Mi piace e 18 visualizzazioni" role="group" id="id__rp56d9xy3us">
+               <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="1 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <a href="/0xSero/status/2010055150891872769/analytics" aria-label="18 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>18</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__tcs51nol8uh id__gxiphcz5b3b id__65n9jd5f5b5 id__z0mgkefcvaq id__y01k099mdr id__e8jl3ajrknn id__sxdepar6az9 id__2ak23kpie2l id__hqr1sv4i1o id__q8fbpht3pzh id__yfy7wldmbb id__229v7e42xg3j id__4rvim2...115 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__y01k099mdr" data-testid="User-Name">
+                <a href="/elonmusk" role="link">
+                 <span>Elon Musk</span>
+                </a>
+                <div>
+                 <a href="/elonmusk" role="link">
+                  <span>@elonmusk</span>
+                 </a>
+                 <a href="/elonmusk/status/2009790829624226099" aria-label="17 ore fa" role="link">
+                  <time>17h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__yfy7wldmbb" data-testid="tweetText">
+               <span>Starmer literally has a lower approval rating than Maduro</span>
+               <img alt="😂" src="https://abs-0.twimg.com/emoji/v2/svg/1f602.svg" title="Faccina con lacrime di gioia">
+              </div>
+              <div aria-labelledby="id__k0ub5bbrl1 id__4z6abubgt5p" id="id__4rvim212vkh">
+               <div id="id__k0ub5bbrl1">
+                <span>Citazione</span>
+                <div role="link">
+                 <div>
+                  <div data-testid="User-Name">
+                   <span>Basil the Great</span>
+                   <div>
+                    <span>@BasilTheGreat</span>
+                    <div aria-label="9 gen">
+                     <time>9 gen</time>
+                    </div>
+                   </div>
+                  </div>
+                  <div data-testid="tweetText">
+                   <img alt="🚨" src="https://abs-0.twimg.com/emoji/v2/svg/1f6a8.svg" title="Lampeggiante dell'auto della polizia">
+                   <span>ASMONGOLD SAYS AMERICANS SHOULD CAPTURE KEIR STARMER This
                                                               comes after Keir Starmer says he may ban X in the UK "We
                                                               should just go and arrest him, he has a lower approval
                                                               rating than Maduro and we arrested him"</span>
-                </div>
-                <div data-testid="tweetPhoto">
-                 <div aria-label="Video incorporato" data-testid="previewInterstitial">
-                  <div aria-label="Video incorporato">
-                   <img alt="Video incorporato">
                   </div>
-                  <span>0:53</span>
-                  <button aria-label="Riproduci questo video" role="button" data-testid="playButton" type="button"></button>
+                  <div data-testid="tweetPhoto">
+                   <div aria-label="Video incorporato" data-testid="previewInterstitial">
+                    <div aria-label="Video incorporato">
+                     <img alt="Video incorporato" src="https://pbs.twimg.com/amplify_video_thumb/2009692115643535360/img/rF_LEilW2cb970LF?format=jpg&amp;name=small">
+                    </div>
+                    <span>0:53</span>
+                    <button aria-label="Riproduci questo video" role="button" data-testid="playButton" type="button"></button>
+                   </div>
+                  </div>
+                 </div>
+                 <div data-testid="birdwatch-pivot" role="link">
+                  <span>Valuta le note della collettività suggerite</span>
                  </div>
                 </div>
                </div>
-               <div data-testid="birdwatch-pivot" role="link">
-                <span>Valuta le note della collettività suggerite</span>
-               </div>
+              </div>
+              <div aria-label="4119 risposte e 16325 repost e 136387 Mi piace e 4426 segnalibri e 6608745 visualizzazioni" role="group" id="id__d97zjrt2pf">
+               <button aria-label="4119 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>4.119</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="16325 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>16.325</span>
+                </span>
+               </button>
+               <button aria-label="136387 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>136.387</span>
+                </span>
+               </button>
+               <a href="/elonmusk/status/2009790829624226099/analytics" aria-label="6608745 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>6&nbsp;Mln</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
               </div>
              </div>
-             <div aria-label="4119 risposte e 16325 repost e 136387 Mi piace e 4426 segnalibri e 6608745 visualizzazioni" role="group">
-              <button aria-label="4119 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>4.119</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="16325 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>16.325</span>
-               </span>
-              </button>
-              <button aria-label="136387 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>136.387</span>
-               </span>
-              </button>
-              <a href="/elonmusk/status/2009790829624226099/analytics" aria-label="6608745 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>6&nbsp;Mln</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__frz9ldf723c id__qjqc0osy369 id__mu738wsaqsk id__nkpxzaa7maj id__emermj6qe29 id__x9m979oxiod id__w6ear905059 id__k63a1b43brr id__pgtwmvdk37l id__ss9rqwuroel id__cn2h9yi6lc id__7astj5h8r5p id__jszxl...117 more characters" role="article" data-testid="tweet">
              <div>
-              <div data-testid="User-Name">
-               <a href="/ryannystrom" role="link">
-                <span>Ryan Nystrom</span>
-               </a>
-               <div>
+              <div>
+               <div id="id__emermj6qe29" data-testid="User-Name">
                 <a href="/ryannystrom" role="link">
-                 <span>@ryannystrom</span>
+                 <span>Ryan Nystrom</span>
                 </a>
-                <a href="/ryannystrom/status/2010017182047187184" aria-label="2 ore fa" role="link">
-                 <time>2h</time>
-                </a>
+                <div>
+                 <a href="/ryannystrom" role="link">
+                  <span>@ryannystrom</span>
+                 </a>
+                 <a href="/ryannystrom/status/2010017182047187184" aria-label="2 ore fa" role="link">
+                  <time>2h</time>
+                 </a>
+                </div>
                </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>I’m watching designers at Notion ship code that is
-                                                      indistinguishable from senior engineers.</span>
-             </div>
-             <div aria-label="23 risposte e 14 repost e 241 Mi piace e 53 segnalibri e 22635 visualizzazioni" role="group">
-              <button aria-label="23 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>23</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="14 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>14</span>
-               </span>
-              </button>
-              <button aria-label="241 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>241</span>
-               </span>
-              </button>
-              <a href="/ryannystrom/status/2010017182047187184/analytics" aria-label="22635 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>22.635</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/hwchase17" role="link">
-                <span>Harrison Chase</span>
-               </a>
                <div>
-                <a href="/hwchase17" role="link">
-                 <span>@hwchase17</span>
-                </a>
-                <a href="/hwchase17/status/2010044779225329688" aria-label="1 ora fa" role="link">
-                 <time>1h</time>
-                </a>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
                </div>
               </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+              <div id="id__cn2h9yi6lc" data-testid="tweetText">
+               <span>I’m watching designers at Notion ship code that is
+                                                      indistinguishable from senior engineers.</span>
+              </div>
+              <div aria-label="23 risposte e 14 repost e 241 Mi piace e 53 segnalibri e 22635 visualizzazioni" role="group" id="id__f8qpdb4qw1p">
+               <button aria-label="23 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>23</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="14 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>14</span>
+                </span>
+               </button>
+               <button aria-label="241 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>241</span>
+                </span>
+               </button>
+               <a href="/ryannystrom/status/2010017182047187184/analytics" aria-label="22635 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>22.635</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
               </div>
              </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__3j0lmoxz5t3 id__130glmezupfi id__i6azk3h8ma8 id__rq5ve7lpvu id__d7dnev1ac7b id__elizdpvtu3p id__p86vq6y28kg id__dzv7fvbcz5a id__2qzhy4w825g id__acfv9wxweq id__83716qxu6zq id__ra00mfiq4r7 id__awaa0...115 more characters" role="article" data-testid="tweet">
              <div>
-              <div data-testid="article-cover-image">
-               <div aria-label="Copertina dell'articolo">
-                <img alt="Copertina dell'articolo">
+              <div>
+               <div id="id__d7dnev1ac7b" data-testid="User-Name">
+                <a href="/hwchase17" role="link">
+                 <span>Harrison Chase</span>
+                </a>
+                <div>
+                 <a href="/hwchase17" role="link">
+                  <span>@hwchase17</span>
+                 </a>
+                 <a href="/hwchase17/status/2010044779225329688" aria-label="1 ora fa" role="link">
+                  <time>1h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
                </div>
               </div>
               <div>
-               <span>In software, the code documents the app. In AI, the traces
+               <div data-testid="article-cover-image">
+                <div aria-label="Copertina dell'articolo">
+                 <img alt="Copertina dell'articolo" src="https://pbs.twimg.com/media/G-Uc4EQasAYZa8k?format=jpg&amp;name=small">
+                </div>
+               </div>
+               <div>
+                <span>In software, the code documents the app. In AI, the traces
                                                         do.</span>
-               <span>TL;DR In traditional software, you read the code to understand
+                <span>TL;DR In traditional software, you read the code to understand
                                                         what the app does - the decision logic lives in your codebase In
                                                         AI agents, the code is just scaffolding - the actual
                                                         decision-making...</span>
-              </div>
-             </div>
-             <div aria-label="4 risposte e 7 repost e 29 Mi piace e 45 segnalibri e 3299 visualizzazioni" role="group">
-              <button aria-label="4 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>4</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="7 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>7</span>
-               </span>
-              </button>
-              <button aria-label="29 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>29</span>
-               </span>
-              </button>
-              <a href="/hwchase17/status/2010044779225329688/analytics" aria-label="3299 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>3.299</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/DavidKPiano" role="link">
-                <span>
-                 <span>David K</span>
-                 <img alt="🎹" title="Tastiera musicale">
-                </span>
-               </a>
-               <div>
-                <a href="/DavidKPiano" role="link">
-                 <span>@DavidKPiano</span>
-                </a>
-                <a href="/DavidKPiano/status/2010048291204186204" aria-label="50 minuti fa" role="link">
-                 <time>50min</time>
-                </a>
                </div>
               </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+              <div aria-label="4 risposte e 7 repost e 29 Mi piace e 45 segnalibri e 3299 visualizzazioni" role="group" id="id__e36n7649608">
+               <button aria-label="4 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>4</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="7 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>7</span>
+                </span>
+               </button>
+               <button aria-label="29 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>29</span>
+                </span>
+               </button>
+               <a href="/hwchase17/status/2010044779225329688/analytics" aria-label="3299 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>3.299</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
               </div>
              </div>
-             <div data-testid="tweetText">
-              <span>Or use a state machine from the beginning</span>
-              <img alt="😉" title="Faccina che fa l'occhiolino">
-              <span>This is the next best thing, though!</span>
-             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__u73z9i9v70f id__at8rxytnef4 id__flkffpk2wpk id__jr5uq6omseo id__nswin5xsj5n id__9u0t54b0izs id__a444ibi07 id__o7bhwsdcyqo id__m92uga9njt id__9q6qnijdcam id__9kss046y2ir id__9s7wbv5wq4 id__s6cwgu4a...111 more characters" role="article" data-testid="tweet">
              <div>
-              <span>Citazione</span>
-              <div role="link">
-               <div>
-                <div data-testid="User-Name">
-                 <span>mert | helius</span>
-                 <div>
-                  <span>@mert</span>
-                  <div aria-label="4 ore fa">
-                   <time>4h</time>
-                  </div>
-                 </div>
+              <div>
+               <div id="id__nswin5xsj5n" data-testid="User-Name">
+                <a href="/DavidKPiano" role="link">
+                 <span>
+                  <span>David K</span>
+                  <img alt="🎹" src="https://abs-0.twimg.com/emoji/v2/svg/1f3b9.svg" title="Tastiera musicale">
+                 </span>
+                </a>
+                <div>
+                 <a href="/DavidKPiano" role="link">
+                  <span>@DavidKPiano</span>
+                 </a>
+                 <a href="/DavidKPiano/status/2010048291204186204" aria-label="50 minuti fa" role="link">
+                  <time>50min</time>
+                 </a>
                 </div>
-                <div data-testid="tweetText">
-                 <span>a quick opus 4.5 vibecoding tip ask claude to make state
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__9kss046y2ir" data-testid="tweetText">
+               <span>Or use a state machine from the beginning</span>
+               <img alt="😉" src="https://abs-0.twimg.com/emoji/v2/svg/1f609.svg" title="Faccina che fa l'occhiolino">
+               <span>This is the next best thing, though!</span>
+              </div>
+              <div aria-labelledby="id__g7e08j09ccb id__qn1jbpslbg" id="id__s6cwgu4as4">
+               <div id="id__g7e08j09ccb">
+                <span>Citazione</span>
+                <div role="link">
+                 <div>
+                  <div data-testid="User-Name">
+                   <span>mert | helius</span>
+                   <div>
+                    <span>@mert</span>
+                    <div aria-label="4 ore fa">
+                     <time>4h</time>
+                    </div>
+                   </div>
+                  </div>
+                  <div data-testid="tweetText">
+                   <span>a quick opus 4.5 vibecoding tip ask claude to make state
                                                               machine diagrams of existing components this causes it to
                                                               map out all paths (which, it will default to being lazy
                                                               otherwise) but also helps you verify if it's doing things
                                                               correctly at a systems ...5 more characters</span>
-                </div>
-                <a href="/mert/status/2009986072953126935/photo/1" role="link">
-                 <div aria-label="Immagine" data-testid="tweetPhoto">
-                  <img alt="Immagine">
+                  </div>
+                  <a href="/mert/status/2009986072953126935/photo/1" role="link">
+                   <div aria-label="Immagine" data-testid="tweetPhoto">
+                    <img alt="Immagine" src="https://pbs.twimg.com/media/G-TnYola0AADW9E?format=png&amp;name=small">
+                   </div>
+                  </a>
                  </div>
-                </a>
+                </div>
                </div>
               </div>
-             </div>
-             <div aria-label="1 risposta e 6 Mi piace e 590 visualizzazioni" role="group">
-              <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="6 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>6</span>
-               </span>
-              </button>
-              <a href="/DavidKPiano/status/2010048291204186204/analytics" aria-label="590 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>590</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/evilrabbit_" role="link">
-                <span>Evil Rabbit</span>
+              <div aria-label="1 risposta e 6 Mi piace e 590 visualizzazioni" role="group" id="id__m683psxj0mn">
+               <button aria-label="1 risposta. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="6 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>6</span>
+                </span>
+               </button>
+               <a href="/DavidKPiano/status/2010048291204186204/analytics" aria-label="590 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>590</span>
+                </span>
                </a>
-               <div>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__pn3tqjemqkh id__g97cid1krk id__t0va4e195 id__ki38fom9bza id__vnmw0zrmkf id__i78vw81mpir id__86s74xdmfd id__y0nr5j636bg id__65ebqjjvteo id__udisnlnyyy id__akeyp6xk2jw id__9pfc1hx3plr id__yu4gns4sne...112 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__vnmw0zrmkf" data-testid="User-Name">
                 <a href="/evilrabbit_" role="link">
-                 <span>@evilrabbit_</span>
+                 <span>Evil Rabbit</span>
                 </a>
-                <a href="/evilrabbit_/status/2009830318535270667" aria-label="15 ore fa" role="link">
-                 <time>15h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>▲ Taste: Coming soon</span>
-             </div>
-             <div aria-label="9 risposte e 40 Mi piace e 2277 visualizzazioni" role="group">
-              <button aria-label="9 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>9</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="40 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>40</span>
-               </span>
-              </button>
-              <a href="/evilrabbit_/status/2009830318535270667/analytics" aria-label="2277 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>2.277</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/kristaletz" role="link">
-                <span>krista</span>
-               </a>
-               <div>
-                <a href="/kristaletz" role="link">
-                 <span>@kristaletz</span>
-                </a>
-                <a href="/kristaletz/status/2010038128229351770" aria-label="1 ora fa" role="link">
-                 <time>1h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>with</span>
-              <a href="/cursor_ai" role="link">@cursor_ai</a>
-             </div>
-             <div>
-              <span>Citazione</span>
-              <div role="link">
-               <div>
                 <div>
-                 <div data-testid="Tweet-User-Avatar">
-                  <div data-testid="UserAvatar-Container-a16z">
-                   <div role="presentation">
-                    <div aria-label="Immagine del profilo quadrata">
-                     <img alt="Immagine del profilo quadrata">
+                 <a href="/evilrabbit_" role="link">
+                  <span>@evilrabbit_</span>
+                 </a>
+                 <a href="/evilrabbit_/status/2009830318535270667" aria-label="15 ore fa" role="link">
+                  <time>15h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__akeyp6xk2jw" data-testid="tweetText">
+               <span>▲ Taste: Coming soon</span>
+              </div>
+              <div aria-label="9 risposte e 40 Mi piace e 2277 visualizzazioni" role="group" id="id__uk5ekdd9a3">
+               <button aria-label="9 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>9</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="40 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>40</span>
+                </span>
+               </button>
+               <a href="/evilrabbit_/status/2009830318535270667/analytics" aria-label="2277 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>2.277</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__5p94uozk11g id__oxfj8f9nyb id__dd5s5oez2nf id__q4kmzjyy12b id__fg0f8hsqwco id__1kwot842qq1 id__2jb0djf5h8b id__r0glpfv568i id__mhrlgyd5ug id__bvi7uwld9g id__bbbdwo8r5z id__paf70uh6xxg id__g2sgjwhy...115 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__fg0f8hsqwco" data-testid="User-Name">
+                <a href="/kristaletz" role="link">
+                 <span>krista</span>
+                </a>
+                <div>
+                 <a href="/kristaletz" role="link">
+                  <span>@kristaletz</span>
+                 </a>
+                 <a href="/kristaletz/status/2010038128229351770" aria-label="1 ora fa" role="link">
+                  <time>1h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__bbbdwo8r5z" data-testid="tweetText">
+               <span>with</span>
+               <a href="/cursor_ai" role="link">@cursor_ai</a>
+              </div>
+              <div aria-labelledby="id__1rwoy0jt3x2 id__rtecpuwlh2" id="id__g2sgjwhy6tc">
+               <div id="id__1rwoy0jt3x2">
+                <span>Citazione</span>
+                <div role="link">
+                 <div>
+                  <div>
+                   <div data-testid="Tweet-User-Avatar">
+                    <div data-testid="UserAvatar-Container-a16z">
+                     <div role="presentation">
+                      <div aria-label="Immagine del profilo quadrata">
+                       <img alt="Immagine del profilo quadrata" src="https://pbs.twimg.com/profile_images/1919488160125616128/QAZXTMEj_mini.png">
+                      </div>
+                     </div>
+                    </div>
+                   </div>
+                   <div data-testid="User-Name">
+                    <span>a16z</span>
+                    <div>
+                     <span>@a16z</span>
+                     <div aria-label="9 gen">
+                      <time>9 gen</time>
+                     </div>
                     </div>
                    </div>
                   </div>
-                 </div>
-                 <div data-testid="User-Name">
-                  <span>a16z</span>
-                  <div>
-                   <span>@a16z</span>
-                   <div aria-label="9 gen">
-                    <time>9 gen</time>
+                  <div data-testid="tweetText">
+                   <span>It's time to build.</span>
+                  </div>
+                  <div data-testid="tweetPhoto">
+                   <div aria-label="Video incorporato" data-testid="previewInterstitial">
+                    <div aria-label="Video incorporato">
+                     <img alt="Video incorporato" src="https://pbs.twimg.com/amplify_video_thumb/2009633769423347712/img/6cVfiygINdv-wf6x?format=jpg&amp;name=small">
+                    </div>
+                    <span>1:45</span>
+                    <button aria-label="Riproduci questo video" role="button" data-testid="playButton" type="button"></button>
                    </div>
                   </div>
                  </div>
                 </div>
-                <div data-testid="tweetText">
-                 <span>It's time to build.</span>
-                </div>
-                <div data-testid="tweetPhoto">
-                 <div aria-label="Video incorporato" data-testid="previewInterstitial">
-                  <div aria-label="Video incorporato">
-                   <img alt="Video incorporato">
-                  </div>
-                  <span>1:45</span>
-                  <button aria-label="Riproduci questo video" role="button" data-testid="playButton" type="button"></button>
-                 </div>
-                </div>
                </div>
               </div>
-             </div>
-             <div aria-label="4 risposte e 25 Mi piace e 1142 visualizzazioni" role="group">
-              <button aria-label="4 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>4</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="25 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>25</span>
-               </span>
-              </button>
-              <a href="/kristaletz/status/2010038128229351770/analytics" aria-label="1142 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>1.142</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/TimSweeneyEpic" role="link">
-                <span>Tim Sweeney</span>
+              <div aria-label="4 risposte e 25 Mi piace e 1142 visualizzazioni" role="group" id="id__5awzms4cwp4">
+               <button aria-label="4 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>4</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="25 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>25</span>
+                </span>
+               </button>
+               <a href="/kristaletz/status/2010038128229351770/analytics" aria-label="1142 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>1.142</span>
+                </span>
                </a>
-               <div>
-                <a href="/TimSweeneyEpic" role="link">
-                 <span>@TimSweeneyEpic</span>
-                </a>
-                <a href="/TimSweeneyEpic/status/2009732745140871463" aria-label="21 ore fa" role="link">
-                 <time>21h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
               </div>
              </div>
-             <div data-testid="tweetText">
-              <span>Reason #42 for open platforms: to shut down every politician’s
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__b4gggz3zmm5 id__fxk0fui6xc9 id__wec17jlmjs id__grz9ypuctpn id__5fscwtf9bw id__lnkpvynahfi id__7f6x1zhi1er id__wt53qn7tgqr id__sybf3k39u7k id__ysapvjmd5x9 id__po3ry89g5g id__gr08gka64m6 id__1rrlpuf...115 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__5fscwtf9bw" data-testid="User-Name">
+                <a href="/TimSweeneyEpic" role="link">
+                 <span>Tim Sweeney</span>
+                </a>
+                <div>
+                 <a href="/TimSweeneyEpic" role="link">
+                  <span>@TimSweeneyEpic</span>
+                 </a>
+                 <a href="/TimSweeneyEpic/status/2009732745140871463" aria-label="21 ore fa" role="link">
+                  <time>21h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__po3ry89g5g" data-testid="tweetText">
+               <span>Reason #42 for open platforms: to shut down every politician’s
                                                       incessant demands to all gatekeepers to censor all of their
                                                       political opponents.</span>
-             </div>
-             <div>
-              <span>Citazione</span>
-              <div role="link">
-               <div>
-                <div>
-                 <div data-testid="Tweet-User-Avatar">
-                  <div data-testid="UserAvatar-Container-MacRumors">
-                   <div role="presentation">
-                    <div aria-label="Immagine del profilo quadrata">
-                     <img alt="Immagine del profilo quadrata">
+              </div>
+              <div aria-labelledby="id__rib2wnl5c1n id__dgue6616yva" id="id__1rrlpufgztz">
+               <div id="id__rib2wnl5c1n">
+                <span>Citazione</span>
+                <div role="link">
+                 <div>
+                  <div>
+                   <div data-testid="Tweet-User-Avatar">
+                    <div data-testid="UserAvatar-Container-MacRumors">
+                     <div role="presentation">
+                      <div aria-label="Immagine del profilo quadrata">
+                       <img alt="Immagine del profilo quadrata" src="https://pbs.twimg.com/profile_images/1171574992821194752/rVrN8JVA_mini.jpg">
+                      </div>
+                     </div>
+                    </div>
+                   </div>
+                   <div data-testid="User-Name">
+                    <span>MacRumors.com</span>
+                    <div>
+                     <span>@MacRumors</span>
+                     <div aria-label="9 gen">
+                      <time>9 gen</time>
+                     </div>
                     </div>
                    </div>
                   </div>
-                 </div>
-                 <div data-testid="User-Name">
-                  <span>MacRumors.com</span>
-                  <div>
-                   <span>@MacRumors</span>
-                   <div aria-label="9 gen">
-                    <time>9 gen</time>
-                   </div>
-                  </div>
-                 </div>
-                </div>
-                <div data-testid="tweetText">
-                 <span>U.S. Senators Ask Apple and Google to Remove X and Grok
+                  <div data-testid="tweetText">
+                   <span>U.S. Senators Ask Apple and Google to Remove X and Grok
                                                               Apps Over Sexualized Image Generation</span>
-                 <span>macrumors.com/2026/01/09/sen</span>
-                </div>
-                <a href="/MacRumors/status/2009682453640983016/photo/1" role="link">
-                 <div aria-label="Immagine" data-testid="tweetPhoto">
-                  <img alt="Immagine">
+                   <span>macrumors.com/2026/01/09/sen</span>
+                  </div>
+                  <a href="/MacRumors/status/2009682453640983016/photo/1" role="link">
+                   <div aria-label="Immagine" data-testid="tweetPhoto">
+                    <img alt="Immagine" src="https://pbs.twimg.com/media/G-PTissbIAAYmtA?format=jpg&amp;name=small">
+                   </div>
+                  </a>
                  </div>
-                </a>
+                </div>
                </div>
               </div>
-             </div>
-             <div aria-label="251 risposte e 203 repost e 1430 Mi piace e 103 segnalibri e 228388 visualizzazioni" role="group">
-              <button aria-label="251 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>251</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="203 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>203</span>
-               </span>
-              </button>
-              <button aria-label="1430 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>1.430</span>
-               </span>
-              </button>
-              <a href="/TimSweeneyEpic/status/2009732745140871463/analytics" aria-label="228388 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>228.388</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/TimSweeneyEpic" role="link">
-                <span>Tim Sweeney</span>
+              <div aria-label="251 risposte e 203 repost e 1430 Mi piace e 103 segnalibri e 228388 visualizzazioni" role="group" id="id__9wqm1v42e9g">
+               <button aria-label="251 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>251</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="203 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>203</span>
+                </span>
+               </button>
+               <button aria-label="1430 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>1.430</span>
+                </span>
+               </button>
+               <a href="/TimSweeneyEpic/status/2009732745140871463/analytics" aria-label="228388 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>228.388</span>
+                </span>
                </a>
-               <div>
-                <a href="/TimSweeneyEpic" role="link">
-                 <span>@TimSweeneyEpic</span>
-                </a>
-                <a href="/TimSweeneyEpic/status/2009753835456156088" aria-label="20 ore fa" role="link">
-                 <time>20h</time>
-                </a>
-               </div>
-              </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
               </div>
              </div>
-             <div data-testid="tweetText">
-              <span>All major AIs have documented instances of going off the rails;
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__7tlzzqoj7gp id__2z5s56pkees id__dkdk28n4a3m id__6os4vzuq7cc id__hmpmtx0cglb id__7b2ljyo8les id__r9adnzsuuzi id__5apbz6z60ae id__agsya9g2kzd id__eksskh68n2q id__2aea0kwexlt id__ni0ybet9g3 id__vjd43...116 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__hmpmtx0cglb" data-testid="User-Name">
+                <a href="/TimSweeneyEpic" role="link">
+                 <span>Tim Sweeney</span>
+                </a>
+                <div>
+                 <a href="/TimSweeneyEpic" role="link">
+                  <span>@TimSweeneyEpic</span>
+                 </a>
+                 <a href="/TimSweeneyEpic/status/2009753835456156088" aria-label="20 ore fa" role="link">
+                  <time>20h</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
+               </div>
+              </div>
+              <div id="id__2aea0kwexlt" data-testid="tweetText">
+               <span>All major AIs have documented instances of going off the rails;
                                                       all major AI companies make their best efforts to combat this;
                                                       none are perfect. Politicians demanding gatekeepers selectively
                                                       crush the one that's their political opponent's company is basic
                                                       crony capitalism.</span>
-             </div>
-             <div aria-label="60 risposte e 14 repost e 318 Mi piace e 10 segnalibri e 22717 visualizzazioni" role="group">
-              <button aria-label="60 risposte. Rispondi" role="button" data-testid="reply" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>60</span>
-               </span>
-              </button>
-              <button aria-expanded="false" aria-label="14 repost. Riposta" role="button" data-testid="retweet" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>14</span>
-               </span>
-              </button>
-              <button aria-label="318 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>318</span>
-               </span>
-              </button>
-              <a href="/TimSweeneyEpic/status/2009753835456156088/analytics" aria-label="22717 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>22.717</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
-          </div>
-          <div data-testid="cellInnerDiv">
-           <article role="article" data-testid="tweet">
-            <div>
-             <div>
-              <div data-testid="User-Name">
-               <a href="/cmuratori" role="link">
-                <span>Casey Muratori</span>
+              </div>
+              <div aria-label="60 risposte e 14 repost e 318 Mi piace e 10 segnalibri e 22717 visualizzazioni" role="group" id="id__oxfnq6f389d">
+               <button aria-label="60 risposte. Rispondi" role="button" data-testid="reply" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>60</span>
+                </span>
+               </button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="14 repost. Riposta" role="button" data-testid="retweet" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>14</span>
+                </span>
+               </button>
+               <button aria-label="318 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>318</span>
+                </span>
+               </button>
+               <a href="/TimSweeneyEpic/status/2009753835456156088/analytics" aria-label="22717 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>22.717</span>
+                </span>
                </a>
-               <div>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
+             </div>
+            </article>
+           </div>
+           <div data-testid="cellInnerDiv">
+            <article aria-labelledby="id__rlkqvcqqll id__cxh48xfodbc id__nsx0o5knxu id__r0mcvomq2yi id__fvdfvs9lmc6 id__4wtnjrieci4 id__2yliyhii62 id__i2m2xjfs05 id__prybes97ro id__6v22v9im2oe id__t1bgebuzvpk id__mlrjpruodp id__68l0jaxjv1...113 more characters" role="article" data-testid="tweet">
+             <div>
+              <div>
+               <div id="id__fvdfvs9lmc6" data-testid="User-Name">
                 <a href="/cmuratori" role="link">
-                 <span>@cmuratori</span>
+                 <span>Casey Muratori</span>
                 </a>
-                <a href="/cmuratori/status/2010060054083579941" aria-label="3 minuti fa" role="link">
-                 <time>3min</time>
-                </a>
+                <div>
+                 <a href="/cmuratori" role="link">
+                  <span>@cmuratori</span>
+                 </a>
+                 <a href="/cmuratori/status/2010060054083579941" aria-label="3 minuti fa" role="link">
+                  <time>3min</time>
+                 </a>
+                </div>
+               </div>
+               <div>
+                <button aria-label="Azioni di Grok" role="button" type="button"></button>
+                <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
                </div>
               </div>
-              <div>
-               <button aria-label="Azioni di Grok" role="button" type="button"></button>
-               <button aria-expanded="false" aria-label="Altro" role="button" data-testid="caret" type="button"></button>
-              </div>
-             </div>
-             <div data-testid="tweetText">
-              <span>I seriously doubt any of these companies makes "their best
+              <div id="id__t1bgebuzvpk" data-testid="tweetText">
+               <span>I seriously doubt any of these companies makes "their best
                                                       efforts" to do anything other than ship AI versions as rapidly as
                                                       possible. Multiple have already admitted in court to mass IP
                                                       theft. Their concern for the law is at best an afterthought when
                                                       it isn't ignored entirely.</span>
+              </div>
+              <div aria-label="2 Mi piace e 30 visualizzazioni" role="group" id="id__944xoiy5xk7">
+               <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
+               <button aria-label="2 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
+                <span data-testid="app-text-transition-container">
+                 <span>2</span>
+                </span>
+               </button>
+               <a href="/cmuratori/status/2010060054083579941/analytics" aria-label="30 visualizzazioni. Visualizza statistiche post" role="link">
+                <span data-testid="app-text-transition-container">
+                 <span>30</span>
+                </span>
+               </a>
+               <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
+               <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" type="button"></button>
+              </div>
              </div>
-             <div aria-label="2 Mi piace e 30 visualizzazioni" role="group">
-              <button aria-label="0 risposte. Rispondi" role="button" data-testid="reply" type="button"></button>
-              <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" data-testid="retweet" type="button"></button>
-              <button aria-label="2 Mi piace. Metti Mi piace" role="button" data-testid="like" type="button">
-               <span data-testid="app-text-transition-container">
-                <span>2</span>
-               </span>
-              </button>
-              <a href="/cmuratori/status/2010060054083579941/analytics" aria-label="30 visualizzazioni. Visualizza statistiche post" role="link">
-               <span data-testid="app-text-transition-container">
-                <span>30</span>
-               </span>
-              </a>
-              <button aria-label="Salva nei segnalibri" role="button" data-testid="bookmark" type="button"></button>
-              <button aria-expanded="false" aria-label="Condividi post" role="button" type="button"></button>
-             </div>
-            </div>
-           </article>
+            </article>
+           </div>
           </div>
          </div>
-        </div>
-       </section>
+        </section>
+       </div>
       </div>
-     </div>
-    </main>
+     </main>
+    </div>
    </div>
   </div>
-  <div>Press space bar to start a drag. When dragging you can use the arrow keys to move the item around and escape to
+  <div id="rbd-hidden-text-14-hidden-text-37">Press space bar to start a drag. When dragging you can use the arrow keys to move the item around and escape to
       cancel. Some screen readers may require you to be in focus mode or to use your pass through key</div>
  </body>
 </html>

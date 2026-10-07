@@ -41,6 +41,9 @@ export const TAPPED_EVENTS = [
   'Network.loadingFinished',
   'Network.loadingFailed',
   'Network.requestServedFromCache',
+  // The headers exactly as sent and received on the wire (net.request, net.har).
+  'Network.requestWillBeSentExtraInfo',
+  'Network.responseReceivedExtraInfo',
   'Network.webSocketCreated',
   'Network.webSocketClosed',
   'Network.webSocketFrameSent',
@@ -76,6 +79,11 @@ export interface TappedWorker {
   session: TappedSession
   /** Commands to the worker's session (Playwright's own, in its server): there is no client session for a worker. */
   cdp: ICDPSession
+  /**
+   * Its target id, which Chrome also gives the request for its script (measured, Chrome 149: the script's
+   * `requestId` is the worker's `targetId`); null for a worker that already ran when the tap started.
+   */
+  targetId: string | null
 }
 
 /** What the journal needs of a page's tap. */
@@ -243,7 +251,7 @@ export class PageSessionTap implements SessionTap {
   /** Server sessions followed for the children they create, with what stops following each. */
   private readonly parents = new Map<ServerSession, () => void>()
   /** Session id → an iframe or worker target that attached and whose session is not created yet. */
-  private readonly attaching = new Map<string, { type: 'iframe' | 'worker'; url: string }>()
+  private readonly attaching = new Map<string, { type: 'iframe' | 'worker'; url: string; targetId: string }>()
   private readonly children = new Map<ServerSession, Tapped>()
   /** Playwright's `CRPage._sessions`: target id → `FrameSession`, the page's and each out-of-process iframe's. */
   private readonly frameSessions: Map<unknown, unknown>
@@ -287,7 +295,7 @@ export class PageSessionTap implements SessionTap {
         if (typeof sessionId !== 'string' || !isServerSession(workerSession) || typeof url !== 'string') {
           throw new Error(`session-tap: Playwright's server keeps worker session ${String(sessionId)} without a worker script address; its requests cannot be journaled.`)
         }
-        running.push(this.tapWorker(workerSession, sessionId, url))
+        running.push(this.tapWorker(workerSession, sessionId, url, null))
       }
     }
     for (const worker of running) this.onWorker(worker)
@@ -333,7 +341,7 @@ export class PageSessionTap implements SessionTap {
       if (target === undefined) return
       this.attaching.delete(sessionId)
       if (target.type === 'worker') {
-        this.onWorker(this.tapWorker(child, sessionId, target.url))
+        this.onWorker(this.tapWorker(child, sessionId, target.url, target.targetId))
         return
       }
       this.children.set(child, new Tapped(child, sessionId))
@@ -343,20 +351,20 @@ export class PageSessionTap implements SessionTap {
     }
   }
 
-  private tapWorker(server: ServerSession, sessionId: string, url: string): TappedWorker {
+  private tapWorker(server: ServerSession, sessionId: string, url: string, targetId: string | null): TappedWorker {
     const tapped = new Tapped(server, sessionId)
     this.children.set(server, tapped)
     // The workers it starts attach on its session.
     this.follow(server)
-    return { url, session: tapped, cdp: new ServerSessionCommands(server) }
+    return { url, session: tapped, cdp: new ServerSessionCommands(server), targetId }
   }
 
   /** Learn the iframe and worker targets `session` attaches (before Playwright creates their sessions), and drop the ones it detaches. */
   private follow(session: ServerSession): void {
     if (this.parents.has(session)) return
     const onAttached = (event: ProtocolMapping.Events['Target.attachedToTarget'][0]): void => {
-      const { type, url } = event.targetInfo
-      if (type === 'iframe' || type === 'worker') this.attaching.set(event.sessionId, { type, url })
+      const { type, url, targetId } = event.targetInfo
+      if (type === 'iframe' || type === 'worker') this.attaching.set(event.sessionId, { type, url, targetId })
     }
     const onDetached = (event: ProtocolMapping.Events['Target.detachedFromTarget'][0]): void => {
       this.attaching.delete(event.sessionId)

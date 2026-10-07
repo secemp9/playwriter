@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landing · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Landing</span></header>
+<main>
+  <h1>Landing page</h1>
+  <div class="card">
+    <p id="via">Arrived via: direct</p>
+    <p id="opener">Opener: none</p>
+    <div class="row">
+      <button type="button" id="close">Close this window</button>
+      <a href="/popups.html">Back to popups</a>
+      <a href="/index.html">All pages</a>
+    </div>
+  </div>
+</main>
+<script type="module">
+import { $, on, setText, tagLinks } from '/lab/common.js';
+const from = new URLSearchParams(location.search).get('from');
+const ALLOWED = new Set(['blank', 'popup', 'same', 'dialogs']);
+setText($('#via'), 'Arrived via: ' + (ALLOWED.has(from) ? from : 'direct'));
+setText($('#opener'), 'Opener: ' + (window.opener ? 'available' : 'none'));
+on($('#close'), 'click', () => window.close());
+tagLinks();
+</script>
+</body>
+</html>

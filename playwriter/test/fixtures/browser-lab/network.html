@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .req { display: grid; grid-template-columns: 230px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }
+  output { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem; word-break: break-all; }
+  .chart { width: 320px; height: 120px; border: 1px dashed var(--line); display: block; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Network</span></header>
+<main>
+  <h1>Network requests</h1>
+  <section class="card" aria-labelledby="h-fetch">
+    <h2 id="h-fetch">Requests</h2>
+    <div class="req"><button type="button" id="btn-200">Fetch JSON (200)</button><output id="out-200" aria-live="polite">Not requested</output></div>
+    <div class="req"><button type="button" id="btn-404">Fetch missing (404)</button><output id="out-404" aria-live="polite">Not requested</output></div>
+    <div class="req"><button type="button" id="btn-500">Fetch server error (500)</button><output id="out-500" aria-live="polite">Not requested</output></div>
+    <div class="req"><button type="button" id="btn-cors">Cross-origin request (CORS)</button><output id="out-cors" aria-live="polite">Not requested</output></div>
+    <div class="req"><button type="button" id="btn-post">POST JSON (echo)</button><output id="out-post" aria-live="polite">Not requested</output></div>
+    <div class="req"><button type="button" id="btn-slow">Slow request (3 s)</button><output id="out-slow" aria-live="polite">Not requested</output></div>
+  </section>
+  <section class="card" aria-labelledby="h-download">
+    <h2 id="h-download">Download</h2>
+    <p><a id="download-link" href="/download/report.csv" download>Download report (CSV)</a></p>
+  </section>
+  <section class="card" aria-labelledby="h-upload">
+    <h2 id="h-upload">Upload</h2>
+    <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+      <div class="field"><label for="upload-files">Files</label><input id="upload-files" name="files" type="file" multiple></div>
+      <button type="submit" class="primary">Upload</button>
+    </form>
+    <p id="upload-result" class="status" role="status"></p>
+  </section>
+  <section class="card" aria-labelledby="h-chart">
+    <h2 id="h-chart">Sales chart</h2>
+    <p class="muted">This chart image is missing on the server (404).</p>
+    <img class="chart" id="chart" src="/lab/missing-chart.png" alt="Sales chart">
+    <p id="chart-status" class="muted">Chart: loading</p>
+  </section>
+  <h2>Request log</h2>
+  <ol id="log" class="log" role="log" aria-label="Request log"></ol>
+</main>
+<script type="module">
+import { $, m, on, setText, logLine, tagLinks } from '/lab/common.js';
+
+const log = $('#log');
+async function run(id, url, init) {
+  const out = $('#out-' + id);
+  setText(out, 'Loading…');
+  logLine(log, `${init?.method || 'GET'} ${url} …`);
+  const started = performance.now();
+  try {
+    const res = await fetch(url, init);
+    const text = await res.text();
+    m(() => {
+      const line = `${res.status} ${res.statusText} — ${text}`;
+      out.textContent = line;
+      logLine(log, `${init?.method || 'GET'} ${url} → ${res.status} ${res.statusText}`);
+    });
+    return { res, text, ms: performance.now() - started };
+  } catch (err) {
+    m(() => {
+      out.textContent = `Request failed: ${err.name}: ${err.message}`;
+      logLine(log, `${init?.method || 'GET'} ${url} → failed (${err.name}: ${err.message})`);
+    });
+    return null;
+  }
+}
+
+on($('#btn-200'), 'click', () => { run('200', '/api/user'); });
+on($('#btn-404'), 'click', () => { run('404', '/api/status/404'); });
+on($('#btn-500'), 'click', () => { run('500', '/api/status/500'); });
+// The lab served the other origin on a fixed port; the test fixture server answers on both 127.0.0.1 and localhost of one ephemeral port.
+on($('#btn-cors'), 'click', () => { run('cors', `http://localhost:${location.port}/api/cors-fail`); });
+on($('#btn-post'), 'click', async () => {
+  const r = await run('post', '/api/echo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Lab-Client': 'network-page' },
+    body: JSON.stringify({ message: 'hello from the lab', n: 42 }),
+  });
+  if (r) {
+    const data = JSON.parse(r.text);
+    setText($('#out-post'), `${r.res.status} ${r.res.statusText} — echoed body ${JSON.stringify(data.body)}; x-lab-client: ${data.headers['x-lab-client']}`);
+  }
+});
+on($('#btn-slow'), 'click', async () => {
+  const r = await run('slow', '/api/slow?ms=3000');
+  if (r) setText($('#out-slow'), `${r.res.status} ${r.res.statusText} after 3000 ms — ${r.text}`);
+});
+
+on($('#upload-form'), 'submit', async (e) => {
+  e.preventDefault();
+  const files = $('#upload-files').files;
+  if (!files.length) { setText($('#upload-result'), 'Choose at least one file'); return; }
+  setText($('#upload-result'), 'Uploading…');
+  try {
+    const res = await fetch('/upload', { method: 'POST', body: new FormData(e.target) });
+    const data = await res.json();
+    const list = data.files.map((f) => `${f.name} (${f.size} bytes)`).join(', ');
+    setText($('#upload-result'), `Uploaded ${data.files.length} ${data.files.length === 1 ? 'file' : 'files'}: ${list}`);
+    logLine(log, `POST /upload → ${res.status} ${res.statusText}`);
+  } catch (err) {
+    setText($('#upload-result'), `Upload failed: ${err.message}`);
+  }
+});
+
+const chart = $('#chart');
+const chartState = () => setText($('#chart-status'), chart.complete && chart.naturalWidth === 0 ? 'Chart: failed to load' : chart.complete ? 'Chart: loaded' : 'Chart: loading');
+on(chart, 'error', chartState);
+on(chart, 'load', chartState);
+chartState();
+
+tagLinks();
+</script>
+</body>
+</html>

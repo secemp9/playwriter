@@ -125,6 +125,8 @@ describe('downloads through the real extension', () => {
     const clicked = await executor.execute(`await act.click(${refOf(look.text, /link "Export CSV"/)})`, 30000)
     expect(clicked.isError, clicked.text).toBe(false)
     expect(clicked.text).toMatch(/DOWNLOAD \[d1\] report\.csv from .*\/export — completed → downloads\.save\('d1', 'report\.csv'\) saves it into the session folder/)
+    // And names the copy Chrome kept where its settings save downloads, so it can be deleted.
+    expect(clicked.text).toContain(`; Chrome also kept its own copy at ${path.join(userDownloads, 'report.csv')} (where this Chrome's settings save downloads)`)
     // Chrome saved it under its own name where the profile says.
     expect(fs.readFileSync(path.join(userDownloads, 'report.csv'), 'utf8')).toBe(CSV)
 

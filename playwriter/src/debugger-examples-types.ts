@@ -31,7 +31,7 @@ import type {
 } from './static-analysis.js'
 import type { ModuleGraphSummary } from './module-graph.js'
 import type { CdpScreencastOptions, CdpScreencastResult, CaptionStamp, HoldResult } from './cdp-screencast.js'
-import type { RecordingState, ExecutionTimestamp } from './screen-recording.js'
+import type { RecordingState, RecordingStopResult } from './screen-recording.js'
 import type { ReactComponentInfo } from './react-source.js'
 import type { HumanTrajectory, Point as HumanPoint } from './human-mouse.js'
 import type { HumanMoveOptions, HumanClickOptions, HumanMoveResult, HumanMouseDefaults } from './human-mouse-driver.js'
@@ -231,9 +231,11 @@ export declare const net: {
  * The `recording` namespace as the sandbox sees it — BOTH recorders, because both live
  * on this one object and a declaration showing only half of it reads as a complete list.
  *
- * `start`/`stop`/`isRecording`/`cancel` drive the tabCapture recorder: true compositor
- * output at a fixed frame rate, survives navigation, and needs one extension-icon click
- * per tab (so it is unavailable over direct CDP and in headless mode).
+ * `start`/`stop`/`isRecording`/`cancel` drive the extension's tabCapture recorder: true
+ * compositor output at a fixed frame rate, survives navigation, and needs one extension-icon
+ * click per tab. A browser without the extension (headless, direct CDP) has no tabCapture, so
+ * there they drive the CDP screencast recorder below; `recorder` in every result says which.
+ * `isRecording` also reports a recording started with `startCdp`.
  *
  * `startCdp` and everything below it drive the gesture-free CDP recorder, which needs no
  * click and works everywhere. It returns immediately and the handle lives on the
@@ -241,7 +243,7 @@ export declare const net: {
  * `frameCount` take no handle, and why they throw rather than no-op when nothing runs.
  */
 export declare const recording: {
-  /** tabCapture recorder. Auto-resizes the viewport to 16:9 and auto-stops after 15 min. */
+  /** tabCapture recorder, or the CDP screencast recorder in a browser without the extension. Auto-stops after 15 min. */
   start: (options?: {
     page?: Page
     outputPath?: string
@@ -251,13 +253,8 @@ export declare const recording: {
     aspectRatio?: { width: number; height: number } | null
     maxDurationMs?: number
   }) => Promise<RecordingState>
-  /** Returns the path, duration, size and the `executionTimestamps` `createDemoVideo` needs. */
-  stop: (options?: { page?: Page }) => Promise<{
-    path: string
-    duration: number
-    size: number
-    executionTimestamps: ExecutionTimestamp[]
-  }>
+  /** Returns the recorder, path, duration, size and the `executionTimestamps` `createDemoVideo` needs. */
+  stop: (options?: { page?: Page }) => Promise<RecordingStopResult>
   isRecording: (options?: { page?: Page }) => Promise<RecordingState>
   cancel: (options?: { page?: Page }) => Promise<void>
   /**
@@ -267,7 +264,7 @@ export declare const recording: {
    */
   startCdp: (
     options: Omit<CdpScreencastOptions, 'cdp' | 'page'> & { page?: Page },
-  ) => Promise<{ started: boolean; outputPath: string; inputOverlay?: boolean; note?: string }>
+  ) => Promise<{ started: boolean; outputPath: string; startedAt: number; inputOverlay?: boolean; note?: string }>
   stopCdp: () => Promise<CdpScreencastResult>
   cancelCdp: () => Promise<{ cancelled: boolean }>
   /** Stamps at call time. `atMs` overrides that when the caller knows the real instant. */

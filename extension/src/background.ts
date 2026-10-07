@@ -23,8 +23,12 @@ import {
   FREESTYLE_GROUP_KEY,
 } from './workspace-groups'
 import { createElementPicker, type PickPurpose } from './element-pick'
-import { copyTextViaOffscreen } from './offscreen-document'
+import { copyTextViaOffscreen, readTextViaOffscreen } from './offscreen-document'
 import { TabDownloads } from './tab-downloads'
+import { DebuggerCuts, type ReattachOutcome } from './debugger-cut'
+import { REATTACH_CUT_TAB } from 'playwriter/src/debugger-cut'
+import { TabVisibilityTracker } from './tab-visibility'
+import { READ_TAB_VISIBILITY } from 'playwriter/src/tab-visibility'
 import { SelfGroupChangeLedger, UNGROUPED_TAB_GROUP_ID } from 'playwriter/src/tab-group-events'
 import type { CDPEvent, Protocol } from 'playwriter/src/cdp-types'
 import type { ExtensionCommandMessage, ExtensionResponseMessage } from 'playwriter/src/protocol'
@@ -585,6 +589,24 @@ class ConnectionManager {
         return
       }
 
+      // A client asks about a cut tab (debugger-cut.ts): try to re-attach it now, answer with its report.
+      if (message.method === REATTACH_CUT_TAB) {
+        const targetId: unknown = message.params?.targetId
+        const tabId = typeof targetId === 'string' ? debuggerCuts.tabOf(targetId) : null
+        const report = tabId === null ? null : await debuggerCuts.attempt(tabId)
+        sendMessage({ id: message.id, result: report })
+        return
+      }
+
+      // A client asks whether the user can see a tab (tab-visibility.ts): read it now; the report goes out first.
+      if (message.method === READ_TAB_VISIBILITY) {
+        const targetId: unknown = message.params?.targetId
+        const found = typeof targetId === 'string' ? getTabByTargetId(targetId) : undefined
+        const report = found && typeof targetId === 'string' ? await tabVisibility.read(found.tabId, targetId, { force: true }).catch(() => null) : null
+        sendMessage({ id: message.id, result: report })
+        return
+      }
+
       // Handle createInitialTab - create a new tab when Playwright connects and no tabs exist
       // We use skipAttachedEvent: true because the relay's Target.setAutoAttach handler will send
       // Target.attachedToTarget for all targets in connectedTargets. If we also sent it here,
@@ -598,6 +620,29 @@ class ConnectionManager {
       // Target.setAutoAttach - so we'd send the event twice to the same client.
       if (message.method === 'createInitialTab') {
         try {
+          // The relay asks only when it knows no tab of this workspace. It can be behind: a tab this
+          // workspace owns may already be connected, its Target.attachedToTarget echo still on its way
+          // (MEASURED with this socket's frames held 250 ms: page-purity.test.ts got a stray about:blank
+          // tab beside the one it had attached). That tab is the answer; the echo precedes this reply
+          // on the ordered socket, so the relay knows it by the time it reads the reply.
+          const owned = Array.from(store.getState().tabs.entries()).find(
+            ([ownedTabId, t]) => t.state === 'connected' && t.sessionId && t.workspaceKey === message.params.workspaceKey && !debuggerCuts.isCut(ownedTabId),
+          )
+          if (owned) {
+            const [ownedTabId, ownedTab] = owned
+            const { targetInfo } = (await sendCommandWithTimeout(
+              { tabId: ownedTabId },
+              'Target.getTargetInfo',
+              undefined,
+              ATTACH_SETUP_TIMEOUT_MS,
+            )) as Protocol.Target.GetTargetInfoResponse
+            logger.debug('Initial tab: the workspace already has tab', ownedTabId, 'sessionId:', ownedTab.sessionId)
+            sendMessage({
+              id: message.id,
+              result: { success: true, tabId: ownedTabId, sessionId: ownedTab.sessionId, targetInfo: { ...targetInfo, attached: true } },
+            })
+            return
+          }
           logger.debug('Creating initial tab for Playwright client')
           const tab = await createTabInPreferredWindow({ url: 'about:blank', active: false })
           if (tab.id) {
@@ -627,6 +672,17 @@ class ConnectionManager {
         } catch (error: any) {
           logger.debug('Failed to create initial tab:', error)
           sendMessage({ id: message.id, error: error.message })
+        }
+        return
+      }
+
+      // The sandbox's clipboard.read(): the clipboard's text, read in the offscreen document on
+      // this explicit request only. The relay routes it from the client's page session.
+      if (message.method === 'readClipboard') {
+        try {
+          sendMessage({ id: message.id, result: { text: await readTextViaOffscreen() } })
+        } catch (error: unknown) {
+          sendMessage({ id: message.id, error: error instanceof Error ? error.message : String(error) })
         }
         return
       }
@@ -753,6 +809,8 @@ class ConnectionManager {
 
     chrome.debugger.onEvent.removeListener(onDebuggerEvent)
     chrome.debugger.onDetach.removeListener(onDebuggerDetach)
+    // The relay's records of cut tabs closed with it; reconnecting re-attaches every tracked tab.
+    debuggerCuts.clear()
 
     const isExtensionReplaced = reason === 'Extension Replaced' || code === 4001
     const isExtensionInUse = reason === 'Extension Already In Use' || code === 4002
@@ -877,10 +935,23 @@ class ConnectionManager {
 
           try {
             await chrome.tabs.get(tabId)
+            // A connect may have finished this tab while Chrome answered.
+            if (store.getState().tabs.get(tabId)?.state === 'connected') {
+              logger.debug('Skipping reattach, tab connected meanwhile:', tabId)
+              continue
+            }
+            // Single-flight: if a connect of this tab is attaching it, this joins that attach.
             await attachTab(tabId)
             logger.debug('Successfully re-attached tab:', tabId)
-          } catch (error: any) {
-            logger.debug('Failed to re-attach tab:', tabId, error.message)
+          } catch (error: unknown) {
+            logger.debug('Failed to re-attach tab:', tabId, error instanceof Error ? error.message : String(error))
+            // Drop only the TabInfo this pass set out to re-attach. A connect that took the tab over
+            // meanwhile (setTabConnecting writes a new TabInfo) reports its own failure on it, and a
+            // tab some other attach connected stays connected.
+            if (store.getState().tabs.get(tabId) !== currentTab) {
+              logger.debug('Keeping tab another connect took over:', tabId)
+              continue
+            }
             store.setState((state) => {
               const newTabs = new Map(state.tabs)
               newTabs.delete(tabId)
@@ -1529,6 +1600,28 @@ if (typeof chrome.downloads !== 'undefined') {
   chrome.downloads.onChanged.addListener(() => tabDownloads.onChromeDownloadChanged())
 }
 
+/**
+ * Tabs Chrome took our debugger off while they stayed open — another extension's frame came into the
+ * page (a password manager's autofill menu), or the tab went to a page no extension may debug. They are
+ * kept and re-attached as soon as Chrome allows (debugger-cut.ts).
+ */
+const debuggerCuts = new DebuggerCuts({
+  ownExtensionId: chrome.runtime.id,
+  send: (report) => sendMessage({ method: 'debuggerCut', params: report }),
+  reattach: reattachCutTab,
+  log: (...args) => logger.debug(...args),
+})
+debuggerCuts.listen()
+
+/** Whether the user can see each attached tab — Chrome throttles one they cannot (tab-visibility.ts). */
+const tabVisibility = new TabVisibilityTracker({
+  attachedTabs: () =>
+    [...store.getState().tabs].flatMap(([tabId, tab]) => (tab.state === 'connected' && tab.targetId ? [{ tabId, targetId: tab.targetId }] : [])),
+  send: (report) => sendMessage({ method: 'tabVisibility', params: report }),
+  log: (...args) => logger.debug(...args),
+})
+tabVisibility.listen()
+
 function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string, params: any): void {
   if (DROPPED_CDP_EVENTS.has(method)) {
     return
@@ -1547,6 +1640,19 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
       elementPicker.onCancelled(source.tabId)
     }
   }
+
+  // The last address no other extension's debugger may be in, loading in this tab: the cause of a cut
+  // that follows (the detach itself says only `target_closed`).
+  if (source.tabId !== undefined && (method === 'Page.frameRequestedNavigation' || method === 'Page.frameStartedNavigating')) {
+    debuggerCuts.noteNavigation(source.tabId, params?.url)
+  } else if (source.tabId !== undefined && method === 'Page.frameNavigated') {
+    debuggerCuts.noteNavigation(source.tabId, params?.frame?.url)
+  }
+
+  // A cut tab has no Playwright session (debugger-cut.ts): what an interim attach of it says — the one
+  // Chrome let through in the instant before the other extension's frame committed, or the re-attach
+  // in progress — reaches no one, so it is not broadcast as browser-level.
+  if (source.tabId !== undefined && debuggerCuts.isCut(source.tabId)) return
 
   logger.debug('Forwarding CDP event:', method, 'from tab:', source.tabId)
 
@@ -1661,6 +1767,10 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     // in this extension process. Clear every tracked tab so Playwright does not
     // keep sending commands to tabs Chrome already detached from.
     for (const [detachedTabId, tab] of store.getState().tabs.entries()) {
+      if (debuggerCuts.isCut(detachedTabId)) {
+        debuggerCuts.end(detachedTabId, 'disconnected')
+        continue
+      }
       detachTabFromPlaywright(detachedTabId, tab)
     }
 
@@ -1668,7 +1778,20 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
     return
   }
 
+  // An interim attach of a cut tab ended (debugger-cut.ts): the cut is still being handled.
+  if (debuggerCuts.isCut(tabId)) {
+    logger.debug('Debugger detach of a cut tab while re-attaching:', tabId, reason)
+    return
+  }
+
   const tab = store.getState().tabs.get(tabId)
+  if (tab && reason === chrome.debugger.DetachReason.TARGET_CLOSED && tab.sessionId && tab.targetId) {
+    // `target_closed` also comes while the tab stays open: another extension's frame came into the
+    // page, or the tab went to a page no extension may debug (debugger-cut.ts). A closed tab fires
+    // tabs.onRemoved first (measured), so it has already left the store; one still open is kept.
+    void keepCutTab({ tabId, tab, targetId: tab.targetId, reason, detach: () => detachTabFromPlaywright(tabId, tab) })
+    return
+  }
   if (tab) {
     detachTabFromPlaywright(tabId, tab)
   }
@@ -1680,9 +1803,146 @@ function onDebuggerDetach(source: chrome.debugger.Debuggee, reason: `${chrome.de
   })
 }
 
+/**
+ * Chrome took the debugger off a tab with `target_closed`. Still open: Playwright is told its session
+ * is gone (after the relay heard why), the tab stays tracked and owned, and it is re-attached as soon
+ * as Chrome allows. Gone: dropped as any detached tab.
+ */
+async function keepCutTab({
+  tabId,
+  tab,
+  targetId,
+  reason,
+  detach,
+}: {
+  tabId: number
+  tab: TabInfo
+  targetId: string
+  reason: string
+  detach: () => void
+}): Promise<void> {
+  const open = await chrome.tabs.get(tabId).then(
+    () => true,
+    () => false,
+  )
+  const current = store.getState().tabs.get(tabId)
+  // Disconnected, or attached again, while Chrome answered: nothing of this detach is left to handle.
+  if (!current || current.sessionId !== tab.sessionId) return
+  if (open) debuggerCuts.begin({ tabId, targetId, detachReason: reason })
+  detach()
+  if (!open) {
+    store.setState((state) => {
+      const newTabs = new Map(state.tabs)
+      newTabs.delete(tabId)
+      return { tabs: newTabs }
+    })
+    return
+  }
+  // A pick in progress died with the session.
+  elementPicker.forget(tabId)
+  store.setState((state) => {
+    const newTabs = new Map(state.tabs)
+    newTabs.set(tabId, { state: 'connecting', workspaceKey: tab.workspaceKey, workspaceLabel: tab.workspaceLabel })
+    return { tabs: newTabs }
+  })
+  debuggerCuts.start(tabId)
+}
+
+/** One re-attach of a cut tab: never touches the page (the other extension's frame is the user's), and announces the tab again. */
+async function reattachCutTab(tabId: number): Promise<ReattachOutcome> {
+  const tab = store.getState().tabs.get(tabId)
+  if (!tab || tab.state !== 'connecting') {
+    return { ok: false, error: 'Playwriter no longer tracks this tab', ended: 'disconnected' }
+  }
+  if (connectionManager.ws?.readyState !== WebSocket.OPEN) {
+    return { ok: false, error: 'the connection to the relay is down' }
+  }
+  const attempt = async (): Promise<ReattachOutcome> => {
+    try {
+      const { sessionId } = await attachTab(tabId, { keepForeignFrames: true })
+      return { ok: true, sessionId }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const gone = await chrome.tabs.get(tabId).then(
+        () => false,
+        () => true,
+      )
+      return gone ? { ok: false, error: message, ended: 'tab-closed' } : { ok: false, error: message }
+    }
+  }
+  const outcome = await attempt()
+  if (outcome.ok || !outcome.error.includes('Another debugger is already attached')) return outcome
+  // MEASURED: an attempt right after the cut can attach in the instant before the other extension's
+  // frame commits; its first command is then refused, and so is attachTab's clean-up detach while the
+  // frame is there. That session is ours and still attached once the frame has gone. attachTab takes
+  // it over when it answers a command; when it does not, attachTab reports the refusal, and this
+  // releases the session, then attaches again.
+  logger.debug('Releasing the interim debugger session left on cut tab:', tabId)
+  await chrome.debugger.detach({ tabId }).catch((error: unknown) => {
+    logger.debug('Releasing the interim session of cut tab failed:', tabId, error instanceof Error ? error.message : String(error))
+  })
+  return await attempt()
+}
+
 type AttachTabResult = {
   targetInfo: Protocol.Target.TargetInfo
   sessionId: string
+}
+
+type AttachTabOptions = {
+  skipAttachedEvent?: boolean
+  /**
+   * A cut tab's re-attach (debugger-cut.ts): one attempt, and another extension's frame is never
+   * removed from the page to make it succeed — Chrome's refusal is the answer, and it is reported.
+   */
+  keepForeignFrames?: boolean
+}
+
+/**
+ * The attach running for each tab. Two attaches of one tab must never run together. MEASURED (relay
+ * log, perf-relay run; attach-race-relay.test.ts forces it): a toggle's connectTab and maintainLoop's
+ * re-attach of 'connecting' tabs resume on the same relay connect, and each called
+ * chrome.debugger.attach — 'Attaching debugger to tab: N' twice right after 'Connection
+ * established'. The second failed with 'Another debugger is already attached', its error path
+ * deleted the TabInfo, the first then threw 'has no TabInfo to inherit ownership from', and the
+ * relay auto-created a background about:blank tab for the client instead.
+ */
+const attachesInFlight = new Map<number, Promise<AttachTabResult>>()
+
+/**
+ * Attach a tab, single-flight: asked while an attach of the same tab runs, it answers with that
+ * attach's result (run with the first request's options).
+ */
+function attachTab(tabId: number, options: AttachTabOptions = {}): Promise<AttachTabResult> {
+  const running = attachesInFlight.get(tabId)
+  if (running) {
+    logger.debug('Attach of tab already in flight, joining it:', tabId)
+    return running
+  }
+  const attach = attachTabNow(tabId, options).finally(() => {
+    if (attachesInFlight.get(tabId) === attach) attachesInFlight.delete(tabId)
+  })
+  attachesInFlight.set(tabId, attach)
+  return attach
+}
+
+/**
+ * The target of OUR debugger session on a tab, or null when the session there is not ours.
+ * chrome.debugger.attach answers 'Another debugger is already attached' for any client, this
+ * extension included; only a session of ours answers a command this extension sends.
+ */
+async function ownSessionTarget(tabId: number): Promise<Protocol.Target.TargetInfo | null> {
+  try {
+    const { targetInfo } = (await sendCommandWithTimeout(
+      { tabId },
+      'Target.getTargetInfo',
+      undefined,
+      ATTACH_SETUP_TIMEOUT_MS,
+    )) as Protocol.Target.GetTargetInfoResponse
+    return targetInfo
+  } catch {
+    return null
+  }
 }
 
 // Remove chrome-extension:// iframes from the page DOM before attaching the debugger.
@@ -1742,9 +2002,9 @@ async function removeRestrictedIframes(tabId: number): Promise<number> {
   }
 }
 
-async function attachTab(
+async function attachTabNow(
   tabId: number,
-  { skipAttachedEvent = false }: { skipAttachedEvent?: boolean } = {},
+  { skipAttachedEvent = false, keepForeignFrames = false }: AttachTabOptions,
 ): Promise<AttachTabResult> {
   const debuggee = { tabId }
   let debuggerAttached = false
@@ -1753,16 +2013,23 @@ async function attachTab(
   try {
     logger.debug('Attaching debugger to tab:', tabId)
 
+    // Set when the attach is refused because a session of OURS is already on the tab: not a failure.
+    let ownTarget: Protocol.Target.TargetInfo | null = null
     // Bounded retry loop: chrome.debugger.attach fails if the tab contains chrome-extension://
     // iframes from other extensions. We remove them and retry, but aggressive extensions can
     // re-inject between cleanup and retry, so we allow up to 3 attempts.
-    const maxAttachAttempts = 3
+    const maxAttachAttempts = keepForeignFrames ? 1 : 3
     for (let attempt = 1; attempt <= maxAttachAttempts; attempt++) {
       try {
         await chrome.debugger.attach(debuggee, '1.3')
         break
-      } catch (attachError: any) {
-        const msg = attachError.message ?? ''
+      } catch (attachError: unknown) {
+        const msg = attachError instanceof Error ? attachError.message : String(attachError)
+        if (msg.includes('Another debugger is already attached')) {
+          ownTarget = await ownSessionTarget(tabId)
+          if (ownTarget) break
+          throw attachError
+        }
         const isRestrictedIframeError = msg.includes('chrome-extension://') || msg.includes('different extension')
         if (!isRestrictedIframeError || attempt === maxAttachAttempts) {
           throw attachError
@@ -1776,6 +2043,16 @@ async function attachTab(
       }
     }
 
+    if (ownTarget) {
+      // A tab this connection already announced keeps its session: a second attach of it (one that
+      // started after the first finished) answers with it instead of announcing the tab again.
+      const current = store.getState().tabs.get(tabId)
+      if (current?.state === 'connected' && current.sessionId && current.targetId === ownTarget.targetId) {
+        logger.debug('Tab is already attached and connected, keeping its session:', tabId, current.sessionId)
+        return { targetInfo: ownTarget, sessionId: current.sessionId }
+      }
+      logger.debug('Our own debugger session is still on tab, setting it up:', tabId)
+    }
     debuggerAttached = true
     logger.debug('Debugger attached successfully to tab:', tabId)
 
@@ -2078,6 +2355,11 @@ async function connectTab(
         logger.debug(`Tab ${tabId} was detached during connect, dropping error state`)
         return
       }
+      // Another attach of this tab connected it while this error was handled: it stays connected.
+      if (store.getState().tabs.get(tabId)?.state === 'connected') {
+        logger.debug(`Tab ${tabId} was connected by another attach, keeping it`)
+        return
+      }
       store.setState((state) => {
         const newTabs = new Map(state.tabs)
         // Stamp the ownership this connect was invoked with (I2): an errored tab still
@@ -2348,6 +2630,7 @@ async function onTabRemoved(tabId: number): Promise<void> {
   // A closed tab can emit no further group events, so any change we recorded for it would sit
   // in the ledger forever — and a recycled tab id would inherit it.
   selfGroupChanges.forget(tabId)
+  debuggerCuts.end(tabId, 'tab-closed')
   const { tabs } = store.getState()
   if (!tabs.has(tabId)) return
   logger.debug(`Connected tab ${tabId} was closed, disconnecting`)
@@ -2396,6 +2679,14 @@ async function applyActionForTab(
 
   if (tabInfo?.state === 'error') {
     logger.debug('Tab has error - disconnecting to clear state')
+    await disconnectTab(tab.id)
+    return
+  }
+
+  // A tab waiting to be re-attached after Chrome cut the debugger off: the click lets it go.
+  if (debuggerCuts.isCut(tab.id)) {
+    logger.debug('Releasing a tab Chrome cut the debugger off:', tab.id)
+    debuggerCuts.end(tab.id, 'disconnected')
     await disconnectTab(tab.id)
     return
   }
@@ -2717,6 +3008,18 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         const { tabs } = store.getState()
         if (isPlaywriterGroup) {
           if (!tabs.has(tabId) && !isRestrictedUrl(tab.url)) {
+            // A tab opened BY a connected tab (target=_blank, window.open) is put in its opener's
+            // group by Chrome itself: it belongs to the opener's workspace, exactly like a
+            // relocated popup (see windows.onCreated below). Connecting it as freestyle hid it
+            // from the agent that opened it while Playwright still drove it, and the relay then
+            // answered Target.getTargetInfo for it with another tab's id.
+            const sourceTabId = popupSourceTabMap.get(tabId)
+            const opener = sourceTabId !== undefined ? tabs.get(sourceTabId) : undefined
+            if (opener) {
+              logger.debug('Tab opened by connected tab', sourceTabId, 'joined its group:', tabId)
+              await connectTab(tabId, { workspaceKey: opener.workspaceKey, workspaceLabel: opener.workspaceLabel })
+              return
+            }
             logger.debug('Tab manually added to playwriter group:', tabId)
             // A human dragged this UNTRACKED tab into a playwriter group by hand — same
             // semantics as clicking the extension icon: freestyle (null), owned by no agent

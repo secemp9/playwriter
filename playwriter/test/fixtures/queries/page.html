@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Queries</title>
+<style>
+  body { font: 16px sans-serif; margin: 16px; }
+  #tall { height: 2400px; }
+  #cover-box, .veiled-box { position: relative; width: 200px; height: 40px; }
+  #cover-box .veil, .veiled-box .shade { position: absolute; inset: 0; background: #fff; }
+  #clicker { cursor: pointer; padding: 4px; border: 1px solid #999; width: 160px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Customers</h1>
+  <table>
+    <caption>Accounts</caption>
+    <tr><td>Initech</td><td><button>Delete</button></td></tr>
+    <tr><td>Umbrella Health</td><td><button>Delete</button></td></tr>
+  </table>
+
+  <label for="email">Email address</label> <input id="email" placeholder="you@example.com">
+  <label>Wrapped name <input id="wrapped"></label>
+  <input id="by-aria" aria-label="Search the catalogue">
+
+  <button id="save" class="primary big" disabled aria-describedby="hint" data-testid="save-btn" type="submit" style="color: red" onclick="void 0">Save</button>
+  <button id="draft">Save draft</button>
+  <span id="hint">Saves the form</span>
+
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" alt="Company logo" width="24" height="24">
+  <a href="/help" title="Open the help page">Help</a>
+
+  <div role="tooltip" id="tip">Free shipping over $50</div>
+  <p class="note">Order <b>placed</b> today</p>
+  <div id="clicker">Card text</div>
+  <output id="count">clicks: 0</output>
+
+  <x-closed></x-closed>
+  <x-open></x-open>
+  <div class="veiled-box"><p id="veiled">Veiled note</p><div class="shade"></div></div>
+
+  <div id="cover-box"><button id="covered">Under the veil</button><div class="veil">veil</div></div>
+
+  <button id="toggle">Toggle panel</button>
+  <button id="sort">Reverse list</button>
+  <input type="checkbox" id="agree"> <label for="agree">I agree</label>
+  <ul id="list"><li>Alpha</li><li>Bravo</li><li>Charlie</li></ul>
+
+  <dialog id="closed-dialog"><p>Never shown</p></dialog>
+
+  <div id="tall"></div>
+  <p id="far">Far below the fold</p>
+</main>
+<script>
+  // What the page itself can see of a reader: DOM mutations, input and focus events (the test reads it afterwards).
+  window.__witness = { mutations: 0, events: [] }
+  new MutationObserver((records) => { window.__witness.mutations += records.length }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true })
+  for (const type of ['focusin', 'focusout', 'pointerdown', 'pointermove', 'mousedown', 'mousemove', 'click', 'keydown', 'scroll', 'selectionchange']) {
+    addEventListener(type, () => { window.__witness.events.push(type) }, true)
+  }
+  customElements.define('x-closed', class extends HTMLElement {
+    constructor() {
+      super()
+      const root = this.attachShadow({ mode: 'closed' })
+      root.innerHTML = '<button class="inner">Shadow button</button><span class="inner-text">Inside closed shadow</span>'
+      root.querySelector('button').addEventListener('click', () => { document.getElementById('count').textContent = 'shadow clicked' })
+    }
+  })
+  customElements.define('x-open', class extends HTMLElement {
+    constructor() {
+      super()
+      this.attachShadow({ mode: 'open' }).innerHTML = '<span class="deep">Open shadow text</span>'
+    }
+  })
+  let clicks = 0
+  document.getElementById('clicker').addEventListener('click', () => { document.getElementById('count').textContent = 'clicks: ' + ++clicks })
+  document.getElementById('toggle').addEventListener('click', () => {
+    const existing = document.getElementById('panel')
+    if (existing) { existing.remove(); return }
+    const panel = document.createElement('section')
+    panel.id = 'panel'
+    panel.setAttribute('aria-label', 'Panel')
+    panel.innerHTML = '<button>Panel button</button>'
+    document.getElementById('toggle').after(panel)
+    document.getElementById('agree').checked = true
+  })
+  document.getElementById('sort').addEventListener('click', () => {
+    const list = document.getElementById('list')
+    for (const item of [...list.children].reverse()) list.appendChild(item)
+  })
+</script>
+</body>
+</html>

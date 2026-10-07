@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mouse buttons</title>
+<style>
+  body { font: 16px sans-serif; margin: 20px; }
+  #file { padding: 20px 30px; }
+  #menu { position: fixed; background: #fff; border: 1px solid #888; list-style: none; margin: 0; padding: 4px; }
+  #menu[hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>Mouse buttons</h1>
+<button type="button" id="file">Report.pdf</button>
+<a id="docs" href="/docs-target.html">Docs</a>
+<ul id="menu" role="menu" aria-label="File actions" hidden>
+  <li role="none"><button type="button" role="menuitem" id="rename">Rename</button></li>
+  <li role="none"><button type="button" role="menuitem" id="delete">Delete</button></li>
+</ul>
+<p id="log"></p>
+<script>
+  const log = [];
+  const write = () => { document.getElementById('log').textContent = log.join('; '); };
+  const file = document.getElementById('file');
+  const menu = document.getElementById('menu');
+  for (const type of ['mousedown', 'mouseup', 'click', 'auxclick', 'contextmenu']) {
+    file.addEventListener(type, (e) => {
+      const box = file.getBoundingClientRect();
+      log.push(`${type} b${e.button} ${e.isTrusted ? 'trusted' : 'synthetic'} ${(e.clientX - box.left).toFixed(1)},${(e.clientY - box.top).toFixed(1)}`);
+      write();
+    });
+  }
+  // The menu opens under the pointer, so the release lands on it rather than on the button.
+  document.addEventListener('mouseup', (e) => {
+    if (e.target !== file) { log.push(`mouseup b${e.button} ${e.isTrusted ? 'trusted' : 'synthetic'} on ${e.target.id || e.target.tagName}`); write(); }
+  });
+  file.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.hidden = false;
+  });
+  const docs = document.getElementById('docs');
+  docs.addEventListener('auxclick', (e) => { log.push(`docs auxclick b${e.button} ${e.isTrusted ? 'trusted' : 'synthetic'}`); write(); e.preventDefault(); });
+  docs.addEventListener('click', (e) => { log.push('docs click'); write(); e.preventDefault(); });
+</script>
+</body>
+</html>

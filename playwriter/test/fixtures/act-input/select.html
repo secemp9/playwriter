@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Selects</title>
+<style>
+  body { font: 15px sans-serif; margin: 16px; }
+  label { display: block; margin-top: 14px; }
+</style>
+</head>
+<body>
+<h1>Selects</h1>
+<label for="region">Region</label>
+<select id="region">
+  <option value="">Choose a region</option>
+  <optgroup label="Europe">
+    <option>France</option>
+    <option>Germany</option>
+    <option disabled>Spain</option>
+    <option>Sweden</option>
+  </optgroup>
+  <optgroup label="Retired" disabled>
+    <option>Yugoslavia</option>
+  </optgroup>
+  <optgroup label="Asia">
+    <option>Japan</option>
+    <option>Korea</option>
+  </optgroup>
+</select>
+
+<label for="size">Size</label>
+<select id="size">
+  <option value="s">Small</option>
+  <option value="m-regular">Medium</option>
+  <option value="l">Large</option>
+  <option value="m-tall">Medium</option>
+  <option value="xl">Extra large</option>
+</select>
+
+<label for="toppings">Toppings</label>
+<select id="toppings" multiple size="4">
+  <option>Basil</option>
+  <option>Cheese</option>
+  <option>Garlic</option>
+  <option>Ham</option>
+  <option>Mushroom</option>
+  <option>Olives</option>
+  <option>Onion</option>
+  <option>Peppers</option>
+  <option>Pineapple</option>
+  <option>Salami</option>
+  <option>Spinach</option>
+  <option>Tomato</option>
+</select>
+
+<label for="locked">Delivery</label>
+<select id="locked">
+  <option>Standard</option>
+  <option>Express</option>
+  <option>Overnight</option>
+</select>
+
+<label for="speed">Speed</label>
+<select id="speed">
+  <option>Slow</option>
+  <option>Normal</option>
+  <option>Fast</option>
+  <option>Faster</option>
+  <option>Fastest</option>
+</select>
+
+<p id="out">Nothing chosen yet</p>
+<script>
+  const out = document.getElementById('out')
+  const show = () => {
+    const value = (id) => Array.from(document.getElementById(id).selectedOptions).map((o) => o.value).join('+')
+    out.textContent = `region=${value('region')} size=${value('size')} toppings=${value('toppings')} delivery=${value('locked')} speed=${value('speed')}`
+  }
+  for (const id of ['region', 'size', 'toppings', 'speed']) document.getElementById(id).addEventListener('change', show)
+  // The page keeps its own picker in mind: a press on Speed focuses it without opening Chrome's list.
+  document.getElementById('speed').addEventListener('mousedown', (event) => { event.preventDefault(); event.target.focus() })
+  // The page's own rule: Overnight is sold out, so choosing it puts Standard back a moment later.
+  document.getElementById('locked').addEventListener('change', (event) => {
+    if (event.target.value === 'Overnight') setTimeout(() => { event.target.value = 'Standard'; show() }, 250)
+    else show()
+  })
+</script>
+</body>
+</html>

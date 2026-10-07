@@ -40,6 +40,7 @@ import type { Download } from '@xmorse/playwright-core'
 import { ModelFacingError } from './probe-types.js'
 import type { ScopedFS } from './scoped-fs.js'
 import type { RelayDownloadStatus } from './download-file.js'
+import { downloadCopyOf } from './new-browser.js'
 
 /** How this session reaches its browser: it decides whether a finished download's file is on this machine. */
 export type BrowserConnection =
@@ -214,13 +215,43 @@ export class SessionDownloads {
     switch (outcome.state) {
       case 'completed':
         return outcome.cannotCopy === null
-          ? `${head} — completed → ${save} saves it into the session folder`
+          ? `${head} — completed → ${save} saves it into the session folder${await this.ownCopy(entry.download)}`
           : `${head} — completed, but it cannot be copied here: ${outcome.cannotCopy}`
       case 'failed':
         return `${head} — FAILED: ${outcome.reason} (no file to save)`
       case 'unknown':
         return `${head} — outcome unknown: ${outcome.reason}`
     }
+  }
+
+  /**
+   * Where the browser keeps its own copy of a finished download, as a clause of its report line, so the
+   * model can tidy up: Playwright's temporary folder in a browser it launched (and the copy in the
+   * session's downloads folder when `browser new` was given one), the file Chrome saved where the user's
+   * settings say through the extension (chrome.downloads names it). Empty for a connection that cannot tell.
+   */
+  private async ownCopy(download: Download): Promise<string> {
+    const connection = this.connection
+    if (connection.kind === 'launched') {
+      const folderCopy = downloadCopyOf(download)
+      const copied = folderCopy === undefined ? null : await folderCopy
+      const folder = copied === null ? '' : 'path' in copied ? `; saved as ${copied.path} (the session's downloads folder)` : `; it could not be copied into the downloads folder: ${copied.error}`
+      try {
+        return `${folder}; the browser's own copy is ${await download.path()} (Playwright's temporary downloads folder, deleted when this browser closes)`
+      } catch (error) {
+        return `${folder}; where the browser keeps its own copy could not be read (${firstLine(error)})`
+      }
+    }
+    if (connection.kind !== 'extension') return ''
+    const asked = artifactPathOf(download)
+    if (asked === null) return ''
+    let status: RelayDownloadStatus | null
+    try {
+      status = await connection.relay(path.basename(asked))
+    } catch (error) {
+      return `; where Chrome saved its own copy could not be asked of the playwriter relay (${firstLine(error)})`
+    }
+    return status?.state === 'saved' ? `; Chrome also kept its own copy at ${status.filePath} (where this Chrome's settings save downloads)` : ''
   }
 
   /**

@@ -389,7 +389,10 @@ describe('observePage on a live page', () => {
       expect(sort.inModal).toBeUndefined()
       expect(sort.visibility).toBe('covered')
       expect(only(obs, 'link', 'Home').visibility).toBe('covered')
-      expect(only(obs, 'link', 'Home').coveredBy).toBe('div#backdrop')
+      // The modal's own backdrop is listed with a ref, and what it covers names it.
+      const backdrop = obs.elements.find((element) => element.role === 'backdrop')!
+      expect(backdrop).toMatchObject({ backdropOf: 'dialog "Cookie consent"', cssLabel: 'div#backdrop' })
+      expect(only(obs, 'link', 'Home').coveredBy).toBe(`the backdrop [${backdrop.ref}] of dialog "Cookie consent"`)
 
       const text = renderObservation(obs)
       expect(text).toContain(`MODAL dialog "Cookie consent" [${obs.modal?.ref}] — only its controls work right now:`)
@@ -525,8 +528,9 @@ describe('observePage: live regions, long text, scroll areas, fields, hidden and
     expect(liveContext(obs, standards[0].ref, 'after "Text"')).toBe('after "Text"')
     const deletes = obs.elements.filter((element) => element.role === 'button' && element.name === 'Delete')
     expect(deletes.map((element) => element.context)).toEqual(['in listitem "Buy milk"', 'in listitem "Call mum"'])
-    // A label's words are its control's name, printed on the control's line, not again as prose.
-    expect(obs.text.map((block) => block.text)).toEqual(['Text', 'Width'])
+    // A label's words are its control's name, printed on the control's line, not again as prose;
+    // the list's own name ("Todos") is listed as the list's line.
+    expect(obs.text.map((block) => `${block.role} ${block.text}`)).toEqual(['text Text', 'text Width', 'list Todos'])
     const text = renderObservation(obs)
     expect(text).toContain(`[${standards[1].ref}] radio "Standard" [checked] (after "Width")`)
     expect(text).toContain(`[${only(obs, 'checkbox', 'Buy milk').ref}] checkbox "Buy milk" [unchecked]`)

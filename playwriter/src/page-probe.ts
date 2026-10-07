@@ -22,13 +22,16 @@ import { getCDPSessionForPage, tabTitle } from './cdp-session.js'
 import { withDeadline, type IsolatedWorld } from './isolated-world.js'
 import { PageFrames, type FrameHandle } from './page-frames.js'
 import { RefRegistry, type RefTarget } from './ref-registry.js'
-import { PageWatch } from './page-watch.js'
-import { DialogController } from './dialog-controller.js'
+import { PageWatch, type BusyRead } from './page-watch.js'
+import { DialogController, type BeforeUnloadPolicy, type DialogPolicy, type DialogPolicySettings } from './dialog-controller.js'
 import { PinTracker } from './element-pins.js'
 import { chooserOpener, describeOpener, FileChooserGate } from './file-chooser-gate.js'
 import { outgoingCallsOf, type OutgoingCallListener } from './playwright-client-hooks.js'
 import { ActError, type ActionRecord, type ActProbe } from './human-actions.js'
 import { observePage, quote, type Observation, type ObservedElement, type ObserveOptions } from './page-observe.js'
+import { hiddenTabNote, WindowOpens, type TabVisibility, type WindowOpenRecord } from './tab-state.js'
+import { tabIsHidden } from './tab-visibility.js'
+import { PERF_OBSERVERS_SOURCE, PERF_SETUP_NAME } from './perf-observers.js'
 
 export interface PageProbe extends ActProbe {
   page: Page
@@ -53,6 +56,8 @@ export interface PageProbe extends ActProbe {
   fileChoosers: FileChooserGate
   /** Elements the human pinned from the extension's context menu, and the pickElement() picker. */
   pins: PinTracker
+  /** The new windows and tabs this tab asked Chrome for (`Page.windowOpen`). */
+  windowOpens: WindowOpens
 }
 
 export interface ProbeLogger {
@@ -158,22 +163,79 @@ export class PageProbes {
   readonly registry = new RefRegistry()
   private readonly probes = new WeakMap<Page, Promise<PageProbe>>()
   private readonly dialogs = new WeakMap<Page, DialogController>()
+  /** Every open page's controller: the session dialog policy applies to all of them. */
+  private readonly controllers = new Set<DialogController>()
+  private dialogSettings: DialogPolicySettings = { policy: 'pending', beforeunload: 'ask' }
+  /** The title each tab showed when last read: a closed tab can no longer be asked. */
+  private readonly titles = new WeakMap<Page, string>()
+  /** How each new page was opened, once a report matched it to its opener's request. */
+  private readonly openedAs = new WeakMap<Page, WindowOpenRecord>()
   private readonly pagesByTarget = new Map<string, Page>()
   private readonly logger: ProbeLogger
+  /**
+   * Whether the user can see a tab, by target id. Absent for a launched browser: its background tabs
+   * are not throttled (measured, tab-visibility.ts), so there is nothing to tell.
+   */
+  private readonly readTabVisibility: ((targetId: string) => Promise<TabVisibility>) | undefined
 
-  constructor(options: { logger: ProbeLogger }) {
+  constructor(options: { logger: ProbeLogger; readTabVisibility?: (targetId: string) => Promise<TabVisibility> }) {
     this.logger = options.logger
+    this.readTabVisibility = options.readTabVisibility
+  }
+
+  /**
+   * Whether the user can see the tab, read now (never rejects). Null for a launched browser. Not the
+   * page's `document.visibilityState`: under Playwright's focus emulation it reads `visible` in a
+   * background tab.
+   */
+  async visibility(probe: PageProbe): Promise<TabVisibility | null> {
+    if (!this.readTabVisibility) return null
+    return await this.readTabVisibility(probe.targetId).catch(
+      (error: unknown): TabVisibility => ({ kind: 'unreadable', error: error instanceof Error ? error.message : String(error) }),
+    )
   }
 
   /** The page's dialog controller, attached on first call. Call this as soon as a page is seen. */
   dialogsFor(page: Page): DialogController {
     let controller = this.dialogs.get(page)
     if (!controller) {
-      controller = new DialogController({ page })
-      controller.attach()
-      this.dialogs.set(page, controller)
+      const created = new DialogController({ page, ...this.dialogSettings })
+      created.attach()
+      this.dialogs.set(page, created)
+      this.controllers.add(created)
+      page.once('close', () => this.controllers.delete(created))
+      controller = created
     }
     return controller
+  }
+
+  /** The session dialog policy (`act.dialog.policy`): every tab, open now or opened later, answers by it. */
+  setDialogPolicy(policy: DialogPolicy, options: { beforeunload?: BeforeUnloadPolicy; promptText?: string } = {}): DialogPolicySettings {
+    this.dialogSettings = {
+      policy,
+      beforeunload: options.beforeunload ?? 'ask',
+      ...(options.promptText !== undefined ? { promptText: options.promptText } : {}),
+    }
+    for (const controller of this.controllers) controller.setPolicy(policy, options)
+    return { ...this.dialogSettings }
+  }
+
+  /** The title `page` showed when last read, or undefined when it never was. */
+  lastTitle(page: Page): string | undefined {
+    return this.titles.get(page)
+  }
+
+  /**
+   * How `page` was opened by `opener`: its window.open/target=_blank request, matched once and
+   * remembered (observe()'s TABS list marks popup windows from then on). Undefined when the opener
+   * asked for no such window.
+   */
+  async openedBy(page: Page, opener: Page, since: number): Promise<WindowOpenRecord | undefined> {
+    const known = this.openedAs.get(page)
+    if (known) return known
+    const record = (await this.get(opener)).windowOpens.take(page.url(), since)
+    if (record) this.openedAs.set(page, record)
+    return record
   }
 
   get(page: Page): Promise<PageProbe> {
@@ -218,8 +280,19 @@ export class PageProbes {
       throw new Error(`Target.getTargetInfo on the page's own session returned no target for ${page.url()}.`)
     }
     const targetId = targetInfo.targetId
+    const holder = this.pagesByTarget.get(targetId)
+    if (holder && holder !== page && !holder.isClosed()) {
+      // Refs and tab tracking key on the target id: two open tabs under one id would hand one
+      // tab's refs to the other.
+      throw new Error(
+        `Target.getTargetInfo on the session of ${page.url()} answered the target id of another open tab (${holder.url()}): ` +
+          'the connection reported the wrong tab. Reconnect with the MCP reset tool.',
+      )
+    }
     const frames = new PageFrames({ page, cdp })
     const world = frames.main.world
+    // Web Vitals and layout shifts are tracked from the page's first world copy on (perf-observers.ts).
+    world.addSetup(PERF_SETUP_NAME, PERF_OBSERVERS_SOURCE)
     // The controller is the one record of open dialogs: bound to this session before the watch
     // that reads it, so a dialog closed outside Playwright is seen as closed.
     const dialogs = this.dialogsFor(page)
@@ -246,6 +319,7 @@ export class PageProbes {
       lastFullObservation: null,
       fileChoosers,
       pins: new PinTracker({ cdp, getUrl: () => page.url() }),
+      windowOpens: new WindowOpens(cdp),
     }
     this.pagesByTarget.set(targetId, page)
     // Picks from the extension's context menu arrive as CDP events from the moment the page is
@@ -257,6 +331,7 @@ export class PageProbes {
       watch.dispose()
       frames.dispose()
       probe.pins.dispose()
+      probe.windowOpens.dispose()
       this.pagesByTarget.delete(targetId)
       this.registry.closeTab(targetId)
     })
@@ -271,14 +346,22 @@ export class PageProbes {
   async tabs(page: Page, context: BrowserContext): Promise<TabSummary[]> {
     const pages = context.pages().filter((candidate) => !candidate.isClosed())
     return await Promise.all(
-      pages.map(async (candidate, index) => ({
-        index,
-        title: await tabTitle(candidate).catch(
+      pages.map(async (candidate, index) => {
+        const title = await tabTitle(candidate).then(
+          (read) => {
+            this.titles.set(candidate, read)
+            return read
+          },
           (error: unknown) => `(title unreadable: ${error instanceof Error ? error.message.split('.')[0] : String(error)})`,
-        ),
-        url: candidate.url(),
-        controlled: candidate === page,
-      })),
+        )
+        return {
+          index,
+          title,
+          url: candidate.url(),
+          controlled: candidate === page,
+          ...(this.openedAs.get(candidate)?.popup ? { popup: true as const } : {}),
+        }
+      }),
     )
   }
 
@@ -288,23 +371,29 @@ export class PageProbes {
    * last look" follow it. A picture the model never sees (the before-state of an action) updates
    * which refs are alive and nothing else. An observation of a page frozen by a native dialog is
    * never remembered: it shows nothing of the page.
+   *
+   * `known`: the busy read the caller made a moment ago, since the same last dispatched action
+   * (act's busy guard, right before its before-picture): its signals are the observation's, and its
+   * accessibility trees are not read again.
    */
-  async observe(page: Page, context: BrowserContext, options: ObserveOptions = {}, remember = true): Promise<Observation> {
+  async observe(page: Page, context: BrowserContext, options: ObserveOptions = {}, remember = true, known?: BusyRead): Promise<Observation> {
     const probe = await this.get(page)
     // Busy signals since the last action that reached the page: animations that ran before it
     // are the page's decoration, not its answer to the action.
     const since = probe.history.findLast((record) => record.dispatched && record.checkpoint)?.checkpoint
     // A dialog the agent must answer freezes the page: nothing can be read. One the policy answers
-    // by itself is waited out by busySignals(); one can also open between the check and the read,
+    // by itself is waited out by readBusy(); one can also open between the check and the read,
     // in which case the dialog is what the observation shows.
-    const busy =
-      probe.dialogs.current()?.handling === 'agent'
-        ? []
-        : await probe.watch.busySignals(since ? { since } : {}).catch((error: unknown) => {
-            if (probe.dialogs.current()) return []
+    const busy: BusyRead | null =
+      known ??
+      (probe.dialogs.current()?.handling === 'agent'
+        ? null
+        : await probe.watch.readBusy(since ? { since } : {}).catch((error: unknown) => {
+            if (probe.dialogs.current()) return null
             throw error
-          })
+          }))
     const jsDialog = probe.dialogs.current()
+    const visibility = this.visibility(probe)
     const observation = await observePage({
       page,
       frames: probe.frames,
@@ -312,12 +401,15 @@ export class PageProbes {
       targetId: probe.targetId,
       shown: remember,
       previous: probe.lastFullObservation,
-      busy,
+      busy: busy?.signals ?? [],
+      ...(busy ? { axTrees: busy.axTrees } : {}),
       jsDialog,
       tabs: await this.tabs(page, context),
       options,
     })
     if (!observation.jsDialog) probe.lastFullObservation = observation
+    const seen = await visibility
+    if (seen?.kind === 'read' && tabIsHidden(seen.report)) observation.tabNotes = [hiddenTabNote(seen.report)]
     const fileDialogs = await probe.fileChoosers.openDialogs()
     if (fileDialogs.length > 0) {
       observation.fileDialogs = fileDialogs.map((record) => {

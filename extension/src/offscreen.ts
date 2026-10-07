@@ -1,5 +1,6 @@
 /**
- * Offscreen document for Playwriter screen recording and clipboard writes.
+ * Offscreen document for Playwriter screen recording, clipboard writes (element picker) and
+ * clipboard reads (the sandbox's `clipboard.read()`).
  *
  * WHY OFFSCREEN DOCUMENT?
  * Manifest V3 service workers cannot use MediaRecorder or getUserMedia directly.
@@ -49,6 +50,7 @@ import type {
   OffscreenCancelRecordingResult,
   OffscreenCopyToClipboardMessage,
   OffscreenCopyToClipboardResult,
+  OffscreenReadClipboardResult,
   ChromeTabCaptureAudioConstraints,
   ChromeTabCaptureVideoConstraints,
 } from './offscreen-types'
@@ -69,6 +71,7 @@ type OffscreenResult =
   | OffscreenIsRecordingResult
   | OffscreenCancelRecordingResult
   | OffscreenCopyToClipboardResult
+  | OffscreenReadClipboardResult
 
 chrome.runtime.onMessage.addListener((message: OffscreenMessage, _sender, sendResponse) => {
   handleMessage(message).then(sendResponse)
@@ -87,6 +90,8 @@ async function handleMessage(message: OffscreenMessage): Promise<OffscreenResult
       return handleCancelRecording(message)
     case 'copyToClipboard':
       return handleCopyToClipboard(message)
+    case 'readClipboard':
+      return handleReadClipboard()
     default:
       return { success: false, error: 'Unknown action' }
   }
@@ -105,6 +110,25 @@ function handleCopyToClipboard(message: OffscreenCopyToClipboardMessage): Offscr
   const copied = document.execCommand('copy')
   textarea.remove()
   return copied ? { success: true } : { success: false, error: 'document.execCommand("copy") returned false' }
+}
+
+/**
+ * The clipboard's text, for the sandbox's `clipboard.read()`. Same constraint as the copy above:
+ * `navigator.clipboard.readText()` needs a focused document, so the text is pasted into a
+ * textarea of this document with `execCommand('paste')`, which Chrome allows an extension page
+ * only with the `clipboardRead` permission (it returns false without it). Nothing is written to
+ * the clipboard, and no web page takes part.
+ */
+function handleReadClipboard(): OffscreenReadClipboardResult {
+  const textarea = document.createElement('textarea')
+  document.body.appendChild(textarea)
+  textarea.focus()
+  const pasted = document.execCommand('paste')
+  const text = textarea.value
+  textarea.remove()
+  return pasted
+    ? { success: true, text }
+    : { success: false, error: 'document.execCommand("paste") returned false: the extension lacks the clipboardRead permission' }
 }
 
 async function handleStartRecording(params: OffscreenStartRecordingMessage): Promise<OffscreenStartRecordingResult> {

@@ -46,10 +46,11 @@ import type { IsolatedWorld } from './isolated-world.js'
 import type { FrameHandle, PageFrames } from './page-frames.js'
 import { isNodeGoneError, withDeadline } from './isolated-world.js'
 import type { RefBinding, RefRegistry, RefTarget } from './ref-registry.js'
-import type { PageWatch } from './page-watch.js'
-import type { DialogController } from './dialog-controller.js'
+import type { BusyRead, PageWatch } from './page-watch.js'
+import { dialogAnswerText, dialogLabel, type BeforeUnloadPolicy, type DialogController, type DialogPolicySettings } from './dialog-controller.js'
 import { chooserOpener, describeOpener, type ChooserWindow, type FileChooserGate, type FileChooserRecord } from './file-chooser-gate.js'
-import type { HumanMouseApi } from './human-mouse-driver.js'
+import type { HumanMouseApi, HumanMoveResult } from './human-mouse-driver.js'
+import { minimumJerkPosition } from './human-mouse.js'
 import { axStatesFromNode, type AxStates } from './ax-states.js'
 import { isSecretField } from './aria-snapshot.js'
 import {
@@ -61,15 +62,25 @@ import {
   type WatchCheckpoint,
   type WatchEvents,
 } from './probe-types.js'
-import type { Observation, ObservationDiff } from './page-observe.js'
+import type { Observation, ObservationDiff, ObservedElement, SemanticContainer, TextBlock } from './page-observe.js'
 import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, liveContext, renderObservationDiff } from './page-observe.js'
 import { CLICK_LABEL_FN } from './label-control.js'
+import { EDITOR_BLOCK_FN, EDITOR_CARET_BLOCK_FN, EDITOR_PARTS_FN, type EditorBlockFacts } from './editor-block.js'
+import { REACHES_TARGET_FN } from './composed-hit.js'
+import { matchSpaLink, routeOf, type SpaLink } from './spa-link.js'
+import { SELECT_OPTION_NODE_FN, SELECT_PLAN_FN, SELECT_STATE_FN, arrowPresses, keyRoute, type SelectPlan, type SelectState } from './native-select.js'
+import { replacedCrashOf } from './page-crash.js'
 
 const CDP_TIMEOUT_MS = 5000
 /** How long a click on an upload control may take to open its file dialog. */
 const FILE_CHOOSER_TIMEOUT_MS = 4000
 /** The longest single act.wait(); longer waits are act.waitForIdle()'s job, which watches the page. */
 const WAIT_CAP_MS = 30_000
+/**
+ * How long a tab's close is waited for after an input Chrome never confirmed: the page closes a
+ * moment after the input event it closed itself in answer to.
+ */
+const CLOSE_AFTER_INPUT_MS = 1000
 
 /** An action the agent asked for could not be done as asked. The message is for the model: specific and actionable. */
 export class ActError extends ModelFacingError {
@@ -94,14 +105,19 @@ export type ActKind =
   | 'upload'
   | 'drag'
   | 'open'
+  | 'reload'
   | 'back'
   | 'spaNavigate'
   | 'dialog-accept'
   | 'dialog-dismiss'
   | 'dialog-choose-files'
+  /** act.dialog.policy: the session's answer to confirm/prompt (and, explicitly, beforeunload) dialogs. A setting, not input. */
+  | 'dialog-policy'
   | 'switchTab'
   | 'waitForIdle'
   | 'wait'
+  /** webmcp.invoke: a page-provided WebMCP tool run through Chrome's WebMCP CDP domain (webmcp.ts). */
+  | 'webmcp'
 
 /** Actions that send input to the app. The busy guard applies to these. */
 const BUSY_GUARDED_KINDS: Partial<Record<ActKind, true>> = {
@@ -116,21 +132,23 @@ const BUSY_GUARDED_KINDS: Partial<Record<ActKind, true>> = {
   upload: true,
   drag: true,
   open: true,
+  reload: true,
   back: true,
   spaNavigate: true,
 }
 
 /** Kinds that are not an action on the page: no "before" picture, and they never count as the call's one action in human mode. */
-const UNCOUNTED_KINDS: Partial<Record<ActKind, true>> = { wait: true, waitForIdle: true, switchTab: true }
+export const UNCOUNTED_KINDS: Partial<Record<ActKind, true>> = { wait: true, waitForIdle: true, switchTab: true, 'dialog-policy': true }
 
 /** Kinds that may run while a native dialog waits for an answer. */
-const DIALOG_FREE_KINDS: Partial<Record<ActKind, true>> = { 'dialog-accept': true, 'dialog-dismiss': true, wait: true, switchTab: true }
+const DIALOG_FREE_KINDS: Partial<Record<ActKind, true>> = { 'dialog-accept': true, 'dialog-dismiss': true, 'dialog-policy': true, wait: true, switchTab: true }
 
 /** Kinds that may run while a file dialog waits for an answer: the ones that answer it, and those that do not touch the page. */
 const FILE_DIALOG_FREE_KINDS: Partial<Record<ActKind, true>> = {
   'dialog-accept': true,
   'dialog-dismiss': true,
   'dialog-choose-files': true,
+  'dialog-policy': true,
   upload: true,
   wait: true,
   waitForIdle: true,
@@ -156,7 +174,7 @@ const ACTIVATING_KINDS: Partial<Record<ActKind, true>> = {
 }
 
 /** Busy signal kinds that block input in human mode (strong ones only; weak ones are reported, never block). */
-export const BLOCKING_BUSY_KINDS: ReadonlySet<BusySignal['kind']> = new Set(['aria-busy', 'progressbar', 'spinner', 'dom-streaming', 'network-streaming'])
+export const BLOCKING_BUSY_KINDS: ReadonlySet<BusySignal['kind']> = new Set(['aria-busy', 'progressbar', 'spinner', 'skeleton', 'dom-streaming', 'network-streaming'])
 
 /**
  * CDP resource types the page is built from or talks to: a failure in one of these is something a
@@ -211,6 +229,12 @@ export interface ActionRecord {
    * refusal: no settle, no diff a model could mistake for the action's effect.
    */
   dispatched?: boolean
+  /**
+   * The tab closed in answer to this action's own input: Chrome confirmed the press (a mouse button,
+   * a key), then the tab closed during or right after the release, whose confirmation was lost with
+   * it. For a click, a key press or a drag the closing is the action's effect.
+   */
+  closedTab?: boolean
   /**
    * Data-changing requests this action caused (`POST /api/messages`): non-GET requests that started
    * between this action and the next one, filled in by the executor from the network journal. The
@@ -279,8 +303,16 @@ export interface ActDeps {
    * and keyboard call, including the ones act makes itself, and uses this to tell them apart.
    */
   activity: { depth: number }
-  /** A fresh observation of the page that updates ref liveness only: it does not count as the model's look. */
-  observeQuietly: (page: Page) => Promise<Observation>
+  /**
+   * A fresh observation of the page that updates ref liveness only: it does not count as the model's
+   * look. `known`: the busy read just made since the same last action (the busy guard's), not read again.
+   */
+  observeQuietly: (page: Page, known?: BusyRead) => Promise<Observation>
+  /** Set the session dialog policy on every tab (open now or opened later); returns the policy now in force. */
+  setDialogPolicy: (
+    policy: 'accept' | 'dismiss' | 'pending',
+    options: { beforeunload?: BeforeUnloadPolicy; promptText?: string },
+  ) => DialogPolicySettings
 }
 
 export interface ClickOptions {
@@ -288,7 +320,22 @@ export interface ClickOptions {
   whileBusy?: boolean
   /** Repeat an action on the same element although its last run sent data-changing requests. */
   again?: boolean
+  /**
+   * The mouse button: 'right' opens the page's context menu (a trusted `contextmenu` fires at the
+   * point), 'middle' is the wheel button (on a link: open it in a new tab).
+   */
   button?: 'left' | 'right' | 'middle'
+}
+
+export interface DragOptions {
+  whileBusy?: boolean
+  /**
+   * 'human' (default): a person's curved path with an overshoot and corrections; it starts and ends
+   * exactly at the two points, but the way between them is longer than the straight distance.
+   * 'straight': the pointer moves along the straight line between the two points at a person's
+   * pace (slow start and end), for a drawn line or anywhere the way itself matters.
+   */
+  path?: 'human' | 'straight'
 }
 
 export interface FillOptions {
@@ -310,11 +357,18 @@ export interface FillOptions {
    * types no keys.
    */
   newline?: 'Enter' | 'Shift+Enter'
+  /**
+   * act.type only: `'caret'` types where the caret already is (after a point click,
+   * `act.click({ ref, x, y })`, or arrow keys), instead of clicking the field and putting the
+   * caret after its text. Refused when keyboard focus is not in the field.
+   */
+  at?: 'caret'
 }
 
 export interface ActApi {
-  click(ref: number | string, options?: ClickOptions): Promise<ActionRecord>
-  dblclick(ref: number | string, options?: ClickOptions): Promise<ActionRecord>
+  /** Click `target`: a ref (a point of the element that receives the pointer) or `{ ref, x, y }`, exactly that point of the element. */
+  click(target: number | string | ElementPoint, options?: ClickOptions): Promise<ActionRecord>
+  dblclick(target: number | string | ElementPoint, options?: ClickOptions): Promise<ActionRecord>
   /**
    * Replace a field's text. Native date/time inputs take ISO text (`2024-05-01`, `13:45`,
    * `2024-05-01T13:45`, `2024-05`, `2024-W18`), typed digit by digit into the field's parts; a range
@@ -327,7 +381,7 @@ export interface ActApi {
   select(ref: number | string, option: string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
   check(ref: number | string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
   uncheck(ref: number | string, options?: { whileBusy?: boolean }): Promise<ActionRecord>
-  hover(ref: number | string): Promise<ActionRecord>
+  hover(target: number | string | ElementPoint): Promise<ActionRecord>
   /**
    * Turn the mouse wheel: 'down'/'up', or 'right'/'left' (horizontal wheel deltas, as a trackpad or
    * tilt wheel sends) for a carousel or wide table. Without a ref: what the wheel scrolls that way in
@@ -337,16 +391,21 @@ export interface ActApi {
   scrollTo(ref: number | string): Promise<ActionRecord>
   upload(ref: number | string, files: string | string[], options?: { whileBusy?: boolean }): Promise<ActionRecord>
   /**
-   * Press on `from`, move with the button held along a person's path, release on `to`. Each end is
-   * a ref (a point on the element that receives the pointer) or a `DragPoint`, an exact point of an
-   * element: a stroke on a canvas, a position on a custom slider's track, a map pan.
+   * Press on `from`, move with the button held, release on `to`. Each end is a ref (a point on the
+   * element that receives the pointer) or an `ElementPoint`, an exact point of an element: a stroke
+   * on a canvas, a position on a custom slider's track, a map pan.
    */
-  drag(from: number | string | DragPoint, to: number | string | DragPoint, options?: { whileBusy?: boolean }): Promise<ActionRecord>
+  drag(from: number | string | ElementPoint, to: number | string | ElementPoint, options?: DragOptions): Promise<ActionRecord>
   open(url: string, options?: { reason?: string }): Promise<ActionRecord>
+  /** Reload the tab like F5. On the tab that replaced a crashed one (PAGE RECOVERED), load the page that crashed. */
+  reload(options?: { reason?: string }): Promise<ActionRecord>
   back(): Promise<ActionRecord>
   spaNavigate(pathOrUrl: string): Promise<ActionRecord>
-  /** Work in tab `index` of observe()'s TABS list from now on. Not an action on the page. */
-  switchTab(index: number): Promise<ActionRecord>
+  /**
+   * Work in another tab from now on: its index in observe()'s TABS list, or text of its title or
+   * URL (case-insensitive) that only one tab has. Not an action on the page.
+   */
+  switchTab(indexOrText: number | string): Promise<ActionRecord>
   waitForIdle(options?: { timeoutMs?: number; quietMs?: number }): Promise<ActionRecord>
   wait(ms: number, options?: { reason?: string }): Promise<ActionRecord>
   dialog: {
@@ -355,39 +414,66 @@ export interface ActApi {
     dismiss(): Promise<ActionRecord>
     /** Choose files (paths relative to the session cwd) in the file dialog that is open on the tab. */
     chooseFiles(files: string | string[]): Promise<ActionRecord>
+    /**
+     * The session's answer to confirm and prompt dialogs, on every tab, from now on: 'accept'
+     * (a prompt gets `promptText`, else its own default), 'dismiss', or 'ask' (the default: they
+     * stay open for act.dialog.accept()/dismiss()). A "Leave site?" (beforeunload) is answered only
+     * by its own `beforeunload` setting: 'leave', 'stay', or 'ask' (the default). Alerts are always
+     * acknowledged. Each answer is stated in the report. A setting, not an action on the page.
+     */
+    policy(
+      policy: 'accept' | 'dismiss' | 'ask',
+      options?: { beforeunload?: BeforeUnloadPolicy; promptText?: string },
+    ): Promise<ActionRecord>
   }
 }
 
 /**
- * A point of an element for act.drag: `x`/`y` are CSS px from the top-left corner of the element's
- * border box as laid out (before any CSS transform; a rotated, scaled or tilted element is mapped
- * through its transform). x runs from 0 up to, not including, the box's width, and y from 0 up to,
- * not including, its height: the far edges are outside the element.
+ * A point of an element for act.click/dblclick/hover/drag: `x`/`y` are CSS px from the top-left
+ * corner of the element's border box as laid out (before any CSS transform; a rotated, scaled or
+ * tilted element is mapped through its transform). x runs from 0 up to, not including, the box's
+ * width, and y from 0 up to, not including, its height: the far edges are outside the element.
  */
-export interface DragPoint {
+export interface ElementPoint {
   ref: number | string
   x: number
   y: number
 }
 
-/** One end of act.drag as the model's (untyped) code passed it: a ref, or a ref and a point of its element. */
-function dragEnd(end: unknown, which: 'from' | 'to'): { ref: number | string; offset?: Point } {
+/**
+ * A pointer target as the model's (untyped) code passed it: a ref, or a ref and a point of its
+ * element. `what` names the argument in a refusal (`act.drag: from`), `nothing` ends it.
+ */
+function pointerTarget(end: unknown, what: string, nothing: string): { ref: number | string; offset?: Point } {
   if (typeof end === 'number' || typeof end === 'string') return { ref: end }
   if (typeof end !== 'object' || end === null || !('ref' in end) || (typeof end.ref !== 'number' && typeof end.ref !== 'string')) {
     throw new ActError(
-      `act.drag: ${which} must be a ref (12 or 'e3') or { ref, x, y } with x/y in CSS px from the element's top-left corner ` +
-        `(got ${typeof end === 'object' && end !== null ? JSON.stringify(end) : String(end)}). Nothing was dragged.`,
+      `${what} must be a ref (12 or 'e3') or { ref, x, y } with x/y in CSS px from the element's top-left corner ` +
+        `(got ${typeof end === 'object' && end !== null ? JSON.stringify(end) : String(end)}). ${nothing}`,
     )
   }
   const x = 'x' in end ? end.x : undefined
   const y = 'y' in end ? end.y : undefined
   if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
     throw new ActError(
-      `act.drag: ${which} { ref: ${JSON.stringify(end.ref)}, x: ${String(x)}, y: ${String(y)} }: x and y must be finite numbers, CSS px from ` +
-        "the element's top-left corner. Nothing was dragged.",
+      `${what} { ref: ${JSON.stringify(end.ref)}, x: ${String(x)}, y: ${String(y)} }: x and y must be finite numbers, CSS px from ` +
+        `the element's top-left corner. ${nothing}`,
     )
   }
   return { ref: end.ref, offset: { x, y } }
+}
+
+/** The mouse button of a click as the model's (untyped) code passed it. */
+function clickButton(button: unknown, method: string): 'left' | 'right' | 'middle' {
+  if (button === undefined) return 'left'
+  if (button === 'left' || button === 'right' || button === 'middle') return button
+  throw new ActError(`act.${method}: button must be 'left', 'right' or 'middle' (got ${JSON.stringify(button)}). Nothing was clicked.`)
+}
+
+/** What a pointer action's report line adds after its target: the point of the element, the button when not the left one. */
+function pointerDetail(offset: Point | undefined, button: 'left' | 'right' | 'middle'): string | undefined {
+  const parts = [offset ? `at (${offset.x}, ${offset.y})` : '', button === 'left' ? '' : `with the ${button} button`].filter(Boolean)
+  return parts.length > 0 ? parts.join(' ') : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -453,8 +539,42 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** How far an input's press got: sent to Chrome, then confirmed by it (the page received it). */
+type PressStage = 'not sent' | 'sent' | 'acknowledged'
+
+/** `page`'s tab is closed now, or closes within CLOSE_AFTER_INPUT_MS. */
+async function closesSoon(page: Page): Promise<boolean> {
+  if (page.isClosed()) return true
+  const closed = Promise.withResolvers<boolean>()
+  const onClose = (): void => closed.resolve(true)
+  page.once('close', onClose)
+  const timer = setTimeout(() => closed.resolve(page.isClosed()), CLOSE_AFTER_INPUT_MS)
+  try {
+    return await closed.promise
+  } finally {
+    clearTimeout(timer)
+    page.off('close', onClose)
+  }
+}
+
+/** `Shift+Tab` → its keys, split the way Playwright's keyboard.press splits them (a lone or last `+` is the key `+`). */
+function keyTokens(key: string): string[] {
+  const tokens: string[] = []
+  let building = ''
+  for (const char of key) {
+    if (char === '+' && building) {
+      tokens.push(building)
+      building = ''
+    } else {
+      building += char
+    }
+  }
+  tokens.push(building)
+  return tokens
+}
+
 function dialogNote(dialog: JsDialogState): string {
-  return `a native ${dialog.type} dialog opened: "${dialog.message}" — the page is frozen until it is answered (act.dialog.accept() / act.dialog.dismiss())`
+  return `a native ${dialogLabel(dialog)} dialog opened — the page is frozen until it is answered (act.dialog.accept() / act.dialog.dismiss())`
 }
 
 /** Attribute `name` of a CDP DOM node, or undefined. */
@@ -504,15 +624,6 @@ const DESCRIBE_FN = `function(_, el) {
         ((style.position === 'fixed' || style.position === 'sticky') && n !== el)) { layer = n; break }
   }
   return { node: describe(el), layer: layer && layer !== el ? describe(layer) : null }
-}`
-
-/** Is `hit` the target, inside it (composed tree), or the target's <label>? Null when the target is gone. */
-const CONTAINS_FN = `function(_, target, hit) {
-  if (!target || !target.isConnected) return null
-  if (!hit) return false
-  for (let n = hit; n; n = n.parentNode || n.host || null) { if (n === target) return true }
-  if (target.labels) { for (const label of target.labels) { if (label === hit || label.contains(hit)) return true } }
-  return false
 }`
 
 /** Whether the element is still in its document (a removed node can still be resolved until it is collected). */
@@ -912,63 +1023,6 @@ const FIELD_FN = `function(_, el) {
     textSecurity: getComputedStyle(el).webkitTextSecurity || 'none',
     disabled: !!el.disabled, readOnly: !!el.readOnly,
   }
-}`
-
-/** What a native `<select>` holds and where the wanted option is, counted the way arrow keys move. */
-interface SelectPlan {
-  error?: 'gone' | 'not-select' | 'no-option' | 'disabled-option' | 'ambiguous'
-  role?: string
-  available?: string[]
-  /** 'ambiguous': the options the wanted text matches, with their values. */
-  matches?: Array<{ label: string; value: string }>
-  /** The wanted option's label. */
-  label?: string
-  /** The wanted option's index in `select.options`. */
-  index?: number
-  /** The selected option's label before the change ('' when none). */
-  before?: string
-  /** Arrow presses from the selected option to the wanted one; disabled options are skipped, as the keys skip them. */
-  steps?: number
-  /** `multiple`, or `size > 1`: a list box drawn in the page, not a popup. */
-  listBox?: boolean
-}
-
-/**
- * Native `<select>`: the one option matching `args.option` — its label, text or value exactly,
- * else the same words ignoring case and spacing — and how to reach it from the keyboard. Several
- * matches are reported, never resolved by picking the first. Reads only.
- */
-const SELECT_PLAN_FN = `function(args, el) {
-  if (!el || !el.isConnected) return { error: 'gone' }
-  if (el.localName !== 'select') return { error: 'not-select', role: el.getAttribute('role') || el.localName }
-  const wanted = String(args.option)
-  const options = Array.from(el.options)
-  const labelOf = (o) => o.label || o.text
-  const norm = (s) => s.trim().replace(/\\s+/g, ' ').toLowerCase()
-  const exact = options.filter((o) => labelOf(o) === wanted || o.text === wanted || o.value === wanted)
-  const matches = exact.length > 0 ? exact : options.filter((o) => norm(labelOf(o)) === norm(wanted))
-  if (matches.length === 0) return { error: 'no-option', available: options.map(labelOf) }
-  if (matches.length > 1) return { error: 'ambiguous', matches: matches.map((o) => ({ label: labelOf(o), value: o.value })) }
-  const target = matches[0]
-  const unusable = (o) => o.disabled || (o.parentElement && o.parentElement.localName === 'optgroup' && o.parentElement.disabled)
-  if (unusable(target)) return { error: 'disabled-option', label: labelOf(target), available: options.map(labelOf) }
-  const usable = options.filter((o) => !unusable(o))
-  const current = el.selectedIndex >= 0 ? options[el.selectedIndex] : null
-  const from = current ? usable.indexOf(current) : -1
-  return { label: labelOf(target), index: options.indexOf(target), before: current ? labelOf(current) : '', steps: usable.indexOf(target) - from, listBox: el.multiple || el.size > 1 }
-}`
-
-/** A native `<select>` now: the selected option's index and label, and whether its popup is open. */
-const SELECT_STATE_FN = `function(_args, el) {
-  if (!el || !el.isConnected) return null
-  return { index: el.selectedIndex, selected: el.selectedIndex >= 0 ? (el.options[el.selectedIndex].label || el.options[el.selectedIndex].text) : '', open: el.matches(':open') }
-}`
-
-/** `fn(args, select)`: option number `args.index` as a one-element array (for a list box click). */
-const SELECT_OPTION_NODE_FN = `function(args, el) {
-  if (!el || !el.isConnected) return []
-  const option = el.options[args.index]
-  return option ? [option] : []
 }`
 
 /** A native checkbox/radio's own state; null for any other element (ARIA widgets report through AX). */
@@ -1572,18 +1626,30 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * What a pointer at `point` is over instead of `target`, hit-tested the way input is routed
    * (through iframes); null when it reaches the target: the target itself or something inside it,
-   * in the target's own document or in an iframe within the target.
+   * in the target's own document or in an iframe within the target, or content slotted into it —
+   * including the label text its own shadow host slots in, for which the hit test names the host
+   * (see REACHES_TARGET_FN).
    */
   async function coverAt(probe: ActProbe, target: RefTarget, point: Point): Promise<{ frameId: string; backendNodeId: number } | null> {
+    const { hit, reaches } = await reachAt(probe, target, point)
+    return reaches ? null : hit
+  }
+
+  /** The element a pointer at `point` is over, hit-tested the way input is routed, and whether that is `target` or inside it (see coverAt). */
+  async function reachAt(probe: ActProbe, target: RefTarget, point: Point): Promise<{ hit: { frameId: string; backendNodeId: number }; reaches: boolean }> {
     const hit = await hitTest(probe, point, `hit-testing ${describeTarget(target)}`)
     const there = await asNodeOf(probe, hit.frameId, hit.backendNodeId, target.frameId)
-    if (there === target.backendNodeId) return null
-    if (there === null) return hit
-    const inside = await (await worldOf(probe, target)).callFunctionOnNodes<boolean | null>([target.backendNodeId, there], CONTAINS_FN, {
+    if (there === target.backendNodeId) return { hit, reaches: true }
+    if (there === null) return { hit, reaches: false }
+    // The point in the target frame's own viewport, where the slotted text's boxes are measured.
+    const box = target.frameId === probe.frames.mainFrameId() ? null : await probe.frames.box(target.frameId)
+    const local = box ? { x: (point.x - box.x) / box.scale, y: (point.y - box.y) / box.scale } : point
+    const inside = await (await worldOf(probe, target)).callFunctionOnNodes<boolean | null>([target.backendNodeId, there], REACHES_TARGET_FN, {
+      args: local,
       what: 'checking which element the click point belongs to',
     })
     if (inside === null) throw goneError(target)
-    return inside ? null : hit
+    return { hit, reaches: inside }
   }
 
   /**
@@ -1592,7 +1658,7 @@ export function createActApi(deps: ActDeps): ActApi {
    * viewport), through the four corners where the box is drawn — so a rotated, scaled, skewed or
    * perspective-tilted element maps right.
    */
-  async function borderBox(probe: ActProbe, target: RefTarget): Promise<{ width: number; height: number; at: (offset: Point) => Point }> {
+  async function borderBox(probe: ActProbe, target: RefTarget): Promise<{ width: number; height: number; at: (offset: Point) => Point; offsetOf: (point: Point) => Point | null }> {
     const frame = await probe.frames.handle(target.frameId)
     let model: Protocol.DOM.BoxModel
     try {
@@ -1627,30 +1693,60 @@ export function createActApi(deps: ActDeps): ActApi {
           y: ((p1.y - p0.y + g * p1.y) * u + (p3.y - p0.y + h * p3.y) * v + p0.y) / w,
         }
       },
+      // The inverse map: solve at(offset) = point for u, v (two linear equations once multiplied by w).
+      offsetOf: ({ x, y }) => {
+        const a = p1.x - p0.x + g * p1.x
+        const b = p3.x - p0.x + h * p3.x
+        const c = p1.y - p0.y + g * p1.y
+        const d = p3.y - p0.y + h * p3.y
+        const [a1, b1, r1] = [a - x * g, b - x * h, x - p0.x]
+        const [a2, b2, r2] = [c - y * g, d - y * h, y - p0.y]
+        const den = a1 * b2 - b1 * a2
+        if (den === 0) return null
+        return { x: ((r1 * b2 - b1 * r2) / den) * width, y: ((a1 * r2 - r1 * a2) / den) * height }
+      },
     }
   }
 
   /**
    * Point `offset` of `target` on the screen, checked the way a click point is, but exactly there:
    * inside what of the page is visible (`outOfView` is the refusal when it is not), and reaching the
-   * target (refuses naming what covers it).
+   * target (refuses naming what covers it, and — when that has a ref — the same spot as a point of it).
+   * `hit` is the element the pointer is over there: the target or something inside it.
    */
-  async function pointOn(probe: ActProbe, target: RefTarget, offset: Point, viewport: Rect, outOfView: string): Promise<Point> {
+  async function pointOn(probe: ActProbe, target: RefTarget, offset: Point, viewport: Rect, outOfView: string): Promise<{ point: Point; hit: { frameId: string; backendNodeId: number } }> {
     const point = (await borderBox(probe, target)).at(offset)
     if (point.x < viewport.x || point.x >= viewport.x + viewport.width || point.y < viewport.y || point.y >= viewport.y + viewport.height) {
       throw new ActError(outOfView)
     }
-    const cover = await coverAt(probe, target, point)
-    if (cover !== null) {
+    const { hit, reaches } = await reachAt(probe, target, point)
+    if (!reaches) {
       throw new ActError(
-        `Not done: at (${offset.x}, ${offset.y}) ${describeTarget(target)} is covered by ${await labelNode(probe, cover.frameId, cover.backendNodeId)}. ` +
-          'A person would first deal with what is on top (close it, accept it, or scroll it away), or pick a point that is not covered. observe() lists the covering layer and its controls.',
+        `Not done: at (${offset.x}, ${offset.y}) ${describeTarget(target)} is covered by ${await labelNode(probe, hit.frameId, hit.backendNodeId)}. ` +
+          'A person would first deal with what is on top (close it, accept it, or scroll it away), or pick a point that is not covered. observe() lists the covering layer and its controls.' +
+          (await coverSpot(probe, hit, point)),
       )
     }
-    return point
+    return { point, hit }
   }
 
-  async function guard(probe: ActProbe, kind: ActKind, options: { whileBusy?: boolean } = {}): Promise<void> {
+  /**
+   * The covered spot as a point of what covers it, when that has a ref: what a person pressing
+   * there really presses (a modal's backdrop, a banner). Empty when the cover has no ref.
+   */
+  async function coverSpot(probe: ActProbe, cover: { frameId: string; backendNodeId: number }, point: Point): Promise<string> {
+    const coverTarget = deps.registry.refFor(probe.targetId, cover.frameId, cover.backendNodeId)
+    if (coverTarget === null) return ''
+    const box = await borderBox(probe, coverTarget)
+    const offset = box.offsetOf(point)
+    if (offset === null) return ''
+    const spot = { x: Math.round(offset.x * 10) / 10, y: Math.round(offset.y * 10) / 10 }
+    if (!(spot.x >= 0 && spot.x < box.width && spot.y >= 0 && spot.y < box.height)) return ''
+    return ` To press that spot anyway (it lands on what is on top): { ref: ${coverTarget.ref}, x: ${spot.x}, y: ${spot.y} }.`
+  }
+
+  /** Refuse what the page's state forbids now. Returns the busy read it made (human mode's busy guard), for the before-picture. */
+  async function guard(probe: ActProbe, kind: ActKind, options: { whileBusy?: boolean } = {}): Promise<BusyRead | undefined> {
     checkAbort()
     const dialog = probe.dialogs.current()
     if (dialog?.handling === 'agent' && !DIALOG_FREE_KINDS[kind]) {
@@ -1670,8 +1766,8 @@ export function createActApi(deps: ActDeps): ActApi {
       }
     }
     if (deps.mode === 'human' && BUSY_GUARDED_KINDS[kind] && !options.whileBusy) {
-      const signals = await probe.watch.busySignals({ since: lastDispatched(probe)?.checkpoint })
-      const busy = signals.filter((s) => s.strength === 'strong' && BLOCKING_BUSY_KINDS.has(s.kind))
+      const read = await probe.watch.readBusy({ since: lastDispatched(probe)?.checkpoint })
+      const busy = read.signals.filter((s) => s.strength === 'strong' && BLOCKING_BUSY_KINDS.has(s.kind))
       if (busy.length > 0) {
         throw new ActError(
           `Not done: the page is still busy (${busy.map((s) => s.label).join('; ')}). A person waits for it to finish ` +
@@ -1679,7 +1775,9 @@ export function createActApi(deps: ActDeps): ActApi {
             '(Only if acting during loading IS what you are testing, pass { whileBusy: true }.)',
         )
       }
+      return read
     }
+    return undefined
   }
 
   /** Contract: one action per execute() call in human mode, counted at run time. */
@@ -1769,6 +1867,8 @@ export function createActApi(deps: ActDeps): ActApi {
     const target = resolution.target
     const listed = before.elements.find((element) => element.ref === target.ref) ?? before.scrollers.find((scroller) => scroller.ref === target.ref)
     if (!listed) {
+      // A ref find() gave to an element observe() does not list (a query matched it): checked live in run().
+      if (deps.registry.isAdopted(target.ref)) return target
       throw new ActError(`Not done: [${target.ref}] is not among what the page shows right now. Call observe() again.`)
     }
     const shown: RefBinding = target.shown ?? { role: resolved.role, name: resolved.name, ...(resolved.context !== undefined ? { context: resolved.context } : {}) }
@@ -1817,7 +1917,8 @@ export function createActApi(deps: ActDeps): ActApi {
       const page = await pageFor(resolved, record)
       probe = await deps.getProbe(page)
       record.targetId = probe.targetId
-      await guard(probe, kind, options)
+      // The busy read the guard just made is the before-picture's: nothing ran in between.
+      const busyRead = await guard(probe, kind, options)
       let before: Observation | undefined
       if ((kind === 'dialog-accept' || kind === 'dialog-dismiss') && probe.dialogs.current()) {
         // The page is frozen by the dialog: nothing new can be read from it.
@@ -1826,10 +1927,20 @@ export function createActApi(deps: ActDeps): ActApi {
       } else if (!UNCOUNTED_KINDS[kind]) {
         // Checkpoint first: whatever happens while the picture is taken belongs to this action.
         record.checkpoint = probe.watch.checkpoint()
-        before = await deps.observeQuietly(page)
+        before = await deps.observeQuietly(page, busyRead)
         record.before = before
       }
       const targets = before ? refs.map((ref, index) => boundTarget(ref, resolved[index], before)) : resolved
+      for (const target of before ? targets : []) {
+        if (!deps.registry.isAdopted(target.ref) || !target.shown) continue
+        const live = await liveAx(probe, target)
+        if (live.role !== target.shown.role || live.name !== target.shown.name) {
+          throw new ActError(
+            `Not done: [${target.ref}] now reads ${describeBinding(live)} (you saw ${describeBinding(target.shown)}). ` +
+              'The page changed it since your last look; find() it again and decide.',
+          )
+        }
+      }
       if (targets[0]) record.target = targetSummary(targets[0])
       repeatGuard(probe, record, options.again)
       // Its input can open a file dialog for as long as the activation it gives lasts: the tab holds
@@ -1916,8 +2027,11 @@ export function createActApi(deps: ActDeps): ActApi {
     step.record.notes.push(...notes)
     if (offset) {
       const outOfView = `(${offset.x}, ${offset.y}) of ${describeTarget(target)} is outside the visible page even after scrolling.`
-      const point = await pointOn(step.probe, target, offset, viewport, outOfView)
+      const { point, hit } = await pointOn(step.probe, target, offset, viewport, outOfView)
       step.record.hit = describeTarget(target)
+      step.record.notes.push(
+        `pointer at (${offset.x}, ${offset.y}) of [${target.ref}] = (${Math.round(point.x * 10) / 10}, ${Math.round(point.y * 10) / 10}) in the viewport, over ${await labelNode(step.probe, hit.frameId, hit.backendNodeId)}`,
+      )
       return point
     }
     const { point, hit } = await hitPoint(step.probe, surface, rects, viewport)
@@ -1935,27 +2049,88 @@ export function createActApi(deps: ActDeps): ActApi {
     return disabled
   }
 
-  /** Press a mouse button at `point` (the pointer is already there), dialog-safe. */
-  async function clickAt(step: Step, point: Point, clickCount: number, button: 'left' | 'right' | 'middle'): Promise<void> {
-    checkAbort()
-    step.record.dispatched = true
-    const move = await untilDialog(
-      step.probe,
-      deps.humanMouse.click({ page: step.page, x: point.x, y: point.y, button, clickCount, delayMs: Math.round(randomBetween(45, 110)) }),
-      step.record,
-    )
-    if (!move) return
-    step.record.notes.push(`pointer travelled ${Math.round(move.distancePx)}px in ${Math.round(move.achievedDurationMs)}ms`)
-    for (const warning of move.warnings) step.record.notes.push(warning)
+  /**
+   * The tab closed in answer to `input`, an input of `step` whose press Chrome confirmed. When that
+   * input is the action itself (a click, a key press, a drag's drop or release), the closing is its
+   * effect; any other action stops there and says so.
+   */
+  function closedByOwnInput(step: Step, input: string, isAction: boolean): void {
+    step.record.closedTab = true
+    if (!isAction) throw new ActError(`${input} closed the tab (the page closed itself in response): the rest of this ${step.record.kind} was not done.`)
   }
 
-  async function clickTarget(step: Step, target: RefTarget, clickCount: number, button: 'left' | 'right' | 'middle'): Promise<Point> {
+  /**
+   * Press a mouse button at `point` (the pointer is already there), dialog-safe. A page that closes
+   * its tab in answer to the press or the release takes Chrome's confirmation of the release with
+   * it: once the press was confirmed, that closing is what the click did, not a failure.
+   */
+  async function clickAt(step: Step, point: Point, clickCount: number, button: 'left' | 'right' | 'middle'): Promise<void> {
+    checkAbort()
+    const { page, record } = step
+    record.dispatched = true
+    const press: { stage: PressStage } = { stage: 'not sent' }
+    const clicking = deps.humanMouse.click({
+      page,
+      x: point.x,
+      y: point.y,
+      button,
+      clickCount,
+      delayMs: Math.round(randomBetween(45, 110)),
+      onPress: (stage) => {
+        // The pointer's travel does not wait for a tab that closes under it: a press that went out
+        // after the close never reached the page.
+        if (stage === 'acknowledged' || !page.isClosed()) press.stage = stage
+      },
+    })
+    const input = `the ${clickCount === 2 ? 'double click' : 'click'}${record.hit ? ` on ${record.hit}` : ''}`
+    const isAction = record.kind === 'click' || record.kind === 'dblclick'
+    let move: HumanMoveResult | undefined
+    try {
+      move = await untilDialog(step.probe, clicking, record)
+    } catch (error) {
+      // A press that went out and failed is waited on for the close; anything before it is decided now.
+      if (!(press.stage === 'not sent' ? page.isClosed() : await closesSoon(page))) throw error
+      if (press.stage === 'not sent') throw new ActError('Not done: the tab closed before the mouse button was pressed (while the pointer moved to it); nothing was clicked.')
+      if (press.stage === 'sent') {
+        throw new ActError('The tab closed while the mouse button was being pressed: Chrome closed it before confirming the press, so whether the page got it cannot be told.')
+      }
+      closedByOwnInput(step, input, isAction)
+      return
+    }
+    if (move) {
+      record.notes.push(`pointer travelled ${Math.round(move.distancePx)}px in ${Math.round(move.achievedDurationMs)}ms`)
+      for (const warning of move.warnings) record.notes.push(warning)
+    }
+    if (page.isClosed()) closedByOwnInput(step, input, isAction)
+  }
+
+  async function clickTarget(step: Step, target: RefTarget, clickCount: number, button: 'left' | 'right' | 'middle', offset?: Point): Promise<Point> {
     if (await isDisabled(step.probe, target)) {
       throw new ActError(`Not done: ${describeTarget(target)} is disabled right now. A person cannot click it; something on the page must enable it first.`)
     }
-    const point = await aimAt(step, target)
+    if (offset) await checkOffset(step.probe, target, offset, 'Nothing was clicked.')
+    const point = await aimAt(step, target, offset)
     await clickAt(step, point, clickCount, button)
     return point
+  }
+
+  /** Refuse a point the model chose outside `target`'s border box (or on a control that has no box of its own). */
+  async function checkOffset(probe: ActProbe, target: RefTarget, offset: Point, nothing: string): Promise<void> {
+    if (target.viaLabel) {
+      throw new ActError(
+        `Not done: ${describeTarget(target)} is hidden and worked through its label, so it has no box of its own to point into. ` +
+          `Use [${target.ref}] itself, without x/y. ${nothing}`,
+      )
+    }
+    const box = await borderBox(probe, target)
+    const width = Math.round(box.width * 10) / 10
+    const height = Math.round(box.height * 10) / 10
+    if (offset.x < 0 || offset.x >= box.width || offset.y < 0 || offset.y >= box.height) {
+      throw new ActError(
+        `Not done: ${describeTarget(target)} is ${width}×${height} px: x must be from 0 up to, not including, ${width}, and y from 0 up to, ` +
+          `not including, ${height} (got ${offset.x}, ${offset.y}), CSS px from its top-left corner. ${nothing}`,
+      )
+    }
   }
 
   /** A native checkbox/radio's own state (its truth even when it is hidden from the accessibility tree). */
@@ -2609,6 +2784,80 @@ export function createActApi(deps: ActDeps): ActApi {
     )
   }
 
+  /** The editing host around `target` and the block `target` is in (EDITOR_PARTS_FN); null when `target` is not editable content. */
+  async function editorParts(probe: ActProbe, target: RefTarget): Promise<{ host: number; block: number } | null> {
+    const [host, block] = await (await worldOf(probe, target)).nodesReturnedBy([target.backendNodeId], EDITOR_PARTS_FN, {
+      what: `finding the editor around ${describeTarget(target)}`,
+    })
+    return typeof host === 'number' && typeof block === 'number' ? { host, block } : null
+  }
+
+  /** EDITOR_BLOCK_FN of `block` in the editor `host` (nodes of `target`'s frame). */
+  async function editorBlock(probe: ActProbe, target: RefTarget, block: number, host: number): Promise<EditorBlockFacts> {
+    const facts = await (await worldOf(probe, target)).callFunctionOnNodes<EditorBlockFacts | null>([block, host], EDITOR_BLOCK_FN, {
+      what: `reading the block of ${describeTarget(target)} in its editor`,
+    })
+    if (!facts) throw goneError(target)
+    return facts
+  }
+
+  /**
+   * The report line for the block of editor `host` the caret is in now, with its whole text as a
+   * person reads it (FIELD_FN's lines): `~ paragraph 2 "…"`. Null when the caret is not in it.
+   */
+  async function caretBlockLine(probe: ActProbe, target: RefTarget, host: number): Promise<string | null> {
+    const world = await worldOf(probe, target)
+    const [block] = await world.nodesReturnedBy([host], EDITOR_CARET_BLOCK_FN, { what: 'finding the block the caret is in' })
+    if (typeof block !== 'number') return null
+    const facts = await world.callFunctionOnNodes<EditorBlockFacts | null>([block, host], EDITOR_BLOCK_FN, { what: 'naming the block the caret is in' })
+    const lines = await world.callFunctionOnNodes<FieldFacts | null>([block], FIELD_FN, { what: 'reading the block the caret is in' })
+    if (!facts || !lines || lines.value === null) return null
+    return `~ ${facts.label} "${lines.value}"`
+  }
+
+  /**
+   * Put the caret at the end of the block `editor.block` of a rich editor, as a person does: a
+   * click on the right half of its last character (Ctrl+End would go to the end of the whole
+   * editor), then a check that the selection is a caret at the block's end and focus is in the
+   * editor. Returns the block as the field typed into.
+   */
+  async function caretAtBlockEnd(step: Step, target: RefTarget, editor: { host: number; block: number }): Promise<{ field: RefTarget; facts: FieldFacts }> {
+    const { probe, record } = step
+    const block: RefTarget = editor.block === target.backendNodeId ? target : { ...target, backendNodeId: editor.block, viaLabel: undefined }
+    const facts = await editorBlock(probe, target, editor.block, editor.host)
+    if (!facts.end) {
+      throw new ActError(`${facts.label} of the editor (${describeTarget(target)}) is not drawn right now, so a person cannot click into it. observe() shows the editor.`)
+    }
+    const point = await aimAt(step, block, facts.end)
+    await clickAt(step, point, 1, 'left')
+    await sleep(randomBetween(60, 140))
+    const now = await editorBlock(probe, target, editor.block, editor.host)
+    const field = await readField(probe, block)
+    if (!now.hostFocused || !field.selection || !field.selection.collapsed || !field.selection.atEnd) {
+      throw new ActError(
+        `Not done: clicked after the last character of ${facts.label} (${describeTarget(target)}), but ` +
+          `${now.hostFocused ? 'the caret is not at its end (the page put it elsewhere)' : `keyboard focus went to ${field.activeLabel}`}. Nothing was typed. ` +
+          `Put the caret there another way (act.click({ ref: ${target.ref}, x, y }) or the End key), then act.type(${target.ref}, text, { at: 'caret' }).`,
+      )
+    }
+    record.notes.push(`put the caret at the end of ${facts.label} with a click after its last character`)
+    return { field: block, facts: field }
+  }
+
+  /** { at: 'caret' }: keyboard focus must be in `target` (a field, or the editor it belongs to) and its caret or selection there. */
+  async function caretWhereItIs(step: Step, target: RefTarget, editor: { host: number; block: number } | null, before: FieldFacts): Promise<void> {
+    const { probe, record } = step
+    const inEditor = editor ? (await editorBlock(probe, target, editor.block, editor.host)).hostFocused : false
+    const caretIn = editor ? inEditor && (await caretBlockLine(probe, target, editor.host)) !== null : before.focused
+    if (!caretIn) {
+      throw new ActError(
+        `Not done: the caret is not in ${describeTarget(target)} (keyboard focus is in ${before.activeLabel}). Put it where the text goes first — ` +
+          `act.click(${target.ref}), or act.click({ ref: ${target.ref}, x, y }) at the spot — then act.type(${target.ref}, text, { at: 'caret' }). Nothing was typed.`,
+      )
+    }
+    record.notes.push('typed where the caret was')
+  }
+
   async function fillOrType(ref: number | string, text: string, options: FillOptions, append: boolean): Promise<ActionRecord> {
     const kind = append ? 'type' : 'fill'
     return run(
@@ -2617,6 +2866,14 @@ export function createActApi(deps: ActDeps): ActApi {
         const { page, probe, record } = step
         const [target] = step.targets
         refuseBadNewlineOption(kind, options)
+        const at: unknown = options.at
+        if (at !== undefined && (at !== 'caret' || !append)) {
+          throw new ActError(
+            append
+              ? `{ at: ${JSON.stringify(at)} } is not an option of act.type: { at: 'caret' } types where the caret is. Nothing was typed.`
+              : "act.fill replaces the whole text; { at: 'caret' } is for act.type. Nothing was typed.",
+          )
+        }
         const before = await readField(probe, target)
         if (before.disabled || before.readOnly) {
           throw new ActError(`${describeTarget(target)} is ${before.disabled ? 'disabled' : 'read-only'}; a person cannot type into it.`)
@@ -2651,10 +2908,25 @@ export function createActApi(deps: ActDeps): ActApi {
         if (!options.paste) {
           refuseIfTooSlow(typed.length, `Typing these ${typed.length} characters`, ', or pass { paste: true } for text a person would paste rather than type')
         }
-        const point = await clickTarget(step, target, 1, 'left')
-        const { field, facts: focused } = await fieldUnderCaret(step, target, point, 'when it was clicked')
+        // Where the keys go: where the caret is ({ at: 'caret' }); the end of the block of a rich
+        // editor the ref is in (a click after its last character); else the clicked field, its text
+        // then selected (fill) or the caret put after it (type).
+        const editor = before.contentEditable ? await editorParts(probe, target) : null
+        let point: Point | null = null
+        let field = target
+        let focused = before
+        const placed = at === 'caret' || (append && editor !== null && editor.block !== editor.host)
+        if (at === 'caret') {
+          record.dispatched = true
+          await caretWhereItIs(step, target, editor, before)
+        } else if (placed && editor) {
+          ;({ field, facts: focused } = await caretAtBlockEnd(step, target, editor))
+        } else {
+          point = await clickTarget(step, target, 1, 'left')
+          ;({ field, facts: focused } = await fieldUnderCaret(step, target, point, 'when it was clicked'))
+        }
         let typedSecret = secret
-        if (field !== target) {
+        if (field !== target && !placed) {
           // The field the page swapped in gets the clicked one's refusals before a key reaches it.
           refuseNewlineInInput(field, focused, text)
           refuseUnsaidNewline(kind, field, focused, text, options)
@@ -2664,7 +2936,7 @@ export function createActApi(deps: ActDeps): ActApi {
             await refuseUntoldSecret(page, probe, field, options)
           }
         }
-        if (!focused.focused) {
+        if (!placed && !focused.focused) {
           throw new ActError(`Clicked ${describeTarget(target)} but the keyboard focus went to ${focused.activeLabel}, so typing would land there. observe() and check what took focus.`)
         }
         if (!append && focused.value) {
@@ -2682,7 +2954,7 @@ export function createActApi(deps: ActDeps): ActApi {
             await page.keyboard.press('Backspace')
           }
           record.notes.push(`replaced the previous value ${typedSecret ? '(masked)' : `"${maskIfSecret(focused.value, false)}"`}`)
-        } else if (append && focused.value) {
+        } else if (append && !placed && focused.value) {
           // End only reaches the end of the clicked line in a text area or editor; this reaches the end of the text.
           const chord = await pressEditingChord(probe, 'end of text')
           await sleep(randomBetween(40, 90))
@@ -2705,24 +2977,34 @@ export function createActApi(deps: ActDeps): ActApi {
           if (typedSecret) record.notes.push('typed a secret (masked in this report)')
         }
         await sleep(randomBetween(80, 160))
-        const { field: typedInto, facts: after } = await fieldUnderCaret(step, field, point, 'while the text was typed')
-        if (typedInto !== field && isSecret(after) && !typedSecret) {
-          // The keys ended in a secret field the page swapped in: the report must not show them.
-          typedSecret = true
-          record.detail = maskIfSecret(text, true)
+        let after: FieldFacts | null
+        if (point) {
+          const read = await fieldUnderCaret(step, field, point, 'while the text was typed')
+          after = read.facts
+          if (read.field !== field && isSecret(after) && !typedSecret) {
+            // The keys ended in a secret field the page swapped in: the report must not show them.
+            typedSecret = true
+            record.detail = maskIfSecret(text, true)
+          }
+        } else {
+          // An editor may re-render the block it typed into: the caret's block is reported below.
+          after = await (await worldOf(probe, field)).callFunctionOnNodes<FieldFacts | null>([field.backendNodeId], FIELD_FN, { what: `reading ${describeTarget(field)}` })
         }
-        if (after.value !== null) {
-          const expected = append ? `${focused.value ?? ''}${typed}` : typed
-          if (after.value !== expected) {
+        const caretLine = editor ? await caretBlockLine(probe, target, editor.host) : null
+        if (after && after.value !== null) {
+          // At the caret, where in the text it was typed is the page's, so no value is predicted.
+          const expected = at === 'caret' ? null : append ? `${focused.value ?? ''}${typed}` : typed
+          if (expected !== null && after.value !== expected) {
             record.notes.push(
               typedSecret
                 ? 'the field value differs from what was typed (the page transformed or rejected some keys)'
                 : `value read back: "${maskIfSecret(after.value, false)}" — differs from what was typed (the page transformed, limited or rejected some keys)`,
             )
-          } else if (!typedSecret) {
+          } else if (!typedSecret && !(placed && caretLine)) {
             record.notes.push(`value read back: "${maskIfSecret(after.value, false)}"`)
           }
         }
+        if (caretLine) record.notes.push(`typed into ${caretLine.slice(2)}`)
       },
       { refs: [ref], whileBusy: options.whileBusy },
     )
@@ -2785,6 +3067,12 @@ export function createActApi(deps: ActDeps): ActApi {
    * horizontal wheel deltas (a trackpad's or tilt wheel's), which Chrome scrolls a carousel with
    * (measured on Chrome 133, headless and headed; so does Shift+wheel). The scroller's own offset
    * is measured before and after.
+   *
+   * The wheel turns only as far as the scroller can still move (its scrollTop/scrollLeft against
+   * its scrollHeight/scrollWidth): what a wheel turns beyond a scroll area's edge chains to what
+   * contains it, and the page moved instead (lab: a chat log asked for 10 screens moved 980px, the
+   * page 1300px more). A container that is off-screen is first brought into view, as a person
+   * scrolls the page to the area before wheeling over it; the report says so.
    */
   async function scrollBy(step: Step, direction: ScrollDirection, screens: number, container: RefTarget | undefined): Promise<void> {
     const { page, probe, record } = step
@@ -2810,13 +3098,19 @@ export function createActApi(deps: ActDeps): ActApi {
     const inIframe = frame.frameId !== probe.frames.mainFrameId()
     const goneScroller = (): ActError =>
       container ? goneError(container) : new ActError('The scroll area in the middle of the screen disappeared while scrolling it. Call observe() again.')
-    const aim = await frame.world.callFunctionOnNodes<WheelAim | null>([scrollerId], WHEEL_POINT_FN, {
-      args: { axis, dir },
-      what: 'finding where to turn the mouse wheel',
-    })
-    if (!aim) throw goneScroller()
-    // In an iframe the aim is in the iframe's own viewport, and "the page" is the iframe's document.
-    const point = aim.point && inIframe ? onScreen({ ...aim.point, width: 0, height: 0 }, await probe.frames.box(frame.frameId)) : aim.point
+    const aimWheel = async (): Promise<{ aim: WheelAim; point: Point | undefined; outside: boolean }> => {
+      const aim = await frame.world.callFunctionOnNodes<WheelAim | null>([scrollerId], WHEEL_POINT_FN, {
+        args: { axis, dir },
+        what: 'finding where to turn the mouse wheel',
+      })
+      if (!aim) throw goneScroller()
+      // In an iframe the aim is in the iframe's own viewport, and "the page" is the iframe's document.
+      const point = aim.point && inIframe ? onScreen({ ...aim.point, width: 0, height: 0 }, await probe.frames.box(frame.frameId)) : aim.point
+      const area = inIframe ? await visibleArea(probe, frame.frameId) : null
+      const outside = point && area ? point.x < area.x || point.y < area.y || point.x > area.x + area.width || point.y > area.y + area.height : false
+      return { aim, point, outside }
+    }
+    let { aim, point, outside } = await aimWheel()
     const label = scrollerRef
       ? describeTarget(scrollerRef)
       : inIframe && aim.label === 'the page'
@@ -2825,10 +3119,13 @@ export function createActApi(deps: ActDeps): ActApi {
     record.detail = `${direction} ${screens} screen${screens === 1 ? '' : 's'} over ${label}`
     record.repeatKey = `${scrollerRef?.key ?? `${step.before?.documentId ?? page.url()}:${frame.frameId}:node${scrollerId}`}|${direction}`
     scrollRepeatGuard(probe, record, label, direction)
-    const area = inIframe ? await visibleArea(probe, frame.frameId) : null
-    const outside = point && area ? point.x < area.x || point.y < area.y || point.x > area.x + area.width || point.y > area.y + area.height : false
     if ((aim.offscreen || outside) && container) {
-      throw new ActError(`${describeTarget(container)} is outside the visible page; bring it into view first (act.scrollTo(${container.ref})), then scroll it.`)
+      const { notes } = await bringIntoView(step, container)
+      record.notes.push(`brought ${label} into view first${notes.length > 0 ? ` (${notes.join('; ')})` : ''}`)
+      ;({ aim, point, outside } = await aimWheel())
+      if (aim.offscreen || outside) {
+        throw new ActError(`${describeTarget(container)} is still outside the visible page after scrolling to it, so the wheel cannot be turned over it. observe() shows where it is.`)
+      }
     }
     if (container && aim.atEnd) {
       // A wheel over a scroll area at its end chains to what contains it: the page would move, not this.
@@ -2850,9 +3147,14 @@ export function createActApi(deps: ActDeps): ActApi {
       )
     }
     const before = await restingOffset(frame.world, scrollerId, axis, goneScroller)
-    record.dispatched = true
-    await deps.humanMouse.moveTo({ page, x: point.x, y: point.y })
-    const total = Math.max(40, screens * before.client) * dir
+    const requested = Math.max(40, screens * before.client)
+    // As far as it can still move: a wheel beyond its edge would scroll what contains it.
+    const room = Math.max(0, Math.floor(dir > 0 ? before.size - before.at - before.client : before.at))
+    const total = Math.min(requested, room) * dir
+    if (total !== 0) {
+      record.dispatched = true
+      await deps.humanMouse.moveTo({ page, x: point.x, y: point.y })
+    }
     let done = 0
     while (Math.abs(done) < Math.abs(total)) {
       checkAbort()
@@ -2879,28 +3181,209 @@ export function createActApi(deps: ActDeps): ActApi {
             ? `nothing moved: ${label} is at the ${words.end}`
             : `nothing moved: nothing in the middle of the screen can scroll further ${direction} (${label} and every scroll area there are at the ${words.end})`,
       )
+    } else if (room <= requested && remaining < 1) {
+      record.notes.push(`reached the ${words.end} of ${label} after ${Math.round(Math.abs(moved))}px`)
     } else {
       record.notes.push(`scrolled ${label} ${Math.round(Math.abs(moved))}px${axis === 'x' ? ` ${words.more}` : ''}; ${where}`)
     }
   }
 
+  /**
+   * Press an arrow key `presses` times (positive: ↓, negative: ↑) the way a person does: a few taps,
+   * or the key held down for many (the first press, the keyboard's repeat delay, then auto-repeated
+   * presses at its ~30 per second). False when a native dialog the page opened stopped the keys.
+   */
+  async function pressArrows(step: Step, presses: number): Promise<boolean> {
+    const { page, probe, record } = step
+    const key = presses > 0 ? 'ArrowDown' : 'ArrowUp'
+    const count = Math.abs(presses)
+    if (count <= 6) {
+      for (let pressed = 0; pressed < count; pressed++) {
+        checkAbort()
+        await untilDialog(probe, page.keyboard.press(key, { delay: Math.round(randomBetween(40, 80)) }), record)
+        if (probe.dialogs.current()?.handling === 'agent') return false
+        await sleep(randomBetween(90, 180))
+      }
+      return true
+    }
+    try {
+      for (let pressed = 0; pressed < count; pressed++) {
+        checkAbort()
+        await untilDialog(probe, page.keyboard.down(key), record)
+        if (probe.dialogs.current()?.handling === 'agent') return false
+        await sleep(pressed === 0 ? randomBetween(380, 520) : randomBetween(30, 38))
+      }
+    } finally {
+      if (probe.dialogs.current()?.handling !== 'agent') await page.keyboard.up(key)
+    }
+    return true
+  }
+
+  /** `${n} × ↓` for a note; '' for none. */
+  function arrowsNote(presses: number): string {
+    return presses === 0 ? '' : `${Math.abs(presses)} × ${presses > 0 ? '↓' : '↑'}`
+  }
+
+  /**
+   * The option a native drop-down select shows as chosen or, while its list is open, highlighted:
+   * Chrome's accessibility value of the select follows the open list's highlight (measured on
+   * Chrome 149 and 151, headless and headed). Null when Chrome reports none.
+   */
+  async function selectShows(probe: ActProbe, target: RefTarget): Promise<string | null> {
+    const result = await send<Protocol.Accessibility.GetPartialAXTreeResponse>(
+      await cdpOf(probe, target),
+      'Accessibility.getPartialAXTree',
+      { backendNodeId: target.backendNodeId, fetchRelatives: false },
+      `reading which option ${describeTarget(target)} highlights`,
+    )
+    const value = result.nodes.find((node) => node.backendDOMNodeId === target.backendNodeId)?.value?.value
+    return typeof value === 'string' ? value : null
+  }
+
+  /**
+   * Choose option `plan.index` of a native drop-down select the way a person does with Chrome's
+   * list: click the select (its list opens), type the start of the option's label (type-ahead),
+   * arrow keys for the rest, check that the list highlights it, then Enter — one change event.
+   * Measured on Chrome 149: keys reach the open list (the page sees no keydown), the select's
+   * selectedIndex stays until Enter. Arrowing through a 200-option list one key at a time took
+   * 28–31 s; in a real Chrome the button release of the opening click can land in the list and
+   * choose a row by itself. When the list is not open after the click (that release chose a row,
+   * or the click closed a list the model had opened), the select keeps focus, closed, and the same
+   * keys change it directly on Windows and Linux, each read back exactly.
+   */
+  async function chooseInMenuList(step: Step, target: RefTarget, plan: SelectPlan, readState: () => Promise<SelectState>): Promise<void> {
+    const { page, probe, record } = step
+    const options = plan.options ?? []
+    const index = plan.index ?? -1
+    const label = plan.label ?? ''
+    let state = await readState()
+    if (state.open) {
+      record.notes.push('its list was open already')
+    } else {
+      await clickTarget(step, target, 1, 'left')
+      await sleep(randomBetween(120, 220))
+      state = await readState()
+      if (state.index !== plan.selectedIndex) {
+        record.notes.push(`the click itself chose "${state.selected}": Chrome took the button release as a choice in the list it opened`)
+      }
+    }
+    record.dispatched = true
+    if (state.open) {
+      const route = keyRoute(options, state.index, index)
+      await typeHuman(page, route.typed)
+      if (!(await pressArrows(step, route.arrows))) return
+      let shown = await selectShows(probe, target)
+      let arrows = route.arrows
+      // The highlight is elsewhere: where, exactly, when that label is one option's only.
+      const at = options.flatMap((candidate, i) => (candidate.label === shown ? [i] : []))
+      if (shown !== label && at.length === 1) {
+        const fix = arrowPresses(options, at[0], index)
+        if (!(await pressArrows(step, fix))) return
+        arrows += fix
+        shown = await selectShows(probe, target)
+      }
+      const how = [route.typed ? `typed "${route.typed}"` : '', arrowsNote(arrows)].filter(Boolean).join(', then ')
+      if (shown !== label) {
+        await page.keyboard.press('Escape')
+        throw new ActError(
+          `Not done: ${how || 'nothing typed'} in the open list of ${describeTarget(target)}, but it highlights ` +
+            `${shown === null ? 'no option' : `"${shown}"`} instead of "${label}". Escape closed the list; nothing was chosen. ` +
+            `act.click(${target.ref}) opens the list; observe() then lists its options.`,
+        )
+      }
+      record.notes.push(`${how || 'it was highlighted'} in its open list, then Enter`)
+      await untilDialog(probe, page.keyboard.press('Enter'), record)
+      return
+    }
+    if (!state.focused) {
+      throw new ActError(
+        `Not done: clicked ${describeTarget(target)}, but its list did not open and keyboard focus is not on it, so keys would go elsewhere. observe() shows what took focus.`,
+      )
+    }
+    const userAgent = await probe.frames.main.world.evaluate<string>('navigator.userAgent', { what: "reading the browser's platform from its user agent" })
+    if (userAgent.includes('Macintosh')) {
+      throw new ActError(
+        `Not done: clicked ${describeTarget(target)}, but its list did not open. On macOS the arrow keys of a closed select open its list instead of ` +
+          `changing it; act.click(${target.ref}) opens it, then act.select(${target.ref}, …) chooses in it.`,
+      )
+    }
+    // A closed select changes with every key (each one fires input and change): typed first, the rest by arrows from where it really is.
+    const route = keyRoute(options, state.index, index)
+    for (const char of route.typed) {
+      checkAbort()
+      await untilDialog(probe, page.keyboard.type(char), record)
+      if (probe.dialogs.current()?.handling === 'agent') return
+      await sleep(KEY_MEAN_MS * randomBetween(0.55, 1.35))
+    }
+    state = await readState()
+    const arrows = arrowPresses(options, state.index, index)
+    if (!(await pressArrows(step, arrows))) return
+    const how = [route.typed ? `typed "${route.typed}"` : '', arrowsNote(arrows)].filter(Boolean).join(', then ')
+    record.notes.push(`its list was closed, so the keys chose on the select itself: ${how}`)
+  }
+
+  /**
+   * After choosing `label` (option `index`): watch the select for half a second, as a person glances
+   * at it. Chrome applies the choice at once; a page that refuses it puts its own value back — which
+   * is said only when the choice was seen taken and then undone.
+   */
+  async function confirmChoice(step: Step, target: RefTarget, plan: SelectPlan, readState: () => Promise<SelectState>, how: string): Promise<void> {
+    const { probe, record } = step
+    const label = plan.label ?? ''
+    const watchedFrom = Date.now()
+    let seenAt: number | null = null
+    let after: SelectState
+    for (;;) {
+      // A native dialog the change opened freezes the page: the report names it, nothing more is read.
+      if (probe.dialogs.current()?.handling === 'agent') return
+      after = await readState()
+      if (after.chosen) seenAt ??= Date.now()
+      if (Date.now() - watchedFrom >= 500) break
+      await sleep(50)
+    }
+    if (!after.chosen) {
+      if (seenAt !== null) {
+        throw new ActError(
+          `Chose "${label}" in ${describeTarget(target)}: it showed "${label}", then the page changed it back to "${after.selected}" ` +
+            `(within ${Date.now() - seenAt}ms). The page refuses that choice; observe() may show why.`,
+        )
+      }
+      throw new ActError(
+        `${how} "${label}" in ${describeTarget(target)}, but it shows "${after.selected}" and did not show "${label}" in the ${Date.now() - watchedFrom}ms ` +
+          'it was watched. Whether Chrome did not take it or the page put its value back at once cannot be told from outside; observe() shows the page now.',
+      )
+    }
+    record.notes.push(
+      plan.multiple
+        ? `selected "${label}"; now selected: ${after.selectedLabels.map((selected) => `"${selected}"`).join(', ')}`
+        : `selected "${label}" (was "${plan.before}")`,
+    )
+  }
+
   const api: ActApi = {
-    click: (ref, options = {}) =>
-      run(
+    click: (targetArg, options = {}) => {
+      // The model's code is untyped: a malformed target or button is refused before anything runs.
+      const end = pointerTarget(targetArg, 'act.click: the target', 'Nothing was clicked.')
+      const button = clickButton(options.button, 'click')
+      return run(
         'click',
         async (step) => {
-          await clickTarget(step, step.targets[0], 1, options.button ?? 'left')
+          await clickTarget(step, step.targets[0], 1, button, end.offset)
         },
-        { refs: [ref], whileBusy: options.whileBusy, again: options.again },
-      ),
-    dblclick: (ref, options = {}) =>
-      run(
+        { refs: [end.ref], whileBusy: options.whileBusy, again: options.again, detail: pointerDetail(end.offset, button) },
+      )
+    },
+    dblclick: (targetArg, options = {}) => {
+      const end = pointerTarget(targetArg, 'act.dblclick: the target', 'Nothing was clicked.')
+      const button = clickButton(options.button, 'dblclick')
+      return run(
         'dblclick',
         async (step) => {
-          await clickTarget(step, step.targets[0], 2, options.button ?? 'left')
+          await clickTarget(step, step.targets[0], 2, button, end.offset)
         },
-        { refs: [ref], whileBusy: options.whileBusy, again: options.again },
-      ),
+        { refs: [end.ref], whileBusy: options.whileBusy, again: options.again, detail: pointerDetail(end.offset, button) },
+      )
+    },
     fill: (ref, text, options = {}) => fillOrType(ref, String(text), options, false),
     type: (ref, text, options = {}) => fillOrType(ref, String(text), options, true),
     press: (key, options = {}) =>
@@ -2921,7 +3404,33 @@ export function createActApi(deps: ActDeps): ActApi {
             repeatGuard(probe, record, options.again)
           }
           record.dispatched = true
-          await untilDialog(probe, page.keyboard.press(key), record)
+          // One key event at a time, as Playwright's keyboard.press sends them (modifiers down, the key
+          // down and up, modifiers up): a tab the page closes in answer to the key is told from one
+          // closed before the key reached it by whether Chrome confirmed the key-down.
+          const tokens = keyTokens(key)
+          const main = tokens[tokens.length - 1]
+          const modifiers = tokens.slice(0, -1)
+          const press: { stage: PressStage } = { stage: 'not sent' }
+          const keys = async (): Promise<void> => {
+            for (const modifier of modifiers) await page.keyboard.down(modifier)
+            if (!page.isClosed()) press.stage = 'sent'
+            await page.keyboard.down(main)
+            press.stage = 'acknowledged'
+            await page.keyboard.up(main)
+            for (const modifier of modifiers.reverse()) await page.keyboard.up(modifier)
+          }
+          try {
+            await untilDialog(probe, keys(), record)
+          } catch (error) {
+            if (!(press.stage === 'not sent' ? page.isClosed() : await closesSoon(page))) throw error
+            if (press.stage === 'not sent') throw new ActError(`Not done: the tab closed before the key ${key} was pressed; no key reached the page.`)
+            if (press.stage === 'sent') {
+              throw new ActError(`The tab closed while the key ${key} was being pressed: Chrome closed it before confirming the key, so whether the page got it cannot be told.`)
+            }
+            closedByOwnInput(step, `the key ${key}`, true)
+            return
+          }
+          if (page.isClosed()) closedByOwnInput(step, `the key ${key}`, true)
         },
         { refs: options.ref !== undefined ? [options.ref] : [], whileBusy: options.whileBusy, again: options.again, detail: key },
       ),
@@ -2957,64 +3466,70 @@ export function createActApi(deps: ActDeps): ActApi {
           const label = plan.label ?? option
           const index = plan.index ?? -1
           record.detail = `"${label}"`
-          if (plan.steps === 0) {
+          if (plan.alreadySelected) {
             record.notes.push(`"${label}" was already selected; nothing to do`)
             return
           }
-          const readState = async (): Promise<{ index: number; selected: string; open: boolean }> => {
-            const state = await world.callFunctionOnNodes<{ index: number; selected: string; open: boolean } | null>([target.backendNodeId], SELECT_STATE_FN, {
+          const readState = async (): Promise<SelectState> => {
+            const state = await world.callFunctionOnNodes<SelectState | null>([target.backendNodeId], SELECT_STATE_FN, {
+              args: { index },
               what: `reading ${describeTarget(target)}`,
             })
             if (!state) throw goneError(target)
             return state
           }
-          if (plan.listBox) {
-            // A list box draws its options in the page: a person clicks the one they want.
-            const [optionNode] = await world.nodesReturnedBy([target.backendNodeId], SELECT_OPTION_NODE_FN, {
-              args: { index },
-              what: `finding the option "${label}" in ${describeTarget(target)}`,
-            })
-            if (optionNode === undefined || optionNode === null) {
-              throw new ActError(`${describeTarget(target)} lost its option "${label}" while choosing it. Call observe() again.`)
-            }
-            await clickTarget(step, { ...target, backendNodeId: optionNode, role: 'option', name: label, viaLabel: undefined }, 1, 'left')
+          if (!plan.listBox) {
+            await chooseInMenuList(step, target, plan, readState)
+            await confirmChoice(step, target, plan, readState, 'Pressed Enter on')
+            return
+          }
+          // A list box draws its options in the page: a person clicks the one they want, holding
+          // Ctrl (⌘ on macOS) to add it to what a multiple list box has selected already.
+          const [optionNode] = await world.nodesReturnedBy([target.backendNodeId], SELECT_OPTION_NODE_FN, {
+            args: { index },
+            what: `finding the option "${label}" in ${describeTarget(target)}`,
+          })
+          if (optionNode === undefined || optionNode === null) {
+            throw new ActError(`${describeTarget(target)} lost its option "${label}" while choosing it. Call observe() again.`)
+          }
+          const optionTarget: RefTarget = { ...target, backendNodeId: optionNode, role: 'option', name: label, viaLabel: undefined }
+          const adding = plan.multiple === true && (plan.selectedLabels ?? []).length > 0
+          if (!adding) {
+            await clickTarget(step, optionTarget, 1, 'left')
           } else {
-            // A person clicks the select, which opens its list, then moves to the option with the arrow
-            // keys and confirms with Enter; Chrome fires the trusted input and change itself.
-            await clickTarget(step, target, 1, 'left')
-            await sleep(randomBetween(120, 220))
-            const { open } = await readState()
-            const key = (plan.steps ?? 0) > 0 ? 'ArrowDown' : 'ArrowUp'
-            for (let pressed = 0; pressed < Math.abs(plan.steps ?? 0); pressed++) {
-              checkAbort()
-              await page.keyboard.press(key)
-              await sleep(randomBetween(90, 180))
+            // Aimed (and wheeled into view) before the key goes down: Ctrl with the wheel zooms.
+            const point = await aimAt(step, optionTarget)
+            const userAgent = await probe.frames.main.world.evaluate<string>('navigator.userAgent', { what: "reading the browser's platform from its user agent" })
+            const modifier = userAgent.includes('Macintosh') ? 'Meta' : 'Control'
+            record.dispatched = true
+            await page.keyboard.down(modifier)
+            try {
+              await sleep(randomBetween(60, 140))
+              await clickAt(step, point, 1, 'left')
+            } finally {
+              await page.keyboard.up(modifier)
             }
-            // Arrows in the open list only move the highlight; Enter chooses. A closed, focused select
-            // changes with each arrow already.
-            if (open) await untilDialog(probe, page.keyboard.press('Enter'), record)
+            record.notes.push(`held ${modifier === 'Meta' ? '⌘' : 'Ctrl'} to add it to the options already selected`)
           }
-          await sleep(randomBetween(80, 140))
-          const after = await readState()
-          if (after.index !== index) {
-            throw new ActError(`Chose "${label}" in ${describeTarget(target)} but it shows "${after.selected}": the page rejected or reset the choice. observe() shows the page now.`)
-          }
-          record.notes.push(`selected "${label}" (was "${plan.before}")`)
+          await confirmChoice(step, target, plan, readState, 'Clicked')
         },
         { refs: [ref], whileBusy: options.whileBusy, detail: `"${option}"` },
       ),
     check: (ref, options = {}) => setChecked(ref, true, options),
     uncheck: (ref, options = {}) => setChecked(ref, false, options),
-    hover: (ref) =>
-      run(
+    hover: (targetArg) => {
+      const end = pointerTarget(targetArg, 'act.hover: the target', 'The pointer was not moved.')
+      return run(
         'hover',
         async (step) => {
-          const point = await aimAt(step, step.targets[0])
+          if (end.offset) await checkOffset(step.probe, step.targets[0], end.offset, 'The pointer was not moved.')
+          const point = await aimAt(step, step.targets[0], end.offset)
           step.record.dispatched = true
           await deps.humanMouse.moveTo({ page: step.page, x: point.x, y: point.y })
         },
-        { refs: [ref] },
-      ),
+        { refs: [end.ref], detail: pointerDetail(end.offset, 'left') },
+      )
+    },
     scroll: (direction = 'down', options = {}) =>
       run(
         'scroll',
@@ -3109,8 +3624,12 @@ export function createActApi(deps: ActDeps): ActApi {
       ),
     drag: (fromArg, toArg, options = {}) => {
       // The model's code is untyped: a malformed end is refused before anything runs.
-      const fromEnd = dragEnd(fromArg, 'from')
-      const toEnd = dragEnd(toArg, 'to')
+      const fromEnd = pointerTarget(fromArg, 'act.drag: from', 'Nothing was dragged.')
+      const toEnd = pointerTarget(toArg, 'act.drag: to', 'Nothing was dragged.')
+      const path = options.path ?? 'human'
+      if (path !== 'human' && path !== 'straight') {
+        throw new ActError(`act.drag: path must be 'human' or 'straight' (got ${JSON.stringify(path)}). Nothing was dragged.`)
+      }
       return run(
         'drag',
         async (step) => {
@@ -3119,23 +3638,9 @@ export function createActApi(deps: ActDeps): ActApi {
           const pointIn = (offset: Point, target: RefTarget): string => `(${offset.x}, ${offset.y}) in ${describeTarget(target)}`
           const onto = toEnd.offset ? pointIn(toEnd.offset, to) : describeTarget(to)
           record.detail = fromEnd.offset ? `from ${pointIn(fromEnd.offset, from)} ${toEnd.offset ? 'to' : 'onto'} ${onto}` : `onto ${onto}`
+          if (path === 'straight') record.detail += ' along a straight line'
           for (const { target, offset } of [{ target: from, offset: fromEnd.offset }, { target: to, offset: toEnd.offset }]) {
-            if (!offset) continue
-            if (target.viaLabel) {
-              throw new ActError(
-                `Not done: ${describeTarget(target)} is hidden and worked through its label, so it has no box of its own to point into. ` +
-                  `Drag from or onto [${target.ref}] itself, without x/y. Nothing was dragged.`,
-              )
-            }
-            const box = await borderBox(probe, target)
-            const width = Math.round(box.width * 10) / 10
-            const height = Math.round(box.height * 10) / 10
-            if (offset.x < 0 || offset.x >= box.width || offset.y < 0 || offset.y >= box.height) {
-              throw new ActError(
-                `Not done: ${describeTarget(target)} is ${width}×${height} px: x must be from 0 up to, not including, ${width}, and y from 0 up to, ` +
-                  `not including, ${height} (got ${offset.x}, ${offset.y}), CSS px from its top-left corner. Nothing was dragged.`,
-              )
-            }
+            if (offset) await checkOffset(probe, target, offset, 'Nothing was dragged.')
           }
           const fromPoint = await aimAt(step, from, fromEnd.offset)
           record.dispatched = true
@@ -3151,6 +3656,19 @@ export function createActApi(deps: ActDeps): ActApi {
             dragData = event.data
           }
           let pressed = false
+          // Set once every input before the drop and the release went through: a tab closing with
+          // either of them (Chrome confirmed the press) closed in answer to it, which is the drag's effect.
+          let releasing = false
+          const closingInput = async (input: Promise<unknown>, what: string): Promise<void> => {
+            try {
+              await input
+            } catch (error) {
+              if (!(await closesSoon(page))) throw error
+              closedByOwnInput(step, what, true)
+              return
+            }
+            if (page.isClosed()) closedByOwnInput(step, what, true)
+          }
           let at = fromPoint
           try {
             probe.cdp.on('Input.dragIntercepted', onIntercepted)
@@ -3162,7 +3680,7 @@ export function createActApi(deps: ActDeps): ActApi {
               await sleep(randomBetween(120, 220))
               if (toEnd.offset) {
                 const outOfView = `(${toEnd.offset.x}, ${toEnd.offset.y}) of ${describeTarget(to)} is not visible while dragging; bring both points into view first.`
-                toPoint = await pointOn(probe, to, toEnd.offset, await visibleArea(probe, to.frameId), outOfView)
+                ;({ point: toPoint } = await pointOn(probe, to, toEnd.offset, await visibleArea(probe, to.frameId), outOfView))
               } else {
                 const toSurface = await pointerSurface(probe, to, record)
                 const toRects = await quadsOf(probe, toSurface)
@@ -3172,16 +3690,35 @@ export function createActApi(deps: ActDeps): ActApi {
                 }
                 ;({ point: toPoint } = await hitPoint(probe, toSurface, toRects, viewport))
               }
+              // The human plan gives a person's pace either way; 'straight' keeps its timing and puts
+              // every sample on the straight line, at the minimum-jerk fraction of the way for its time.
               const trajectory = await deps.humanMouse.plan({ page, from: at, x: toPoint.x, y: toPoint.y })
+              const start = at
+              const endMs = trajectory.samples.at(-1)?.tMs ?? 0
+              const samples =
+                path === 'straight'
+                  ? trajectory.samples.map((sample) => {
+                      const s = minimumJerkPosition(endMs > 0 ? sample.tMs / endMs : 1)
+                      return { tMs: sample.tMs, x: start.x + (toPoint.x - start.x) * s, y: start.y + (toPoint.y - start.y) * s }
+                    })
+                  : trajectory.samples
+              let travelled = 0
               const startedAt = Date.now()
-              for (const sample of trajectory.samples) {
+              for (const sample of [...samples, { tMs: endMs, x: toPoint.x, y: toPoint.y }]) {
                 checkAbort()
                 const wait = startedAt + sample.tMs - Date.now()
                 if (wait > 0) await sleep(wait)
                 await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: sample.x, y: sample.y, button: 'left', buttons: 1 }, 'moving the pointer with the button held')
+                travelled += Math.hypot(sample.x - at.x, sample.y - at.y)
                 at = { x: sample.x, y: sample.y }
               }
-              await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: toPoint.x, y: toPoint.y, button: 'left', buttons: 1 }, 'moving the pointer with the button held')
+              const distance = Math.hypot(toPoint.x - start.x, toPoint.y - start.y)
+              record.notes.push(
+                path === 'straight'
+                  ? `held-button path: a straight line of ${Math.round(distance)} px`
+                  : `held-button path: ${Math.round(travelled)} px of a person's curved path for ${Math.round(distance)} px between the two points; ` +
+                      "where the way itself counts (a drawn line), pass { path: 'straight' }",
+              )
               at = toPoint
               await sleep(randomBetween(80, 160))
             } finally {
@@ -3190,18 +3727,23 @@ export function createActApi(deps: ActDeps): ActApi {
             }
             const data: Protocol.Input.DragData | null = dragData
             if (data) {
-              for (const type of ['dragEnter', 'dragOver', 'drop'] as const) {
+              for (const type of ['dragEnter', 'dragOver'] as const) {
                 await untilDialog(probe, send(probe.cdp, 'Input.dispatchDragEvent', { type, x: toPoint.x, y: toPoint.y, data }, `dispatching ${type}`), record)
               }
+              releasing = true
+              await closingInput(untilDialog(probe, send(probe.cdp, 'Input.dispatchDragEvent', { type: 'drop', x: toPoint.x, y: toPoint.y, data }, 'dispatching drop'), record), 'the drop')
               record.notes.push('the page started an HTML drag: its drag data was dropped on the target with drag events')
             }
+            releasing = true
           } finally {
-            if (pressed) {
-              await untilDialog(
+            if (pressed && !record.closedTab) {
+              const released = untilDialog(
                 probe,
                 send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: at.x, y: at.y, button: 'left', buttons: 0, clickCount: 1 }, 'releasing the mouse button'),
                 record,
               )
+              if (releasing) await closingInput(released, 'the release')
+              else await released
             }
           }
         },
@@ -3233,6 +3775,30 @@ export function createActApi(deps: ActDeps): ActApi {
         },
         { detail: url },
       ),
+    reload: (options = {}) =>
+      run('reload', async ({ page, probe, record }) => {
+        const timeout = Math.max(1000, Math.min(30_000, remainingMs() - 4000))
+        const current = page.url()
+        // The new tab that replaced a crashed one is still blank: reloading it means loading what crashed.
+        const crashed = isBlankUrl(current) ? replacedCrashOf(page) : null
+        if (crashed) {
+          record.detail = `${crashed.url} (the page that crashed)`
+          record.dispatched = true
+          const response = await untilDialog(probe, page.goto(crashed.url, { waitUntil: 'domcontentloaded', timeout }), record)
+          if (response && response.status() >= 400) record.notes.push(`the server answered HTTP ${response.status()}`)
+          return
+        }
+        if (deps.mode === 'human' && !isBlankUrl(current) && !options.reason) {
+          throw new ActError(
+            `Refused: act.reload would reload the whole document (${current}); client caches and in-memory state are wiped, which a person ` +
+              "clicking around never does. If a reload is genuinely what you are testing, pass { reason: '…' }.",
+          )
+        }
+        record.detail = options.reason ? `${current} (reason: ${options.reason})` : current
+        record.dispatched = true
+        const response = await untilDialog(probe, page.reload({ waitUntil: 'domcontentloaded', timeout }), record)
+        if (response && response.status() >= 400) record.notes.push(`the server answered HTTP ${response.status()}`)
+      }),
     back: () =>
       run('back', async ({ probe, record }) => {
         const history = await send<Protocol.Page.GetNavigationHistoryResponse>(probe.cdp, 'Page.getNavigationHistory', undefined, "reading this tab's history")
@@ -3280,35 +3846,70 @@ export function createActApi(deps: ActDeps): ActApi {
             )
           }
           // The way a person does it: the page's own link to that route, found in the picture taken
-          // right before this action (so the link is exactly what is on the page now).
+          // right before this action (so the link is exactly what is on the page now). Matched by
+          // path: apps carry state in their links' query strings (see matchSpaLink).
           const observation = step.before
-          const link = observation?.elements.find(
-            (element) =>
-              element.role === 'link' &&
-              element.href !== undefined &&
-              new URL(element.href, observation.url).href === target.href &&
-              element.visibility !== 'hidden' &&
-              element.visibility !== 'unknown',
+          const links: SpaLink[] = (observation?.elements ?? []).flatMap((element) =>
+            element.role === 'link' && element.href !== undefined && element.visibility !== 'hidden' && element.visibility !== 'unknown'
+              ? [{ ref: element.ref, name: element.name, href: element.href, inView: element.visibility === 'in-view' }]
+              : [],
           )
-          if (!link) {
+          const base = new URL(observation?.url ?? page.url())
+          const listed = (link: SpaLink): string => `[${link.ref}] link "${link.name}" → ${routeOf(new URL(link.href, base))}`
+          const match = matchSpaLink(pathOrUrl, base, links)
+          if (match.kind === 'ambiguous') {
             throw new ActError(
-              `No link to ${target.pathname}${target.search}${target.hash} is on the page. A person would reach it through the UI — find() a menu ` +
-                'or link that leads there — or type the address, which is a full load: act.open(url, { reason }).',
+              `${match.links.length} links on the page lead to ${routeOf(target)} with different addresses: ${match.links.map(listed).join(', ')}. ` +
+                `Pass the one you mean in full (act.spaNavigate('${routeOf(new URL(match.links[0].href, base))}')), or act.click(ref) on it.`,
             )
           }
-          const resolution = deps.registry.resolve(link.ref)
+          if (match.kind === 'none') {
+            const inApp = [...new Set(links.flatMap((link) => {
+              const url = new URL(link.href, base)
+              return url.origin === here.origin ? [routeOf(url)] : []
+            }))]
+            const shown = inApp.slice(0, 25).join(', ')
+            const more = inApp.length > 25 ? ` (+${inApp.length - 25} more; observe() lists every link)` : ''
+            throw new ActError(
+              `No link to ${routeOf(target)} is on the page${inApp.length > 0 ? `; its in-app links lead to ${shown}${more}` : ' (it has no in-app links)'}. ` +
+                'A person would reach it through the UI — find() a menu or link that leads there — or type the address, which is a full load: act.open(url, { reason }).',
+            )
+          }
+          const resolution = deps.registry.resolve(match.link.ref)
           if (!resolution.ok) throw new ActError(resolution.error)
           record.target = targetSummary(resolution.target)
           await clickTarget(step, resolution.target, 1, 'left')
-          record.notes.push(`clicked the page's own link to it`)
+          record.notes.push(
+            `clicked the page's own link ${listed(match.link)}${match.exact ? '' : ` (matched by its path; ${routeOf(target)} was asked)`}`,
+          )
         },
         { detail: pathOrUrl },
       ),
-    switchTab: (index) =>
+    switchTab: (indexOrText) =>
       run('switchTab', async ({ record }) => {
         const tabs = deps.listTabs()
-        if (!Number.isInteger(index) || index < 0 || index >= tabs.length) {
-          throw new ActError(`There is no tab ${index}: the open tabs are 0–${tabs.length - 1} (observe() lists them under TABS).`)
+        let index: number
+        if (typeof indexOrText === 'string') {
+          const needle = indexOrText.trim().toLowerCase()
+          if (needle === '') throw new ActError('act.switchTab(text) takes text of the tab’s title or URL; it got an empty string.')
+          const titles = await Promise.all(
+            tabs.map((tab) => tabTitle(tab).catch((error: unknown) => `(title unreadable: ${errorMessage(error).split('.')[0]})`)),
+          )
+          const listing = (indexes: number[]): string => indexes.map((i) => `${i}: "${titles[i]}" ${tabs[i].url()}`).join(' · ')
+          const matches = tabs.flatMap((tab, i) => (titles[i].toLowerCase().includes(needle) || tab.url().toLowerCase().includes(needle) ? [i] : []))
+          if (matches.length !== 1) {
+            throw new ActError(
+              matches.length === 0
+                ? `No open tab has "${indexOrText}" in its title or URL. The open tabs: ${listing(tabs.map((_, i) => i))}. Pass an index, or text only one of them has.`
+                : `${matches.length} tabs have "${indexOrText}" in their title or URL: ${listing(matches)}. Pass the index of the one you mean, or text only it has.`,
+            )
+          }
+          index = matches[0]
+        } else {
+          if (!Number.isInteger(indexOrText) || indexOrText < 0 || indexOrText >= tabs.length) {
+            throw new ActError(`There is no tab ${indexOrText}: the open tabs are 0–${tabs.length - 1} (observe() lists them under TABS).`)
+          }
+          index = indexOrText
         }
         const page = tabs[index]
         await withDeadline(page.bringToFront(), CDP_TIMEOUT_MS, `bringing tab ${index} to the front`)
@@ -3354,7 +3955,7 @@ export function createActApi(deps: ActDeps): ActApi {
           }
           record.dispatched = true
           const state = await probe.dialogs.accept(promptText)
-          record.detail = `${state.type}("${state.message}")${promptText !== undefined ? ` with "${promptText}"` : ''}`
+          record.detail = `${dialogLabel(state)}${state.promptText !== undefined ? ` with "${state.promptText}"` : ''}`
         }),
       dismiss: () =>
         run('dialog-dismiss', async ({ probe, record }) => {
@@ -3370,7 +3971,7 @@ export function createActApi(deps: ActDeps): ActApi {
           }
           record.dispatched = true
           const state = await probe.dialogs.dismiss()
-          record.detail = `${state.type}("${state.message}")`
+          record.detail = dialogLabel(state)
         }),
       chooseFiles: (files) =>
         run('dialog-choose-files', async (step) => {
@@ -3381,6 +3982,38 @@ export function createActApi(deps: ActDeps): ActApi {
           const list = resolveFiles(files)
           step.record.detail = list.map((file) => path.basename(file)).join(', ')
           await chooseInDialog(step, fileDialog, list)
+        }),
+      policy: (policy, options = {}) =>
+        run('dialog-policy', async ({ probe, record }) => {
+          if (policy !== 'accept' && policy !== 'dismiss' && policy !== 'ask') {
+            throw new ActError(`act.dialog.policy takes 'accept', 'dismiss' or 'ask' (got ${JSON.stringify(policy)}).`)
+          }
+          const { beforeunload, promptText } = options
+          if (beforeunload !== undefined && beforeunload !== 'ask' && beforeunload !== 'leave' && beforeunload !== 'stay') {
+            throw new ActError(`act.dialog.policy's beforeunload takes 'ask', 'leave' or 'stay' (got ${JSON.stringify(beforeunload)}).`)
+          }
+          if (promptText !== undefined && policy !== 'accept') {
+            throw new ActError(`promptText is the text prompts are accepted with: it needs act.dialog.policy('accept', { promptText }), not '${policy}'.`)
+          }
+          // A dialog waiting for the agent right now is answered by the new policy: that answer is
+          // this call's effect, reported like act.dialog.accept()'s.
+          const waiting = probe.dialogs.current()
+          if (waiting?.handling === 'agent') {
+            record.checkpoint = probe.watch.checkpoint()
+            record.before = probe.lastFullObservation ?? undefined
+          }
+          const settings = deps.setDialogPolicy(policy === 'ask' ? 'pending' : policy, options)
+          const confirmPrompt =
+            settings.policy === 'pending'
+              ? 'ask'
+              : settings.policy === 'accept'
+                ? `accept${settings.promptText !== undefined ? ` (prompts with "${settings.promptText}")` : ' (prompts with their default)'}`
+                : 'dismiss'
+          record.detail = `confirm/prompt: ${confirmPrompt} · beforeunload: ${settings.beforeunload} · alert: acknowledged — on every tab from now on`
+          if (waiting?.handling === 'agent' && probe.dialogs.current()?.handling !== 'agent') {
+            record.dispatched = true
+            record.notes.push(`answers the ${dialogLabel(waiting)} dialog that is open now`)
+          }
         }),
     },
   }
@@ -3405,14 +4038,20 @@ export interface ActionReportInput {
   /** Why the page could not be observed after the action. */
   afterError?: string
   diff: ObservationDiff | null
-  /** Tabs this page opened during the call, with their index in observe()'s TABS list (null: closed again). */
-  newTabs: Array<{ title: string; url: string; index: number | null }>
+  /**
+   * Tabs this page opened during the call, with their index in observe()'s TABS list (null: closed
+   * again) and how Chrome opened them (`opened`: a popup window or a tab; undefined when the opener
+   * reported no request for it).
+   */
+  newTabs: Array<{ title: string; url: string; index: number | null; opened?: { popup: boolean; features: string[] } }>
   /** Download lines, formatted by the executor. */
   downloads: string[]
   /** File dialog lines (each one opened since the last report, and why a tab could not hold them back), formatted by the executor. */
   fileDialogs: string[]
   /** Did anything change (measured by the executor)? Undefined when it could not be measured. */
   changed?: boolean
+  /** Layout-shift lines, formatted by the executor (perf.ts layoutShiftLines). */
+  shifts?: string[]
   maxChars?: number
 }
 
@@ -3438,25 +4077,39 @@ function recordLine(record: ActionRecord): string {
     return `… ${actionLabel(record)}\n        STILL RUNNING when this call ended — it did not finish; do not assume it took effect`
   }
   const head = `${record.ok ? '✓' : '✗'} ${actionLabel(record)}`
-  return record.ok ? head : `${head}\n        FAILED: ${record.error}`
+  if (!record.ok) return `${head}\n        FAILED: ${record.error}`
+  return record.closedTab ? `${head} — the tab closed (the page closed itself in response)` : head
 }
 
-/** Identical new items appearing together: the double-post symptom. */
-function duplicateWarnings(after: Observation | null): string[] {
+/**
+ * Identical new items appearing together in one container (a list, a log, a table): the
+ * double-post symptom. "New" is what the diff found added once re-renders are paired off (a table
+ * re-rendered with the same rows added nothing); without a diff, what the model was not shown yet.
+ * Three tables each showing "(empty)" are three containers, not a duplicate.
+ */
+function duplicateWarnings(after: Observation | null, diff: ObservationDiff | null): string[] {
   if (!after) return []
-  const counts = new Map<string, number>()
-  for (const block of after.text) {
-    if (!block.isNew || block.text.length < 4) continue
-    const key = `${block.role} "${block.text}"`
-    counts.set(key, (counts.get(key) ?? 0) + 1)
+  const texts: TextBlock[] = diff ? diff.textAdded : after.text.filter((block) => block.isNew)
+  const elements: ObservedElement[] = diff ? diff.added : after.elements.filter((element) => element.isNew)
+  const counts = new Map<string, { what: string; container?: SemanticContainer; n: number }>()
+  const count = (what: string, container: SemanticContainer | undefined): void => {
+    const key = `${container?.key ?? ''}\u0000${what}`
+    const entry = counts.get(key)
+    if (entry) entry.n++
+    else counts.set(key, { what, ...(container ? { container } : {}), n: 1 })
   }
-  for (const element of after.elements) {
-    if (!element.isNew || !element.name || element.role === 'clickable') continue
+  for (const block of texts) {
+    if (block.text.length < 4) continue
+    count(`${block.role} "${block.text}"`, block.container)
+  }
+  for (const element of elements) {
+    if (!element.name || element.role === 'clickable') continue
     if (!['article', 'listitem', 'row', 'comment'].includes(element.role)) continue
-    const key = `${element.role} "${element.name}"`
-    counts.set(key, (counts.get(key) ?? 0) + 1)
+    count(`${element.role} "${element.name}"`, element.container)
   }
-  return [...counts.entries()].filter(([, n]) => n >= 2).map(([key, n]) => `⚠ possible duplicate: ${n} identical new ${key} appeared — was something submitted twice?`)
+  return [...counts.values()]
+    .filter(({ n }) => n >= 2)
+    .map(({ what, container, n }) => `⚠ possible duplicate: ${n} identical new ${what} appeared${container ? ` in ${container.label}` : ''} — was something submitted twice?`)
 }
 
 /** Console errors and LIVE announcements listed in full up to this many (latest first kept), with a count of the rest. */
@@ -3464,7 +4117,12 @@ const REPORT_LIST_MAX = 5
 const LIVE_LIST_MAX = 8
 
 function settleLine(settle: SettleResult): string {
-  if (settle.settled) return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet`
+  // What the page showed as loading while the settle step waited (skeletons, an aria-busy region, a
+  // spinner): the reason it took that long, and what came before the content now shown.
+  const meanwhile = settle.busyWhileSettling?.length
+    ? `\n        busy while it settled, gone now: ${settle.busyWhileSettling.map((seen) => `${seen.label} (seen ${(seen.seenMs / 1000).toFixed(1)}s)`).join(' · ')}`
+    : ''
+  if (settle.settled) return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet${meanwhile}`
   if (settle.reason === 'js-dialog') return 'NOT SETTLED — a native dialog is blocking the page'
   if (settle.reason === 'page-closed') return 'NOT SETTLED — the page was closed'
   const pending = settle.pendingRequests.slice(0, 4).map((r) => `${r.method} ${shortUrl(r.url)} (${(r.ageMs / 1000).toFixed(1)}s)`)
@@ -3473,7 +4131,7 @@ function settleLine(settle: SettleResult): string {
     pending.length ? `waiting on ${pending.join(', ')}${more > 0 ? ` +${more} more` : ''}` : '',
     settle.domChangingIn ? `content still changing in ${settle.domChangingIn}` : '',
   ].filter(Boolean)
-  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${parts.length ? ` — ${parts.join(' · ')}` : ''}`
+  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${parts.length ? ` — ${parts.join(' · ')}` : ''}${meanwhile}`
 }
 
 function navLine(nav: WatchEvents['navigations'][number]): string {
@@ -3512,23 +4170,34 @@ export function renderActionReport(input: ActionReportInput): string {
   if (events) {
     for (const nav of events.navigations) lines.push(navLine(nav))
     for (const dialog of events.dialogs) {
-      if (!dialog.outcome) {
-        lines.push(`DIALOG  ${dialog.type}("${dialog.message}") is OPEN and blocks the page → act.dialog.accept() or act.dialog.dismiss()`)
+      if (dialog.closedAt === undefined) {
+        lines.push(
+          dialog.handling === 'agent'
+            ? `DIALOG  ${dialogLabel(dialog)} is OPEN and blocks the page → act.dialog.accept() or act.dialog.dismiss()`
+            : `DIALOG  ${dialogLabel(dialog)} is open and being answered by ${dialog.type === 'alert' ? 'the session (alerts are acknowledged)' : 'the session dialog policy'}`,
+        )
       } else {
-        lines.push(`DIALOG  ${dialog.type}("${dialog.message}") was shown and ${dialog.outcome === 'auto-accepted' ? 'accepted automatically' : dialog.outcome}`)
+        lines.push(`DIALOG  ${dialogLabel(dialog)} — ${dialogAnswerText(dialog)}`)
       }
     }
   }
   for (const tab of input.newTabs) {
+    const what = !tab.opened
+      ? 'a new tab or window opened by this page (this tab reported no window.open or link request for it, so which of the two is unknown)'
+      : tab.opened.popup
+        ? `a popup window opened by this page (window.open with window features ${tab.opened.features.join(', ') || 'none'})`
+        : 'a new tab opened by this page'
+    const label = tab.opened?.popup ? 'POPUP  ' : 'TAB    '
     lines.push(
       tab.index === null
-        ? `TAB     a new tab opened by this page and closed again: "${tab.title}" ${tab.url}`
-        : `TAB     a new tab opened by this page: "${tab.title}" ${tab.url} — act.switchTab(${tab.index}) to work in it`,
+        ? `${label} ${what}, closed again: "${tab.title}" ${tab.url}`
+        : `${label} ${what}: "${tab.title}" ${tab.url} — act.switchTab(${tab.index}) to work in it`,
     )
   }
+  lines.push(...(input.after?.tabNotes ?? []))
   for (const download of input.downloads) lines.push(`DOWNLOAD ${download}`)
   for (const dialog of input.fileDialogs) lines.push(`FILE DIALOG ${dialog}`)
-  lines.push(...duplicateWarnings(input.after))
+  lines.push(...duplicateWarnings(input.after, input.diff))
 
   // Only what a person would read as "still working". Content that changed a moment ago is the
   // settle step's business (and is in SETTLED / NOT SETTLED above), not a reason to wait.
@@ -3536,6 +4205,8 @@ export function renderActionReport(input: ActionReportInput): string {
   if (busy.length) {
     lines.push(`BUSY    ${busy.map((s) => s.label).join(' · ')} — the app is still working; act.waitForIdle() before the next action`)
   }
+  // Content that moved by itself (layout shifts without recent input), placed among the refs.
+  for (const shift of input.shifts ?? []) lines.push(`SHIFT   ${shift}`)
 
   if (events) {
     const errors: string[] = []

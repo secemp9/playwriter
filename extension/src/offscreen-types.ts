@@ -53,14 +53,22 @@ export interface OffscreenCopyToClipboardMessage {
   text: string
 }
 
+/** Read the clipboard's text (the sandbox's `clipboard.read()`); the offscreen document never writes it for this. */
+export interface OffscreenReadClipboardMessage {
+  action: 'readClipboard'
+}
+
 export type OffscreenMessage =
   | OffscreenStartRecordingMessage
   | OffscreenStopRecordingMessage
   | OffscreenIsRecordingMessage
   | OffscreenCancelRecordingMessage
   | OffscreenCopyToClipboardMessage
+  | OffscreenReadClipboardMessage
 
 export type OffscreenCopyToClipboardResult = { success: true } | { success: false; error: string }
+
+export type OffscreenReadClipboardResult = { success: true; text: string } | { success: false; error: string }
 
 // Offscreen document response types
 export type OffscreenStartRecordingResult =

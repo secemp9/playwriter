@@ -544,6 +544,8 @@ describe('checkPolicy by bindings (human mode)', () => {
     { name: 'one action through an alias', code: 'const { click } = act\nawait click(3)\nawait act.waitForIdle()' },
     { name: 'act.spaNavigate', code: "await act.spaNavigate('/cart')" },
     { name: 'Promise.all of act waits', code: 'await Promise.all([act.waitForIdle()])' },
+    // audit() reads the page in its frames' CDP isolated worlds: a read, however often it runs, next to one action.
+    { name: 'audit() as a read beside one action', code: "await audit()\nawait audit({ ref: 4, rules: ['color-contrast'] })\nawait act.click(3)" },
   ]
   for (const testCase of allowed) {
     it(`allows: ${testCase.name}`, () => {

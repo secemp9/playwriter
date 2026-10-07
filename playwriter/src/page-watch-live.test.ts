@@ -511,7 +511,7 @@ describe('settle', () => {
     expect(finalText).toBe('Reply complete.')
     // 2s of streaming + 1.5s of quiet.
     expect(result.waitedMs).toBeGreaterThanOrEqual(3300)
-    expect(result.busy.filter((s) => s.strength === 'strong')).toEqual([])
+    expect(result.busy?.filter((s) => s.strength === 'strong')).toEqual([])
     await page.close()
   })
 
@@ -522,7 +522,9 @@ describe('settle', () => {
     expect(result.reason).toBe('timeout')
     expect(result.domChangingIn).toMatch(/chunk \d+/)
     expect(result.msSinceLastContentMutation).toBeLessThan(400)
-    expect(result.busy.some((s) => s.kind === 'dom-streaming' && s.strength === 'strong')).toBe(true)
+    // settle leaves busy signals to the reader after it: read now, the stream is still running.
+    expect(result.busy).toBeUndefined()
+    expect((await watch.busySignals()).some((s) => s.kind === 'dom-streaming' && s.strength === 'strong')).toBe(true)
     await page.close()
   })
 
@@ -534,7 +536,7 @@ describe('settle', () => {
       const busy = await watch.settle({ since: cp, timeoutMs: 1000, domQuietMs: 1000 })
       expect(busy.reason).toBe('timeout')
       expect(busy.msSinceLastContentMutation).toBeLessThan(400)
-      expect(busy.busy.some((s) => s.kind === 'dom-streaming' && s.strength === 'strong')).toBe(true)
+      expect((await watch.busySignals({ since: cp })).some((s) => s.kind === 'dom-streaming' && s.strength === 'strong')).toBe(true)
       const idle = await watch.waitForIdle({ since: cp, timeoutMs: 15000 })
       expect(idle).toMatchObject({ settled: true, reason: 'quiet' })
       expect(await page.getAttribute('chat-reply', 'data-done')).toBe('')
@@ -546,12 +548,8 @@ describe('settle', () => {
 describe('busy signals', () => {
   it('words and a progressbar standing at 45% are not "busy"', async () => {
     const { page, watch } = await openWatched('/calm')
-    const signals = await watch.busySignals()
-    expect(signals.filter((s) => s.strength === 'strong')).toEqual([])
-    expect(signals).toEqual([
-      { strength: 'weak', kind: 'progressbar', label: 'progressbar "Course" 45%' },
-      { strength: 'weak', kind: 'progressbar', label: 'progressbar 45%' },
-    ])
+    // A determinate bar standing still says nothing is working: no signal at all, not even a weak one.
+    expect(await watch.busySignals()).toEqual([])
     const idle = await watch.waitForIdle({ timeoutMs: 5000, quietMs: 300, networkQuietMs: 300 })
     expect(idle).toMatchObject({ settled: true, reason: 'quiet' })
     await page.close()
@@ -561,7 +559,7 @@ describe('busy signals', () => {
     const { page, watch } = await openWatched('/busy')
     const strong = (await watch.busySignals()).filter((s) => s.strength === 'strong')
     expect(strong).toEqual([
-      { strength: 'strong', kind: 'aria-busy', label: 'region "Search results" is marked busy' },
+      { strength: 'strong', kind: 'aria-busy', label: 'region "Search results" [aria-busy]' },
       { strength: 'strong', kind: 'progressbar', label: 'progressbar "Upload" (indeterminate)' },
       { strength: 'strong', kind: 'spinner', label: 'div.spinner "Loading results" (animation spin) repeating endlessly' },
     ])
@@ -575,7 +573,7 @@ describe('busy signals', () => {
     })
     const idle = await watch.waitForIdle({ timeoutMs: 1200, quietMs: 200, networkQuietMs: 200 })
     expect(idle.reason).toBe('timeout')
-    expect(idle.busy.some((s) => s.kind === 'aria-busy' && s.strength === 'strong')).toBe(true)
+    expect(idle.busy?.some((s) => s.kind === 'aria-busy' && s.strength === 'strong')).toBe(true)
     await page.close()
   })
 
@@ -604,7 +602,10 @@ describe('busy signals', () => {
     await expect
       .poll(async () => (await watch.busySignals({ since: cp })).find((s) => s.kind === 'progressbar'))
       .toEqual({ strength: 'strong', kind: 'progressbar', label: 'progressbar "Upload" 80% (advanced since the action)' })
-    expect((await watch.busySignals()).find((s) => s.kind === 'progressbar')).toEqual({ strength: 'weak', kind: 'progressbar', label: 'progressbar "Upload" 80%' })
+    // Without an action to measure from it is moving while it moved within the last 2 s; once it
+    // stops (at 80% here) it is no busy signal.
+    expect((await watch.busySignals()).find((s) => s.kind === 'progressbar')).toEqual({ strength: 'strong', kind: 'progressbar', label: 'progressbar "Upload" 80% (moving)' })
+    await expect.poll(async () => (await watch.busySignals()).find((s) => s.kind === 'progressbar'), { timeout: 5000 }).toBeUndefined()
     await page.close()
   })
 })

@@ -1,4 +1,4 @@
-import { exec } from 'node:child_process'
+import { exec, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import http from 'node:http'
 import net from 'node:net'
@@ -79,6 +79,19 @@ const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'popup-relocation.test.ts': 19995,
   'relay-state.test.ts': 19996,
   'page-purity.test.ts': 19997,
+  'tabs-dialogs-relay.test.ts': 19781,
+  'act-buttons-relay.test.ts': 19787,
+  'page-storage-relay.test.ts': 19793,
+  'debugger-cut-relay.test.ts': 19799,
+  'webmcp-relay.test.ts': 19805,
+  'act-select-relay.test.ts': 19811,
+  'page-crash-relay.test.ts': 19817,
+  'queries-relay.test.ts': 19823,
+  'perf-relay.test.ts': 19842,
+  'workers-relay.test.ts': 19848,
+  'hidden-tab-relay.test.ts': 19854,
+  'speed-relay.test.ts': 19860,
+  'attach-race-relay.test.ts': 19866,
 })
 
 // Invariants (1) and (2), enforced at module load so a bad edit cannot reach a test run.
@@ -192,6 +205,7 @@ export async function setupTestContext({
   tempDirPrefix,
   toggleExtension = false,
   additionalExtensions = [],
+  chrome,
 }: {
   /**
    * Pass `import.meta.url`. The relay port is looked up from TEST_RELAY_PORTS, never supplied
@@ -203,6 +217,13 @@ export async function setupTestContext({
   toggleExtension?: boolean
   /** Additional extension paths to load alongside the main playwriter extension */
   additionalExtensions?: string[]
+  /**
+   * Run an installed Chrome (e.g. Google Chrome stable at /opt/google/chrome/chrome) instead of the
+   * bundled Chromium, with these features on. Branded Chrome ignores --load-extension since 137, so
+   * the extensions are loaded over the pipe with Extensions.loadUnpacked
+   * (needs --enable-unsafe-extension-debugging).
+   */
+  chrome?: { executablePath: string; features: string[] }
 }): Promise<TestContext> {
   const port = testRelayPort(suiteUrl)
   await killPortProcess({ port }).catch(() => {})
@@ -221,7 +242,8 @@ export async function setupTestContext({
   // made the download-events assertion in relay-core flip to all-false in a full run while
   // passing alone. Per-port files remove the sharing; TestContext hands the test the exact
   // logger so it can flush() before reading, which removes the 500ms buffer race too.
-  const logger = createFileLogger({ logFilePath: path.join(process.cwd(), 'tmp', `relay-server-${port}.log`) })
+  const relayLogPath = path.join(process.cwd(), 'tmp', `relay-server-${port}.log`)
+  const logger = createFileLogger({ logFilePath: relayLogPath })
   const cdpLogger = createCdpLogger({ logFilePath: path.join(process.cwd(), 'tmp', `cdp-${port}.jsonl`) })
   const relayServer = await startPlayWriterCDPRelayServer({ port, logger, cdpLogger })
 
@@ -230,24 +252,51 @@ export async function setupTestContext({
   const allExtensionPaths = [extensionPath, ...additionalExtensions].join(',')
 
   const { chromium } = await import('@xmorse/playwright-core')
-  const browserContext = await chromium.launchPersistentContext(userDataDir, {
-    channel: 'chromium',
-    headless: !process.env.HEADFUL,
-    colorScheme: 'dark',
-    args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`],
-  })
+  const browserContext = chrome
+    ? await chromium.launchPersistentContext(userDataDir, {
+        executablePath: chrome.executablePath,
+        headless: !process.env.HEADFUL,
+        colorScheme: 'dark',
+        ignoreDefaultArgs: ['--disable-extensions'],
+        args: ['--enable-unsafe-extension-debugging', ...(chrome.features.length > 0 ? [`--enable-features=${chrome.features.join(',')}`] : [])],
+      })
+    : await chromium.launchPersistentContext(userDataDir, {
+        channel: 'chromium',
+        headless: !process.env.HEADFUL,
+        colorScheme: 'dark',
+        args: [`--disable-extensions-except=${allExtensionPaths}`, `--load-extension=${allExtensionPaths}`],
+      })
+  if (chrome) {
+    const browser = browserContext.browser()
+    if (!browser) throw new Error('setupTestContext: the persistent context has no Browser to load extensions through')
+    const session = await browser.newBrowserCDPSession()
+    for (const extension of [extensionPath, ...additionalExtensions]) await session.send('Extensions.loadUnpacked', { path: extension })
+  }
 
   const serviceWorker = await getExtensionServiceWorker(browserContext)
 
   if (toggleExtension) {
     const page = await browserContext.newPage()
     await page.goto('about:blank')
-    await serviceWorker.evaluate(
+    // A toggle that did not connect leaves the test without its tab: the first client would get an
+    // auto-created background about:blank tab and run the whole file there, throttled. Fail here.
+    const notConnected = await serviceWorker.evaluate(
       async ([k, l]) => {
-        await globalThis.toggleExtensionForActiveTab(k, l)
+        const { isConnected, state } = await globalThis.toggleExtensionForActiveTab(k, l)
+        if (isConnected) return null
+        // The toggle records the tab it acted on as currentTabId.
+        const tabId = state.currentTabId
+        const tab = tabId === undefined ? undefined : state.tabs.get(tabId)
+        const tabText = tab ? `'${tab.state}'${tab.errorText ? ` (${tab.errorText})` : ''}` : 'not tracked by the extension'
+        return `tab ${tabId} is ${tabText}; connection '${state.connectionState}'${state.errorText ? ` (${state.errorText})` : ''}`
       },
       [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
     )
+    if (notConnected !== null) {
+      await browserContext.close()
+      await relayServer.close()
+      throw new Error(`setupTestContext: toggleExtension did not connect the tab: ${notConnected}. Relay log: ${relayLogPath}`)
+    }
   }
 
   return { browserContext, userDataDir, relayServer, port, logger, cdpLogger }
@@ -482,6 +531,88 @@ export async function safeCloseCDPBrowser(
   // This gives Playwright's messageWrap time to process pending CDP responses
   await new Promise((r) => setTimeout(r, drainDelayMs))
   await browser.close()
+}
+
+/** A Chrome a test started itself and reaches over Chrome's own remote debugging. */
+export interface SpawnedChrome {
+  /** The browser's CDP WebSocket URL. */
+  wsEndpoint: string
+  /**
+   * Ends the browser AND its helper processes (renderer, GPU, utility). They share the browser's
+   * process group and go on writing into the profile for a moment after the browser process exits,
+   * so removing the profile right after only the browser's exit failed with ENOTEMPTY.
+   */
+  stop(): Promise<void>
+}
+
+function isNoSuchProcess(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ESRCH'
+}
+
+function processGroupAlive(groupId: number): boolean {
+  try {
+    process.kill(-groupId, 0)
+    return true
+  } catch (error) {
+    if (isNoSuchProcess(error)) return false
+    throw error
+  }
+}
+
+/**
+ * Starts `executable` headless on `profileDir`, as the leader of its own process group, with `args`
+ * added before the start page. Resolves once Chrome prints its DevTools URL.
+ */
+export async function spawnDebuggableChrome({
+  executable,
+  profileDir,
+  args = [],
+}: {
+  executable: string
+  profileDir: string
+  args?: string[]
+}): Promise<SpawnedChrome> {
+  const child = spawn(
+    executable,
+    ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profileDir}`, ...args, 'about:blank'],
+    { stdio: ['ignore', 'ignore', 'pipe'], detached: true },
+  )
+  const exited = Promise.withResolvers<void>()
+  child.once('exit', () => exited.resolve())
+  const endpoint = Promise.withResolvers<string>()
+  let output = ''
+  child.stderr?.on('data', (chunk: Buffer) => {
+    output += chunk.toString()
+    const match = /DevTools listening on (ws:\/\/\S+)/.exec(output)
+    if (match) endpoint.resolve(match[1]!)
+  })
+  child.once('exit', (code) => endpoint.reject(new Error(`Chrome exited (${code}) before listening:\n${output}`)))
+  child.once('error', (error) => {
+    endpoint.reject(error)
+    exited.resolve()
+  })
+  const stop = async (): Promise<void> => {
+    const groupId = child.pid
+    if (groupId === undefined) return
+    try {
+      process.kill(-groupId, 'SIGTERM')
+    } catch (error) {
+      if (!isNoSuchProcess(error)) throw error
+    }
+    await exited.promise
+    const deadline = Date.now() + 10_000
+    // Real timer: nothing signals that the last member of a process group exited; poll for it, bounded.
+    while (processGroupAlive(groupId)) {
+      if (Date.now() > deadline) throw new Error(`Chrome's helper processes (process group ${groupId}) still run 10 s after SIGTERM`)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  try {
+    return { wsEndpoint: await endpoint.promise, stop }
+  } catch (error) {
+    await stop()
+    throw error
+  }
 }
 
 /**

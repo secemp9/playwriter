@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign up · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  form { max-width: 560px; }
+  .pw-wrap { display: flex; gap: 6px; }
+  .pw-wrap input { flex: 1; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 14px; padding: 8px 14px 12px; }
+  legend { font-weight: 600; padding: 0 4px; }
+  fieldset label { font-weight: 400; margin-right: 14px; }
+  .hint { color: var(--muted); font-size: 0.9rem; }
+  .summary { border: 1px solid var(--danger); background: #fff6f6; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; }
+  .summary[hidden] { display: none; }
+  .success { border: 1px solid var(--ok); background: #f1fbf4; padding: 10px 14px; border-radius: 8px; }
+  .success:empty { display: none; }
+  form[aria-busy="true"] { opacity: 0.85; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Sign up</span></header>
+<main>
+  <h1>Create your account</h1>
+  <div id="error-summary" class="summary" role="alert" tabindex="-1" hidden></div>
+  <form id="signup" novalidate aria-labelledby="form-title">
+    <h2 id="form-title" class="sr-only">Sign-up form</h2>
+    <div class="field">
+      <label for="name">Full name</label>
+      <input id="name" name="name" type="text" autocomplete="name" required aria-required="true" aria-describedby="name-error">
+      <span id="name-error" class="error" hidden></span>
+    </div>
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required aria-required="true" aria-describedby="email-error">
+      <span id="email-error" class="error" hidden></span>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <div class="pw-wrap">
+        <input id="password" name="password" type="password" autocomplete="new-password" required aria-required="true" aria-describedby="password-hint password-error">
+        <button type="button" id="toggle-password" class="icon" aria-label="Show password" aria-pressed="false" aria-controls="password">
+          <svg id="eye-open" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 5C6.5 5 2.7 9.3 1.5 12c1.2 2.7 5 7 10.5 7s9.3-4.3 10.5-7C21.3 9.3 17.5 5 12 5zm0 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8z" fill="currentColor"/></svg>
+          <svg id="eye-closed" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false" hidden><path d="M2 4.3 3.3 3l17.7 17.7-1.3 1.3-3.2-3.2A11.6 11.6 0 0 1 12 19C6.5 19 2.7 14.7 1.5 12a13 13 0 0 1 4-4.9zM12 5c5.5 0 9.3 4.3 10.5 7a13.4 13.4 0 0 1-2.9 4l-3.3-3.3A4 4 0 0 0 11.3 8L8.6 5.4A11 11 0 0 1 12 5z" fill="currentColor"/></svg>
+        </button>
+      </div>
+      <span id="password-hint" class="hint">At least 8 characters.</span>
+      <span id="password-error" class="error" hidden></span>
+    </div>
+    <div class="field">
+      <label for="country">Country</label>
+      <select id="country" name="country" required aria-required="true" aria-describedby="country-error">
+        <option value="">Select a country</option>
+      </select>
+      <span id="country-error" class="error" hidden></span>
+    </div>
+    <fieldset>
+      <legend>Plan</legend>
+      <label><input type="radio" name="plan" value="Free" checked> Free</label>
+      <label><input type="radio" name="plan" value="Pro"> Pro ($12/mo)</label>
+      <label><input type="radio" name="plan" value="Team"> Team ($49/mo)</label>
+    </fieldset>
+    <div class="field">
+      <label for="bio">Bio <span class="hint">(optional)</span></label>
+      <textarea id="bio" name="bio" rows="4"></textarea>
+      <span id="bio-count" class="hint">0 lines</span>
+    </div>
+    <div class="field">
+      <label for="avatar">Avatar <span class="hint">(optional image)</span></label>
+      <input id="avatar" name="avatar" type="file" accept="image/*" aria-describedby="avatar-info">
+      <span id="avatar-info" class="hint">No file selected</span>
+    </div>
+    <div class="field">
+      <label for="birthday">Birthday <span class="hint">(optional)</span></label>
+      <input id="birthday" name="birthday" type="date" min="1800-01-01" max="2026-12-31" aria-describedby="birthday-info">
+      <span id="birthday-info" class="hint">Not set</span>
+    </div>
+    <div class="field">
+      <label for="colour">Favourite colour</label>
+      <div class="row"><input id="colour" name="colour" type="color" value="#3366ff" aria-describedby="colour-info"><span id="colour-info" class="hint">Colour: #3366ff</span></div>
+    </div>
+    <div class="field">
+      <label for="volume">Notification volume</label>
+      <div class="row"><input id="volume" name="volume" type="range" min="0" max="100" step="1" value="50" aria-describedby="volume-info"><output id="volume-info" for="volume">Volume: 50</output></div>
+    </div>
+    <div class="field">
+      <label style="font-weight:400"><input id="terms" name="terms" type="checkbox"> I agree to the Terms of Service</label>
+    </div>
+    <button id="submit" class="primary" type="submit" disabled><span class="spinner" id="spinner" hidden aria-hidden="true"></span><span id="submit-label">Create account</span></button>
+  </form>
+  <div id="result" class="status" role="status" aria-live="polite"></div>
+  <div id="result-details" class="success"></div>
+</main>
+<script type="module">
+import { $, m, on, later, setText, tagLinks } from '/lab/common.js';
+
+const COUNTRIES = ['Afghanistan','Albania','Algeria','Andorra','Angola','Antigua and Barbuda','Argentina','Armenia','Australia','Austria','Azerbaijan','Bahamas','Bahrain','Bangladesh','Barbados','Belarus','Belgium','Belize','Benin','Bhutan','Bolivia','Bosnia and Herzegovina','Botswana','Brazil','Brunei','Bulgaria','Burkina Faso','Burundi','Cabo Verde','Cambodia','Cameroon','Canada','Central African Republic','Chad','Chile','China','Colombia','Comoros','Congo','Costa Rica','Côte d’Ivoire','Croatia','Cuba','Cyprus','Czechia','Democratic Republic of the Congo','Denmark','Djibouti','Dominica','Dominican Republic','Ecuador','Egypt','El Salvador','Equatorial Guinea','Eritrea','Estonia','Eswatini','Ethiopia','Fiji','Finland','France','Gabon','Gambia','Georgia','Germany','Ghana','Greece','Grenada','Guatemala','Guinea','Guinea-Bissau','Guyana','Haiti','Honduras','Hong Kong','Hungary','Iceland','India','Indonesia','Iran','Iraq','Ireland','Israel','Italy','Jamaica','Japan','Jordan','Kazakhstan','Kenya','Kiribati','Kosovo','Kuwait','Kyrgyzstan','Laos','Latvia','Lebanon','Lesotho','Liberia','Libya','Liechtenstein','Lithuania','Luxembourg','Madagascar','Malawi','Malaysia','Maldives','Mali','Malta','Marshall Islands','Mauritania','Mauritius','Mexico','Micronesia','Moldova','Monaco','Mongolia','Montenegro','Morocco','Mozambique','Myanmar','Namibia','Nauru','Nepal','Netherlands','New Zealand','Nicaragua','Niger','Nigeria','North Korea','North Macedonia','Norway','Oman','Pakistan','Palau','Palestine','Panama','Papua New Guinea','Paraguay','Peru','Philippines','Poland','Portugal','Puerto Rico','Qatar','Romania','Russia','Rwanda','Saint Kitts and Nevis','Saint Lucia','Saint Vincent and the Grenadines','Samoa','San Marino','São Tomé and Príncipe','Saudi Arabia','Senegal','Serbia','Seychelles','Sierra Leone','Singapore','Slovakia','Slovenia','Solomon Islands','Somalia','South Africa','South Korea','South Sudan','Spain','Sri Lanka','Sudan','Suriname','Sweden','Switzerland','Syria','Taiwan','Tajikistan','Tanzania','Thailand','Timor-Leste','Togo','Tonga','Trinidad and Tobago','Tunisia','Turkey','Turkmenistan','Tuvalu','Uganda','Ukraine','United Arab Emirates','United Kingdom','United States','Uruguay','Uzbekistan','Vanuatu','Vatican City','Venezuela','Vietnam','Yemen','Zambia','Zimbabwe'];
+
+const form = $('#signup');
+const submit = $('#submit');
+const terms = $('#terms');
+const email = $('#email');
+const password = $('#password');
+const summary = $('#error-summary');
+let busy = false;
+
+m(() => {
+  const select = $('#country');
+  for (const c of COUNTRIES) {
+    const o = document.createElement('option');
+    o.value = c;
+    o.textContent = c;
+    select.append(o);
+  }
+});
+
+function setError(id, msg) {
+  const input = $('#' + id);
+  const err = $('#' + id + '-error');
+  if (msg) {
+    input.setAttribute('aria-invalid', 'true');
+    err.textContent = msg;
+    err.hidden = false;
+  } else if (input.hasAttribute('aria-invalid')) {
+    input.removeAttribute('aria-invalid');
+    err.textContent = '';
+    err.hidden = true;
+  }
+}
+const emailError = (v) => {
+  const s = v.trim();
+  if (!s) return 'Email is required';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return 'Enter a valid email address, like name@example.com';
+  return '';
+};
+const errors = {
+  name: () => ($('#name').value.trim() ? '' : 'Enter your full name'),
+  email: () => emailError(email.value),
+  password: () => (!password.value ? 'Password is required' : password.value.length < 8 ? 'Password must be at least 8 characters' : ''),
+  country: () => ($('#country').value ? '' : 'Choose your country'),
+};
+
+on(email, 'blur', () => setError('email', emailError(email.value)));
+on(email, 'input', () => { if (email.hasAttribute('aria-invalid') && !emailError(email.value)) setError('email', ''); });
+for (const id of ['name', 'password', 'country']) {
+  on($('#' + id), id === 'country' ? 'change' : 'input', () => { if ($('#' + id).hasAttribute('aria-invalid') && !errors[id]()) setError(id, ''); });
+}
+
+on(terms, 'change', () => { if (!busy) submit.disabled = !terms.checked; });
+
+on($('#toggle-password'), 'click', () => {
+  const show = password.type === 'password';
+  const btn = $('#toggle-password');
+  password.type = show ? 'text' : 'password';
+  btn.setAttribute('aria-pressed', String(show));
+  btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+  $('#eye-open').toggleAttribute('hidden', show);
+  $('#eye-closed').toggleAttribute('hidden', !show);
+});
+
+on($('#bio'), 'input', () => {
+  const v = $('#bio').value;
+  const lines = v ? v.split('\n').length : 0;
+  setText($('#bio-count'), lines === 1 ? '1 line' : lines + ' lines');
+});
+on($('#avatar'), 'change', () => {
+  const f = $('#avatar').files[0];
+  setText($('#avatar-info'), f ? `Selected: ${f.name} (${f.size} bytes)` : 'No file selected');
+});
+on($('#birthday'), 'input', () => setText($('#birthday-info'), $('#birthday').value ? 'Birthday: ' + $('#birthday').value : 'Not set'));
+on($('#colour'), 'input', () => setText($('#colour-info'), 'Colour: ' + $('#colour').value));
+on($('#volume'), 'input', () => setText($('#volume-info'), 'Volume: ' + $('#volume').value));
+
+on(form, 'submit', (e) => {
+  e.preventDefault();
+  if (busy || !terms.checked) return;
+  setText($('#result'), '');
+  setText($('#result-details'), '');
+  const failed = [];
+  for (const id of Object.keys(errors)) {
+    const msg = errors[id]();
+    setError(id, msg);
+    if (msg) failed.push(id);
+  }
+  if (failed.length) {
+    summary.textContent = `Please fix ${failed.length} ${failed.length === 1 ? 'error' : 'errors'}`;
+    summary.hidden = false;
+    $('#' + failed[0]).focus();
+    return;
+  }
+  summary.textContent = '';
+  summary.hidden = true;
+  busy = true;
+  submit.disabled = true;
+  form.setAttribute('aria-busy', 'true');
+  $('#spinner').hidden = false;
+  $('#submit-label').textContent = 'Processing…';
+  const name = $('#name').value.trim();
+  const plan = form.elements.plan.value;
+  const country = $('#country').value;
+  const mail = email.value.trim();
+  later(1500, () => {
+    busy = false;
+    form.removeAttribute('aria-busy');
+    $('#spinner').hidden = true;
+    $('#submit-label').textContent = 'Create account';
+    submit.disabled = !terms.checked;
+    $('#result').textContent = `Account created for ${name}`;
+    $('#result-details').textContent = `Plan: ${plan} · Country: ${country} · Email: ${mail}`;
+  });
+});
+
+tagLinks();
+</script>
+</body>
+</html>

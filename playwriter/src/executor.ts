@@ -16,7 +16,7 @@ import vm from 'node:vm'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
 import * as acorn from 'acorn'
-import { createSmartDiff } from './diff-utils.js'
+import { SnapshotRevisions } from './snapshot-delta.js'
 import { getCdpUrl, parseRelayHost, sleep } from './utils.js'
 import type { Workspace } from './workspace-key.js'
 import { getExtensionOutdatedWarning, getExtensionStaleError } from './relay-client.js'
@@ -60,6 +60,7 @@ import {
 import { ScopedFS } from './scoped-fs.js'
 import { getAriaSnapshot, resizeImageForAgent, DEFAULT_SNAPSHOT_FORMAT, type SnapshotFormat } from './aria-snapshot.js'
 import { screenshotWithAccessibilityLabels, type ScreenshotResult } from './labelled-screenshot.js'
+import { takeScreenshot, diffScreenshot, BEYOND_VIEWPORT_EVENTS, type ScreenshotDeps } from './page-screenshot.js'
 import { createGhostBrowserChrome, type GhostBrowserCommandResult } from './ghost-browser.js'
 export type { SnapshotFormat }
 import { getCleanHTML, type GetCleanHTMLOptions, type HtmlDiffStore } from './clean-html.js'
@@ -71,6 +72,7 @@ import {
   type MarkdownDiffStore,
 } from './page-markdown.js'
 import { createRecordingApi } from './screen-recording.js'
+import { crashOf, crashedLine, replaceCrashedPage, watchForCrash } from './page-crash.js'
 import { startCdpScreencast, type CdpScreencastHandle, type CdpScreencastOptions, type InputAction } from './cdp-screencast.js'
 import { createDemoVideo } from './ffmpeg.js'
 import { type GhostCursorClientOptions } from './ghost-cursor.js'
@@ -79,6 +81,7 @@ import { createHumanMouseApi, type HumanClickOptions, type HumanMouseApi, type H
 import { formatInputLabel } from './cdp-screencast.js'
 import { ModelFacingError, type PolicyMode, type SettleResult, type WatchCheckpoint, type WatchEvents } from './probe-types.js'
 import { PageProbes, renderLocatedNode, type PageProbe } from './page-probe.js'
+import { CUT_WAIT_MS, DebuggerCutAdoption, type ClosedPageVerdict } from './debugger-cut-adoption.js'
 import {
   renderObservation,
   renderObservationDiff,
@@ -87,17 +90,37 @@ import {
   type Observation,
   type ObserveOptions,
 } from './page-observe.js'
-import { withDeadline } from './isolated-world.js'
+import { PageUnresponsiveError, withDeadline } from './isolated-world.js'
+import { hiddenTabNote, unresponsiveDiagnosis, type TabVisibility } from './tab-state.js'
+import { parseTabVisibilityStatus, tabIsHidden } from './tab-visibility.js'
 import { analyzeCode, checkPolicy, type CodeAnalysis } from './code-policy.js'
 import { explainElement, renderExplanation } from './element-explain.js'
 import { ActError, BLOCKING_BUSY_KINDS, createActApi, isBlankUrl, renderActionReport, type ActionRecord } from './human-actions.js'
+import { createWebMcpApi } from './webmcp.js'
 import { refElementTarget, resolveElement, type ElementTarget, type ResolvedElement } from './element-resolve.js'
 import { chooserOpener, describeOpener, type ChooserWindow } from './file-chooser-gate.js'
 import { outgoingCallsOf, outgoingGuardsOf, openingOwnCdpSession, type OutgoingCallGuard, type OutgoingCallListener } from './playwright-client-hooks.js'
 import { callEffect, isRefusedEffect, refusalFor, unclassifiedRefusal } from './playwright-call-effects.js'
 import { readPage } from './read-page.js'
+import { runAudit, type AuditReport } from './page-audit.js'
+import { parseQuery, queryRef, runQuery, type QueryResult } from './page-query.js'
+import { createStorageGlobals } from './page-storage.js'
 import { SessionDownloads, jailedTarget, type SessionDownload } from './session-downloads.js'
+import { requestDetail, writeHar } from './network-detail.js'
+import {
+  contextOptionsFor,
+  copyDownloadsInto,
+  describeNewBrowser,
+  launchKey,
+  launchNewBrowser,
+  planNewBrowser,
+  type LaunchedNewBrowser,
+  type NewBrowserPlan,
+} from './new-browser.js'
+import type { NewBrowserOptions } from './new-browser-options.js'
 import { parseRelayDownloadStatus, type RelayDownloadStatus } from './download-file.js'
+import { createPerfGlobals, layoutShiftLines } from './perf.js'
+import { createReactGlobals } from './react-tree.js'
 
 
 const __filename = fileURLToPath(import.meta.url)
@@ -400,7 +423,9 @@ const WEBSOCKET_DATA_OPCODES: ReadonlySet<number> = new Set([1, 2])
  * The CDP commands human-mode code may send through getCDPSession(): reads only. Input, navigation,
  * script evaluation and every state change go through act.* (human pointer path, busy and cover
  * checks, one action per call, a report). `Accessibility.disable` is not a read and would switch the
- * domain off for the probes sharing this session.
+ * domain off for the probes sharing this session. The Performance, Profiler, Tracing and IO commands
+ * measure the renderer and change nothing the page can see (perf.ts sends the same ones); their
+ * `*.disable` stays refused on the shared session.
  */
 const READ_ONLY_CDP_COMMANDS: Record<string, true> = {
   'DOM.describeNode': true,
@@ -411,6 +436,17 @@ const READ_ONLY_CDP_COMMANDS: Record<string, true> = {
   'Page.getNavigationHistory': true,
   'Page.captureScreenshot': true,
   'Accessibility.enable': true,
+  'Performance.enable': true,
+  'Performance.getMetrics': true,
+  'Profiler.enable': true,
+  'Profiler.setSamplingInterval': true,
+  'Profiler.start': true,
+  'Profiler.stop': true,
+  'Tracing.start': true,
+  'Tracing.end': true,
+  'Tracing.getCategories': true,
+  'IO.read': true,
+  'IO.close': true,
 }
 const READ_ONLY_CDP_PREFIXES: readonly string[] = ['DOM.get', 'CSS.get', 'Accessibility.get', 'Accessibility.query']
 
@@ -537,6 +573,9 @@ const executeContext = new AsyncLocalStorage<ExecuteRun>()
 /** Set while an act.* method runs: act's own Playwright calls are not raw input from the code. */
 const insideAct = new AsyncLocalStorage<true>()
 
+/** How long a read that failed on a closing controlled tab waits for that tab's close event before giving up on it. */
+const CLOSE_EVENT_WAIT_MS = 1000
+
 /** `api` with every method (and every method of its nested objects, like `act.dialog`) running inside {@link insideAct}. */
 function markedAsAct<T extends object>(api: T): T {
   return new Proxy(api, {
@@ -625,10 +664,20 @@ class ReadOnlyCdpSession implements ICDPSession {
       throw new ActError(
         `Refused (human mode): getCDPSession().send('${method}') is not a read. In human mode raw CDP may only read ` +
           '(DOM.get*, DOM.describeNode, Accessibility.*, DOMSnapshot.captureSnapshot, CSS.get*, Network.getResponseBody, ' +
-          'Page.getFrameTree/getLayoutMetrics/getNavigationHistory/captureScreenshot). Input, navigation and script go ' +
+          'Page.getFrameTree/getLayoutMetrics/getNavigationHistory/captureScreenshot, Performance.enable/getMetrics, ' +
+          'Profiler.enable/setSamplingInterval/start/stop, Tracing.start/end/getCategories, IO.read/close — perf.* wraps those). Input, navigation and script go ' +
           'through act.* — act.click(ref), act.press(key), act.fill(ref, text), act.open(url, { reason }) — which move ' +
           'like a person and report what happened; readPage(fn) reads the page. Raw CDP that changes the page needs debug ' +
           'mode (ask the user).',
+      )
+    }
+    // Measured (page-screenshot.ts): captureBeyondViewport resizes the window while it shoots, and a clip
+    // does too in a headed window with an emulated viewport; the page gets resize events either way.
+    if (method === 'Page.captureScreenshot' && typeof params === 'object' && params !== null && (('captureBeyondViewport' in params && params.captureBeyondViewport) || 'clip' in params)) {
+      throw new ActError(
+        `Refused (human mode): Page.captureScreenshot with ${'clip' in params ? 'clip' : 'captureBeyondViewport'} changes the page while it shoots — ` +
+          `${BEYOND_VIEWPORT_EVENTS} (a clip does the same in a window with an emulated viewport). screenshot() takes the window, ` +
+          'screenshot({ ref: 12 }) one element cropped in Node, both without touching the page. It was not run.',
       )
     }
     return await this.#session.send(method, params)
@@ -663,6 +712,17 @@ export interface ExecutorLogger {
   error(...args: any[]): void
 }
 
+/** One headless browser of this process (PlaywrightExecutor.headlessBrowsers). */
+interface HeadlessBrowserEntry {
+  /** `launchKey` of the plan it was launched for. */
+  key: string
+  launching: Promise<LaunchedNewBrowser>
+  /** Set once launched. */
+  browser: Browser | null
+  /** The sessions whose contexts live in it. */
+  executors: Set<PlaywrightExecutor>
+}
+
 export interface CdpConfig {
   host?: string
   port?: number
@@ -674,8 +734,8 @@ export interface CdpConfig {
   workspace?: Workspace
   /** Direct CDP WebSocket URL — bypasses relay + extension, connects straight to Chrome */
   directCdpUrl?: string
-  /** Launch a headless Chrome via chromium.launch() instead of connecting to an existing one.
-   *  Uses direct Playwright browser management, no extension or relay CDP routing needed. */
+  /** Launch a new browser (new-browser.ts: the installed Google Chrome, presented as a person's Chrome)
+   *  instead of connecting to an existing one. Its options: `planNewBrowser()` before the first connect. */
   headless?: boolean
 }
 
@@ -1099,7 +1159,8 @@ export class PlaywrightExecutor {
   // When addBrowserLog shifts old entries (cap at MAX_LOGS_PER_PAGE), cursors
   // are decremented so they stay in sync with the array.
   private pageLogCursor: Map<Page, number> = new Map()
-  private lastSnapshots: WeakMap<Page, Map<string, string>> = new WeakMap()
+  /** The revisions of every snapshot() scope: what `snapshot({ diff: true })` compares against. */
+  private snapshotRevisions = new SnapshotRevisions()
   /**
    * Diff baselines for the other two readers, held HERE rather than in their modules.
    *
@@ -1154,9 +1215,21 @@ export class PlaywrightExecutor {
   private pagesWithListeners = new WeakSet<Page>()
   /** Per-page state of the observe/act layer: refs, journal, dialogs, last observation. */
   private probes: PageProbes
+  /** Over the relay: the closed controlled page whose tab Chrome may only have taken the debugger off (debugger-cut.ts). */
+  private readonly debuggerCuts: DebuggerCutAdoption
+  /** DEBUGGER CUT lines for the top of this call's output (debugger-cut.ts). */
+  private readonly cutNotices: string[] = []
+  /** Calls already told their tab is still cut. */
+  private readonly runsToldStillCut = new WeakSet<ExecuteRun>()
+  /** Controlled pages that closed and were replaced (replaceClosedPage): a sandbox `page` still holding one follows the replacement. */
+  private readonly replacedPages = new WeakSet<Page>()
   /** human (default) or debug — see `PolicyMode`. Fixed per session by whoever created it. */
   private policy: PolicyMode
   private suppressPageCloseWarnings = false
+  /** The tab each popup/new tab came from (the report asks the opener how it was opened). */
+  private readonly popupOpeners = new WeakMap<Page, Page>()
+  /** Set when the controlled tab closed and none was left: the blank tab getCurrentPage opens next is reported. */
+  private controlledTabLost = false
 
   private scopedFs: ScopedFS
   /** Every download an action report saw, by id: `downloads.list()` / `downloads.save(id, path)`. */
@@ -1181,11 +1254,21 @@ export class PlaywrightExecutor {
     this.sessionMetadata = options.sessionMetadata || { extensionId: null, browser: null, profile: null, workspace: null }
     this.sessionCwd = options.cwd ? path.resolve(options.cwd) : null
     this.policy = options.policy ?? policyFromEnv() ?? 'human'
+    // Whether the user can see a tab: only the extension can tell (tab-visibility.ts); a launched
+    // browser does not throttle its background tabs, so it needs no source.
     this.probes = new PageProbes({
       logger: {
         error: (...args: unknown[]) => {
           this.logger.error(...args)
         },
+      },
+      ...(this.cdpConfig.headless ? {} : { readTabVisibility: (targetId: string) => this.tabVisibility(targetId) }),
+    })
+    this.debuggerCuts = new DebuggerCutAdoption({
+      probes: this.probes,
+      relay: () => {
+        const { host = '127.0.0.1', port = 19988, token } = this.cdpConfig
+        return { httpBaseUrl: parseRelayHost(host, port).httpBaseUrl, token: token || process.env.PLAYWRITER_TOKEN }
       },
     })
     this.cloudSession = options.cloudSession || null
@@ -1317,6 +1400,8 @@ export class PlaywrightExecutor {
     this.browser = null
     this.page = null
     this.context = null
+    // A closed page of the old connection awaits no verdict in the new one.
+    this.debuggerCuts.forget()
   }
 
   enqueueWarning(message: string) {
@@ -1409,6 +1494,8 @@ export class PlaywrightExecutor {
     this.setupPageCloseDetection(page)
     this.setupPageConsoleListener(page)
     this.setupNewPageLogging(page)
+    // A renderer crash ends the Page for good: the next call is refused or recovers (execute()).
+    watchForCrash(page)
     // Attach before anything can open a confirm(): without a `dialog` listener Playwright
     // auto-dismisses it, and a "Delete" click silently does nothing.
     this.probes.dialogsFor(page)
@@ -1484,61 +1571,150 @@ export class PlaywrightExecutor {
 
   private setupPageCloseDetection(page: Page) {
     page.on('close', () => {
-      const stateKeysForClosedPage = Object.entries(this.userState)
-        .filter(([, value]) => {
-          return value === page
-        })
-        .map(([key]) => key)
-
       const wasCurrentPage = this.page === page
-      let replacementPageInfo: { index: string; url: string } | null = null
-
-      if (wasCurrentPage) {
+      // Over the relay a closed controlled page may be a tab Chrome only took the debugger off: the tab
+      // is still open and comes back (debugger-cut.ts). Nothing replaces it until the relay has said
+      // which it is (settleClosedPage). A reset or disconnect closes pages on purpose.
+      if (wasCurrentPage && !this.isHeadlessMode() && !this.isDirectCdpMode() && !this.suppressPageCloseWarnings) {
         this.page = null
-        const context = this.context || page.context()
-        const openPages = context.pages().filter((candidate) => {
-          return !candidate.isClosed()
-        })
-        if (openPages.length > 0) {
-          const replacementPage = openPages[0]
-          this.page = replacementPage
-          const replacementIndex = context.pages().indexOf(replacementPage)
-          replacementPageInfo = {
-            index: replacementIndex >= 0 ? String(replacementIndex) : 'unknown',
-            url: replacementPage.url() || 'unknown',
-          }
-        }
-      }
-
-      if (!this.isConnected || this.suppressPageCloseWarnings || stateKeysForClosedPage.length === 0) {
+        this.debuggerCuts.pageClosed(page)
         return
       }
+      this.reportClosedPage(page, wasCurrentPage)
+    })
+  }
 
-      const stateKeyLabel = stateKeysForClosedPage.map((key) => `state.${key}`).join(', ')
-      const closedUrl = page.url() || 'unknown'
+  /** A page closed for good: the controlled one is replaced (replaceClosedPage), and `state` keys still holding it are named. */
+  private reportClosedPage(page: Page, wasCurrentPage: boolean): void {
+    const stateKeysForClosedPage = Object.entries(this.userState)
+      .filter(([, value]) => {
+        return value === page
+      })
+      .map(([key]) => key)
 
-      if (!wasCurrentPage) {
-        this.enqueueWarning(
-          `Page closed (url: ${closedUrl}) for ${stateKeyLabel}. ` +
-            `Assign a new open page to ${stateKeyLabel} before reusing it.`,
-        )
-        return
-      }
+    const replacementPageInfo = wasCurrentPage ? this.replaceClosedPage(page) : null
 
-      if (replacementPageInfo) {
-        this.enqueueWarning(
-          `The current page in ${stateKeyLabel} was closed (url: ${closedUrl}). ` +
-            `Switched active page to index ${replacementPageInfo.index} (url: ${replacementPageInfo.url}). ` +
-            `Reassign ${stateKeyLabel} before using it again.`,
-        )
-        return
-      }
+    if (!this.isConnected || this.suppressPageCloseWarnings || stateKeysForClosedPage.length === 0) {
+      return
+    }
 
+    const stateKeyLabel = stateKeysForClosedPage.map((key) => `state.${key}`).join(', ')
+    const closedUrl = page.url() || 'unknown'
+
+    if (!wasCurrentPage) {
+      this.enqueueWarning(
+        `Page closed (url: ${closedUrl}) for ${stateKeyLabel}. ` +
+          `Assign a new open page to ${stateKeyLabel} before reusing it.`,
+      )
+      return
+    }
+
+    if (replacementPageInfo) {
       this.enqueueWarning(
         `The current page in ${stateKeyLabel} was closed (url: ${closedUrl}). ` +
-          `No open pages remain. Open a tab with Playwriter enabled, then reassign ${stateKeyLabel}.`,
+          `Switched active page to index ${replacementPageInfo.index} (url: ${replacementPageInfo.url}). ` +
+          `Reassign ${stateKeyLabel} before using it again.`,
       )
-    })
+      return
+    }
+
+    this.enqueueWarning(
+      `The current page in ${stateKeyLabel} was closed (url: ${closedUrl}). ` +
+        `No open pages remain. Open a tab with Playwriter enabled, then reassign ${stateKeyLabel}.`,
+    )
+  }
+
+  /**
+   * Over the relay, what became of the closed controlled page's tab (debugger-cut.ts), waiting up to
+   * `waitMs` for a cut tab to come back: back → its new page is controlled (and `state` keys holding
+   * the old one hold it); gone → reportClosedPage; still cut → nothing is controlled yet. The caller
+   * decides where the verdict's notice goes.
+   */
+  private async settleClosedPage(waitMs: number): Promise<ClosedPageVerdict | null> {
+    if (!this.context) return null
+    const verdict = await this.debuggerCuts.settle({ context: this.context, waitMs })
+    if (verdict?.kind === 'closed') this.reportClosedPage(verdict.page, true)
+    if (verdict?.kind === 'reattached') {
+      for (const [key, value] of Object.entries(this.userState)) {
+        if (value === verdict.page) this.userState[key] = verdict.replacement
+      }
+      // Code later in the call that ended with the cut may already have switched to another tab.
+      if (!this.page) {
+        this.page = verdict.replacement
+        this.replacedPages.add(verdict.page)
+      }
+    }
+    return verdict
+  }
+
+  /**
+   * The controlled page closed during this call (`run`): what became of its tab, waited for within
+   * the call's time, with the DEBUGGER CUT line queued for the top of its output — once per call for a
+   * tab that is still cut.
+   */
+  private async noteCutDuringCall(run: ExecuteRun): Promise<void> {
+    if (!this.debuggerCuts.pending || this.runsToldStillCut.has(run)) return
+    const verdict = await this.settleClosedPage(Math.min(CUT_WAIT_MS, Math.max(0, run.deadlineAt - Date.now())))
+    if (verdict?.kind === 'still-cut') this.runsToldStillCut.add(run)
+    if (verdict?.notice) this.cutNotices.push(verdict.notice)
+  }
+
+  /**
+   * The controlled tab closed (by the page, the person, or the browser): control moves to the tab
+   * that opened it when that is still open, else to the first open tab — never silently: the next
+   * report says `TAB CLOSED` with both tabs. With no tab left, nothing is created here; the next
+   * call's blank tab is reported by getCurrentPage.
+   */
+  private replaceClosedPage(closed: Page): { index: number; url: string } | null {
+    this.page = null
+    const context = this.context || closed.context()
+    const open = context.pages().filter((candidate) => !candidate.isClosed())
+    const describe = (tab: Page): string => {
+      const title = this.probes.lastTitle(tab)
+      return `${title === undefined ? '(title never read)' : `"${title}"`} ${tab.url() || 'about:blank'}`
+    }
+    const closedLabel = describe(closed)
+    if (open.length === 0) {
+      // A reset closes every tab on purpose and says so itself.
+      if (!this.suppressPageCloseWarnings) {
+        this.controlledTabLost = true
+        this.enqueueWarning(
+          `TAB CLOSED — the controlled tab ${closedLabel} was closed and no tab is left. The next call opens a new blank tab to work in; load a page there with page.goto(url).`,
+        )
+      }
+      return null
+    }
+    const opener = this.popupOpeners.get(closed)
+    const replacement = opener && !opener.isClosed() ? opener : open[0]
+    this.page = replacement
+    this.replacedPages.add(closed)
+    const index = open.indexOf(replacement)
+    if (!this.suppressPageCloseWarnings) {
+      const why = replacement === opener ? 'the tab that opened it' : 'the first open tab'
+      const blank = isBlankUrl(replacement.url()) ? ' It is an empty tab: load a page in it with page.goto(url), or pick another.' : ''
+      this.enqueueWarning(
+        `TAB CLOSED — the controlled tab ${closedLabel} was closed; now controlling tab ${index} ${describe(replacement)} (${why}).${blank} ` +
+          'act.switchTab(n or text of its title/URL) works in another; refs of open tabs still work.',
+      )
+    }
+    return { index, url: replacement.url() || 'unknown' }
+  }
+
+  /**
+   * A failure's message for the model. A tab that did not answer in time gets what is known about
+   * it — the dialog controller's record and whether the user can see it, read now — instead of a guess;
+   * any other timeout on a tab the user cannot see gets the HIDDEN line (Chrome throttles that tab).
+   */
+  private async explainFailure(error: unknown, page: Page | null): Promise<string> {
+    const message = error instanceof Error ? error.message : String(error)
+    const unresponsive = error instanceof PageUnresponsiveError
+    const timedOut = error instanceof CodeExecutionTimeoutError || (error instanceof Error && error.name === 'TimeoutError')
+    if ((!unresponsive && !timedOut) || !page || page.isClosed()) return message
+    const probe = await this.probes.get(page).catch(() => null)
+    if (!probe) return message
+    const visibility = await this.probes.visibility(probe)
+    if (unresponsive) return `${message} ${unresponsiveDiagnosis({ dialog: probe.dialogs.current(), visibility })}`
+    return visibility?.kind === 'read' && tabIsHidden(visibility.report) ? `${message}\n${hiddenTabNote(visibility.report)}` : message
   }
 
   private setupNewPageLogging(page: Page) {
@@ -1574,17 +1750,22 @@ export class PlaywrightExecutor {
       this.pageLogCursor.delete(page)
     })
 
+    // Each entry keeps where it came from on its following lines, `    at <url>:<line>:<col>` like a stack
+    // frame (just `    at <url>` for Chrome's own messages, which name the resource without a line), so a
+    // search finds the entry and the first line stays the message.
     page.on('console', (msg) => {
       try {
-        const logEntry = `[${msg.type()}] ${msg.text()}`
-        this.addBrowserLog({ page, logEntry })
+        const { url, lineNumber, columnNumber } = msg.location()
+        const at = !url ? '' : lineNumber === 0 && columnNumber === 0 ? `\n    at ${url}` : `\n    at ${url}:${lineNumber + 1}:${columnNumber + 1}`
+        this.addBrowserLog({ page, logEntry: `[${msg.type()}] ${msg.text()}${at}` })
       } catch (e) {
         this.logger.error('[Executor] Failed to get console message text:', e)
       }
     })
 
     page.on('pageerror', (error) => {
-      this.addBrowserLog({ page, logEntry: `[pageerror] ${error.message}` })
+      const frames = (error.stack ?? '').split('\n').filter((line) => /^\s+at /.test(line))
+      this.addBrowserLog({ page, logEntry: [`[pageerror] ${error.message}`, ...frames.map((frame) => `    ${frame.trim()}`)].join('\n') })
     })
   }
 
@@ -1712,6 +1893,31 @@ export class PlaywrightExecutor {
     return status
   }
 
+  /**
+   * Whether the user can see tab `targetId`: the extension's report through the relay
+   * (`GET /tab-visibility/:targetId`, tab-visibility.ts). Rejects when the relay cannot be asked.
+   */
+  private async tabVisibility(targetId: string): Promise<TabVisibility> {
+    if (this.isDirectCdpMode()) {
+      return { kind: 'unreadable', error: 'connected over CDP directly, which does not say which tab is in front of its window; only the Playwriter extension can' }
+    }
+    const { host = '127.0.0.1', port = 19988, token } = this.cdpConfig
+    const { httpBaseUrl } = parseRelayHost(host, port)
+    const effectiveToken = token || process.env.PLAYWRITER_TOKEN
+    // The relay waits up to 1 s for the extension to re-read the tab.
+    const response = await fetch(`${httpBaseUrl}/tab-visibility/${encodeURIComponent(targetId)}`, {
+      signal: AbortSignal.timeout(3000),
+      headers: effectiveToken ? { Authorization: `Bearer ${effectiveToken}` } : {},
+    })
+    if (response.status === 404) {
+      return { kind: 'unreadable', error: 'the relay has no report of this tab from the extension (an extension older than this relay sends none)' }
+    }
+    if (!response.ok) return { kind: 'unreadable', error: `the relay at ${httpBaseUrl} answered HTTP ${response.status}` }
+    const status = parseTabVisibilityStatus(await response.json())
+    if ('invalid' in status) return { kind: 'unreadable', error: `the relay at ${httpBaseUrl} answered something that is not a tab visibility (${status.invalid})` }
+    return { kind: 'read', report: status }
+  }
+
   private isDirectCdpMode(): boolean {
     return !!this.cdpConfig.directCdpUrl
   }
@@ -1810,16 +2016,50 @@ export class PlaywrightExecutor {
     return { browser, page, context }
   }
 
+  /** The new browser this headless session runs in: set by `planNewBrowser`, the defaults otherwise. */
+  private newBrowserPlan: NewBrowserPlan | null = null
+  /** What that browser presents, once launched (for `describeNewBrowser`). */
+  private newBrowserLaunch: LaunchedNewBrowser | null = null
+  /** The key of the shared headless browser this session's context lives in (`launchKey`). */
+  private headlessKey: string | null = null
+
   /**
-   * Launch a headless Chrome via chromium.launch(). No extension, no relay CDP routing.
-   * Reuses an existing shared browser if one was already launched for headless mode.
-   * Does NOT add per-session disconnect listeners to avoid accumulation on the shared
-   * browser; instead, ensureConnection checks browser.isConnected() on each call.
+   * Check `options` for this headless session's new browser (new-browser.ts `planNewBrowser`): they
+   * apply from its next connect. Throws a ModelFacingError naming the fix for an option it refuses.
+   */
+  async planNewBrowser(options: NewBrowserOptions): Promise<NewBrowserPlan> {
+    const plan = await planNewBrowser(options, { cwd: this.sessionCwd ?? process.cwd() })
+    this.newBrowserPlan = plan
+    return plan
+  }
+
+  /** One line per option of this session's new browser, and what still shows this computer; null when not headless. */
+  describeNewBrowser(): string[] | null {
+    return this.isHeadlessMode() && this.newBrowserPlan ? describeNewBrowser(this.newBrowserPlan, this.newBrowserLaunch) : null
+  }
+
+  /**
+   * This session's context in a new browser (new-browser.ts). Sessions whose browser-wide options are the
+   * same share one Chrome, each in its own context. Does NOT add per-session disconnect listeners to the
+   * shared browser; ensureConnection checks browser.isConnected() on each call.
    */
   private async connectHeadlessBrowser(): Promise<{ browser: Browser; page: Page; context: BrowserContext }> {
-    const browser = await PlaywrightExecutor.getOrLaunchHeadlessBrowser()
+    const plan = this.newBrowserPlan ?? (await this.planNewBrowser({}))
+    const entry = PlaywrightExecutor.headlessBrowserFor(plan, this.logger)
+    // Claimed before the launch finishes, so a launch for other options does not close it as idle.
+    entry.executors.add(this)
+    this.headlessKey = entry.key
+    let launched: LaunchedNewBrowser
+    try {
+      launched = await entry.launching
+    } catch (error) {
+      entry.executors.delete(this)
+      throw error
+    }
+    this.newBrowserLaunch = launched
+    const browser = launched.browser
 
-    const context = await browser.newContext()
+    const context = await browser.newContext(contextOptionsFor(plan))
     try {
       context.setDefaultTimeout(60000)
       context.setDefaultNavigationTimeout(10000)
@@ -1827,13 +2067,13 @@ export class PlaywrightExecutor {
       context.on('page', (page) => {
         this.setupPageListeners(page)
       })
+      if (plan.downloads) copyDownloadsInto(context, plan.downloads)
 
       const page = await context.newPage()
       this.setupPageListeners(page)
 
       await this.setDeviceScaleFactorForMacOS(context)
 
-      PlaywrightExecutor._headlessExecutors.add(this)
       return { browser, page, context }
     } catch (e) {
       // Clean up the partially created context so it doesn't leak on the
@@ -1843,72 +2083,60 @@ export class PlaywrightExecutor {
     }
   }
 
-  /** Shared headless browser instance across all headless sessions.
-   *  Uses a launch promise to prevent concurrent first-session races from
-   *  spawning multiple browsers. The disconnect handler is registered once
-   *  at launch time and clears both statics so the next session relaunches. */
-  private static _sharedHeadlessBrowser: Browser | null = null
-  private static _sharedHeadlessBrowserPromise: Promise<Browser> | null = null
-  /** Active headless executors sharing the browser. Using a Set instead of a
-   *  counter makes tracking idempotent: reset() re-adds the same executor (no-op),
-   *  and concurrent deletes can't double-decrement. When the set empties after
-   *  a session delete, the shared browser is auto-closed. */
-  private static _headlessExecutors = new Set<PlaywrightExecutor>()
+  /**
+   * The headless browsers of this process, by `launchKey`: one launch each (concurrent sessions share
+   * its promise), and the executors whose contexts live in it. A browser closes when its last executor
+   * leaves, and leaves the map when it disconnects (a crash), so the next session launches it again.
+   */
+  private static headlessBrowsers = new Map<string, HeadlessBrowserEntry>()
 
-  private static async getOrLaunchHeadlessBrowser(): Promise<Browser> {
-    // Check the cached browser is actually alive (not just non-null after a crash)
-    if (PlaywrightExecutor._sharedHeadlessBrowser?.isConnected()) {
-      return PlaywrightExecutor._sharedHeadlessBrowser
+  private static headlessBrowserFor(plan: NewBrowserPlan, logger: ExecutorLogger): HeadlessBrowserEntry {
+    const browsers = PlaywrightExecutor.headlessBrowsers
+    const key = launchKey(plan)
+    const existing = browsers.get(key)
+    if (existing && (existing.browser === null || existing.browser.isConnected())) return existing
+    // A browser nobody uses, launched for other options (a prelaunch the session did not take), closes now.
+    for (const [otherKey, other] of browsers) {
+      if (otherKey === key || other.executors.size > 0) continue
+      browsers.delete(otherKey)
+      other.launching.then(({ browser }) => browser.close()).catch(() => {})
     }
+    const launching = getChromium().then((chromium) => launchNewBrowser(chromium, plan, logger))
+    const entry: HeadlessBrowserEntry = { key, launching, browser: null, executors: new Set() }
+    browsers.set(key, entry)
+    launching.then(
+      ({ browser }) => {
+        entry.browser = browser
+        browser.on('disconnected', () => {
+          if (browsers.get(key) === entry) browsers.delete(key)
+        })
+      },
+      // The sessions awaiting the launch get the error; the next connect launches again.
+      () => {
+        if (browsers.get(key) === entry) browsers.delete(key)
+      },
+    )
+    return entry
+  }
 
-    // Deduplicate concurrent launches: second caller awaits the first's promise
-    if (PlaywrightExecutor._sharedHeadlessBrowserPromise) {
-      return PlaywrightExecutor._sharedHeadlessBrowserPromise
+  /**
+   * Start launching this session's new browser now, before its first call needs it (the MCP server does
+   * this at startup with PLAYWRITER_BROWSER=new). The session owns the browser from here: its first
+   * connect takes it, and `disconnect()` closes it even before that. A failed launch is reported by
+   * the first connect, which launches again. Needs `planNewBrowser()` first.
+   */
+  prelaunch(): void {
+    if (!this.isHeadlessMode() || !this.newBrowserPlan) {
+      throw new Error('prelaunch() is for a headless session whose options planNewBrowser() has checked.')
     }
-
-    const launchPromise = (async () => {
-      const chromium = await getChromium()
-      const { resolveBrowserExecutablePath } = await import('./browser-config.js')
-      const executablePath = resolveBrowserExecutablePath()
-
-      const browser = await chromium.launch({
-        headless: true,
-        executablePath,
-      })
-
-      // Single handler registered once per browser lifetime.
-      // Only clears statics if this is still the current shared browser;
-      // prevents an old browser's disconnect from wiping state for a newer one
-      // (race: new session launches while old browser.close() is in progress).
-      browser.on('disconnected', () => {
-        if (PlaywrightExecutor._sharedHeadlessBrowser !== browser) {
-          return
-        }
-        PlaywrightExecutor._sharedHeadlessBrowser = null
-        PlaywrightExecutor._sharedHeadlessBrowserPromise = null
-        PlaywrightExecutor._headlessExecutors.clear()
-      })
-
-      PlaywrightExecutor._sharedHeadlessBrowser = browser
-      // Clear the promise now that the browser is cached; future callers
-      // use _sharedHeadlessBrowser directly. Concurrent waiters already
-      // hold a reference to launchPromise so they still resolve correctly.
-      PlaywrightExecutor._sharedHeadlessBrowserPromise = null
-      return browser
-    })()
-
-    PlaywrightExecutor._sharedHeadlessBrowserPromise = launchPromise
-    try {
-      return await launchPromise
-    } catch (error) {
-      PlaywrightExecutor._sharedHeadlessBrowserPromise = null
-      throw error
-    }
+    const entry = PlaywrightExecutor.headlessBrowserFor(this.newBrowserPlan, this.logger)
+    entry.executors.add(this)
+    this.headlessKey = entry.key
   }
 
   /** Close the headless context for this session (called on session delete).
-   *  When the last headless executor is removed, the shared browser is also
-   *  closed automatically so the Chrome process doesn't linger. */
+   *  When the last executor of its browser leaves, that browser is closed too
+   *  so the Chrome process doesn't linger. */
   async closeHeadlessContext(): Promise<void> {
     if (!this.isHeadlessMode()) {
       return
@@ -1923,25 +2151,20 @@ export class PlaywrightExecutor {
       })
     }
 
-    const wasTracked = PlaywrightExecutor._headlessExecutors.delete(this)
-    if (wasTracked && PlaywrightExecutor._headlessExecutors.size === 0) {
-      await PlaywrightExecutor.closeSharedHeadlessBrowser()
+    const key = this.headlessKey
+    const entry = key === null ? undefined : PlaywrightExecutor.headlessBrowsers.get(key)
+    if (key !== null && entry?.executors.delete(this) && entry.executors.size === 0) {
+      PlaywrightExecutor.headlessBrowsers.delete(key)
+      await entry.launching.then(({ browser }) => browser.close()).catch(() => {})
     }
   }
 
-  /** Close the shared headless browser (called on relay shutdown or when last
-   *  session is deleted). Nulls statics before awaiting close so concurrent
-   *  callers of getOrLaunchHeadlessBrowser() launch a fresh browser instead
-   *  of reusing one that is mid-shutdown. */
+  /** Close every headless browser of this process (relay shutdown). Each leaves the map before
+   *  it closes, so a concurrent session launches a fresh one instead of reusing a dying one. */
   static async closeSharedHeadlessBrowser(): Promise<void> {
-    const browser = PlaywrightExecutor._sharedHeadlessBrowser
-    if (browser) {
-      // Detach from statics first so new sessions don't reuse a dying browser.
-      // The disconnect handler checks identity, so it becomes a no-op for this browser.
-      PlaywrightExecutor._sharedHeadlessBrowser = null
-      PlaywrightExecutor._sharedHeadlessBrowserPromise = null
-      await browser.close().catch(() => {})
-    }
+    const entries = [...PlaywrightExecutor.headlessBrowsers.values()]
+    PlaywrightExecutor.headlessBrowsers.clear()
+    await Promise.all(entries.map((entry) => entry.launching.then(({ browser }) => browser.close()).catch(() => {})))
   }
 
   /**
@@ -1977,13 +2200,14 @@ export class PlaywrightExecutor {
     }
   }
 
-  private async ensureConnection(): Promise<{ browser: Browser; page: Page }> {
+  private async ensureConnection(): Promise<void> {
     // In headless mode, also check the shared browser is still alive.
     // After a crash, isConnected() returns false and we need to reconnect.
     const browserAlive = this.isHeadlessMode() ? this.browser?.isConnected() : true
-    if (this.isConnected && this.browser && this.page && browserAlive) {
-      return { browser: this.browser, page: this.page }
-    }
+    // A closed controlled tab (this.page null) is not a lost connection: reconnecting here made a
+    // new context with a blank tab and moved to it silently. getCurrentPage picks the next tab of
+    // this session's context and says so.
+    if (this.isConnected && this.browser && (this.page || this.context) && browserAlive) return
 
     try {
       const { browser, page, context } = await this.connectToBrowser()
@@ -1992,8 +2216,6 @@ export class PlaywrightExecutor {
       this.page = page
       this.context = context
       this.isConnected = true
-
-      return { browser, page }
     } catch (error) {
       // Cloud sessions that fail to connect are likely expired VMs.
       // Give a clear error instead of a cryptic WebSocket/connection error.
@@ -2005,6 +2227,13 @@ export class PlaywrightExecutor {
   }
 
   private async getCurrentPage(timeout = 10000): Promise<Page> {
+    // The controlled page closed over the relay: when Chrome only took the debugger off its tab
+    // (debugger-cut.ts), that tab is waited for and taken back — never replaced while it is open.
+    if (this.debuggerCuts.pending) {
+      const verdict = await this.settleClosedPage(Math.min(CUT_WAIT_MS, timeout))
+      if (verdict?.kind === 'still-cut') throw new ModelFacingError(`${verdict.notice} Nothing from this call was run.`)
+      if (verdict?.notice) this.cutNotices.push(verdict.notice)
+    }
     if (this.page && !this.page.isClosed()) {
       return this.page
     }
@@ -2012,17 +2241,29 @@ export class PlaywrightExecutor {
     if (this.browser) {
       const contexts = this.browser.contexts()
       if (contexts.length > 0) {
-        const context = contexts[0]
+        // This session's own context when it is still open: a shared headless browser holds other
+        // sessions' contexts too, and contexts[0] can be one of them.
+        const context = this.context && contexts.includes(this.context) ? this.context : contexts[0]
         this.context = context
         const pages = context.pages().filter((p) => !p.isClosed())
         if (pages.length > 0) {
           const page = pages[0]
           await page.waitForLoadState('domcontentloaded', { timeout }).catch(() => {})
           this.page = page
+          if (this.controlledTabLost) {
+            this.controlledTabLost = false
+            this.enqueueWarning(`TAB    now controlling tab 0 ${page.url() || 'about:blank'}, a tab opened since the controlled tab closed.`)
+          }
           return page
         }
         const page = await this.ensurePageForContext({ context, timeout })
         this.page = page
+        if (this.controlledTabLost) {
+          this.controlledTabLost = false
+          this.enqueueWarning(
+            `TAB    no tab was left, so a new blank tab was opened (tab 0, ${page.url() || 'about:blank'}) to work in — page.goto(url) loads a page in it.`,
+          )
+        }
         return page
       }
     }
@@ -2135,6 +2376,12 @@ export class PlaywrightExecutor {
         /** Scope the snapshot to the subtree of this element: a ref from observe()/find() */
         ref?: number | string
         search?: string | RegExp
+        /**
+         * Return a revision of this scope (the page, or the ref's subtree): `full` the first time and
+         * for a new document, `unchanged`, or a `delta` of the nodes that appeared, went away or changed.
+         */
+        diff?: boolean
+        /** The same as `diff` (the name getCleanHTML and getPageMarkdown use). */
         showDiffSinceLastCall?: boolean
         /** Snapshot format. `'raw'` is the only one that exists; anything else THROWS. */
         format?: SnapshotFormat
@@ -2146,15 +2393,15 @@ export class PlaywrightExecutor {
          * for finding click targets, so labelling every static node is just clutter.
          */
         interactiveOnly?: boolean
-      }) => {
+      } = {}) => {
         const {
           page: targetPage,
           frame,
           locator,
           ref,
           search,
-          // Opt-in. As a default the second call returned a unified diff whose `>> nth=` locators
-          // shift whenever anything is inserted above them, and weak models read it as the page.
+          // Opt-in. As a default the second call returned a delta, and weak models read it as the page.
+          diff = false,
           showDiffSinceLastCall = false,
           interactiveOnly = false,
           format = DEFAULT_SNAPSHOT_FORMAT,
@@ -2200,14 +2447,24 @@ export class PlaywrightExecutor {
             : frame && 'page' in frame
               ? frame.page()
               : undefined
-        const resolvedPage = targetPage || pageFromScope || page
+        const resolvedPage = targetPage || pageFromScope || currentPage()
         if (!resolvedPage) {
           throw new Error('snapshot requires a page')
         }
 
-        // Use new in-page implementation via getAriaSnapshot
+        const wantsRevision = diff || showDiffSinceLastCall
+        if (wantsRevision && search !== undefined) {
+          throw new ModelFacingError('snapshot: `diff` returns what changed in the whole scope, and `search` filters lines; pass one of them.')
+        }
+        if (wantsRevision && frame) {
+          throw new ModelFacingError(
+            "snapshot: `diff` keeps revisions of the page or of one element's subtree. For an iframe pass its ref from observe(): snapshot({ ref: 7, diff: true }).",
+          )
+        }
+
         const {
           snapshot: rawSnapshot,
+          tree,
           refs,
           getSelectorForRef,
         } = await getAriaSnapshot({
@@ -2227,39 +2484,23 @@ export class PlaywrightExecutor {
         }
         this.lastRefToLocator.set(resolvedPage, refToLocator)
 
-        const shouldCacheSnapshot = !frame
-        // Baselines are keyed by scope AND url: a diff must never span a navigation (an SPA route
-        // change included), where "what changed" is the whole page.
-        const snapshotKey = `${locator ? `locator:${locator.selector()}` : element ? `ref:${element.target.ref}` : 'page'}@${resolvedPage.url()}`
-        let pageSnapshots = this.lastSnapshots.get(resolvedPage)
-        if (!pageSnapshots) {
-          pageSnapshots = new Map()
-          this.lastSnapshots.set(resolvedPage, pageSnapshots)
-        }
-        const previousSnapshot = shouldCacheSnapshot ? pageSnapshots.get(snapshotKey) : undefined
-        if (shouldCacheSnapshot) {
-          pageSnapshots.set(snapshotKey, snapshotStr)
-        }
-
-        // A diff only when asked for, and only against a baseline of the same scope and url.
-        if (showDiffSinceLastCall && previousSnapshot && shouldCacheSnapshot) {
-          const diffResult = createSmartDiff({
-            oldContent: previousSnapshot,
-            newContent: snapshotStr,
-            label: 'snapshot',
-          })
-          if (diffResult.type === 'no-change') {
-            return 'No changes since the last snapshot of this page. Call snapshot() without showDiffSinceLastCall for the full content.'
-          }
-          return diffResult.content
-        }
-
-        if (!search) {
-          // A line's selector (after the role and name) is the element's Playwright locator.
-          return self.policy === 'human'
+        const shown =
+          self.policy === 'human'
             ? `${snapshotStr}\n\nThe selector on each line (like [id="q"] or role=button[name="Save"]) is a Playwright locator; human mode refuses locators, because they run Playwright's script in the page. Act with a ref from observe() or find().`
             : snapshotStr
+
+        // A `diff` snapshot of a scope is its next revision, compared with the previous `diff` snapshot of it.
+        if (wantsRevision) {
+          const documentId = element
+            ? `${element.target.documentId}:${element.target.frameDocumentId}`
+            : (
+                await withDeadline((await self.probes.get(resolvedPage)).cdp.send('Page.getFrameTree'), 5000, 'reading which document the page shows (Page.getFrameTree)')
+              ).frameTree.frame.loaderId
+          const scope = `${locator ? `locator:${locator.selector()}` : element ? `ref:${element.target.ref}` : 'page'}|${interactiveOnly ? 'interactive' : 'all'}`
+          return this.snapshotRevisions.record({ page: resolvedPage, scope, documentId, tree, snapshot: snapshotStr, shown })
         }
+
+        if (!search) return shown
 
         const lines = snapshotStr.split('\n')
         const matchIndices: number[] = []
@@ -2982,6 +3223,24 @@ export class PlaywrightExecutor {
         })
       }
 
+      /** screenshot() / diffScreenshot() (page-screenshot.ts): plain captures of the controlled tab, saved in the session folder. */
+      const screenshotDeps = async (): Promise<ScreenshotDeps> => {
+        const target = currentPage()
+        const probe = await self.probes.get(target)
+        return {
+          policy: self.policy,
+          page: target,
+          cdp: probe.cdp,
+          world: probe.world,
+          dialog: () => probe.dialogs.current(),
+          observe: () => self.probes.observe(target, context, {}, false),
+          jail: self.scopedFs,
+          emit: (image) => resizedImageCollector.push(image),
+        }
+      }
+      const screenshotFn = async (options?: unknown) => await takeScreenshot(options, await screenshotDeps())
+      const diffScreenshotFn = async (baselinePath: unknown, options?: unknown) => await diffScreenshot(baselinePath, options, await screenshotDeps())
+
       // Screen recording functions (via chrome.tabCapture in extension - survives navigation)
       // Recording uses chrome.tabCapture which requires activeTab permission.
       // This permission is granted when the user clicks the Playwriter extension icon on a tab.
@@ -3085,14 +3344,69 @@ export class PlaywrightExecutor {
       // forgets to log what it looked at learns nothing; what they return inspects as one line,
       // so `return await observe()` does not print the page twice.
       const currentPage = (): Page => vmContextObj.page
+      /**
+       * The controlled page once a close of it seen during this call has its verdict (noteCutDuringCall):
+       * a tab really closed is replaced (TAB CLOSED), a cut one re-adopted, before anything reads it.
+       * A sandbox `page` that was the controlled page and got replaced follows the replacement.
+       */
+      const settledPage = async (): Promise<Page> => {
+        if (self.debuggerCuts.pending) await self.noteCutDuringCall(run)
+        const held = vmContextObj.page
+        const controlled = self.page
+        if (held.isClosed() && self.replacedPages.has(held) && controlled && !controlled.isClosed()) {
+          vmContextObj.page = controlled
+          run.follow?.(controlled)
+        }
+        return vmContextObj.page
+      }
+      /**
+       * `read` on `explicit`, else on the controlled page (settledPage). The controlled tab can close
+       * while it is read, before its close event reaches this session (the protocol says "closed"
+       * first): then the close is waited for briefly, its verdict settled, and the read is made once
+       * on the page now controlled — never a failure that reads the closed tab.
+       */
+      const readControlled = async <T,>(explicit: Page | undefined, read: (target: Page) => Promise<T>): Promise<{ target: Page; value: T }> => {
+        if (explicit) return { target: explicit, value: await read(explicit) }
+        const target = await settledPage()
+        try {
+          return { target, value: await read(target) }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!target.isClosed() && !message.includes('has been closed')) throw error
+          if (!target.isClosed()) {
+            const closing = Promise.withResolvers<void>()
+            const timer = setTimeout(closing.resolve, CLOSE_EVENT_WAIT_MS)
+            target.once('close', () => closing.resolve())
+            await closing.promise
+            clearTimeout(timer)
+          }
+          const next = await settledPage()
+          if (next === target || next.isClosed()) throw error
+          return { target: next, value: await read(next) }
+        }
+      }
+      /** `api` whose calls first wait for a pending closed-page verdict (settledPage); its getPage is synchronous. */
+      const afterClosedVerdict = <T extends object>(api: T): T =>
+        new Proxy(api, {
+          get(target, key, receiver) {
+            const value: unknown = Reflect.get(target, key, receiver)
+            if (typeof value === 'function') {
+              return (...args: unknown[]) =>
+                self.debuggerCuts.pending || (vmContextObj.page.isClosed() && self.replacedPages.has(vmContextObj.page))
+                  ? settledPage().then(() => Reflect.apply(value, target, args))
+                  : Reflect.apply(value, target, args)
+            }
+            if (typeof value === 'object' && value !== null) return afterClosedVerdict(value)
+            return value
+          },
+        })
       const quietInspect = <T extends object>(value: T, summary: string): T => {
         Object.defineProperty(value, util.inspect.custom, { value: () => summary, enumerable: false })
         return value
       }
 
       const observe = async (options: ObserveOptions & { page?: Page } = {}): Promise<Observation> => {
-        const target = options.page ?? currentPage()
-        const observation = await self.probes.observe(target, context, options)
+        const { target, value: observation } = await readControlled(options.page, (candidate) => self.probes.observe(candidate, context, options))
         const pinned = await renderPins(target, observation)
         run.probeOutput.push(pinned ? `${renderObservation(observation, options)}\n${pinned}` : renderObservation(observation, options))
         return quietInspect(observation, `[observation of ${observation.url} — printed above]`)
@@ -3122,9 +3436,17 @@ export class PlaywrightExecutor {
         )
       }
 
-      const find = async (query: string, options: { limit?: number; page?: Page } = {}): Promise<{ text: string }> => {
-        const target = options.page ?? currentPage()
-        const observation = await self.probes.observe(target, context)
+      const find = async (query: string, options: { limit?: number; page?: Page } = {}): Promise<{ text: string } | QueryResult> => {
+        // role/, label/, text/, pierce/… (page-query.ts); plain words are searched in what observe() lists.
+        const handlerQuery = typeof query === 'string' ? parseQuery(query) : null
+        if (handlerQuery) {
+          const { value: result } = await readControlled(options.page, (target) =>
+            runQuery({ probes: self.probes, context }, target, handlerQuery, { limit: options.limit }),
+          )
+          run.probeOutput.push(result.text)
+          return quietInspect(result, `[find("${query}") — ${result.count} match${result.count === 1 ? '' : 'es'}, printed above]`)
+        }
+        const { value: observation } = await readControlled(options.page, (target) => self.probes.observe(target, context))
         const text = findInObservation(observation, query, { limit: options.limit })
         run.probeOutput.push(text)
         return quietInspect({ text }, `[find("${query}") — printed above]`)
@@ -3164,7 +3486,23 @@ export class PlaywrightExecutor {
           context,
           currentPage,
           log: (level, text) => consoleLogs.push({ method: level, args: [`[readPage] ${text}`] }),
+          resolveQuery: async (query, target) => await queryRef({ probes: self.probes, context }, target, query),
         })
+
+      /**
+       * Accessibility audit (page-audit.ts): axe-core in each frame's isolated world plus playwriter's
+       * own checks, printed grouped by impact with refs; the full report is the return value.
+       */
+      const audit = async (options?: unknown): Promise<AuditReport> => {
+        const report = await runAudit(options, {
+          probes: self.probes,
+          currentPage,
+          observeQuietly: (target) => self.probes.observe(target, context, {}, false),
+          deadlineAt: run.deadlineAt,
+        })
+        run.probeOutput.push(report.text)
+        return quietInspect(report, `[audit of ${report.url} — printed above]`)
+      }
 
       /**
        * Ask the human to point at the element they mean: Chrome's element picker turns on in the tab
@@ -3172,7 +3510,7 @@ export class PlaywrightExecutor {
        * to the page. The wait is bounded by this call's own timeout.
        */
       const pickElement = async (options: { page?: Page; timeoutMs?: number } = {}): Promise<{ ref?: number; text: string }> => {
-        const target = options.page ?? currentPage()
+        const target = options.page ?? (await settledPage())
         const probe = await self.probes.get(target)
         // Room left after the click for the observation that turns it into a ref.
         const available = run.deadlineAt - Date.now() - 5000
@@ -3271,8 +3609,10 @@ export class PlaywrightExecutor {
         return quietInspect({ text }, `[docs(${topic === undefined ? '' : JSON.stringify(topic)}) — printed above]`)
       }
 
-      // Wrapped so act's own Playwright calls run inside `insideAct`: the raw-action tap counts only the code's.
+      // Wrapped so act's own Playwright calls run inside `insideAct`: the raw-action tap counts only the code's;
+      // and so each call waits for the verdict on a controlled tab that closed (afterClosedVerdict).
       const act = markedAsAct(
+        afterClosedVerdict(
         createActApi({
           getPage: currentPage,
           setPage: (target) => {
@@ -3292,9 +3632,22 @@ export class PlaywrightExecutor {
           records: run.actRecords,
           rawActions: run.rawActions,
           activity: run.actActivity,
-          observeQuietly: (target) => self.probes.observe(target, context, {}, false),
+          observeQuietly: (target, known) => self.probes.observe(target, context, {}, false, known),
+          setDialogPolicy: (policy, options) => self.probes.setDialogPolicy(policy, options),
         }),
+        ),
       )
+
+      const webmcp = afterClosedVerdict(createWebMcpApi({
+        getPage: currentPage,
+        getProbe: (target) => self.probes.get(target),
+        mode: self.policy,
+        signal: run.signal,
+        deadlineAt: run.deadlineAt,
+        records: run.actRecords,
+        rawActions: run.rawActions,
+        observeQuietly: (target) => self.probes.observe(target, context, {}, false),
+      }))
 
       /**
        * The previous implementation polled `performance.getEntriesByType('resource')`, which lists a
@@ -3305,7 +3658,7 @@ export class PlaywrightExecutor {
        * event-driven, so there is no polling interval to set.
        */
       const waitForPageLoadFn = async (options: { page?: Page; timeout?: number; minWait?: number } = {}): Promise<WaitForPageLoadResult> => {
-        const target = options.page ?? currentPage()
+        const target = options.page ?? (await settledPage())
         const probe = await self.probes.get(target)
         const startedAt = Date.now()
         const result = await probe.watch.settle({
@@ -3350,6 +3703,18 @@ export class PlaywrightExecutor {
           (await self.probes.get(target)).world.evaluate<{ width: number; height: number }>('({ width: innerWidth, height: innerHeight })', {
             what: 'reading the viewport size for the pointer track',
           }),
+        // A launched headless Chrome and a direct CDP connection have no extension, so no tab capture:
+        // there recording.* drive this session's CDP screencast (startCdp below; arrows because those
+        // are declared further down).
+        tabCapture: !self.isHeadlessMode() && !self.isDirectCdpMode(),
+        cdp: {
+          start: ({ page: target, outputPath, fps, maxDurationMs, pointer }) => startCdpRecording({ page: target, outputPath, fps, maxDurationMs, pointer }),
+          stop: () => stopCdpRecording(),
+          cancel: async () => {
+            await cancelCdpRecording()
+          },
+          active: () => (self.cdpScreencast ? { startedAt: self.cdpScreencast.startedAt, frames: self.cdpScreencast.frameCount() } : null),
+        },
       })
 
       // Ghost Browser API - creates chrome object that mirrors Ghost Browser's APIs
@@ -3570,10 +3935,32 @@ export class PlaywrightExecutor {
           const probe = await self.probes.get(filter.page ?? currentPage())
           return probe.watch.requests(filter)
         },
-        /** One request's response body by id (`r12`): textual bodies decoded, capped at 64K characters. */
-        request: async (id: string, options: { page?: Page } = {}) => {
+        /**
+         * Everything Chrome reported about one request (`r12`): request and response headers (as on the wire
+         * when Chrome reported them), status text, sizes, duration, failure and CORS reason, request body,
+         * and the response body (textual bodies decoded, capped at 64K characters). Credential headers are
+         * redacted unless `secrets: true`.
+         */
+        request: async (id: string, options: { page?: Page; secrets?: boolean } = {}) => {
           const probe = await self.probes.get(options.page ?? currentPage())
-          return await probe.watch.responseBody(id)
+          return await requestDetail(probe.watch, id, { secrets: options.secrets === true })
+        },
+        /**
+         * The page's request journal written as a HAR 1.2 file (jailed like the sandbox fs), with the
+         * response bodies Chrome still holds. A read: nothing is requested again.
+         */
+        har: async (options: { path: string; page?: Page; urlIncludes?: string; bodies?: boolean; secrets?: boolean }) => {
+          const resolved = jailedTarget({ jail: self.scopedFs, target: options?.path, call: 'net.har({ path })', example: "net.har({ path: 'requests.har' })" })
+          const target = options.page ?? currentPage()
+          const probe = await self.probes.get(target)
+          return await writeHar({
+            journal: probe.watch,
+            target: resolved,
+            pageUrl: target.url(),
+            secrets: options.secrets === true,
+            bodies: options.bodies !== false,
+            ...(options.urlIncludes !== undefined ? { urlIncludes: options.urlIncludes } : {}),
+          })
         },
         /**
          * One request's WHOLE response body written to a file (an image, a large JSON response — what
@@ -3789,6 +4176,7 @@ export class PlaywrightExecutor {
         return {
           started: true,
           outputPath: options.outputPath,
+          startedAt: handle.startedAt,
           ...(options.inputOverlay ? { inputOverlay: true } : {}),
           ...(inputOverlayNote ? { note: inputOverlayNote } : {}),
         }
@@ -3880,6 +4268,26 @@ export class PlaywrightExecutor {
         return { cancelled: true }
       }
 
+      // Cookies, Web Storage, saved state and the clipboard (page-storage.ts): reads in every mode,
+      // writes in debug mode only. The clipboard reader's own Playwright calls run as act's do.
+      const storageGlobals = createStorageGlobals({
+        policy: () => self.policy,
+        currentPage,
+        probes: self.probes,
+        fs: self.scopedFs,
+        browser: () => self.browser,
+        viaExtension: !self.isHeadlessMode() && !self.isDirectCdpMode(),
+        ownCalls: (work) => insideAct.run(true, work),
+      })
+
+      // Read-only instruments (perf.ts, react-tree.ts): Web Vitals, metrics, Chrome trace, CPU
+      // profile, PDF, the React tree. None reloads or writes the page; pdf() says what the page saw.
+      const print = (text: string): void => {
+        run.probeOutput.push(text)
+      }
+      const instruments = createPerfGlobals({ probes: self.probes, context, currentPage, jail: self.scopedFs, print })
+      const react = createReactGlobals({ probes: self.probes, context, currentPage, print })
+
       let vmContextObj: any = {
         page,
         context,
@@ -3889,6 +4297,9 @@ export class PlaywrightExecutor {
         snapshot,
         accessibilitySnapshot: snapshot, // backward compat alias
         refToLocator,
+        perf: instruments.perf,
+        pdf: instruments.pdf,
+        react,
         // Wrapped only to pin the diff baseline to THIS session — see `lastCleanHtml`.
         getCleanHTML: getCleanHTMLFn,
         getPageMarkdown: getPageMarkdownFn,
@@ -3900,7 +4311,9 @@ export class PlaywrightExecutor {
         find,
         explain,
         readPage: readPageFn,
+        audit,
         act,
+        webmcp,
         docs,
         getCDPSession: sandboxGetCDPSession,
         createDebugger,
@@ -3918,6 +4331,15 @@ export class PlaywrightExecutor {
         readLogpoints: readLogpointsFn,
         storeIdentity: storeIdentityFn,
         net: netFns,
+        cookies: storageGlobals.cookies,
+        storage: storageGlobals.storage,
+        saveState: storageGlobals.saveState,
+        loadState: storageGlobals.loadState,
+        setCookies: storageGlobals.setCookies,
+        clearCookies: storageGlobals.clearCookies,
+        setStorage: storageGlobals.setStorage,
+        clearStorage: storageGlobals.clearStorage,
+        clipboard: storageGlobals.clipboard,
         // The downloads this session's action reports listed (`DOWNLOAD [d1] …`): list() shows each
         // with its state, save(id, path) writes one where the sandbox fs may write, waiting for it to
         // finish within this call.
@@ -3946,6 +4368,8 @@ export class PlaywrightExecutor {
         inspectPinnedElement,
         pickElement,
         screenshotWithAccessibilityLabels: screenshotWithAccessibilityLabelsFn,
+        screenshot: screenshotFn,
+        diffScreenshot: diffScreenshotFn,
         resizeImageForAgent: resizeImageForAgentFn,
         // Backward-compatible alias for resizeImageForAgent
         resizeImage: resizeImageForAgentFn,
@@ -4204,6 +4628,7 @@ export class PlaywrightExecutor {
       watched.add(target)
       const onPopup = (popup: Page): void => {
         scope.popups.push(popup)
+        this.popupOpeners.set(popup, target)
         watch(popup)
       }
       target.on('popup', onPopup)
@@ -4395,8 +4820,14 @@ export class PlaywrightExecutor {
     }
 
     let settle: SettleResult | null = null
+    // A page closed by a debugger cut (debugger-cut.ts) belongs to a tab that is still open: the relay is
+    // asked before the report calls it closed.
+    const closedWhy = async (): Promise<string> => {
+      await this.noteCutDuringCall(run)
+      return this.debuggerCuts.wasCut(reportPage) ? 'Chrome took the debugger off the tab (DEBUGGER CUT above)' : 'the page was closed'
+    }
     let settleError: string | undefined
-    if (reportPage.isClosed()) settleError = 'the page was closed'
+    if (reportPage.isClosed()) settleError = await closedWhy()
     else if (!probe) settleError = `the page could not be watched: ${probeError}`
     else {
       try {
@@ -4407,7 +4838,7 @@ export class PlaywrightExecutor {
           timeoutMs: Math.min(5000, Math.max(1500, remaining - 1000)),
         })
       } catch (error) {
-        settleError = messageOf(error)
+        settleError = await this.explainFailure(error, reportPage)
       }
     }
 
@@ -4438,20 +4869,27 @@ export class PlaywrightExecutor {
       try {
         events = await probe.watch.since(baseline.checkpoint ?? scope.checkpoint)
       } catch (error) {
-        eventsError = messageOf(error)
+        eventsError = await this.explainFailure(error, reportPage)
       }
     }
 
     let after: Observation | null = null
     let afterError: string | undefined
-    if (reportPage.isClosed() || settle?.reason === 'page-closed') afterError = 'the page was closed'
+    if (reportPage.isClosed() || settle?.reason === 'page-closed') afterError = await closedWhy()
     else {
       try {
         after = await this.probes.observe(reportPage, context)
       } catch (error) {
-        afterError = messageOf(error)
+        afterError = await this.explainFailure(error, reportPage)
       }
     }
+    // Content that moved by itself since the action began (layout shifts without recent input).
+    const shifts =
+      probe && after
+        ? await layoutShiftLines({ probes: this.probes, probe, page: reportPage, after, since: (baseline.checkpoint ?? scope.checkpoint).at }).catch(
+            (error: unknown) => [`could not be read: ${error instanceof Error ? error.message : String(error)}`],
+          )
+        : []
     // Watching stops only now: a popup or download can follow the input by a moment.
     await scope.detach()
     const dialogs = await this.fileDialogLines(scope)
@@ -4498,17 +4936,22 @@ export class PlaywrightExecutor {
 
     const openTabs = context.pages().filter((candidate) => !candidate.isClosed())
     const newTabs = await Promise.all(
-      scope.popups.map(async (popup) => ({
-        title: popup.isClosed()
-          ? '(closed again)'
-          : stillLoading.has(popup)
-            ? `(still loading ${popupWaitMs}ms after the action)`
-            : await tabTitle(popup).catch(
-                (error: unknown) => `(title unreadable: ${error instanceof Error ? error.message.split('.')[0] : String(error)})`,
-              ),
-        url: popup.url(),
-        index: openTabs.indexOf(popup) >= 0 ? openTabs.indexOf(popup) : null,
-      })),
+      scope.popups.map(async (popup) => {
+        const opener = this.popupOpeners.get(popup)
+        const opened = opener ? await this.probes.openedBy(popup, opener, scope.checkpoint.at).catch(() => undefined) : undefined
+        return {
+          title: popup.isClosed()
+            ? '(closed again)'
+            : stillLoading.has(popup)
+              ? `(still loading ${popupWaitMs}ms after the action)`
+              : await tabTitle(popup).catch(
+                  (error: unknown) => `(title unreadable: ${error instanceof Error ? error.message.split('.')[0] : String(error)})`,
+                ),
+          url: popup.url(),
+          index: openTabs.indexOf(popup) >= 0 ? openTabs.indexOf(popup) : null,
+          ...(opened ? { opened: { popup: opened.popup, features: opened.features } } : {}),
+        }
+      }),
     )
 
     // Raw calls on a tab other than the controlled one name that tab (its index is act.switchTab's).
@@ -4553,6 +4996,7 @@ export class PlaywrightExecutor {
       downloads,
       fileDialogs,
       changed,
+      shifts,
     })
   }
 
@@ -4666,7 +5110,10 @@ export class PlaywrightExecutor {
 
     /** Report, then what observe()/find()/explain() printed, separated so each reads as its own block. */
     const headSections = (): string => {
-      const sections = [reportText, ...run.probeOutput].filter((section) => section.trim().length > 0)
+      // The tab crashed during this call: what the report could not read is explained by this line.
+      const crash = this.page ? crashOf(this.page) : null
+      // A DEBUGGER CUT line comes first: it explains every line below that could not read the tab.
+      const sections = [...this.cutNotices.splice(0), reportText, ...run.probeOutput, crash ? crashedLine(crash) : ''].filter((section) => section.trim().length > 0)
       return sections.length ? `${sections.join('\n\n')}\n\n` : ''
     }
 
@@ -4690,12 +5137,26 @@ export class PlaywrightExecutor {
       }
 
       await this.ensureConnection()
-      const page = await this.getCurrentPage(timeout)
-      const context = this.context || page.context()
+      const current = await this.getCurrentPage(timeout)
+      const context = this.context || current.context()
 
       // Read the code before running it (Babel AST). What it does to the page decides whether it
       // may run at all (human policy) and whether an action report follows it.
       const analysis = analyzeCode(code)
+      // A crashed tab's Page never works again (page-crash.ts): only a reload brings the session back,
+      // in a new tab that replaces it. Anything else would wait on a renderer that is gone.
+      const crash = crashOf(current)
+      if (crash && !analysis.navigations.some((site) => site.api === 'act.open' || site.api === 'act.reload')) {
+        return { text: `${crashedLine(crash)} Nothing from this call was run.`, images: [], screenshots: [], isError: true }
+      }
+      let page = current
+      if (crash) {
+        const adopt = (replacement: Page): void => {
+          this.page = replacement
+          page = replacement
+        }
+        run.probeOutput.push(await replaceCrashedPage(current, crash, adopt))
+      }
       const verdict = checkPolicy(analysis, { mode: this.policy, pageIsBlank: isBlankUrl(page.url()) })
       if (!verdict.allowed) {
         return { text: verdict.refusal ?? 'Refused by the human-mode policy.', images: [], screenshots: [], isError: true }
@@ -4768,7 +5229,17 @@ export class PlaywrightExecutor {
       while (run.actActivity.depth > 0 && Date.now() < run.deadlineAt + 2000) {
         await sleep(50)
       }
+      // Chrome took the debugger off the controlled tab during this call (debugger-cut.ts). A command
+      // in flight then fails with Chrome's "Detached while handling command." a moment before the page
+      // closes; the close is waited for, then the tab, briefly — so this call already says whether it
+      // came back, and its report says why it could not read the tab.
+      if (codeError instanceof Error && codeError.message.includes('Detached while handling command') && !page.isClosed()) {
+        await page.waitForEvent('close', { timeout: 1000 }).catch(() => {})
+      }
+      await this.noteCutDuringCall(run)
       await buildReport(context)
+      // The cut came while the report was being read.
+      await this.noteCutDuringCall(run)
       if (codeError !== null) {
         throw codeError
       }
@@ -4830,6 +5301,9 @@ export class PlaywrightExecutor {
       // Model-facing messages (ActError, ExplainError, picker and unresponsive-page errors) are
       // complete on their own; a stack and the generic reset hint only add noise.
       const isModelFacing = error instanceof ModelFacingError
+      // The code failed because Chrome took the debugger off the tab: the DEBUGGER CUT line says what
+      // happened and what to do; a stack and the reset hint would point elsewhere.
+      const cutNoticed = this.cutNotices.length > 0
 
       this.logger.error('Error in execute:', errorStack)
 
@@ -4840,7 +5314,7 @@ export class PlaywrightExecutor {
       // Give a clear actionable message instead of a generic "call reset" hint.
       const isDisconnect = error instanceof Error && isDisconnectionError(error)
       const resetHint = (() => {
-        if (isTimeoutError || isModelFacing) return ''
+        if (isTimeoutError || isModelFacing || cutNoticed) return ''
         if (this.cloudSession && isDisconnect) {
           return `\n\n[Cloud browser expired or disconnected. Create a new session with: playwriter session new --browser cloud]`
         }
@@ -4848,7 +5322,7 @@ export class PlaywrightExecutor {
       })()
 
       // timeout stacks are internal noise (Promise.race / setTimeout); only show the message
-      const errorText = isTimeoutError || isModelFacing ? error.message : errorStack
+      const errorText = isTimeoutError || isModelFacing || cutNoticed ? await this.explainFailure(error, this.page) : errorStack
       return {
         text: capOutput(`${headSections()}${logsText}${warningText}\nError executing code: ${errorText}${resetHint}`.trim()),
         images: [],

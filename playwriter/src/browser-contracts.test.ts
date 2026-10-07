@@ -448,7 +448,7 @@ describe('CONTRACT 3: layout.bounds is CSS pixels in DOCUMENT space', () => {
         await page.goto(baseUrl)
         await page.evaluate(() => window.scrollTo(0, 900))
         await page.waitForTimeout(120)
-        const geometry = await fetchPageGeometry({ cdp })
+        const geometry = await fetchPageGeometry({ cdp, timeoutMs: 10_000 })
         const frame = [...geometry.values()].find((f) => f.viewport)!
         expect(frame.viewport, 'the main frame must carry a viewport').toBeDefined()
         // pageY IS the scroll offset, in the same document space as the boxes.

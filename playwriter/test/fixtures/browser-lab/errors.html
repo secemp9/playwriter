@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Errors · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Errors</span></header>
+<main>
+  <h1>Errors and console output</h1>
+  <p class="muted">On load this page writes one console.log, one console.warn and one console.error, and a script tag fails to load (404).</p>
+  <p id="script-status">Script: loading</p>
+  <script src="/lab/missing-script.js" onerror="lab.m(() => { document.getElementById('script-status').textContent = 'Script failed to load: /lab/missing-script.js'; })"></script>
+  <section class="card" aria-labelledby="h-trigger">
+    <h2 id="h-trigger">Trigger errors</h2>
+    <div class="row">
+      <button type="button" id="throw">Throw uncaught error</button>
+      <button type="button" id="reject">Unhandled promise rejection</button>
+      <button type="button" id="worker">Error in Web Worker</button>
+    </div>
+  </section>
+  <h2>Errors seen by the page</h2>
+  <ol id="errors" class="log" role="log" aria-label="Errors seen by the page"></ol>
+</main>
+<script type="module">
+import { $, on, logLine, tagLinks } from '/lab/common.js';
+
+console.log('[errors] page loaded');
+console.warn('[errors] deprecated API used: legacyInit()');
+console.error('[errors] failed to load user preferences');
+
+const list = $('#errors');
+on(window, 'error', (e) => { if (e.error) logLine(list, `Uncaught error: ${e.error.message}`); });
+on(window, 'unhandledrejection', (e) => logLine(list, `Unhandled rejection: ${e.reason && e.reason.message}`));
+
+on($('#throw'), 'click', () => { throw new Error('Lab uncaught error: button handler'); });
+on($('#reject'), 'click', () => { Promise.reject(new Error('Lab unhandled rejection')); });
+on($('#worker'), 'click', () => {
+  const w = new Worker('/lab/error-worker.js');
+  on(w, 'error', (e) => { logLine(list, `Worker error: ${e.message}`); w.terminate(); });
+  w.postMessage('boom');
+});
+
+tagLinks();
+</script>
+</body>
+</html>

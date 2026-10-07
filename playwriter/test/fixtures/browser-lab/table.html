@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invoices · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  caption { text-align: left; padding: 8px 0; color: var(--muted); caption-side: bottom; }
+  td.actions { white-space: nowrap; position: relative; }
+  td.actions button { margin-right: 4px; }
+  td input { width: 100%; max-width: 180px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.85rem; font-weight: 600; }
+  .badge.Paid { background: #e3f6e8; color: var(--ok); }
+  .badge.Pending { background: #fff4d6; color: var(--warn); }
+  .badge.Overdue { background: #fde6e6; color: var(--danger); }
+  .menu { position: absolute; right: 0; top: 100%; z-index: 20; background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 20px rgba(0,0,0,.15); padding: 4px; margin: 0; list-style: none; min-width: 160px; }
+  .menu[hidden] { display: none; }
+  .menu button { display: block; width: 100%; text-align: left; border: 0; margin: 0; }
+  .menu button:hover, .menu button:focus { background: #eef2ff; }
+  nav.pager { margin-top: 12px; }
+  nav.pager button[aria-current="page"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Invoices</span></header>
+<main>
+  <h1>Invoices</h1>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <table id="invoices">
+    <caption id="caption">Showing 1–6 of 12 invoices</caption>
+    <thead><tr><th scope="col">Invoice</th><th scope="col">Customer</th><th scope="col">Date</th><th scope="col">Amount</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <nav class="pager row" aria-label="Pagination" id="pager"></nav>
+</main>
+<script type="module">
+import { $, $$, m, on, setText, money, tagLinks } from '/lab/common.js';
+
+const PAGE_SIZE = 6;
+const invoices = [
+  ['INV-1001', 'Acme Corp', '2026-01-05', 1200.00, 'Paid'],
+  ['INV-1002', 'Globex', '2026-01-12', 830.50, 'Pending'],
+  ['INV-1003', 'Initech', '2026-01-19', 2400.00, 'Overdue'],
+  ['INV-1004', 'Umbrella Health', '2026-01-26', 415.75, 'Paid'],
+  ['INV-1005', 'Stark Industries', '2026-02-02', 9999.99, 'Pending'],
+  ['INV-1006', 'Wayne Enterprises', '2026-02-09', 3050.00, 'Paid'],
+  ['INV-1007', 'Hooli', '2026-02-16', 760.00, 'Overdue'],
+  ['INV-1008', 'Soylent', '2026-02-23', 128.40, 'Paid'],
+  ['INV-1009', 'Tyrell Corp', '2026-03-02', 5600.00, 'Pending'],
+  ['INV-1010', 'Cyberdyne', '2026-03-09', 2222.22, 'Paid'],
+  ['INV-1011', 'Wonka Industries', '2026-03-16', 87.00, 'Pending'],
+  ['INV-1012', 'Oscorp', '2026-03-23', 4310.00, 'Overdue'],
+].map(([id, customer, date, amount, status]) => ({ id, customer, date, amount, status }));
+
+let page = 1;
+let editing = null;
+const rows = $('#rows');
+const status = $('#status');
+const pageCount = () => Math.max(1, Math.ceil(invoices.length / PAGE_SIZE));
+const moreIcon = '<svg width="18" height="18" viewBox="0 0 24 24" focusable="false"><title>More actions</title><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>';
+
+function cell(text) { const td = document.createElement('td'); td.textContent = text; return td; }
+function button(text, cls) { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; if (cls) b.className = cls; return b; }
+
+function rowFor(inv) {
+  const tr = document.createElement('tr');
+  tr.dataset.id = inv.id;
+  const th = document.createElement('th');
+  th.scope = 'row';
+  th.textContent = inv.id;
+  tr.append(th);
+  if (editing === inv.id) {
+    const c = document.createElement('td');
+    const ci = document.createElement('input');
+    ci.value = inv.customer; ci.setAttribute('aria-label', `Customer for ${inv.id}`); ci.id = 'edit-customer';
+    c.append(ci);
+    const a = document.createElement('td');
+    const ai = document.createElement('input');
+    ai.value = inv.amount.toFixed(2); ai.setAttribute('aria-label', `Amount for ${inv.id}`); ai.inputMode = 'decimal'; ai.id = 'edit-amount';
+    a.append(ai);
+    const err = document.createElement('div'); err.className = 'error'; err.id = 'edit-error'; err.setAttribute('role', 'alert');
+    a.append(err);
+    const st = document.createElement('td');
+    st.innerHTML = `<span class="badge ${inv.status}">${inv.status}</span>`;
+    const act = document.createElement('td'); act.className = 'actions';
+    const save = button('Save', 'primary'); save.dataset.action = 'save';
+    const cancel = button('Cancel'); cancel.dataset.action = 'cancel';
+    act.append(save, cancel);
+    tr.append(c, cell(inv.date), a, st, act);
+    return tr;
+  }
+  const st = document.createElement('td');
+  st.innerHTML = `<span class="badge ${inv.status}">${inv.status}</span>`;
+  const act = document.createElement('td'); act.className = 'actions';
+  const edit = button('Edit'); edit.dataset.action = 'edit';
+  const del = button('Delete', 'danger'); del.dataset.action = 'delete';
+  const more = button('', 'icon'); more.dataset.action = 'more'; more.innerHTML = moreIcon;
+  more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', 'false'); more.setAttribute('aria-controls', `menu-${inv.id}`);
+  const menu = document.createElement('ul');
+  menu.className = 'menu'; menu.id = `menu-${inv.id}`; menu.setAttribute('role', 'menu'); menu.hidden = true;
+  menu.setAttribute('aria-label', `Actions for ${inv.id}`);
+  for (const [label, action] of [['Mark as paid', 'paid'], ['Send reminder', 'remind']]) {
+    const li = document.createElement('li'); li.setAttribute('role', 'none');
+    const b = button(label); b.setAttribute('role', 'menuitem'); b.dataset.action = action; b.tabIndex = -1;
+    li.append(b); menu.append(li);
+  }
+  act.append(edit, del, more, menu);
+  tr.append(cell(inv.customer), cell(inv.date), cell(money(inv.amount)), st, act);
+  return tr;
+}
+
+function render() {
+  m(() => {
+    page = Math.min(page, pageCount());
+    const start = (page - 1) * PAGE_SIZE;
+    const slice = invoices.slice(start, start + PAGE_SIZE);
+    rows.replaceChildren(...slice.map(rowFor));
+    $('#caption').textContent = invoices.length ? `Showing ${start + 1}–${start + slice.length} of ${invoices.length} invoices` : 'No invoices';
+    const pager = $('#pager');
+    const items = [];
+    const prev = button('Previous'); prev.dataset.page = String(page - 1); prev.disabled = page === 1;
+    items.push(prev);
+    for (let p = 1; p <= pageCount(); p++) {
+      const b = button(String(p)); b.dataset.page = String(p); b.setAttribute('aria-label', `Page ${p}`);
+      if (p === page) b.setAttribute('aria-current', 'page');
+      items.push(b);
+    }
+    const next = button('Next'); next.dataset.page = String(page + 1); next.disabled = page === pageCount();
+    items.push(next);
+    pager.replaceChildren(...items);
+  });
+}
+
+function closeMenus(except) {
+  for (const menu of $$('.menu')) {
+    if (menu === except || menu.hidden) continue;
+    menu.hidden = true;
+    menu.parentElement.querySelector('[data-action="more"]').setAttribute('aria-expanded', 'false');
+  }
+}
+function openMenu(btn) {
+  const menu = btn.nextElementSibling;
+  closeMenus(menu);
+  menu.hidden = false;
+  btn.setAttribute('aria-expanded', 'true');
+  menu.querySelector('[role="menuitem"]').focus();
+}
+
+on(rows, 'click', (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const tr = btn.closest('tr');
+  const inv = invoices.find((i) => i.id === tr.dataset.id);
+  const action = btn.dataset.action;
+  if (action === 'more') {
+    if (btn.getAttribute('aria-expanded') === 'true') closeMenus(); else openMenu(btn);
+    return;
+  }
+  closeMenus();
+  if (action === 'delete') {
+    if (confirm(`Delete invoice ${inv.id} (${inv.customer})?`)) {
+      invoices.splice(invoices.indexOf(inv), 1);
+      if (editing === inv.id) editing = null;
+      render();
+      setText(status, `Deleted ${inv.id}`);
+    } else {
+      setText(status, `Kept ${inv.id}`);
+    }
+  } else if (action === 'edit') {
+    editing = inv.id;
+    render();
+    $('#edit-customer').focus();
+  } else if (action === 'cancel') {
+    editing = null;
+    render();
+    setText(status, `Edit cancelled for ${inv.id}`);
+  } else if (action === 'save') {
+    const customer = $('#edit-customer').value.trim();
+    const raw = $('#edit-amount').value.replace(/[$,\s]/g, '');
+    const amount = Number(raw);
+    if (!customer || !raw || !Number.isFinite(amount) || amount < 0) {
+      $('#edit-error').textContent = 'Enter a customer and a valid amount';
+      return;
+    }
+    inv.customer = customer;
+    inv.amount = Math.round(amount * 100) / 100;
+    editing = null;
+    render();
+    setText(status, `Saved ${inv.id}`);
+  } else if (action === 'paid') {
+    inv.status = 'Paid';
+    render();
+    setText(status, `${inv.id} marked as paid`);
+  } else if (action === 'remind') {
+    setText(status, `Reminder sent to ${inv.customer}`);
+  }
+});
+
+on(rows, 'keydown', (e) => {
+  if (e.key === 'Enter' && e.target.matches('#edit-customer, #edit-amount')) {
+    e.preventDefault();
+    e.target.closest('tr').querySelector('[data-action="save"]').click();
+  } else if (e.key === 'Escape') {
+    if (e.target.matches('#edit-customer, #edit-amount')) {
+      e.target.closest('tr').querySelector('[data-action="cancel"]').click();
+    } else if (e.target.closest('.menu')) {
+      const btn = e.target.closest('td').querySelector('[data-action="more"]');
+      closeMenus();
+      btn.focus();
+    }
+  } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && e.target.matches('[role="menuitem"]')) {
+    e.preventDefault();
+    const items = $$('[role="menuitem"]', e.target.closest('.menu'));
+    const i = items.indexOf(e.target);
+    items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus();
+  }
+});
+
+on(document, 'click', (e) => { if (!e.target.closest('td.actions')) closeMenus(); });
+
+on($('#pager'), 'click', (e) => {
+  const b = e.target.closest('button[data-page]');
+  if (!b || b.disabled) return;
+  page = Number(b.dataset.page);
+  editing = null;
+  render();
+});
+
+render();
+tagLinks();
+</script>
+</body>
+</html>

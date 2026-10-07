@@ -1,9 +1,9 @@
 <html data-theme="dark" style="overflow-y: scroll; overscroll-behavior-y: none; font-size: 15px; color-scheme: dark">
  <body style="background-color: rgb(0, 0, 0); scrollbar-color: rgb(62, 65, 68) rgb(22, 24, 28)">
-  <div style="height: 100%; display: flex">
+  <div id="react-root" style="height: 100%; display: flex">
    <div class="css-175oi2r r-13awgt0 r-12vffkv">
     <div class="css-175oi2r r-13awgt0 r-12vffkv">
-     <h2 role="heading" class="css-175oi2r r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h">
+     <h2 aria-level="2" role="heading" class="css-175oi2r r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h">
       <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41" style="color: rgb(231, 233, 234)">
        <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Per visualizzare i tasti di scelta rapida, premi il pulsante ?</span>
       </div>
@@ -36,7 +36,7 @@
              <a href="/i/bookmarks" aria-label="Segnalibri" role="link" class="css-175oi2r r-6koalj r-eqz5dr r-16y2uox r-1habvwh r-cnw61z r-13qz1uu r-1ny4l3l r-1loqt21"></a>
              <a href="/__morse/communities" aria-label="Community" role="link" class="css-175oi2r r-6koalj r-eqz5dr r-16y2uox r-1habvwh r-cnw61z r-13qz1uu r-1ny4l3l r-1loqt21"></a>
              <a href="/__morse" aria-label="Profilo" role="link" class="css-175oi2r r-6koalj r-eqz5dr r-16y2uox r-1habvwh r-cnw61z r-13qz1uu r-1ny4l3l r-1loqt21" data-testid="AppTabBar_Profile_Link"></a>
-             <button aria-expanded="false" aria-label="Altri elementi del menu" role="button" class="css-175oi2r r-6koalj r-eqz5dr r-16y2uox r-1habvwh r-cnw61z r-13qz1uu r-1loqt21 r-1ny4l3l" data-testid="AppTabBar_More_Menu" type="button"></button>
+             <button aria-expanded="false" aria-haspopup="menu" aria-label="Altri elementi del menu" role="button" class="css-175oi2r r-6koalj r-eqz5dr r-16y2uox r-1habvwh r-cnw61z r-13qz1uu r-1loqt21 r-1ny4l3l" data-testid="AppTabBar_More_Menu" type="button"></button>
             </nav>
            </div>
            <div class="css-175oi2r r-e7q0ms r-1awozwy r-12kyg2d">
@@ -59,7 +59,7 @@
                      <div class="css-175oi2r r-1adg3ll r-1udh08x" style="">
                       <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                        <div aria-label="Tommy D. Rossi" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af">
-                        <img alt="Tommy D. Rossi" class="css-9pa8cd">
+                        <img alt="Tommy D. Rossi" src="https://pbs.twimg.com/profile_images/1870480870567514112/Y0D-zTEY_normal.jpg" class="css-9pa8cd">
                        </div>
                       </div>
                      </div>
@@ -87,10 +87,10 @@
             <div class="css-175oi2r r-aqfbo4 r-gtdqiz r-1gn8etr r-4zbufd r-1g40b8q">
              <div class="css-175oi2r r-1e5uvyk r-5zmot">
               <div class="css-175oi2r">
-               <nav role="navigation" class="css-175oi2r r-1awozwy r-18u37iz r-1igl3o0 r-rull8r r-qklmqi">
+               <nav aria-live="polite" role="navigation" class="css-175oi2r r-1awozwy r-18u37iz r-1igl3o0 r-rull8r r-qklmqi">
                 <div class="css-175oi2r r-1awozwy r-1ro0kt6 r-18u37iz r-16y2uox r-1pi2tsx r-1ny4l3l">
                  <div class="css-175oi2r r-1537yvj r-u8s1d r-184en5c r-orgf3d r-633pao r-o7ynqc r-1i6wzkk" data-testid="ScrollSnap-prevButtonWrapper">
-                  <button aria-disabled="true" aria-label="Precedente" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
+                  <button aria-disabled="true" disabled aria-label="Precedente" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
  border-color: rgba(0, 0, 0, 0);
  backd...61 more characters"></button>
                  </div>
@@ -135,7 +135,7 @@
                   </div>
                  </div>
                  <div class="css-175oi2r r-1537yvj r-u8s1d r-184en5c r-zchlnj r-orgf3d r-633pao r-o7ynqc r-1i6wzkk" data-testid="ScrollSnap-nextButtonWrapper">
-                  <button aria-disabled="true" aria-label="Avanti" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
+                  <button aria-disabled="true" disabled aria-label="Avanti" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
  border-color: rgba(0, 0, 0, 0);
  backd...61 more characters"></button>
                  </div>
@@ -164,7 +164,7 @@
                            <div class="css-175oi2r r-1adg3ll r-1udh08x" style="">
                             <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                              <div aria-label="Tommy D. Rossi" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af">
-                              <img alt="Tommy D. Rossi" class="css-9pa8cd">
+                              <img alt="Tommy D. Rossi" src="https://pbs.twimg.com/profile_images/1870480870567514112/Y0D-zTEY_normal.jpg" class="css-9pa8cd">
                              </div>
                             </div>
                            </div>
@@ -197,7 +197,7 @@
                                      <div class="r-1niwhzg r-17gur6a r-1yadl64 r-deolkf r-homxoj r-poiln3 r-7cikom r-1ny4l3l r-1ttztb7 r-t60dpp" data-testid="tweetTextarea_0RichTextInputContainer" style="min-height: 24px; height: 100%">
                                       <div class="DraftEditor-root">
                                        <div class="public-DraftEditorPlaceholder-root">
-                                        <div class="public-DraftEditorPlaceholder-inner" style="white-space: pre-wrap">Che c'è di nuovo?</div>
+                                        <div class="public-DraftEditorPlaceholder-inner" id="placeholder-fkd1a" style="white-space: pre-wrap">Che c'è di nuovo?</div>
                                        </div>
                                       </div>
                                      </div>
@@ -221,10 +221,10 @@
                     <div class="css-175oi2r r-kemksi r-jumn1c r-xd6kpl r-gtdqiz r-ipm5af r-184en5c">
                      <div class="css-175oi2r">
                       <div class="css-175oi2r r-1awozwy r-kemksi r-18u37iz r-1wtj0ep r-13qz1uu r-184en5c" data-testid="toolBar">
-                       <nav role="navigation" class="css-175oi2r r-1awozwy r-18u37iz r-knv0ih r-13awgt0 r-m5k245">
+                       <nav aria-live="polite" role="navigation" class="css-175oi2r r-1awozwy r-18u37iz r-knv0ih r-13awgt0 r-m5k245">
                         <div class="css-175oi2r r-1awozwy r-1ro0kt6 r-18u37iz r-16y2uox r-1pi2tsx r-1ny4l3l">
                          <div class="css-175oi2r r-1537yvj r-u8s1d r-184en5c r-orgf3d r-633pao r-o7ynqc r-1i6wzkk" data-testid="ScrollSnap-prevButtonWrapper">
-                          <button aria-disabled="true" aria-label="Precedente" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
+                          <button aria-disabled="true" disabled aria-label="Precedente" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
  border-color: rgba(0, 0, 0, 0);
  ...133 more characters"></button>
                          </div>
@@ -250,13 +250,13 @@
                            </div>
                            <div role="presentation" class="css-175oi2r r-14tvyh0 r-cpa5s6">
                             <div class="css-175oi2r">
-                             <button aria-label="Aggiungi emoji" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-136ojw6 r-2yi16 r-1qi8awa r-1loqt21 r-o7ynqc r-6416eg r-1ny4l3l" type="button" style="background-color: rgba(0, 0, 0, 0);
+                             <button aria-haspopup="menu" aria-label="Aggiungi emoji" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-136ojw6 r-2yi16 r-1qi8awa r-1loqt21 r-o7ynqc r-6416eg r-1ny4l3l" type="button" style="background-color: rgba(0, 0, 0, 0);
  border-color: rgba(0, 0, 0, 0);
  ...59 more characters"></button>
                             </div>
                            </div>
                            <div role="presentation" class="css-175oi2r r-14tvyh0 r-cpa5s6">
-                            <button aria-disabled="true" aria-label="Tagga la posizione" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" data-testid="geoButton" type="button" style="background-color: rgba(0, 0, 0, 0);
+                            <button aria-disabled="true" disabled aria-label="Tagga la posizione" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" data-testid="geoButton" type="button" style="background-color: rgba(0, 0, 0, 0);
  border-color: rgba(0, 0, 0, 0);
  ...53 more characters"></button>
                            </div>
@@ -273,14 +273,14 @@
                           </div>
                          </div>
                          <div class="css-175oi2r r-1537yvj r-u8s1d r-184en5c r-zchlnj r-orgf3d r-633pao r-o7ynqc r-1i6wzkk" data-testid="ScrollSnap-nextButtonWrapper">
-                          <button aria-disabled="true" aria-label="Avanti" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
+                          <button aria-disabled="true" disabled aria-label="Avanti" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-2yi16 r-1qi8awa r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" type="button" style="background-color: rgba(15, 20, 25, 0.75);
  border-color: rgba(0, 0, 0, 0);
  ...133 more characters"></button>
                          </div>
                         </div>
                        </nav>
                        <div class="css-175oi2r r-1awozwy r-18u37iz r-knv0ih">
-                        <button aria-disabled="true" role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-1cwvpvk r-2yi16 r-1qi8awa r-3pj75a r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" data-testid="tweetButtonInline" type="button" style="background-color: rgb(239, 243, 244);
+                        <button aria-disabled="true" disabled role="button" class="css-175oi2r r-sdzlij r-1phboty r-rs99b7 r-lrvibr r-1cwvpvk r-2yi16 r-1qi8awa r-3pj75a r-o7ynqc r-6416eg r-icoktb r-1ny4l3l" data-testid="tweetButtonInline" type="button" style="background-color: rgb(239, 243, 244);
  border-color: rgba(0, 0, 0, 0);
  ...31 more characters">
                          <div class="css-146c3p1 r-bcqeeo r-qvutc0 r-37j5jr r-q4m81j r-a023e6 r-rjixqe r-b88u0q r-1awozwy r-6koalj r-18u37iz r-16y2uox r-1777fci" style="color: rgb(15, 20, 25)">
@@ -302,8 +302,8 @@
              </div>
             </div>
             <div class="css-175oi2r r-f8sm7e r-13qz1uu r-1ye8kvj">
-             <section role="region" class="css-175oi2r">
-              <h1 role="heading" class="css-146c3p1 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h">La tua cronologia principale</h1>
+             <section aria-labelledby="accessible-list-1" role="region" class="css-175oi2r">
+              <h1 aria-level="1" role="heading" class="css-146c3p1 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" id="accessible-list-1">La tua cronologia principale</h1>
               <div aria-label="Cronologia: La tua cronologia principale" class="css-175oi2r">
                <div style="position: relative; min-height: 13493px">
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(0px); position: absolute; width: 100%">
@@ -320,7 +320,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(49px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__zlwrk747fkl id__69tu215vrks id__1z6s2cr3cb2 id__32d3ldjf2bm id__v8gqaf3qdd7 id__tqlwiler5u9 id__ly3ec5frolk id__5to15vijhh4 id__u6m6vfu0xam id__hqcjtxzb01i id__bnshii2390i id__34xeyhgy29e id__6r1p...117 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -329,7 +329,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__v8gqaf3qdd7" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/HSVSphere" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -370,7 +370,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -379,11 +379,11 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__bnshii2390i" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">lmao</span>
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
+                        <div aria-labelledby="id__rj2j84pm63 id__v7kshn9wnt" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__6r1p7ad2ppe">
                          <div class="css-175oi2r r-9aw3ui">
                           <div class="css-175oi2r" style="max-width: 530.108px">
                            <div class="css-175oi2r">
@@ -394,7 +394,7 @@
                                 <div class="css-175oi2r r-1adg3ll r-1udh08x">
                                  <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                   <div aria-label="Immagine" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="tweetPhoto" style="margin: 0px">
-                                   <img alt="Immagine" class="css-9pa8cd">
+                                   <img alt="Immagine" src="https://pbs.twimg.com/media/G-UdjHlWoAAE9Nk?format=jpg&amp;name=small" class="css-9pa8cd">
                                   </div>
                                  </div>
                                 </div>
@@ -408,7 +408,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="1 risposta e 3 repost e 30 Mi piace e 6 segnalibri e 1502 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="1 risposta e 3 repost e 30 Mi piace e 6 segnalibri e 1502 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__x9gh9w8kos9">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="1 risposta. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -425,7 +425,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="3 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="3 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -476,7 +476,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -493,7 +493,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(520px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__0dc9rdnufv0e id__713n8nr8ba id__5lby55m061v id__09mpmrz9fonc id__md2arzf5evg id__oitagjnqcbe id__re7wdz5htg id__n9sbxdqiz4 id__fflahzp9pvv id__h5q4053gu1 id__5u91g3f5qij id__bofb487zizi id__qoein2...114 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -502,7 +502,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__md2arzf5evg" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/ryanvogel" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -543,7 +543,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -552,7 +552,7 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__5u91g3f5qij" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">i'm running my own</span>
                           <div class="css-175oi2r r-xoduu5">
                            <span class="r-18u37iz">
@@ -562,7 +562,7 @@
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">games with opencode zen AI models</span>
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
+                        <div aria-labelledby="id__0q6pypti9z5f id__ye7jghvm2ol" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__qoein2y046">
                          <div class="css-175oi2r r-9aw3ui">
                           <div class="css-175oi2r" style="max-width: 761.131px">
                            <div class="css-175oi2r">
@@ -573,7 +573,7 @@
                                 <div class="css-175oi2r r-1adg3ll r-1udh08x">
                                  <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                   <div aria-label="Immagine" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="tweetPhoto" style="margin: 0px">
-                                   <img alt="Immagine" class="css-9pa8cd">
+                                   <img alt="Immagine" src="https://pbs.twimg.com/media/G-UFb4jWgAA5h3E?format=png&amp;name=small" class="css-9pa8cd">
                                   </div>
                                  </div>
                                 </div>
@@ -587,12 +587,12 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="1 repost e 267 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="1 repost e 267 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__5klxmhg5b72">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="0 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="1 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="1 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -631,7 +631,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -648,7 +648,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(902px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__oi12pdh6xl id__m2byltulkz7 id__9lu217r3edm id__tnwjx2vvkl id__grcq8bxkldp id__vlsebicxroa id__c1ixeqtndqe id__4iki0savb3l id__kfbol0b67ve id__zsjxh3num4 id__02zd0wggg4hj id__pxr78m0ubk id__iw3oawg...115 more characters" role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -657,7 +657,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__grcq8bxkldp" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/1Bexly" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -698,7 +698,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -707,14 +707,14 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__02zd0wggg4hj" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">This is revisionist history bruhh. Everyone shat on them for
                                                       weeks until 2 days ago lmaooo People will say anything for money</span>
-                          <img alt="😆" title="Faccina che sorride a bocca aperta e strizza gli occhi" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
+                          <img alt="😆" src="https://abs-0.twimg.com/emoji/v2/svg/1f606.svg" title="Faccina che sorride a bocca aperta e strizza gli occhi" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
-                         <div class="css-175oi2r">
+                        <div aria-labelledby="id__0uq0jfsgauxk id__cl9x2831z8u" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__iw3oawgl75">
+                         <div class="css-175oi2r" id="id__0uq0jfsgauxk">
                           <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" style="color: rgb(231, 233, 234)">
                            <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Citazione</span>
                           </div>
@@ -776,7 +776,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="1 risposta e 1 Mi piace e 36 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="1 risposta e 1 Mi piace e 36 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__r81yp9butg8">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="1 risposta. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -793,7 +793,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="1 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -832,7 +832,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -849,7 +849,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(1185px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__wooti2csjoj id__men0v92bp4 id__es36iepqzpp id__6pjns6mqlga id__7k3n7eaz53a id__whgk6d4vmsr id__z63dymftuuc id__c5j2xg8kllk id__0egui60bfva id__yxzz5y8xo6 id__m0vryrfux4 id__kh9yg0gf6qm id__d5ty9cc...114 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -858,7 +858,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__7k3n7eaz53a" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/0xSero" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -899,7 +899,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -908,18 +908,18 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__m0vryrfux4" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Not true</span>
                          </div>
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="1 Mi piace e 18 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="1 Mi piace e 18 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__rp56d9xy3us">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="0 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="1 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -958,7 +958,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -975,7 +975,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(1284px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__tcs51nol8uh id__gxiphcz5b3b id__65n9jd5f5b5 id__z0mgkefcvaq id__y01k099mdr id__e8jl3ajrknn id__sxdepar6az9 id__2ak23kpie2l id__hqr1sv4i1o id__q8fbpht3pzh id__yfy7wldmbb id__229v7e42xg3j id__4rvim2...115 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -984,7 +984,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__y01k099mdr" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/elonmusk" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1025,7 +1025,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1034,13 +1034,13 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__yfy7wldmbb" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Starmer literally has a lower approval rating than Maduro</span>
-                          <img alt="😂" title="Faccina con lacrime di gioia" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
+                          <img alt="😂" src="https://abs-0.twimg.com/emoji/v2/svg/1f602.svg" title="Faccina con lacrime di gioia" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
-                         <div class="css-175oi2r">
+                        <div aria-labelledby="id__k0ub5bbrl1 id__4z6abubgt5p" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__4rvim212vkh">
+                         <div class="css-175oi2r" id="id__k0ub5bbrl1">
                           <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" style="color: rgb(231, 233, 234)">
                            <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Citazione</span>
                           </div>
@@ -1091,7 +1091,7 @@
                             </div>
                             <div class="css-175oi2r r-6gpygo r-jusfrs">
                              <div class="css-146c3p1 r-8akbws r-krxsd3 r-dnmrzs r-1udh08x r-1udbk01 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim r-14gqq1x" data-testid="tweetText" style="-webkit-line-clamp: 5; color: rgb(231, 233, 234)">
-                              <img alt="🚨" title="Lampeggiante dell'auto della polizia" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
+                              <img alt="🚨" src="https://abs-0.twimg.com/emoji/v2/svg/1f6a8.svg" title="Lampeggiante dell'auto della polizia" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
                               <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">ASMONGOLD SAYS AMERICANS SHOULD CAPTURE KEIR STARMER This
                                                               comes after Keir Starmer says he may ban X in the UK "We
                                                               should just go and arrest him, he has a lower approval
@@ -1109,7 +1109,7 @@
                                     <div aria-label="Video incorporato" class="css-175oi2r r-1awozwy r-1p0dtai r-1777fci r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="previewInterstitial">
                                      <div class="css-175oi2r r-1p0dtai r-1d2f490 r-1udh08x r-u8s1d r-zchlnj r-ipm5af">
                                       <div aria-label="Video incorporato" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" style="margin: 0px">
-                                       <img alt="Video incorporato" class="css-9pa8cd">
+                                       <img alt="Video incorporato" src="https://pbs.twimg.com/amplify_video_thumb/2009692115643535360/img/rF_LEilW2cb970LF?format=jpg&amp;name=small" class="css-9pa8cd">
                                       </div>
                                      </div>
                                      <div class="css-175oi2r r-18u37iz r-vampta r-u8s1d r-rki7wi r-1f55h46 r-633pao">
@@ -1145,7 +1145,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="4119 risposte e 16325 repost e 136387 Mi piace e 4426 segnalibri e 6608745 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="4119 risposte e 16325 repost e 136387 Mi piace e 4426 segnalibri e 6608745 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__d97zjrt2pf">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="4119 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -1162,7 +1162,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="16325 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="16325 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -1212,7 +1212,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -1229,7 +1229,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(1854px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__frz9ldf723c id__qjqc0osy369 id__mu738wsaqsk id__nkpxzaa7maj id__emermj6qe29 id__x9m979oxiod id__w6ear905059 id__k63a1b43brr id__pgtwmvdk37l id__ss9rqwuroel id__cn2h9yi6lc id__7astj5h8r5p id__jszxl...117 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -1238,7 +1238,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__emermj6qe29" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/ryannystrom" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1279,7 +1279,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1288,14 +1288,14 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__cn2h9yi6lc" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">I’m watching designers at Notion ship code that is
                                                       indistinguishable from senior engineers.</span>
                          </div>
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="23 risposte e 14 repost e 241 Mi piace e 53 segnalibri e 22635 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="23 risposte e 14 repost e 241 Mi piace e 53 segnalibri e 22635 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__f8qpdb4qw1p">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="23 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -1311,7 +1311,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="14 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="14 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -1360,7 +1360,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -1377,7 +1377,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(1975px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__3j0lmoxz5t3 id__130glmezupfi id__i6azk3h8ma8 id__rq5ve7lpvu id__d7dnev1ac7b id__elizdpvtu3p id__p86vq6y28kg id__dzv7fvbcz5a id__2qzhy4w825g id__acfv9wxweq id__83716qxu6zq id__ra00mfiq4r7 id__awaa0...115 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -1386,7 +1386,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__d7dnev1ac7b" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/hwchase17" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1427,7 +1427,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1440,7 +1440,7 @@
                           <div class="css-175oi2r r-1adg3ll r-1udh08x">
                            <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                             <div aria-label="Copertina dell'articolo" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" style="margin: 0px">
-                             <img alt="Copertina dell'articolo" class="css-9pa8cd">
+                             <img alt="Copertina dell'articolo" src="https://pbs.twimg.com/media/G-Uc4EQasAYZa8k?format=jpg&amp;name=small" class="css-9pa8cd">
                             </div>
                            </div>
                           </div>
@@ -1460,7 +1460,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="4 risposte e 7 repost e 29 Mi piace e 45 segnalibri e 3299 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="4 risposte e 7 repost e 29 Mi piace e 45 segnalibri e 3299 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__e36n7649608">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="4 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -1477,7 +1477,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="7 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="7 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -1527,7 +1527,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -1544,7 +1544,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(2403px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__u73z9i9v70f id__at8rxytnef4 id__flkffpk2wpk id__jr5uq6omseo id__nswin5xsj5n id__9u0t54b0izs id__a444ibi07 id__o7bhwsdcyqo id__m92uga9njt id__9q6qnijdcam id__9kss046y2ir id__9s7wbv5wq4 id__s6cwgu4a...111 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -1553,7 +1553,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__nswin5xsj5n" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/DavidKPiano" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1561,7 +1561,7 @@
                                  <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-b88u0q r-1awozwy r-6koalj r-1udh08x r-3s2u2q" style="color: rgb(231, 233, 234)">
                                   <span class="css-1jxf684 r-dnmrzs r-1udh08x r-1udbk01 r-3s2u2q r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">
                                    <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">David K</span>
-                                   <img alt="🎹" title="Tastiera musicale" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
+                                   <img alt="🎹" src="https://abs-0.twimg.com/emoji/v2/svg/1f3b9.svg" title="Tastiera musicale" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
                                   </span>
                                  </div>
                                 </div>
@@ -1595,7 +1595,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1604,14 +1604,14 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__9kss046y2ir" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Or use a state machine from the beginning</span>
-                          <img alt="😉" title="Faccina che fa l'occhiolino" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
+                          <img alt="😉" src="https://abs-0.twimg.com/emoji/v2/svg/1f609.svg" title="Faccina che fa l'occhiolino" class="r-4qtqp9 r-dflpy8 r-k4bwe5 r-1kpi4qh r-pp5qcn r-h9hxbl">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">This is the next best thing, though!</span>
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
-                         <div class="css-175oi2r">
+                        <div aria-labelledby="id__g7e08j09ccb id__qn1jbpslbg" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__s6cwgu4as4">
+                         <div class="css-175oi2r" id="id__g7e08j09ccb">
                           <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" style="color: rgb(231, 233, 234)">
                            <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Citazione</span>
                           </div>
@@ -1678,7 +1678,7 @@
                                   <div class="css-175oi2r r-1adg3ll r-1udh08x">
                                    <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                     <div aria-label="Immagine" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="tweetPhoto" style="margin: 0px">
-                                     <img alt="Immagine" class="css-9pa8cd">
+                                     <img alt="Immagine" src="https://pbs.twimg.com/media/G-TnYola0AADW9E?format=png&amp;name=small" class="css-9pa8cd">
                                     </div>
                                    </div>
                                   </div>
@@ -1694,7 +1694,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="1 risposta e 6 Mi piace e 590 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="1 risposta e 6 Mi piace e 590 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__m683psxj0mn">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="1 risposta. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -1711,7 +1711,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="6 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -1749,7 +1749,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -1766,7 +1766,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(3083px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__pn3tqjemqkh id__g97cid1krk id__t0va4e195 id__ki38fom9bza id__vnmw0zrmkf id__i78vw81mpir id__86s74xdmfd id__y0nr5j636bg id__65ebqjjvteo id__udisnlnyyy id__akeyp6xk2jw id__9pfc1hx3plr id__yu4gns4sne...112 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -1775,7 +1775,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__vnmw0zrmkf" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/evilrabbit_" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1816,7 +1816,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1825,13 +1825,13 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__akeyp6xk2jw" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">▲ Taste: Coming soon</span>
                          </div>
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="9 risposte e 40 Mi piace e 2277 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="9 risposte e 40 Mi piace e 2277 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__uk5ekdd9a3">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="9 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -1848,7 +1848,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="40 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -1886,7 +1886,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -1903,7 +1903,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(3184px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__5p94uozk11g id__oxfj8f9nyb id__dd5s5oez2nf id__q4kmzjyy12b id__fg0f8hsqwco id__1kwot842qq1 id__2jb0djf5h8b id__r0glpfv568i id__mhrlgyd5ug id__bvi7uwld9g id__bbbdwo8r5z id__paf70uh6xxg id__g2sgjwhy...115 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -1912,7 +1912,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__fg0f8hsqwco" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/kristaletz" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -1953,7 +1953,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -1962,7 +1962,7 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__bbbdwo8r5z" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">with</span>
                           <div class="css-175oi2r r-xoduu5">
                            <span class="r-18u37iz">
@@ -1971,8 +1971,8 @@
                           </div>
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
-                         <div class="css-175oi2r">
+                        <div aria-labelledby="id__1rwoy0jt3x2 id__rtecpuwlh2" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__g2sgjwhy6tc">
+                         <div class="css-175oi2r" id="id__1rwoy0jt3x2">
                           <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" style="color: rgb(231, 233, 234)">
                            <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Citazione</span>
                           </div>
@@ -1996,7 +1996,7 @@
                                          <div class="css-175oi2r r-1adg3ll r-1udh08x" style="">
                                           <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                            <div aria-label="Immagine del profilo quadrata" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af">
-                                            <img alt="Immagine del profilo quadrata" class="css-9pa8cd">
+                                            <img alt="Immagine del profilo quadrata" src="https://pbs.twimg.com/profile_images/1919488160125616128/QAZXTMEj_mini.png" class="css-9pa8cd">
                                            </div>
                                           </div>
                                          </div>
@@ -2064,7 +2064,7 @@
                                     <div aria-label="Video incorporato" class="css-175oi2r r-1awozwy r-1p0dtai r-1777fci r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="previewInterstitial">
                                      <div class="css-175oi2r r-1p0dtai r-1d2f490 r-1udh08x r-u8s1d r-zchlnj r-ipm5af">
                                       <div aria-label="Video incorporato" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" style="margin: 0px">
-                                       <img alt="Video incorporato" class="css-9pa8cd">
+                                       <img alt="Video incorporato" src="https://pbs.twimg.com/amplify_video_thumb/2009633769423347712/img/6cVfiygINdv-wf6x?format=jpg&amp;name=small" class="css-9pa8cd">
                                       </div>
                                      </div>
                                      <div class="css-175oi2r r-18u37iz r-vampta r-u8s1d r-rki7wi r-1f55h46 r-633pao">
@@ -2091,7 +2091,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="4 risposte e 25 Mi piace e 1142 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="4 risposte e 25 Mi piace e 1142 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__5awzms4cwp4">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="4 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -2108,7 +2108,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="25 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -2146,7 +2146,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -2163,7 +2163,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(3629px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__b4gggz3zmm5 id__fxk0fui6xc9 id__wec17jlmjs id__grz9ypuctpn id__5fscwtf9bw id__lnkpvynahfi id__7f6x1zhi1er id__wt53qn7tgqr id__sybf3k39u7k id__ysapvjmd5x9 id__po3ry89g5g id__gr08gka64m6 id__1rrlpuf...115 more characters" role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -2172,7 +2172,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__5fscwtf9bw" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/TimSweeneyEpic" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -2213,7 +2213,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -2222,14 +2222,14 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__po3ry89g5g" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Reason #42 for open platforms: to shut down every politician’s
                                                       incessant demands to all gatekeepers to censor all of their
                                                       political opponents.</span>
                          </div>
                         </div>
-                        <div class="css-175oi2r r-9aw3ui r-1s2bzr4">
-                         <div class="css-175oi2r">
+                        <div aria-labelledby="id__rib2wnl5c1n id__dgue6616yva" class="css-175oi2r r-9aw3ui r-1s2bzr4" id="id__1rrlpufgztz">
+                         <div class="css-175oi2r" id="id__rib2wnl5c1n">
                           <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-4iw3lz r-1xk2f4g r-109y4c4 r-1udh08x r-wwvuq4 r-u8s1d r-92ng3h" style="color: rgb(231, 233, 234)">
                            <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">Citazione</span>
                           </div>
@@ -2253,7 +2253,7 @@
                                          <div class="css-175oi2r r-1adg3ll r-1udh08x" style="">
                                           <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                            <div aria-label="Immagine del profilo quadrata" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af">
-                                            <img alt="Immagine del profilo quadrata" class="css-9pa8cd">
+                                            <img alt="Immagine del profilo quadrata" src="https://pbs.twimg.com/profile_images/1171574992821194752/rVrN8JVA_mini.jpg" class="css-9pa8cd">
                                            </div>
                                           </div>
                                          </div>
@@ -2321,7 +2321,7 @@
                                   <div class="css-175oi2r r-1adg3ll r-1udh08x">
                                    <div class="r-1p0dtai r-1pi2tsx r-1d2f490 r-u8s1d r-ipm5af r-13qz1uu">
                                     <div aria-label="Immagine" class="css-175oi2r r-1mlwlqe r-1udh08x r-417010 r-aqfbo4 r-n1ft60 r-gf0ln r-agouwx r-1p0dtai r-1d2f490 r-u8s1d r-zchlnj r-ipm5af" data-testid="tweetPhoto" style="margin: 0px">
-                                     <img alt="Immagine" class="css-9pa8cd">
+                                     <img alt="Immagine" src="https://pbs.twimg.com/media/G-PTissbIAAYmtA?format=jpg&amp;name=small" class="css-9pa8cd">
                                     </div>
                                    </div>
                                   </div>
@@ -2337,7 +2337,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="251 risposte e 203 repost e 1430 Mi piace e 103 segnalibri e 228388 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="251 risposte e 203 repost e 1430 Mi piace e 103 segnalibri e 228388 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__9wqm1v42e9g">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="251 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -2354,7 +2354,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="203 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="203 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -2403,7 +2403,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -2420,7 +2420,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(4150px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__7tlzzqoj7gp id__2z5s56pkees id__dkdk28n4a3m id__6os4vzuq7cc id__hmpmtx0cglb id__7b2ljyo8les id__r9adnzsuuzi id__5apbz6z60ae id__agsya9g2kzd id__eksskh68n2q id__2aea0kwexlt id__ni0ybet9g3 id__vjd43...116 more characters" role="article" class="css-175oi2r r-1ut4w64 r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -2429,7 +2429,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__hmpmtx0cglb" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/TimSweeneyEpic" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -2470,7 +2470,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -2479,7 +2479,7 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__2aea0kwexlt" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">All major AIs have documented instances of going off the rails;
                                                       all major AI companies make their best efforts to combat this;
                                                       none are perfect. Politicians demanding gatekeepers selectively
@@ -2489,7 +2489,7 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="60 risposte e 14 repost e 318 Mi piace e 10 segnalibri e 22717 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="60 risposte e 14 repost e 318 Mi piace e 10 segnalibri e 22717 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__oxfnq6f389d">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="60 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
@@ -2506,7 +2506,7 @@
                             </button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="14 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="14 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button">
                              <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-1awozwy r-6koalj r-1h0z5md r-o7ynqc r-clp7b1 r-3s2u2q" style="color: rgb(113, 118, 123)">
                               <div class="css-175oi2r r-xoduu5 r-1udh08x">
                                <span data-testid="app-text-transition-container" style="transition-property: transform;
@@ -2556,7 +2556,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -2573,7 +2573,7 @@
                 <div class="css-175oi2r" data-testid="cellInnerDiv" style="transform: translateY(4327px); position: absolute; width: 100%">
                  <div class="css-175oi2r r-1igl3o0 r-qklmqi r-1adg3ll r-1ny4l3l">
                   <div class="css-175oi2r">
-                   <article role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
+                   <article aria-labelledby="id__rlkqvcqqll id__cxh48xfodbc id__nsx0o5knxu id__r0mcvomq2yi id__fvdfvs9lmc6 id__4wtnjrieci4 id__2yliyhii62 id__i2m2xjfs05 id__prybes97ro id__6v22v9im2oe id__t1bgebuzvpk id__mlrjpruodp id__68l0jaxjv1...113 more characters" role="article" class="css-175oi2r r-18u37iz r-1udh08x r-1c4vpko r-1c7gwzm r-o7ynqc r-6416eg r-1ny4l3l r-1loqt21" data-testid="tweet">
                     <div class="css-175oi2r r-eqz5dr r-16y2uox r-1wbh5a2">
                      <div class="css-175oi2r r-16y2uox r-1wbh5a2 r-1ny4l3l">
                       <div class="css-175oi2r r-18u37iz r-136ojw6">
@@ -2582,7 +2582,7 @@
                          <div class="css-175oi2r r-k4xj1c r-18u37iz r-1wtj0ep">
                           <div class="css-175oi2r r-1d09ksm r-18u37iz r-1wbh5a2">
                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l">
-                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" id="id__fvdfvs9lmc6" data-testid="User-Name">
                              <div class="css-175oi2r r-1awozwy r-18u37iz r-1wbh5a2 r-dnmrzs">
                               <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
                                <a href="/cmuratori" role="link" class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1loqt21">
@@ -2623,7 +2623,7 @@
                             <div class="css-175oi2r r-1awozwy r-6koalj r-18u37iz">
                              <div class="css-175oi2r">
                               <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                               <button aria-expanded="false" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
+                               <button aria-expanded="false" aria-haspopup="menu" aria-label="Altro" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="caret" type="button"></button>
                               </div>
                              </div>
                             </div>
@@ -2632,7 +2632,7 @@
                          </div>
                         </div>
                         <div class="css-175oi2r">
-                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" data-testid="tweetText" style="color: rgb(231, 233, 234)">
+                         <div class="css-146c3p1 r-bcqeeo r-1ttztb7 r-qvutc0 r-37j5jr r-a023e6 r-rjixqe r-16dba41 r-bnwqim" id="id__t1bgebuzvpk" data-testid="tweetText" style="color: rgb(231, 233, 234)">
                           <span class="css-1jxf684 r-bcqeeo r-1ttztb7 r-qvutc0 r-poiln3">I seriously doubt any of these companies makes "their best
                                                       efforts" to do anything other than ship AI versions as rapidly as
                                                       possible. Multiple have already admitted in court to mass IP
@@ -2642,12 +2642,12 @@
                         </div>
                         <div class="css-175oi2r">
                          <div class="css-175oi2r">
-                          <div aria-label="2 Mi piace e 30 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4">
+                          <div aria-label="2 Mi piace e 30 visualizzazioni" role="group" class="css-175oi2r r-1kbdv8c r-18u37iz r-1wtj0ep r-1ye8kvj r-1s2bzr4" id="id__944xoiy5xk7">
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="0 risposte. Rispondi" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="reply" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
-                            <button aria-expanded="false" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
+                            <button aria-expanded="false" aria-haspopup="menu" aria-label="0 repost. Riposta" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="retweet" type="button"></button>
                            </div>
                            <div class="css-175oi2r r-18u37iz r-1h0z5md r-13awgt0">
                             <button aria-label="2 Mi piace. Metti Mi piace" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" data-testid="like" type="button">
@@ -2686,7 +2686,7 @@
  display: inline-grid;
  ...140 more characters">
                             <div class="css-175oi2r r-18u37iz r-1h0z5md">
-                             <button aria-expanded="false" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
+                             <button aria-expanded="false" aria-haspopup="menu" aria-label="Condividi post" role="button" class="css-175oi2r r-1777fci r-bt1l66 r-bztko3 r-lrvibr r-1loqt21 r-1ny4l3l" type="button"></button>
                             </div>
                            </div>
                           </div>
@@ -2714,7 +2714,7 @@
     </div>
    </div>
   </div>
-  <div style="display: none">Press space bar to start a drag. When dragging you can use the arrow keys to move the item around and escape to
+  <div id="rbd-hidden-text-14-hidden-text-37" style="display: none">Press space bar to start a drag. When dragging you can use the arrow keys to move the item around and escape to
       cancel. Some screen readers may require you to be in focus mode or to use your pass through key</div>
  </body>
 </html>

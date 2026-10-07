@@ -1182,6 +1182,8 @@ export interface HoldResult {
 }
 
 export interface CdpScreencastHandle {
+  /** Epoch ms the recording started: zero of the recording clock (`atMs`, `durationMs`). */
+  readonly startedAt: number
   /** Stop capturing, encode, and return the written file. */
   stop(): Promise<CdpScreencastResult>
   /** Abort without writing anything. */
@@ -1788,6 +1790,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
   }
 
   return {
+    startedAt,
     frameCount: () => frames.length,
     captionCount: () => stamped.length,
 

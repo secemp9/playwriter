@@ -141,6 +141,8 @@ describe('Cross-workspace isolation (Todo 24 — decisive)', () => {
   let server: RelayServer
   let ext: WebSocket
   let autoCreateCounter = 0
+  /** Tabs whose attach echo the fake extension sends just before it answers the next sessionless Target.setAutoAttach. */
+  const attachDuringAutoAttach: Array<{ workspaceKey: string; sessionId: string; targetId: string; url: string }> = []
 
   beforeAll(async () => {
     server = await startPlayWriterCDPRelayServer({ port: TEST_PORT, host: '127.0.0.1', logger: quietLogger })
@@ -173,6 +175,22 @@ describe('Cross-workspace isolation (Todo 24 — decisive)', () => {
           }),
         )
       } else {
+        const late = msg.method === 'forwardCDPCommand' && msg.params?.method === 'Target.setAutoAttach' && !msg.params.sessionId
+          ? attachDuringAutoAttach.shift()
+          : undefined
+        if (late) {
+          // The extension writes a tab's attach echo before its answer on the same ordered socket.
+          ext.send(
+            JSON.stringify({
+              method: 'forwardCDPEvent',
+              params: {
+                method: 'Target.attachedToTarget',
+                workspaceKey: late.workspaceKey,
+                params: { sessionId: late.sessionId, targetInfo: pageTarget(late.targetId, late.url), waitingForDebugger: false },
+              },
+            }),
+          )
+        }
         // Every other forwarded command (e.g. forwardCDPCommand for setAutoAttach) just
         // needs an ack so routeCdpCommand's await resolves.
         ext.send(JSON.stringify({ id: msg.id, result: {} }))
@@ -327,6 +345,28 @@ describe('Cross-workspace isolation (Todo 24 — decisive)', () => {
       expect(d.attachedSessionIds).not.toContain('sessB')
     } finally {
       d.close()
+      await sleep(100)
+    }
+  }, 15000)
+
+  // MEASURED (page-purity.test.ts, real extension, its frames to the relay held 250 ms the way a loaded
+  // full run holds them): the attached tab's echo reached the relay while the connecting client's
+  // sessionless Target.setAutoAttach was in flight. The relay announced the tab to that client live,
+  // then again in the setAutoAttach replay, on the same sessionId. Playwright's crBrowser hands the
+  // session to a new CRSession before it asserts "Duplicate target", so the page it already had never
+  // hears from Chrome again: every later call on it hangs.
+  it('announces a tab to a client once when the tab attaches while that client is connecting', async () => {
+    attachDuringAutoAttach.push({ workspaceKey: KEY_A, sessionId: 'sessLate', targetId: 'tLate', url: 'http://late.test/' })
+    const a = new KeyedClient('t24-late-A', q(KEY_A, 'A'))
+    try {
+      await a.open()
+      await a.autoAttachAndSettle()
+
+      expect(attachDuringAutoAttach, 'the fake extension sent the late attach').toEqual([])
+      expect(a.attachedSessionIds.filter((s) => s === 'sessLate')).toEqual(['sessLate'])
+      expect(a.attachedSessionIds.filter((s) => s === 'sessA')).toEqual(['sessA'])
+    } finally {
+      a.close()
       await sleep(100)
     }
   }, 15000)

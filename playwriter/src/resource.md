@@ -1,3 +1,5 @@
+Plain Playwright, for debug mode. In playwriter's human mode (the default) these calls are refused — locator reads and actions, `page.evaluate`, `page.screenshot`, `page.goto` after the first load, `selectOption`, `setInputFiles` — because they run Playwright's script in the page or fake a state. There, read with `observe()` / `find()` / `readPage()`, act with `act.*` (`act.select`, `act.upload`, `act.open`), take pictures with `screenshot()`, and read cookies and storage with `cookies()` / `storage()`; `docs()` inside execute has the details.
+
 You can also find `getByRole` to get elements on the page.
 
 ```javascript

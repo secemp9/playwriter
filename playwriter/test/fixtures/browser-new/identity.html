@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Identity · Browser New</title>
+<script src="/witness.js"></script>
+<script src="/scope.js"></script>
+</head>
+<body>
+<h1>Identity</h1>
+<p id="status">Collecting…</p>
+<a href="/download/report.csv" download>Download report</a>
+<script>
+// The page reports how every scope presents the browser to its own server (POST /report), the way a
+// fingerprinting script would. `?fetch=<url>` makes every scope also try that URL.
+(async () => {
+  const query = new URLSearchParams(location.search)
+  const fetchUrl = query.get('fetch')
+  const ask = (post) => new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ error: 'no answer in 5 s' }), 5000)
+    post((data) => { clearTimeout(timer); resolve(data) }, fetchUrl ? { fetch: fetchUrl } : {})
+  })
+  const report = { tag: query.get('tag') || 'untagged' }
+  report.page = { scope: await describeScope(), fetched: fetchUrl ? await tryFetch(fetchUrl) : null }
+  report.dedicated = await ask((done, message) => { const worker = new Worker('/scope.js'); worker.onmessage = (event) => done(event.data); worker.onerror = (event) => done({ error: String(event.message) }); worker.postMessage(message) })
+  report.shared = await ask((done, message) => { const worker = new SharedWorker('/scope.js'); worker.port.onmessage = (event) => done(event.data); worker.onerror = () => done({ error: 'shared worker failed to start' }); worker.port.postMessage(message) })
+  report.service = await ask(async (done, message) => {
+    try {
+      const registration = await navigator.serviceWorker.register('/scope.js')
+      await navigator.serviceWorker.ready
+      navigator.serviceWorker.onmessage = (event) => done(event.data)
+      ;(registration.active || registration.waiting || registration.installing).postMessage(message)
+    } catch (error) { done({ error: String(error) }) }
+  })
+  const canvas = document.createElement('canvas').getContext('webgl')
+  const debugInfo = canvas && canvas.getExtension('WEBGL_debug_renderer_info')
+  report.webglRenderer = canvas ? canvas.getParameter(debugInfo ? debugInfo.UNMASKED_RENDERER_WEBGL : canvas.RENDERER) : null
+  report.screen = { width: screen.width, height: screen.height, availWidth: screen.availWidth, availHeight: screen.availHeight }
+  report.window = { innerWidth, innerHeight, outerWidth, outerHeight, devicePixelRatio }
+  report.media = { dark: matchMedia('(prefers-color-scheme: dark)').matches, coarse: matchMedia('(pointer: coarse)').matches }
+  report.touchPoints = navigator.maxTouchPoints
+  await fetch('/report', { method: 'POST', body: JSON.stringify(report) })
+  document.getElementById('status').textContent = 'Report sent'
+})()
+</script>
+</body>
+</html>

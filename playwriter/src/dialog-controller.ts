@@ -13,7 +13,10 @@
  *    decision about the page's unsaved work, and accepting it silently would discard
  *    that work. While it is open the page's JS is frozen (and a beforeunload holds the
  *    navigation that raised it).
- *  - `accept` / `dismiss`: every dialog is answered at once by the policy.
+ *  - `accept` / `dismiss` (the session policy, `act.dialog.policy`): a confirm or prompt is
+ *    answered at once (a prompt accepted with the policy's text, else its own default) and
+ *    recorded with `answeredBy: 'policy'`. A beforeunload is answered only by its own
+ *    explicit setting (`beforeunload: 'leave' | 'stay'`), never implied by `accept`.
  *
  * Every open dialog — the ones the policy answers too, until they are actually closed —
  * is reported by `current()` with `handling: 'auto' | 'agent'`, and every open/close is
@@ -33,7 +36,31 @@ import type { ICDPSession } from './cdp-session.js'
 import { withDeadline } from './isolated-world.js'
 import { ModelFacingError, type JsDialogState } from './probe-types.js'
 
+/** Confirm and prompt: `pending` waits for the agent (act.dialog.policy('ask')); `accept`/`dismiss` answer as they open. */
 export type DialogPolicy = 'pending' | 'accept' | 'dismiss'
+/** beforeunload ("Leave site?"): `ask` waits for the agent; `leave` accepts it, `stay` dismisses it. */
+export type BeforeUnloadPolicy = 'ask' | 'leave' | 'stay'
+
+export interface DialogPolicySettings {
+  policy: DialogPolicy
+  beforeunload: BeforeUnloadPolicy
+  /** Text an accepted prompt is answered with; absent: the prompt's own default. */
+  promptText?: string
+}
+
+/** `prompt("What is your name?", default "Guest")`: what the dialog asks, the way the model reads it. */
+export function dialogLabel(state: Pick<JsDialogState, 'type' | 'message' | 'defaultValue'>): string {
+  const fallback = state.type === 'prompt' && state.defaultValue !== undefined ? `, default "${state.defaultValue}"` : ''
+  return `${state.type}("${state.message}"${fallback})`
+}
+
+/** How a closed dialog was answered: `accepted by the session dialog policy with "Guest"`. */
+export function dialogAnswerText(state: JsDialogState): string {
+  if (state.outcome === undefined) return 'closed (which button is unknown: it closed outside this session)'
+  if (state.outcome === 'auto-accepted') return 'accepted automatically'
+  const text = state.type === 'prompt' && state.outcome === 'accepted' && state.promptText !== undefined ? ` with "${state.promptText}"` : ''
+  return `${state.outcome}${state.answeredBy === 'policy' ? ' by the session dialog policy' : ''}${text}`
+}
 
 const HISTORY_CAP = 100
 /** Answering a dialog is one protocol round trip; if it does not come back, say so rather than hang. */
@@ -56,16 +83,20 @@ interface OpenDialog {
 
 export class DialogController {
   private readonly page: Page
-  private policy: DialogPolicy
+  private settings: DialogPolicySettings
   private attached = false
   private session: ICDPSession | null = null
   private open: OpenDialog | null = null
   private readonly log: JsDialogState[] = []
   private readonly listeners = new Set<(state: JsDialogState | null) => void>()
 
-  constructor(options: { page: Page; policy?: DialogPolicy }) {
+  constructor(options: { page: Page; policy?: DialogPolicy; beforeunload?: BeforeUnloadPolicy; promptText?: string }) {
     this.page = options.page
-    this.policy = options.policy ?? 'pending'
+    this.settings = {
+      policy: options.policy ?? 'pending',
+      beforeunload: options.beforeunload ?? 'ask',
+      ...(options.promptText !== undefined ? { promptText: options.promptText } : {}),
+    }
   }
 
   /** Must run synchronously when the page is first seen: from then on Playwright no longer auto-dismisses. */
@@ -120,14 +151,35 @@ export class DialogController {
     return await this.answer('dismissed', undefined)
   }
 
-  /** Switching to accept/dismiss also answers a confirm/prompt/beforeunload that is waiting right now. */
-  setPolicy(policy: DialogPolicy): void {
-    this.policy = policy
+  /** The policy in force: what a dialog that opens now is answered with. */
+  policySettings(): DialogPolicySettings {
+    return { ...this.settings }
+  }
+
+  /**
+   * Set the policy. A confirm/prompt (or, with an explicit `beforeunload`, a "Leave site?") that
+   * waits for the agent right now is answered by the new policy at once.
+   */
+  setPolicy(policy: DialogPolicy, options: { beforeunload?: BeforeUnloadPolicy; promptText?: string } = {}): void {
+    this.settings = {
+      policy,
+      beforeunload: options.beforeunload ?? 'ask',
+      ...(options.promptText !== undefined ? { promptText: options.promptText } : {}),
+    }
     const open = this.open
-    if (policy === 'pending' || !open || open.state.handling === 'auto' || open.answering) return
+    if (!open || open.state.handling === 'auto' || open.answering || this.policyAnswer(open.state.type) === null) return
     open.state.handling = 'auto'
     this.notify()
     void this.answerAutomatically(open)
+  }
+
+  /** The answer the policy gives a dialog of `type` as it opens; null: the agent answers it. */
+  private policyAnswer(type: JsDialogState['type']): Outcome | null {
+    if (type === 'alert') return this.settings.policy === 'dismiss' ? 'dismissed' : 'auto-accepted'
+    if (type === 'beforeunload') {
+      return this.settings.beforeunload === 'leave' ? 'accepted' : this.settings.beforeunload === 'stay' ? 'dismissed' : null
+    }
+    return this.settings.policy === 'accept' ? 'accepted' : this.settings.policy === 'dismiss' ? 'dismissed' : null
   }
 
   private notify(): void {
@@ -140,7 +192,7 @@ export class DialogController {
     // Chrome shows one dialog per page at a time: a new one means the previous one closed,
     // with which button unknown here.
     if (stale) this.markClosed(stale, stale.answering)
-    const handling: JsDialogState['handling'] = this.policy !== 'pending' || type === 'alert' ? 'auto' : 'agent'
+    const handling: JsDialogState['handling'] = this.policyAnswer(type) === null ? 'agent' : 'auto'
     const state: JsDialogState = { type, message, openedAt: Date.now(), handling }
     if (type === 'prompt' && defaultValue !== undefined) state.defaultValue = defaultValue
     this.log.push(state)
@@ -172,11 +224,19 @@ export class DialogController {
    * thrown out of Playwright's event listener, it is the state change.
    */
   private async answerAutomatically(open: OpenDialog): Promise<void> {
-    const outcome: Outcome = this.policy === 'dismiss' ? 'dismissed' : 'auto-accepted'
+    const outcome = this.policyAnswer(open.state.type)
+    if (outcome === null) {
+      // The policy changed to `ask` before the handle arrived: the agent answers it.
+      open.state.handling = 'agent'
+      this.notify()
+      return
+    }
+    if (open.state.type !== 'alert') open.state.answeredBy = 'policy'
     try {
-      await this.send(open, outcome, undefined)
+      await this.send(open, outcome, open.state.type === 'prompt' ? this.settings.promptText : undefined)
     } catch {
       if (open.state.closedAt === undefined && open.state.handling === 'auto') {
+        delete open.state.answeredBy
         open.state.handling = 'agent'
         this.notify()
       }
@@ -188,13 +248,16 @@ export class DialogController {
     open.answering = outcome
     const verb = outcome === 'dismissed' ? 'dismissing' : 'accepting'
     const what = `the ${open.state.type} dialog "${open.state.message.slice(0, 80)}"`
+    // OK on a prompt nobody typed into returns what the field shows: its default.
+    const text = open.state.type === 'prompt' && outcome === 'accepted' ? (promptText ?? open.state.defaultValue ?? '') : promptText
     try {
       const dialog = await withDeadline(open.handle.promise, HANDLE_TIMEOUT_MS, `waiting for Playwright to report ${what}`)
       await withDeadline(
-        outcome === 'dismissed' ? dialog.dismiss() : dialog.accept(promptText),
+        outcome === 'dismissed' ? dialog.dismiss() : dialog.accept(text),
         HANDLE_TIMEOUT_MS,
         `${verb} ${what}`,
       )
+      if (open.state.type === 'prompt' && outcome === 'accepted' && text !== undefined) open.state.promptText = text
       this.markClosed(open, outcome)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

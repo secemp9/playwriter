@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  main { padding-bottom: 160px; }
+  .action-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; background: #fff; border-top: 1px solid var(--line); padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; }
+  .cookie-banner { position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; background: #1f2433; color: #fff; padding: 22px 20px 28px; min-height: 120px; box-shadow: 0 -6px 18px rgba(0,0,0,.25); }
+  .cookie-banner p { margin: 0 0 12px; max-width: 760px; }
+  .cookie-banner button { margin-right: 8px; }
+  .backdrop { position: fixed; inset: 0; z-index: 100; background: rgba(10, 14, 30, 0.55); }
+  .modal { position: fixed; z-index: 101; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(440px, 92vw); background: #fff; border-radius: 12px; padding: 22px; box-shadow: 0 20px 50px rgba(0,0,0,.35); }
+  .modal h2 { margin-top: 0; }
+  .modal .close { position: absolute; top: 10px; right: 10px; }
+  .modal.shake { animation: lab-shake 0.3s; }
+  @keyframes lab-shake { 25% { transform: translate(-52%, -50%); } 75% { transform: translate(-48%, -50%); } }
+  .article p { max-width: 720px; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Checkout</span></header>
+<main>
+  <h1>Checkout</h1>
+  <p id="step" class="status">Step 1 of 3 — Shipping</p>
+  <div class="article card">
+    <h2>Shipping details</h2>
+    <p>Your order of <strong>2 items</strong> will ship from our Lyon warehouse. Standard delivery takes 3–5 business days.</p>
+    <p>Orders over $50 ship for free. You can change the delivery address on the next step.</p>
+  </div>
+  <h2>Activity</h2>
+  <ol id="activity" class="log" aria-live="polite"></ol>
+</main>
+<div class="action-bar">
+  <span>Total: $74.00</span>
+  <button id="continue" type="button" class="primary">Continue</button>
+</div>
+<div id="cookie-banner" class="cookie-banner" role="region" aria-label="Cookie consent">
+  <p>We use cookies to keep you signed in and to measure how the store is used. You can accept all cookies or keep only the essential ones.</p>
+  <button id="cookie-accept" type="button" class="primary">Accept all</button>
+  <button id="cookie-reject" type="button">Reject non-essential</button>
+</div>
+<script type="module">
+import { $, on, later, logLine, tagLinks } from '/lab/common.js';
+
+const activity = $('#activity');
+let step = 1;
+const STEPS = ['Shipping', 'Payment', 'Review'];
+let modal = null;
+let backdrop = null;
+let returnFocus = null;
+
+function closeBanner(accepted) {
+  $('#cookie-banner').remove();
+  logLine(activity, accepted ? 'Cookies accepted' : 'Cookies rejected');
+}
+on($('#cookie-accept'), 'click', () => closeBanner(true));
+on($('#cookie-reject'), 'click', () => closeBanner(false));
+
+on($('#continue'), 'click', () => {
+  if (step >= 3) return;
+  step++;
+  $('#step').textContent = `Step ${step} of 3 — ${STEPS[step - 1]}`;
+  logLine(activity, `Continued to step ${step}`);
+  if (step === 3) $('#continue').disabled = true;
+});
+
+function focusables() {
+  return Array.from(modal.querySelectorAll('button, input')).filter((el) => !el.disabled && !el.hidden);
+}
+
+function openModal() {
+  returnFocus = document.activeElement;
+  backdrop = document.createElement('div');
+  backdrop.className = 'backdrop';
+  backdrop.id = 'newsletter-backdrop';
+  modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.id = 'newsletter';
+  modal.setAttribute('role', 'dialog');
+  modal.setAttribute('aria-modal', 'true');
+  modal.setAttribute('aria-labelledby', 'newsletter-title');
+  modal.setAttribute('aria-describedby', 'newsletter-desc');
+  modal.innerHTML = `
+    <button type="button" class="icon close" id="newsletter-close" aria-label="Close"><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.5"/></svg></button>
+    <h2 id="newsletter-title">Get 10% off your first order</h2>
+    <div id="newsletter-body">
+      <p id="newsletter-desc">Subscribe to our newsletter and we will email you a discount code.</p>
+      <form id="newsletter-form" novalidate>
+        <div class="field">
+          <label for="newsletter-email">Email address</label>
+          <input id="newsletter-email" type="email" autocomplete="email" aria-describedby="newsletter-error">
+          <span id="newsletter-error" class="error" role="alert"></span>
+        </div>
+        <button type="submit" class="primary">Subscribe</button>
+      </form>
+    </div>`;
+  document.body.append(backdrop, modal);
+  logLine(activity, 'Newsletter modal opened');
+  on(backdrop, 'click', () => {
+    logLine(activity, 'Backdrop clicked (modal still open)');
+    modal.classList.remove('shake');
+    void modal.offsetWidth;
+    modal.classList.add('shake');
+  });
+  on($('#newsletter-close'), 'click', () => closeModal('close button'));
+  on($('#newsletter-form'), 'submit', (e) => {
+    e.preventDefault();
+    const value = $('#newsletter-email').value.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      $('#newsletter-email').setAttribute('aria-invalid', 'true');
+      $('#newsletter-error').textContent = 'Enter a valid email address';
+      return;
+    }
+    $('#newsletter-body').innerHTML = '';
+    const p = document.createElement('p');
+    p.id = 'newsletter-thanks';
+    p.textContent = `Thanks! A 10% code is on its way to ${value}.`;
+    $('#newsletter-body').append(p);
+    $('#newsletter-close').focus();
+    logLine(activity, `Subscribed ${value}`);
+    later(1500, () => { if (modal) closeModal('after subscribing'); });
+  });
+  $('#newsletter-email').focus();
+}
+
+function closeModal(how) {
+  modal.remove();
+  backdrop.remove();
+  modal = null;
+  backdrop = null;
+  logLine(activity, `Newsletter closed (${how})`);
+  if (returnFocus && document.contains(returnFocus)) returnFocus.focus();
+}
+
+on(document, 'keydown', (e) => {
+  if (!modal) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeModal('Escape');
+  } else if (e.key === 'Tab') {
+    const f = focusables();
+    const i = f.indexOf(document.activeElement);
+    if (e.shiftKey && (i <= 0)) { e.preventDefault(); f[f.length - 1].focus(); }
+    else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus(); }
+    else if (i === -1) { e.preventDefault(); f[0].focus(); }
+  }
+});
+
+later(1000, openModal);
+tagLinks();
+</script>
+</body>
+</html>

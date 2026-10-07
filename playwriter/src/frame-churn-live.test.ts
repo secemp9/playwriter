@@ -28,6 +28,7 @@ import { getCDPSessionForPage } from './cdp-session.js'
 import { DialogController } from './dialog-controller.js'
 import { FileChooserGate } from './file-chooser-gate.js'
 import { PageFrames } from './page-frames.js'
+import { writeFakePasswordManager } from './fake-password-manager.js'
 import { getPageMarkdown } from './page-markdown.js'
 import { observePage, renderObservation } from './page-observe.js'
 import { RefRegistry } from './ref-registry.js'
@@ -104,6 +105,12 @@ let browser: Browser
 let context: BrowserContext
 /** The extension frame's address, once the extension is loaded. */
 let menuUrl = ''
+/**
+ * While set, `/child` answers wait for it: no iframe can commit a navigation before the test lets it.
+ * Without it a cross-site menu, committed in a spare renderer, can report its navigation before the
+ * page's renderer has reported the last menus attached — before Playwright's server disposes it.
+ */
+let childrenHeld: Promise<void> | null = null
 const rejections: unknown[] = []
 const onRejection = (reason: unknown): void => {
   rejections.push(reason)
@@ -120,7 +127,12 @@ beforeAll(async () => {
     if (url.pathname === '/menus') return html(MENUS(`http://127.0.0.1:${port}`))
     if (url.pathname === '/churn') return html(CHURN(`http://127.0.0.1:${port}`))
     if (url.pathname === '/sealed') return html(SEALED(menuUrl))
-    if (url.pathname === '/child') return html(CHILD(url.searchParams.get('name') ?? 'child'))
+    if (url.pathname === '/child') {
+      const body = CHILD(url.searchParams.get('name') ?? 'child')
+      if (!childrenHeld) return html(body)
+      void childrenHeld.then(() => html(body))
+      return
+    }
     res.writeHead(404)
     res.end()
   })
@@ -199,17 +211,25 @@ describe('frames that leave the page while they are being walked', () => {
     // same-site) while the client still lists them, and the re-arm the next frame events start
     // borrows a session for each frame the page lists.
     capServerObjects(20)
+    const held = Promise.withResolvers<void>()
+    childrenHeld = held.promise
     try {
       await page.evaluate(() => Reflect.apply(Reflect.get(globalThis, 'openMenus'), globalThis, [21]))
-      // The two disposed menus never report their navigation to the client; the other 19 load.
+      // The client lists all 21 menus only once the server has made all 21, and so disposed the two
+      // oldest: neither had loaded, as no menu can load before this.
+      await expect.poll(() => page.frames().length).toBe(22)
+      held.resolve()
+      // The two disposed menus never report their navigation to the client; the other 19 load. Under
+      // the full suite's load only 13 of 19 had loaded by expect.poll's 1 s default, so the wait gets a
+      // deadline that fits a loaded machine; the count it waits for is unchanged.
       const loaded = (): number => page.frames().filter((frame) => frame.name().startsWith('menu-') && frame.url().endsWith(`name=${frame.name()}`)).length
-      await expect.poll(loaded).toBe(19)
+      await expect.poll(loaded, { timeout: 15_000 }).toBe(19)
       await settle(500)
       expect(rejectionMessages()).toEqual([])
       expect(gate.drain().failures).toEqual([])
       // The menus that remain keep their sessions: the page's own first, then the cross-site menus'
-      // in tree order. The first cross-site menu keeps the session it was borrowed before the server
-      // disposed it, when its borrow got there first.
+      // in tree order. The first cross-site menu has none: its process came only after the server
+      // disposed it, and no borrow can name a frame the server no longer has.
       const idOf = (name: string): string => {
         const frame = page.frames().find((candidate) => candidate.name() === name)
         if (!frame) throw new Error(`no frame named ${name}`)
@@ -217,16 +237,18 @@ describe('frames that leave the page while they are being walked', () => {
       }
       const sessions = (await frames.sessions()).map((session) => session.rootId)
       const crossMenus = [idOf('menu-10'), idOf('menu-20')]
-      expect([[frames.mainFrameId(), ...crossMenus], [frames.mainFrameId(), page.frames()[1].frameId(), ...crossMenus]]).toContainEqual(sessions)
+      expect(sessions).toEqual([frames.mainFrameId(), ...crossMenus])
       const listing = await frames.list()
       expect(listing.frames.map((entry) => entry.name)).toEqual(expect.arrayContaining(['menu-2', 'menu-10', 'menu-15', 'menu-20']))
-      // A disposed menu the client still lists (nameless: its name came with the navigation it never
-      // heard of) is named as gone; nothing else is unreadable.
-      expect(listing.unreadable.length).toBeLessThanOrEqual(2)
+      // Each disposed menu the client still lists (nameless: its name came with the navigation it
+      // never heard of) is named as gone; nothing else is unreadable.
+      expect(listing.unreadable.length).toBe(2)
       for (const entry of listing.unreadable) {
         expect(entry).toEqual(expect.objectContaining({ name: '', url: '', reason: 'it was removed from the page while being read' }))
       }
     } finally {
+      held.resolve()
+      childrenHeld = null
       capServerObjects(null)
       window.close()
       await tab.close()
@@ -307,18 +329,7 @@ describe('a frame no debugger may enter', () => {
 
   beforeAll(async () => {
     extensionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-churn-extension-'))
-    fs.writeFileSync(
-      path.join(extensionDir, 'manifest.json'),
-      JSON.stringify({
-        manifest_version: 3,
-        name: 'Test password manager',
-        version: '1.0',
-        background: { service_worker: 'worker.js' },
-        web_accessible_resources: [{ resources: ['menu.html'], matches: ['<all_urls>'] }],
-      }),
-    )
-    fs.writeFileSync(path.join(extensionDir, 'worker.js'), '')
-    fs.writeFileSync(path.join(extensionDir, 'menu.html'), '<!doctype html><title>Menu</title><button>Fill password</button>')
+    writeFakePasswordManager({ dir: extensionDir, inlineMenu: false })
     extensionContext = await chromium.launchPersistentContext('', {
       channel: 'chromium',
       headless: true,

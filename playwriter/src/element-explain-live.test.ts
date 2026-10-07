@@ -576,7 +576,8 @@ describe('explainElement while a native dialog is open', () => {
       const startedAt = Date.now()
       const blind = explainElement({ page, frames, frameId: frames.mainFrameId(), backendNodeId })
       await expect(blind).rejects.toBeInstanceOf(PageUnresponsiveError)
-      await expect(blind).rejects.toThrow('A native JS dialog')
+      // Without the dialog controller's knowledge the error states only the timeout (no guessed dialog).
+      await expect(blind).rejects.toThrow('The page did not respond within')
       expect(Date.now() - startedAt).toBeLessThan(8000)
 
       await dialog.accept()

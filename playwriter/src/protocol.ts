@@ -1,4 +1,6 @@
 import { CDPEventFor, ProtocolMapping } from './cdp-types.js'
+import type { DebuggerCutReport } from './debugger-cut.js'
+import type { TabVisibilityReport } from './tab-visibility.js'
 
 export const VERSION = 1
 
@@ -122,6 +124,20 @@ export type ExtensionDownloadStateMessage = {
   }
 }
 
+/** A tab Chrome took the debugger off while it stayed open, and what became of it since (debugger-cut.ts). */
+export type ExtensionDebuggerCutMessage = {
+  id?: undefined
+  method: 'debuggerCut'
+  params: DebuggerCutReport
+}
+
+/** Whether the user can see an attached tab, on every change the extension sees and when the relay asks (tab-visibility.ts). */
+export type ExtensionTabVisibilityMessage = {
+  id?: undefined
+  method: 'tabVisibility'
+  params: TabVisibilityReport
+}
+
 export type ExtensionMessage =
   | ExtensionResponseMessage
   | ExtensionEventMessage
@@ -130,6 +146,8 @@ export type ExtensionMessage =
   | RecordingDataMessage
   | RecordingCancelledMessage
   | ExtensionDownloadStateMessage
+  | ExtensionDebuggerCutMessage
+  | ExtensionTabVisibilityMessage
 
 // Recording command messages (MCP -> Extension via relay)
 export type StartRecordingParams = {

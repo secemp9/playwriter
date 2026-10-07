@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Worker errors · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<!-- Not a lab page: errors.html terminates its worker in the worker's error handler, which makes Chrome
+     report nothing of the error (measured). Here the page keeps its worker, as most apps do. -->
+<main>
+  <h1>Import</h1>
+  <button type="button" id="import">Import rows</button>
+  <p id="status" role="status"></p>
+</main>
+<script>
+const worker = new Worker('/lab/import-worker.js')
+worker.onmessage = (event) => { document.getElementById('status').textContent = event.data }
+document.getElementById('import').addEventListener('click', () => worker.postMessage('rows.csv'))
+</script>
+</body>
+</html>

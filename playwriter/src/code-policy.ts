@@ -57,10 +57,10 @@ export interface CodeSite {
 export type InputActionSite = CodeSite & { viaAct: boolean; viaScript?: { instead: string }; loop?: string }
 
 /**
- * `document` — a new document loads (goto, reload, setContent, act.open, location.href=).
+ * `document` — a new document loads (goto, reload, setContent, act.open, act.reload, location.href=).
  * `spa` — the URL changes without a new document (act.spaNavigate, history.pushState, location.hash=).
  * `history` — a move through browser history (goBack/goForward, act.back, history.back()).
- * `reason` — the literal `reason` passed to `act.open(url, { reason })`, when there is one.
+ * `reason` — the literal `reason` passed to `act.open(url, { reason })` or `act.reload({ reason })`, when there is one.
  * `inPage` — made by code the page evaluates (`page.evaluate(() => history.pushState(…))`).
  */
 export type NavigationSite = CodeSite & {
@@ -132,11 +132,20 @@ export const ACT_INPUT_METHODS: readonly string[] = [
 /** `act.<m>` calls that wait for the app; never restricted. */
 export const ACT_WAIT_METHODS: readonly string[] = ['waitForIdle', 'wait']
 
+/**
+ * `act.<path>` calls that are session settings the model chooses: which tab it works in, and how
+ * native dialogs are answered from now on. Neither input nor navigation (they never count as the
+ * call's one action); their CDP traffic is the tab switch (`Page.bringToFront`) and, when a dialog
+ * is open, its answer (`Page.handleJavaScriptDialog`), both sent through act itself.
+ */
+export const ACT_SESSION_SETTINGS: readonly string[] = ['switchTab', 'dialog.policy']
+
 /** `act.<m>` calls that navigate. They count as input actions. */
-export const ACT_NAVIGATION_METHODS: readonly string[] = ['open', 'back', 'spaNavigate']
+export const ACT_NAVIGATION_METHODS: readonly string[] = ['open', 'reload', 'back', 'spaNavigate']
 
 const ACT_NAVIGATION_KIND: Record<string, NavigationSite['kind']> = {
   open: 'document',
+  reload: 'document',
   back: 'history',
   spaNavigate: 'spa',
 }
@@ -207,10 +216,22 @@ const FORCED_STATE_METHODS: Record<string, string> = {
   setExtraHTTPHeaders: 'adds headers to every request the page makes',
   setHTTPCredentials: 'answers HTTP authentication prompts from the script',
   setStorageState: 'writes cookies and storage directly',
-  pdf: 'prints the page: its beforeprint and afterprint handlers run and it lays out for paper',
+  pdf: "prints the page through Playwright (its beforeprint and afterprint handlers run and it lays out for paper); pdf({ path: 'page.pdf' }) prints it the way Ctrl+P does and says what the page's print handlers changed",
   newCDPSession: "opens a CDP session that can send any command (getCDPSession({ page }) gives the page's session, read-only in human mode)",
   getExistingCDPSession: "opens a CDP session that can send any command (getCDPSession({ page }) gives the page's session, read-only in human mode)",
   newBrowserCDPSession: 'opens a browser CDP session that can send any command to any page',
+}
+
+/**
+ * Sandbox globals that write cookies or Web Storage directly (page-storage.ts): forged state the
+ * page never made. Their reads — cookies(), storage(), saveState() — are allowed.
+ */
+const STATE_WRITE_GLOBALS: Record<string, string> = {
+  setCookies: 'writes cookies the page never set; cookies() reads them',
+  clearCookies: 'deletes cookies directly; cookies() reads them',
+  setStorage: 'writes localStorage/sessionStorage directly; storage() reads them',
+  clearStorage: 'empties localStorage/sessionStorage directly; storage() reads them',
+  loadState: 'loads cookies and localStorage from a file; saveState({ path }) saves them',
 }
 
 /** `page.clock.*` / `context.clock.*`: Playwright's fake timers. */
@@ -462,6 +483,7 @@ const UNREADABLE = {
   timerString: 'runs a string as code when the timer fires',
   with: '`with` makes every name inside it ambiguous',
   actComputed: 'calls an act method whose name is computed at run time',
+  webmcpComputed: 'calls a webmcp method whose name is computed at run time (webmcp.invoke is an input action)',
 } as const
 
 // --- AST plumbing -----------------------------------------------------------------------
@@ -1003,6 +1025,15 @@ class Analyzer {
         } else if (root === 'getLocatorStringForElement' && args[0] !== undefined && makesLocator(args[0])) {
           // A Locator or ElementHandle made right there: the reader resolves it with Playwright's script.
           this.result.scriptForms.push({ api: 'getLocatorStringForElement(<locator>)', line, instead: 'getLocatorStringForElement({ ref: 12 })' })
+        } else if (root === 'screenshot' || root === 'diffScreenshot') {
+          // Reads, except a full-page capture: Chrome resizes the window while it shoots beyond it
+          // (measured in page-screenshot.ts). A fullPage the analysis cannot fold is refused when it runs.
+          const fullPage = objectPropertyValue(args[root === 'screenshot' ? 0 : 1], 'fullPage')?.evaluate()
+          if (fullPage?.confident && fullPage.value === true) {
+            this.result.forcedState.push({ api: `${root}({ fullPage: true })`, line, why: 'resizes the window to 1×1 and back while it shoots (the page gets resize, ResizeObserver and matchMedia events)' })
+          }
+        } else if (listed(STATE_WRITE_GLOBALS, root)) {
+          this.result.forcedState.push({ api: root, line, why: STATE_WRITE_GLOBALS[root] })
         }
         return
       }
@@ -1028,7 +1059,15 @@ class Analyzer {
         return
       }
       if (root === 'net') {
+        // Every other net.* call is a read: net.requests/request (also with { secrets: true }), net.save and
+        // net.har only read the journal and the bodies Chrome holds (and write a file in the session folder).
         if (rest.length === 1 && rest[0] === 'delay') this.result.forcedState.push({ api: 'net.delay', line, why: 'delays network responses artificially' })
+        return
+      }
+      // webmcp.list()/events() only read; webmcp.invoke runs a page tool: an input action, settled and reported like act's.
+      if (root === 'webmcp') {
+        if (rest.some((key) => key === null)) this.result.unanalysable.push({ api: 'webmcp[…]', line, why: UNREADABLE.webmcpComputed })
+        else if (rest.length === 1 && rest[0] === 'invoke') this.pushInput(path, { api: 'webmcp.invoke', line }, true)
         return
       }
       if (root === 'ghostCursor') {
@@ -1115,6 +1154,8 @@ class Analyzer {
       this.result.unanalysable.push({ api: 'act[…]', line, why: UNREADABLE.actComputed })
       return
     }
+    // A session setting (which tab, how dialogs are answered): neither input nor navigation.
+    if (ACT_SESSION_SETTINGS.includes(rest.join('.'))) return
     if (rest.length === 2 && rest[0] === 'dialog' && (rest[1] === 'accept' || rest[1] === 'dismiss' || rest[1] === 'chooseFiles')) {
       this.pushInput(path, { api: `act.dialog.${rest[1]}`, line }, true)
       return
@@ -1124,7 +1165,7 @@ class Analyzer {
     if (ACT_INPUT_METHODS.includes(method)) {
       this.pushInput(path, { api: `act.${method}`, line }, true)
     } else if (ACT_NAVIGATION_METHODS.includes(method)) {
-      const reason = method === 'open' ? reasonOption(args[1]) : undefined
+      const reason = method === 'open' ? reasonOption(args[1]) : method === 'reload' ? reasonOption(args[0]) : undefined
       this.pushNavigation(path, { api: `act.${method}`, line, kind: ACT_NAVIGATION_KIND[method], viaAct: true, ...(reason ? { reason } : {}) })
     } else if (ACT_WAIT_METHODS.includes(method)) {
       this.result.waits.push({ api: `act.${method}`, line })
@@ -1351,6 +1392,14 @@ function siteList(sites: CodeSite[]): string {
 }
 
 function navigationRefusal(site: NavigationSite): string {
+  if (site.api === 'act.reload') {
+    return (
+      `${REFUSED} act.reload on line ${site.line} has no reason. Reloading wipes client-side caches and in-memory state ` +
+      '(SWR, React Query, Redux), so it is only allowed when that is what you are testing: write ' +
+      "act.reload({ reason: 'why a reload is the point' }) with the reason as a literal string. A crashed tab needs no " +
+      'reason: its PAGE CRASHED line says so, and act.reload() then loads the page that crashed.'
+    )
+  }
   if (site.api === 'act.open') {
     return (
       `${REFUSED} act.open on line ${site.line} has no reason. A full document load wipes client-side caches and ` +
@@ -1491,9 +1540,9 @@ export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode;
 
   for (const site of analysis.navigations) {
     if (site.kind === 'spa' && site.viaAct) continue
-    if (site.api === 'act.open' && site.reason) {
+    if ((site.api === 'act.open' || site.api === 'act.reload') && site.reason) {
       notes.push(
-        `act.open on line ${site.line} loads a new document (reason: "${site.reason}"): client-side caches and in-memory state start empty.`,
+        `${site.api} on line ${site.line} loads a new document (reason: "${site.reason}"): client-side caches and in-memory state start empty.`,
       )
     } else if (site.api === 'act.back') {
       notes.push(`act.back on line ${site.line} goes back in history like the browser's Back button.`)

@@ -24,13 +24,13 @@ export const PLAYWRITER_WORLD_NAME = '__playwriter_probe__'
 
 const DEFAULT_TIMEOUT_MS = 5000
 
-/** The renderer did not answer in time. Usually a native dialog is open, or the main thread is blocked. */
+/**
+ * The renderer did not answer in time. The message states only that; the executor adds what it
+ * knows about the tab (an open dialog, a hidden tab) — tab-state.ts `unresponsiveDiagnosis`.
+ */
 export class PageUnresponsiveError extends ModelFacingError {
   constructor(what: string, timeoutMs: number) {
-    super(
-      `The page did not respond within ${timeoutMs}ms while ${what}. A native JS dialog ` +
-        '(alert/confirm/prompt) may be open, or the page main thread is blocked by a long task.',
-    )
+    super(`The page did not respond within ${timeoutMs}ms while ${what}.`)
     this.name = 'PageUnresponsiveError'
   }
 }

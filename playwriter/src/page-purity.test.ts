@@ -285,6 +285,9 @@ describe('page purity through the extension', () => {
     expect(buttonLine).toBeGreaterThan(0)
     const reader = await browserContext.newPage()
     await reader.goto(url)
+    // Its own grant: in a run where the pin test stopped before its grant, this test failed on the
+    // missing permission ("Read permission denied") instead of on what it checks.
+    await browserContext.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(url).origin })
     await reader.bringToFront()
     let copied = ''
     await until(async () => {

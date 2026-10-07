@@ -3,7 +3,14 @@ import beautify from 'posthtml-beautify'
 
 export interface FormatHtmlOptions {
   html: string
+  /** Keep inline `style` and `class`. */
   keepStyles?: boolean
+  /**
+   * Keep `class` (without `style`). For one element's markup, where a class is the hook a selector needs.
+   * Off for a whole page: on utility-CSS sites class strings are most of the cleaned page (the x.com
+   * fixture: 207 424 characters with them, 56 693 without).
+   */
+  keepClass?: boolean
   maxAttrLen?: number
   maxContentLen?: number
 }
@@ -11,39 +18,47 @@ export interface FormatHtmlOptions {
 export async function formatHtmlForPrompt({
   html,
   keepStyles = false,
+  keepClass = false,
   maxAttrLen = 200,
   maxContentLen = 500,
 }: FormatHtmlOptions) {
   const tagsToRemove = ['hint', 'style', 'link', 'script', 'meta', 'noscript', 'svg', 'head']
 
+  /**
+   * What an element's markup must keep for a reader that cannot see the page:
+   *   - who it is: `id`, `class` (the hook a CSS selector or readPage((d) => d.querySelector('.…')) needs,
+   *     and what a developer greps for; kept with `keepClass` or `keepStyles`), `name`, `role`, `type`,
+   *     `for` (the control a label names), `data-*` (data-testid and the other test ids);
+   *   - what it says and where it leads: `label`, `title`, `alt`, `placeholder`, `value`, `href`, `src`,
+   *     `target`, every `aria-*` (names, descriptions, the ids they point to, states);
+   *   - what a person can do with it right now: `disabled`, `checked`, `selected`, `readonly`, `required`,
+   *     `hidden`.
+   * Everything else is dropped as noise: inline `style` (unless includeStyles), event-handler
+   * attributes, `srcset`/`sizes`, `width`/`height`, `loading`, `rel`, `integrity`, `nonce`, framework
+   * attributes (`jsaction`, `ng-*`)…
+   */
   const attributesToKeep = [
-    // Standard descriptive attributes
+    'id',
+    ...(keepClass || keepStyles ? ['class'] : []),
+    'name',
+    'role',
+    'type',
+    'for',
     'label',
     'title',
     'alt',
-    'href',
-    'name',
-    'value',
-    'checked',
     'placeholder',
-    'type',
-    'role',
+    'value',
+    'href',
+    'src',
     'target',
-    // Descriptive aria attributes (text content)
-    'aria-label',
-    'aria-placeholder',
-    'aria-valuetext',
-    'aria-roledescription',
-    // Useful aria state attributes
-    'aria-hidden',
-    'aria-expanded',
-    'aria-checked',
-    'aria-selected',
-    'aria-disabled',
-    'aria-pressed',
-    'aria-required',
-    'aria-current',
-    // Test IDs (data-testid, data-test, data-cy, data-qa are covered by data-* prefix)
+    'disabled',
+    'checked',
+    'selected',
+    'readonly',
+    'required',
+    'hidden',
+    // Test ids without a data- prefix (data-testid, data-test, data-cy, data-qa are covered by data-*)
     'testid',
     'test-id',
     'tid',
@@ -56,11 +71,10 @@ export async function formatHtmlForPrompt({
     'selenium',
     'pw',
     'vimium-label',
-    // Conditionally added: 'style', 'class'
   ]
 
   if (keepStyles) {
-    attributesToKeep.push('style', 'class')
+    attributesToKeep.push('style')
   }
 
   const truncate = (str: string, maxLen: number): string => {
@@ -99,7 +113,7 @@ export async function formatHtmlForPrompt({
         if (node.attrs) {
           const newAttrs: typeof node.attrs = {}
           for (const [attr, value] of Object.entries(node.attrs)) {
-            const shouldKeep = attr.startsWith('data-') || attributesToKeep.includes(attr)
+            const shouldKeep = attr.startsWith('data-') || attr.startsWith('aria-') || attributesToKeep.includes(attr)
 
             if (shouldKeep) {
               // Truncate attribute values

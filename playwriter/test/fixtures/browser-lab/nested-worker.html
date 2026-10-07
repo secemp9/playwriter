@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Nested worker · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<!-- Not a lab page: a dedicated worker that starts its own dedicated worker, whose console error the
+     report must show (Chrome attaches the inner worker on the outer worker's session). -->
+<main>
+  <h1>Resize</h1>
+  <button type="button" id="resize">Resize images</button>
+  <p id="status" role="status"></p>
+</main>
+<script>
+const worker = new Worker('/lab/nested-outer-worker.js')
+worker.onmessage = (event) => { document.getElementById('status').textContent = event.data }
+document.getElementById('resize').addEventListener('click', () => worker.postMessage('photo-3.png'))
+</script>
+</body>
+</html>

@@ -48,9 +48,15 @@ Adds two items to the page and extension-icon context menus of connected tabs: "
 
 After the user picks an element with one of the context-menu items, the extension copies the result to the clipboard: a `playwriter -e 'inspectPinnedElement({...})'` command, or the `file:line` of the component's source. The copy is done from the extension's offscreen document (`document.execCommand('copy')` needs this permission there); measured, it fails without it.
 
+### clipboardRead
+
+When the user's automation script calls `clipboard.read()` (for example to check what a page's "Copy" button put on the clipboard), the extension reads the clipboard's text once, in its offscreen document (`document.execCommand('paste')` into its own textarea, which needs this permission there). It reads only on that explicit call, never writes the clipboard for it, and runs nothing in any web page. The text goes only to the local Playwriter relay.
+
+Adding it changes Chrome's install warning from "Modify data you copy and paste" to "Read and modify data you copy and paste" (measured with `chrome.management.getPermissionWarningsByManifest`).
+
 ### offscreen
 
-The offscreen document hosts tab recording (`MediaRecorder` for `chrome.tabCapture`) and the clipboard copy described above.
+The offscreen document hosts tab recording (`MediaRecorder` for `chrome.tabCapture`), the clipboard copy described above and the clipboard read on request.
 
 ### downloads
 

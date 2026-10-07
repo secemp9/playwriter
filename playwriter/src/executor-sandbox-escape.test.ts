@@ -229,11 +229,29 @@ const SANDBOX_GLOBALS = [
   // Runs the model's function in the PAGE over CDP (Runtime.callFunctionOn under V8's side-effect
   // check): its source is compiled by the page's V8, never by Node, and it gets no module loader or fs.
   'readPage',
+  // Loads the package's own axe-core file by fixed path (require.resolve) into the page's CDP isolated
+  // world; takes no path, loads no module for the sandbox, hands out no fs.
+  'audit',
   // Saves a download an action report listed, through Playwright's Download.saveAs (the server copies
   // the finished file, or streams it over a remote connection). It loads no module and hands out no
   // fs: the only path it takes is checked with the jailed fs's own rule (ScopedFS.resolveAllowed)
   // before anything is written — see 'downloads.save and net.save write only where the jailed fs may'.
   'downloads',
+  // Capture the tab over CDP (Page.captureScreenshot) and read/write image files only at paths
+  // checked with ScopedFS.resolveAllowed, like downloads.save; no module loader, no fs handed out.
+  'screenshot', 'diffScreenshot',
+  // Measure the page over CDP (Performance, Tracing, Profiler, Page.printToPDF) and the isolated world's
+  // PerformanceObservers; trace, profile and PDF files are written only at paths checked with
+  // ScopedFS.resolveAllowed (perf.ts outputPath). No module loader, no fs handed out.
+  'perf', 'pdf',
+  // CDP only: React fibers read with Runtime.callFunctionOn, and Chrome's WebMCP domain. No files, no modules.
+  'react', 'webmcp',
+  // CDP only: cookies over Network.*, Web Storage in the isolated world (the writes are refused in human
+  // mode), the clipboard through the extension's offscreen document or a private browser context.
+  'cookies', 'storage', 'setCookies', 'setStorage', 'clearCookies', 'clearStorage', 'clipboard',
+  // Cookies and localStorage to and from a JSON file, through the jailed fs itself at a path checked with
+  // ScopedFS.resolveAllowed (page-storage.ts); loadState is refused in human mode.
+  'saveState', 'loadState',
 ].sort()
 
 describe('the sandbox global surface is a closed, reviewed set', () => {

@@ -7,10 +7,12 @@
  * Notes:
  * - Windows: discover listeners via PowerShell/netstat and kill via taskkill.
  * - Unix: discover listeners via lsof (preferred) or fuser (fallback) and kill via
- *   process.kill(). This intentionally avoids shell pipelines (grep/awk/xargs).
+ *   process.kill(). This intentionally avoids shell pipelines (grep/awk/xargs). On Linux the
+ *   kernel's socket tables answer first: a port nothing listens on costs no process scan.
  */
 
 import { execFile } from 'node:child_process'
+import fs from 'node:fs'
 import os from 'node:os'
 import { promisify } from 'node:util'
 
@@ -108,13 +110,62 @@ async function getPidsForPortWindows(port: number): Promise<number[]> {
   }
 }
 
+/**
+ * lsof exits 1 and prints nothing when no process matches: an answer ("nothing listens"), not a
+ * failure. Its fallbacks scan every process again, and give no other answer.
+ */
+function isLsofNoMatch(error: unknown): boolean {
+  if (!(error instanceof Error) || !('code' in error) || error.code !== 1) {
+    return false
+  }
+  const stdout = 'stdout' in error ? error.stdout : undefined
+  const stderr = 'stderr' in error ? error.stderr : undefined
+  return stdout === '' && stderr === ''
+}
+
+/**
+ * Linux: whether any TCP socket listens on the port, read from the kernel's socket tables. Unlike
+ * lsof and fuser it scans no process, so a machine running many processes does not slow it down.
+ * `null`: neither table can be read.
+ */
+async function linuxHasListener(port: number): Promise<boolean | null> {
+  const portHex = port.toString(16).toUpperCase().padStart(4, '0')
+  const tables = await Promise.all(
+    ['/proc/net/tcp', '/proc/net/tcp6'].map((file) => {
+      return fs.promises.readFile(file, 'utf8').catch(() => null)
+    }),
+  )
+  if (tables.every((table) => table === null)) {
+    return null
+  }
+  // Each row: `sl local_address rem_address st …`, the address as `HEXIP:HEXPORT`, state 0A = LISTEN.
+  return tables.some((table) => {
+    return (table ?? '')
+      .split('\n')
+      .slice(1)
+      .some((row) => {
+        const [, local = '', , state] = row.trim().split(/\s+/)
+        return state === '0A' && local.endsWith(`:${portHex}`)
+      })
+  })
+}
+
 async function getPidsForPortUnix(port: number): Promise<number[]> {
+  if (os.platform() === 'linux' && (await linuxHasListener(port)) === false) {
+    return []
+  }
+
   try {
-    // Prefer lsof's built-in filtering and pid-only output.
-    const { stdout } = await execFileAsync('lsof', ['-n', '-P', '-i', `TCP:${port}`, '-sTCP:LISTEN', '-t'])
+    // Prefer lsof's built-in filtering and pid-only output. `-w`: no warnings (e.g. a file system it
+    // cannot stat), so an empty stderr tells "no match" apart from unsupported flags.
+    const { stdout } = await execFileAsync('lsof', ['-w', '-n', '-P', '-i', `TCP:${port}`, '-sTCP:LISTEN', '-t'])
     const pids = parsePids(stdout)
     return pids
-  } catch {}
+  } catch (error) {
+    if (isLsofNoMatch(error)) {
+      return []
+    }
+  }
 
   try {
     // Compatibility fallback: some environments may have lsof but not support

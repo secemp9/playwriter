@@ -36,6 +36,10 @@ import { getReactComponentInfo } from './react-source.js'
 import { fetchNormalizedStyles } from './styles.js'
 import { resolveCascade, type NormalizedRule, type DeclRef } from './css-cascade.js'
 import { registerType, registerVirtualType, traverse, query, type PagePath, type PageNode } from './page-path.js'
+import { withDeadline } from './isolated-world.js'
+
+/** A layout read of a whole page may take this long; observe() gives its whole page read the same bound. */
+const LAYOUT_READ_TIMEOUT_MS = 20_000
 
 /** page-path's `PageNode` requires a string index signature; our nodes are structurally compatible. */
 function asPageNode(node: PageModelNode): PageNode {
@@ -1903,16 +1907,22 @@ function attrsToRecord(attributes?: string[]): Record<string, string> {
  * box) is the only rectangle consumed here, and offset/scroll/client rects are in
  * element-relative coordinate spaces that would have to be re-based before they could
  * be mixed with it. Asking for three unused tables per node is not free.
+ *
+ * The four commands go out together: a session runs its commands in the order they were
+ * sent, so the domains are enabled before the capture and the metrics are read right after
+ * it, without a round trip between each. Each waits at most `timeoutMs`.
  */
-export async function fetchPageGeometry({ cdp }: { cdp: ICDPSession }): Promise<Map<string, FrameGeometry>> {
-  await cdp.send('DOM.enable')
-  await cdp.send('DOMSnapshot.enable')
-  const snapshot = (await cdp.send('DOMSnapshot.captureSnapshot', {
-    computedStyles: [...PAGE_MODEL_COMPUTED_STYLES],
-    includePaintOrder: true,
-  })) as Protocol.DOMSnapshot.CaptureSnapshotResponse
-
-  const metrics = (await cdp.send('Page.getLayoutMetrics')) as Protocol.Page.GetLayoutMetricsResponse
+export async function fetchPageGeometry({ cdp, timeoutMs }: { cdp: ICDPSession; timeoutMs: number }): Promise<Map<string, FrameGeometry>> {
+  const [, , snapshot, metrics] = await Promise.all([
+    withDeadline(cdp.send('DOM.enable'), timeoutMs, 'enabling the DOM domain (DOM.enable)'),
+    withDeadline(cdp.send('DOMSnapshot.enable'), timeoutMs, 'enabling the DOMSnapshot domain (DOMSnapshot.enable)'),
+    withDeadline(
+      cdp.send('DOMSnapshot.captureSnapshot', { computedStyles: [...PAGE_MODEL_COMPUTED_STYLES], includePaintOrder: true }),
+      timeoutMs,
+      'reading the layout (DOMSnapshot.captureSnapshot)',
+    ),
+    withDeadline(cdp.send('Page.getLayoutMetrics'), timeoutMs, 'reading the layout metrics (Page.getLayoutMetrics)'),
+  ])
   const layoutViewport = metrics.cssLayoutViewport
   // The main frame is documents[0]; only it has published viewport metrics, so nodes in
   // child frames keep `inViewport: undefined` rather than being measured against the
@@ -1978,7 +1988,9 @@ export async function buildPageModel({
     throw new Error(`buildPageModel: both a root element and \`rootSelector\` ("${selector}") were given. Pass only one.`)
   }
   const locator = root ?? (selector ? page.locator(selector) : undefined)
-  const aria = await getAriaSnapshot({ page, locator, cdp })
+  // The layout first: the snapshot measures its images from it instead of reading each one.
+  const geometry = await fetchPageGeometry({ cdp, timeoutMs: LAYOUT_READ_TIMEOUT_MS })
+  const aria = await getAriaSnapshot({ page, locator, cdp, prefetched: { layout: [...geometry.values()] } })
 
   const { nodes } = (await cdp.send('DOM.getFlattenedDocument', {
     depth: -1,
@@ -1993,7 +2005,6 @@ export async function buildPageModel({
     })
   }
 
-  const geometry = await fetchPageGeometry({ cdp })
   const frameId = page.mainFrame().frameId()
   // The layout snapshot always contains the main document, so if it does not cover
   // `frameId` the frame tree and the snapshot disagree about this page — which

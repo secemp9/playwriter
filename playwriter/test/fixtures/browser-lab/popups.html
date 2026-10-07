@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Popups · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Popups</span></header>
+<main>
+  <h1>New tabs, popups and navigation</h1>
+  <div class="card">
+    <ul>
+      <li><a id="link-blank" href="/landing.html?from=blank" target="_blank">Open landing in a new tab</a></li>
+      <li><button type="button" id="open-popup">Open popup window</button> <span id="popup-status" role="status">Popup not opened</span></li>
+      <li><a id="link-same" href="/landing.html?from=same">Go to landing (same tab)</a></li>
+    </ul>
+  </div>
+</main>
+<script type="module">
+import { $, on, setText, withTag, tagLinks } from '/lab/common.js';
+on($('#open-popup'), 'click', () => {
+  const w = window.open(withTag('/landing.html?from=popup'), 'labpopup', 'popup,width=520,height=420');
+  setText($('#popup-status'), w ? 'Popup opened' : 'Popup blocked');
+});
+tagLinks();
+</script>
+</body>
+</html>

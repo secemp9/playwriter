@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Todos (WebMCP) · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  #todos li.done span { text-decoration: line-through; color: var(--muted); }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Todos (WebMCP)</span></header>
+<main>
+  <h1>Todos</h1>
+  <p id="webmcp-status" class="status" role="status">Checking for WebMCP…</p>
+  <form id="add-form" class="row" novalidate>
+    <label for="todo-text">New todo</label>
+    <input id="todo-text" type="text" autocomplete="off">
+    <button type="submit" class="primary">Add</button>
+  </form>
+  <ul id="todos" aria-label="Todos"></ul>
+  <p id="todo-count" class="muted"></p>
+  <h2>Tool calls</h2>
+  <ol id="calls" class="log" role="log" aria-label="Tool calls"></ol>
+</main>
+<script type="module">
+import { $, m, on, setText, logLine, tagLinks } from '/lab/common.js';
+
+const todos = [
+  { id: 1, text: 'Write tests', done: false },
+  { id: 2, text: 'Review PR #42', done: true },
+];
+let nextId = 3;
+
+function render() {
+  m(() => {
+    $('#todos').replaceChildren(...todos.map((t) => {
+      const li = document.createElement('li');
+      li.id = `todo-${t.id}`;
+      if (t.done) li.className = 'done';
+      const span = document.createElement('span');
+      span.textContent = t.text;
+      li.append(span);
+      return li;
+    }));
+    const open = todos.filter((t) => !t.done).length;
+    $('#todo-count').textContent = `${todos.length} todos, ${open} open`;
+  });
+}
+function addTodo(text) {
+  const t = { id: nextId++, text, done: false };
+  todos.push(t);
+  render();
+  return t;
+}
+
+on($('#add-form'), 'submit', (e) => {
+  e.preventDefault();
+  const text = $('#todo-text').value.trim();
+  if (!text) return;
+  addTodo(text);
+  $('#todo-text').value = '';
+});
+
+const TOOLS = [
+  {
+    name: 'addTodo',
+    description: 'Add a todo item to the visible todo list.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'Todo text' } }, required: ['text'] },
+    async execute(input) {
+      const text = String(input?.text ?? '').trim();
+      if (!text) return { content: [{ type: 'text', text: 'Error: text is required' }], isError: true };
+      const t = addTodo(text);
+      logLine($('#calls'), `addTodo(${JSON.stringify(text)}) → #${t.id}`);
+      return { content: [{ type: 'text', text: `Added todo #${t.id}: ${t.text}` }] };
+    },
+  },
+  {
+    name: 'listTodos',
+    description: 'List all todo items with their done state.',
+    inputSchema: { type: 'object', properties: {} },
+    async execute() {
+      logLine($('#calls'), 'listTodos()');
+      return { content: [{ type: 'text', text: JSON.stringify(todos) }] };
+    },
+  },
+];
+
+async function registerWebMcp() {
+  const mc = navigator.modelContext;
+  if (!mc) return 'WebMCP not available in this browser (navigator.modelContext is undefined)';
+  if (typeof mc.registerTool === 'function') {
+    for (const tool of TOOLS) await mc.registerTool(tool);
+    return 'WebMCP available: registered tools addTodo, listTodos (registerTool)';
+  }
+  if (typeof mc.provideContext === 'function') {
+    await mc.provideContext({ tools: TOOLS });
+    return 'WebMCP available: registered tools addTodo, listTodos (provideContext)';
+  }
+  return 'WebMCP not available: navigator.modelContext has no registerTool/provideContext';
+}
+
+render();
+registerWebMcp().then(
+  (msg) => setText($('#webmcp-status'), msg),
+  (err) => setText($('#webmcp-status'), `WebMCP registration failed: ${err.name}: ${err.message}`),
+);
+tagLinks();
+</script>
+</body>
+</html>

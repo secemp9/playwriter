@@ -121,7 +121,7 @@ describe('confirm and prompt wait for the agent', () => {
     await openDialog(page, "window.answer = confirm('Leave the group?')")
     dialogs.setPolicy('accept')
     await expect.poll(() => page.evaluate('window.answer')).toBe(true)
-    expect(dialogs.history().at(-1)).toMatchObject({ type: 'confirm', outcome: 'auto-accepted' })
+    expect(dialogs.history().at(-1)).toMatchObject({ type: 'confirm', outcome: 'accepted', answeredBy: 'policy' })
     await page.close()
   })
 })

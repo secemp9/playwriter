@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shadow buttons</title>
+<style>
+  body { font: 15px sans-serif; margin: 20px; }
+  section { position: relative; margin: 18px 0; }
+  #banner { position: absolute; left: 0; top: -6px; width: 320px; height: 52px; background: rgba(30, 30, 30, 0.92); color: #fff; }
+  x-banner { position: absolute; left: 0; top: -6px; width: 320px; height: 52px; }
+</style>
+</head>
+<body>
+<h1>Shadow buttons</h1>
+<section><mdn-button id="run-open" data-mode="open">Run</mdn-button></section>
+<section><mdn-button id="run-closed" data-mode="closed">Run closed</mdn-button></section>
+<section><mdn-button id="save" data-mode="closed"><span>Save draft</span></mdn-button></section>
+<section><mdn-button id="behind-banner" data-mode="open">Publish</mdn-button><div id="banner" role="region" aria-label="Cookie banner">We use cookies</div></section>
+<section><mdn-button id="behind-host" data-mode="closed">Delete</mdn-button><x-banner id="promo"></x-banner></section>
+<p id="out">Nothing clicked yet</p>
+<script>
+  const out = document.getElementById('out')
+  for (const host of document.querySelectorAll('mdn-button')) {
+    const root = host.attachShadow({ mode: host.dataset.mode })
+    // No padding or border: every point of the button is over its slotted label, as on MDN's Run.
+    root.innerHTML = '<style>button { font: inherit; padding: 0; border: 0; background: #ddf; }</style><button part="button"><slot></slot></button>'
+    root.querySelector('button').addEventListener('click', () => { out.textContent = 'clicked ' + host.textContent.trim() })
+  }
+  const promo = document.getElementById('promo').attachShadow({ mode: 'open' })
+  promo.innerHTML = '<div style="width:100%;height:100%;background:#335;color:#fff">Sale! 20% off</div>'
+</script>
+</body>
+</html>

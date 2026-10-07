@@ -164,6 +164,46 @@ export function resolveBrowserExecutablePath({
   )
 }
 
+/**
+ * The installed Google Chrome (stable channel) binaries, in the order a new browser prefers them. Chrome
+ * itself, not Chrome for Testing or a distribution's Chromium: it is what people browse with, so a page
+ * sees the same brands, version and GPU stack as on a person's machine, and it is current (WebMCP needs
+ * Chrome ≥ 149). Branded Chrome refuses `--load-extension`, which only `browser start` needs.
+ */
+export function getGoogleChromeCandidates({
+  platform = os.platform(),
+  env = process.env,
+  homeDir = os.homedir(),
+}: Omit<BrowserLookupOptions, 'browserPath' | 'existsSync'> = {}): string[] {
+  if (platform === 'darwin') {
+    return ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', path.join(homeDir, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome')]
+  }
+  if (platform === 'win32') {
+    const programFiles = env.PROGRAMFILES || 'C:\\Program Files'
+    const programFilesX86 = env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)'
+    return [programFiles, programFilesX86, env.LOCALAPPDATA || ''].filter(Boolean).map((root) => path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'))
+  }
+  return ['/opt/google/chrome/chrome', ...getPathEntries(env).flatMap((entry) => ['google-chrome-stable', 'google-chrome'].map((name) => path.join(entry, name)))]
+}
+
+/**
+ * The binary a new browser (`browser({ action: 'new' })`, headless sessions) launches: PLAYWRITER_BROWSER_PATH
+ * when the user set it, else the installed Google Chrome, else what `resolveBrowserExecutablePath` finds
+ * (Chrome for Testing from `playwriter browser install`, Chromium, Playwright's Chromium).
+ */
+export function resolveNewBrowserExecutablePath({
+  env = process.env,
+  platform = os.platform(),
+  homeDir = os.homedir(),
+  existsSync = fs.existsSync,
+}: Omit<BrowserLookupOptions, 'browserPath'> = {}): string {
+  if (env.PLAYWRITER_BROWSER_PATH?.trim()) {
+    return resolveBrowserExecutablePath({ env, platform, homeDir, existsSync })
+  }
+  const chrome = getGoogleChromeCandidates({ platform, env, homeDir }).find((candidate) => existsSync(candidate))
+  return chrome ?? resolveBrowserExecutablePath({ env, platform, homeDir, existsSync })
+}
+
 export function shouldUseHeadlessByDefault({
   platform = os.platform(),
   env = process.env,

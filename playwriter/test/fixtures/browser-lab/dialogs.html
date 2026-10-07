@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script src="/lab/witness.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dialogs · Browser Lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/lab/lab.css" data-lab-own>
+<style data-lab-own>
+  .dirty { color: var(--warn); font-weight: 600; }
+  .dirty[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header class="site-header"><a href="/index.html">Browser Lab</a><span class="crumb">/ Dialogs</span></header>
+<main>
+  <h1>Native dialogs</h1>
+  <div class="card">
+    <h2>Alert, confirm, prompt</h2>
+    <div class="row">
+      <button type="button" id="btn-alert">Show alert</button>
+      <button type="button" id="btn-confirm">Ask confirm</button>
+      <button type="button" id="btn-prompt">Ask prompt</button>
+    </div>
+    <p id="alert-result">Alert: not shown yet</p>
+    <p id="confirm-result">Confirm result: none yet</p>
+    <p id="prompt-result">Prompt result: none yet</p>
+  </div>
+  <div class="card">
+    <h2>Draft (unsaved changes warning)</h2>
+    <div class="field">
+      <label for="draft-title">Draft title</label>
+      <input id="draft-title" type="text">
+    </div>
+    <div class="row">
+      <button type="button" id="save-draft">Save draft</button>
+      <span id="dirty" class="dirty" hidden>Unsaved changes</span>
+      <span id="saved" class="muted">No changes</span>
+    </div>
+    <p><a id="leave" href="/landing.html?from=dialogs">Leave this page</a></p>
+  </div>
+</main>
+<script type="module">
+import { $, on, setText, tagLinks } from '/lab/common.js';
+
+let dirty = false;
+let alerts = 0;
+
+on($('#btn-alert'), 'click', () => {
+  alert('Saved successfully');
+  alerts++;
+  setText($('#alert-result'), `Alert dismissed (${alerts})`);
+});
+on($('#btn-confirm'), 'click', () => {
+  const ok = confirm('Discard draft?');
+  setText($('#confirm-result'), `Confirm result: ${ok}`);
+});
+on($('#btn-prompt'), 'click', () => {
+  const answer = prompt('What is your name?', 'Guest');
+  setText($('#prompt-result'), answer === null ? 'Prompt result: (cancelled)' : `Prompt result: ${answer}`);
+});
+
+on($('#draft-title'), 'input', () => {
+  dirty = true;
+  $('#dirty').hidden = false;
+  setText($('#saved'), '');
+});
+on($('#save-draft'), 'click', () => {
+  dirty = false;
+  $('#dirty').hidden = true;
+  setText($('#saved'), `Draft saved: ${$('#draft-title').value}`);
+});
+
+window.addEventListener('beforeunload', (e) => {
+  if (!dirty) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+tagLinks();
+</script>
+</body>
+</html>

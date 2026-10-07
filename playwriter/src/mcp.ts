@@ -16,17 +16,33 @@ Buffer.prototype[util.inspect.custom] = function () {
 import dedent from 'string-dedent'
 import { LOG_FILE_PATH, VERSION, parseRelayHost } from './utils.js'
 import { ensureRelayServer, RELAY_PORT } from './relay-client.js'
-import { PlaywrightExecutor, CodeExecutionTimeoutError, capOutput } from './executor.js'
+import type { PlaywrightExecutor } from './executor.js'
+import type * as ExecutorExports from './executor.js'
 import { deriveWorkspace } from './workspace-key.js'
 import { discoverChromeInstances, resolveDirectInput, appendSessionToWsUrl } from './chrome-discovery.js'
-import { resolveBrowserExecutablePath } from './browser-config.js'
+import { newBrowserOptionShapes, type NewBrowserOptions } from './new-browser-options.js'
+import type { NewBrowserPlan } from './new-browser.js'
 import { ModelFacingError } from './probe-types.js'
+import { exitOnStdinEnd } from './mcp-lifecycle.js'
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
 import crypto from 'node:crypto'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const require = createRequire(import.meta.url)
+
+type ExecutorModule = typeof ExecutorExports
+let executorModule: Promise<ExecutorModule> | null = null
+
+/**
+ * The executor module, loaded on first need: dynamic because its import graph (Playwright's client and
+ * server) takes ≈1 s, which the server must not spend before it answers `initialize`. startMcp warms it
+ * once the client is initialized.
+ */
+function loadExecutorModule(): Promise<ExecutorModule> {
+  executorModule ??= import('./executor.js')
+  return executorModule
+}
 
 // The executor this MCP session drives its browser through, and which browser that is. Both are
 // null until the first `browser` call, or until execute/reset applies the default (see
@@ -248,8 +264,10 @@ function describeBinding(current: Binding): string {
       return `the Chrome at ${current.endpoint} (PLAYWRITER_DIRECT)`
     case 'extension':
       return `${current.email || '(not signed in)'} (key ${current.key})`
-    case 'headless':
-      return `a new headless Chrome (${current.executablePath})`
+    case 'headless': {
+      const options = executor?.describeNewBrowser() ?? []
+      return [`a new Chrome launched for this session (${current.executablePath})`, ...options.map((line) => `  ${line}`)].join('\n')
+    }
   }
 }
 
@@ -306,6 +324,7 @@ async function bindExtension(extension: ConnectedExtension): Promise<{ exec: Pla
   const remote = getRemoteConfig()
   // The workspace and the extension key ride on cdpConfig and reach the relay via getCdpUrl
   // (executor.ts). Only this relay/remote path sets them: direct CDP and headless never call getCdpUrl.
+  const { PlaywrightExecutor } = await loadExecutorModule()
   const exec = new PlaywrightExecutor({
     cdpConfig: { ...(remote || { port: RELAY_PORT }), workspace, extensionId: extension.stableKey },
     logger: mcpLogger,
@@ -316,12 +335,19 @@ async function bindExtension(extension: ConnectedExtension): Promise<{ exec: Pla
   return { exec, released }
 }
 
-/** Bind this session to a headless Chrome launched for it. Refuses, telling the model to ask the user, when no Chrome binary exists. */
-async function bindNewBrowser(): Promise<{ exec: PlaywrightExecutor; released: string | null; executablePath: string }> {
-  let executablePath: string
+/**
+ * Bind this session to a new browser launched for it with `options` (new-browser.ts). The options are
+ * checked before the current browser is released: a refused option leaves the session as it was.
+ * Refuses, telling the model to ask the user, when no Chrome binary exists.
+ */
+async function bindNewBrowser(options: NewBrowserOptions): Promise<{ exec: PlaywrightExecutor; released: string | null; plan: NewBrowserPlan }> {
+  const { PlaywrightExecutor } = await loadExecutorModule()
+  const exec = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: mcpLogger, cwd: process.cwd() })
+  let plan: NewBrowserPlan
   try {
-    executablePath = resolveBrowserExecutablePath()
+    plan = await exec.planNewBrowser(options)
   } catch (error) {
+    if (error instanceof ModelFacingError) throw error
     const reason = error instanceof Error ? error.message : String(error)
     throw new ModelFacingError(
       'No Chrome binary was found to launch a new browser. Ask the user to point PLAYWRITER_BROWSER_PATH in this MCP ' +
@@ -330,22 +356,30 @@ async function bindNewBrowser(): Promise<{ exec: PlaywrightExecutor; released: s
     )
   }
   const released = await releaseBinding()
-  const exec = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: mcpLogger, cwd: process.cwd() })
   executor = exec
-  binding = { kind: 'headless', executablePath }
-  return { exec, released, executablePath }
+  binding = { kind: 'headless', executablePath: plan.executablePath }
+  return { exec, released, plan }
 }
 
 /**
  * The executor execute/reset run on. Before any `browser` call it applies the default: PLAYWRITER_DIRECT,
  * else PLAYWRITER_BROWSER (`new`, an email or a key), else the only connected profile. No profile, or
- * several, is a model-facing error saying how to choose — never a guess.
+ * several, is a model-facing error saying how to choose — never a guess. Concurrent callers (the startup
+ * prelaunch and a first execute) share one creation.
  */
 async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   if (executor) {
     return executor
   }
+  creatingExecutor ??= createDefaultExecutor().finally(() => {
+    creatingExecutor = null
+  })
+  return creatingExecutor
+}
 
+let creatingExecutor: Promise<PlaywrightExecutor> | null = null
+
+async function createDefaultExecutor(): Promise<PlaywrightExecutor> {
   const configured = process.env.PLAYWRITER_BROWSER?.trim() || null
   const directConfig = await getDirectCdpConfig()
   if (directConfig) {
@@ -355,6 +389,7 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
           'Ask the user to remove one of them.',
       )
     }
+    const { PlaywrightExecutor } = await loadExecutorModule()
     const exec = new PlaywrightExecutor({ cdpConfig: directConfig, logger: mcpLogger, cwd: process.cwd() })
     executor = exec
     binding = { kind: 'direct', endpoint: directConfig.directCdpUrl }
@@ -362,7 +397,7 @@ async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   }
 
   if (configured === 'new') {
-    return (await bindNewBrowser()).exec
+    return (await bindNewBrowser({})).exec
   }
   // execute and reset have already started the local relay (ensureLocalRelay) before calling this.
   const extensions = await fetchConnectedExtensions()
@@ -517,7 +552,7 @@ server.tool(
     code: z
       .string()
       .describe(
-        'JavaScript run against the controlled browser tab. In scope: observe, act, find, explain, docs, page, state, context, snapshot, getLatestLogs, net. Usually one line; in human mode one input action per call (waits and reads are free).',
+        'JavaScript run against the controlled browser tab. In scope: observe, act, find, explain, readPage, docs, page, state, context, snapshot, screenshot, getLatestLogs, net, cookies, storage, webmcp, perf, audit. Usually one line; in human mode one input action per call (waits and reads are free).',
       ),
     timeout: z
       .number()
@@ -542,7 +577,7 @@ server.tool(
         text += `\nScreenshot saved to: ${s.path} (image included below, ${s.labelCount} labels)\n`
         text += `Accessibility snapshot:\n${s.snapshot}\n`
       }
-      text = capOutput(text)
+      text = (await loadExecutorModule()).capOutput(text)
 
       const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [
         { type: 'text', text },
@@ -560,8 +595,10 @@ server.tool(
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       const errorStack = error instanceof Error ? error.stack || error.message : String(error)
+      // Only the executor module throws CodeExecutionTimeoutError: when it never loaded, this is not one.
+      const loaded = executorModule ? await executorModule.catch(() => null) : null
       const isTimeoutError =
-        error instanceof CodeExecutionTimeoutError ||
+        (loaded !== null && error instanceof loaded.CodeExecutionTimeoutError) ||
         (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'))
       // No browser chosen, or the configured one is not connected: the message says what to do.
       const isModelFacing = error instanceof ModelFacingError
@@ -589,7 +626,7 @@ server.tool(
 server.tool(
   'reset',
   dedent`
-    Recreates the CDP connection and resets the browser/page/context. Use this when the MCP stops responding, you get connection errors, if there are no pages in context, assertion failures, page closed, or other issues. It reconnects the same browser; the \`browser\` tool changes which browser this session drives.
+    Recreates the CDP connection and resets the browser/page/context. Use this when the MCP stops responding, you get connection errors, if there are no pages in context, assertion failures, or other issues. It reconnects the same browser; the \`browser\` tool changes which browser this session drives. Not needed after a TAB CLOSED, PAGE CRASHED or DEBUGGER CUT line: execute keeps working and that line says what to do.
 
     After calling this tool, the page and context variables are automatically updated in the execution environment.
 
@@ -627,9 +664,13 @@ server.tool(
 )
 
 /** What the `browser` tool does for one call; throws ModelFacingError for every refusal. */
-async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string | undefined): Promise<string> {
+async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string | undefined, options: NewBrowserOptions): Promise<string> {
   if (action !== 'use' && choice !== undefined) {
     throw new ModelFacingError(`\`browser\` is only read by use; ${action} takes no browser.`)
+  }
+  const given = Object.entries(options).flatMap(([name, value]) => (value === undefined ? [] : [name]))
+  if (action !== 'new' && given.length > 0) {
+    throw new ModelFacingError(`${given.join(', ')} ${given.length === 1 ? 'is' : 'are'} only read by new; ${action} takes none. Nothing was changed.`)
   }
   const direct = process.env.PLAYWRITER_DIRECT
   if (direct) {
@@ -643,10 +684,13 @@ async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string |
   }
 
   if (action === 'new') {
-    const { exec, released, executablePath } = await bindNewBrowser()
+    const { exec, released, plan } = await bindNewBrowser(options)
     const { page, context } = await exec.reset()
     return boundReply({
-      headline: `Now driving a new headless Chrome launched for this session from ${executablePath}: no logins, no extensions, nothing shared with the user's browsers.`,
+      headline: [
+        `Now driving a new ${plan.headed ? 'headed' : 'headless'} Chrome launched for this session: no logins, no extensions, nothing shared with the user's browsers.`,
+        ...(exec.describeNewBrowser() ?? []).map((line) => `  ${line}`),
+      ].join('\n'),
       released,
       page,
       context,
@@ -687,17 +731,20 @@ server.tool(
 
     - \`{ action: "list" }\`: every browser you can drive — each of the user's Chrome profiles connected through the Playwriter extension (email, key, attached tabs) and \`new\` — and which one this session drives now.
     - \`{ action: "use", browser: "<email or key>" }\`: drive that Chrome profile, the user's real logged-in browser.
-    - \`{ action: "new" }\`: launch a fresh headless Chrome for this session: no logins, no extensions, nothing shared with the user's browsers.
+    - \`{ action: "new" }\`: launch a fresh Chrome for this session: no logins, no extensions, nothing shared with the user's browsers. Pages see a normal Chrome of that version on this computer (no automation flag, no "HeadlessChrome").
+      Options (only with new, all optional): \`viewport: { width, height }\` (default 1280×720) or \`device: "Pixel 7"\` (a phone/tablet/desktop Chrome preset; an unknown name lists them), \`userAgent\`, \`locale: "fr-FR"\`, \`timezone: "America/New_York"\`, \`colorScheme: "dark"\`, \`headed: true\` (a visible window; needs a display), \`allowedDomains: ["example.com"]\` (other hosts are blocked and the report says so), \`downloads: "/tmp/dl"\` (every download is also saved there under its own name).
+      Example: \`{ action: "new", device: "Pixel 7", locale: "de-DE" }\`.
 
-    Switching releases the previous browser (the user's tabs stay open; a headless Chrome this session launched is closed) and resets page, context and \`state\`.
+    Switching releases the previous browser (the user's tabs stay open; a Chrome this session launched is closed) and resets page, context and \`state\`.
   `,
   {
-    action: z.enum(['list', 'use', 'new']).describe('list the choices, use a connected Chrome profile, or launch a new headless Chrome'),
+    action: z.enum(['list', 'use', 'new']).describe('list the choices, use a connected Chrome profile, or launch a new Chrome'),
     browser: z.string().optional().describe('With use: a profile email (case-insensitive) or a key, as list shows them.'),
+    ...newBrowserOptionShapes,
   },
-  async ({ action, browser: choice }) => {
+  async ({ action, browser: choice, ...options }) => {
     try {
-      return { content: [{ type: 'text', text: await runBrowserAction(action, choice) }] }
+      return { content: [{ type: 'text', text: await runBrowserAction(action, choice, options) }] }
     } catch (error) {
       const text =
         error instanceof ModelFacingError
@@ -733,6 +780,20 @@ export async function startMcp(options: { host?: string; token?: string } = {}) 
     }
   }
 
+  // Once the client is initialized (the server answered without loading the executor), load the
+  // executor in the background, and with PLAYWRITER_BROWSER=new start the session's browser too: it
+  // launches while the model reads the tool list, and the first execute takes it.
+  server.server.oninitialized = () => {
+    const prelaunch = process.env.PLAYWRITER_BROWSER?.trim() === 'new' && !process.env.PLAYWRITER_DIRECT
+    const warm = prelaunch ? getOrCreateExecutor().then((exec) => exec.prelaunch()) : loadExecutorModule()
+    warm.catch((error: unknown) => mcpLog('Preparing the browser at startup failed; the first execute reports why:', error))
+  }
   const transport = new StdioServerTransport()
   await server.connect(transport)
+  // A browser still being created at stdin's end is released too (the startup prelaunch).
+  const release = async (): Promise<string | null> => {
+    await creatingExecutor?.catch(() => {})
+    return releaseBinding()
+  }
+  exitOnStdinEnd({ stdin: process.stdin, release, log: mcpLog, exit: (code) => process.exit(code), graceMs: 5000 })
 }

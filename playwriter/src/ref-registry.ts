@@ -86,6 +86,8 @@ interface TabState {
   alive: Set<number>
   /** Refs still in the document but not usable, from the latest committed observation. */
   absent: Map<number, AbsentNode>
+  /** Refs given to elements a query matched that the latest observation does not list (`RefRegistry.adopt`). */
+  adopted: Set<number>
   /** Element and text keys of this document the model has been shown. Empty: nothing of it shown yet. */
   shownKeys: Set<string>
 }
@@ -141,15 +143,20 @@ export class RefRegistry {
   private readonly tabs = new Map<string, TabState>()
   private readonly refByKey = new Map<string, number>()
   private readonly targets = new Map<number, RefTarget>()
-  /** Refs whose document or tab is gone; `frame-navigated`: only the iframe it was in loaded a new document. */
-  private readonly retired = new Map<number, 'navigated' | 'frame-navigated' | 'closed'>()
+  /**
+   * Refs whose document or tab is gone; `frame-navigated`: only the iframe it was in loaded a new document;
+   * `debugger-cut`: Chrome took the debugger off the tab, which stayed open (debugger-cut.ts).
+   */
+  private readonly retired = new Map<number, 'navigated' | 'frame-navigated' | 'closed' | 'debugger-cut'>()
+  /** The tab of each ref retired as `closed`, until it is known whether the tab really closed. */
+  private readonly closedIn = new Map<number, string>()
 
   /** Start an observation of the document `documentId` (main-frame loaderId) in tab `targetId`. */
   begin(targetId: string, documentId: string): RefObservation {
     const tab = this.tabs.get(targetId)
     if (tab && tab.documentId !== documentId) this.retireTab(targetId, 'navigated')
     if (!this.tabs.has(targetId)) {
-      this.tabs.set(targetId, { documentId, frameDocuments: new Map(), alive: new Set(), absent: new Map(), shownKeys: new Set() })
+      this.tabs.set(targetId, { documentId, frameDocuments: new Map(), alive: new Set(), absent: new Map(), adopted: new Set(), shownKeys: new Set() })
     }
     return new RefObservation(this, targetId, documentId)
   }
@@ -195,10 +202,13 @@ export class RefRegistry {
       const current = options.frameDocuments.get(target.frameId)
       if (current === undefined || current === target.frameDocumentId) continue
       this.retired.set(ref, 'frame-navigated')
+      tab.adopted.delete(ref)
       this.targets.delete(ref)
       this.refByKey.delete(target.key)
     }
     tab.alive = new Set(seen)
+    // An adopted element the observation lists is an ordinary listed one from now on.
+    for (const ref of seen) tab.adopted.delete(ref)
     tab.absent = new Map([...options.absent].filter(([ref]) => !seen.has(ref)))
     if (!options.shown) return
     for (const ref of seen) {
@@ -237,9 +247,49 @@ export class RefRegistry {
     return ref === undefined ? null : (this.targets.get(ref) ?? null)
   }
 
+  /**
+   * A ref for an element no observation lists — a query matched it (a tooltip, a paragraph, an image) —
+   * shown to the model as `element`'s role, name and context. It resolves for as long as its node lives:
+   * until act or a read finds it gone (`markGone`), or its document or its frame's document is replaced.
+   * An element observe() lists keeps its ref unchanged. Null when `documentId` is no longer the tab's
+   * document, or the element's frame document is not the one the latest observation read.
+   */
+  adopt(targetId: string, documentId: string, element: RefAssignment): number | null {
+    const tab = this.tabs.get(targetId)
+    if (!tab || tab.documentId !== documentId || tab.frameDocuments.get(element.frameId) !== element.frameDocumentId) return null
+    const listed = this.refByKey.get(`${targetId}:${documentId}:${element.frameId}:${element.frameDocumentId}:${element.backendNodeId}`)
+    if (listed !== undefined && tab.alive.has(listed)) return listed
+    const ref = this.place(targetId, documentId, element)
+    const target = this.targets.get(ref)
+    if (target) target.shown = { role: element.role, name: element.name, ...(element.context !== undefined ? { context: element.context } : {}) }
+    tab.absent.delete(ref)
+    tab.adopted.add(ref)
+    return ref
+  }
+
+  /** Whether `ref` was given by a query (`adopt`) and no observation has listed it since. */
+  isAdopted(ref: number): boolean {
+    const target = this.targets.get(ref)
+    return !!target && !!this.tabs.get(target.targetId)?.adopted.has(ref)
+  }
+
   /** The tab closed: its refs say so from now on. */
   closeTab(targetId: string): void {
     this.retireTab(targetId, 'closed')
+  }
+
+  /**
+   * Chrome took the debugger off the tab while it stayed open (debugger-cut.ts): its refs — retired as
+   * closed when its page closed — say that instead. The tab keeps its target id; its next observation
+   * numbers its elements afresh.
+   */
+  debuggerCut(targetId: string): void {
+    this.retireTab(targetId, 'closed')
+    for (const [ref, tab] of this.closedIn) {
+      if (tab !== targetId) continue
+      this.retired.set(ref, 'debugger-cut')
+      this.closedIn.delete(ref)
+    }
   }
 
   /**
@@ -253,6 +303,7 @@ export class RefRegistry {
     const tab = this.tabs.get(target.targetId)
     tab?.alive.delete(ref)
     tab?.absent.delete(ref)
+    tab?.adopted.delete(ref)
     const resolution = this.resolve(ref)
     return resolution.ok ? '' : resolution.error
   }
@@ -290,10 +341,17 @@ export class RefRegistry {
         error: `Ref [${parsed}] is from a tab that has been closed. Call observe() to get refs for the page you are on.`,
       }
     }
+    if (retired === 'debugger-cut') {
+      return {
+        ok: false,
+        reason: 'closed',
+        error: `Ref [${parsed}] is from before Chrome took the debugger off this tab (DEBUGGER CUT); the tab is the same, but its elements must be read again. Call observe() to get new refs.`,
+      }
+    }
     const target = this.targets.get(parsed)
     if (!target) return unknown()
     const tab = this.tabs.get(target.targetId)
-    if (tab?.alive.has(parsed)) return { ok: true, target }
+    if (tab?.alive.has(parsed) || tab?.adopted.has(parsed)) return { ok: true, target }
     const label = `Ref [${parsed}] (${target.role}${target.name ? ` "${target.name}"` : ''})`
     const absent = tab?.absent.get(parsed)
     if (absent) {
@@ -333,6 +391,7 @@ export class RefRegistry {
     for (const [ref, target] of this.targets) {
       if (target.targetId !== targetId) continue
       this.retired.set(ref, why)
+      if (why === 'closed') this.closedIn.set(ref, targetId)
       this.targets.delete(ref)
       this.refByKey.delete(target.key)
     }

@@ -8,7 +8,7 @@ import type { ICDPSession } from './cdp-session.js'
 import { getCDPSessionForPage, getCDPSessionForFrame } from './cdp-session.js'
 import { axStatesFromNode, formatAxStates, type AxStates } from './ax-states.js'
 import { resolveElement, type ElementTarget } from './element-resolve.js'
-import { withDeadline } from './isolated-world.js'
+import { isNodeGoneError, withDeadline } from './isolated-world.js'
 
 // Import sharp at module level - resolves to null if not available
 const sharpPromise = import('sharp')
@@ -231,6 +231,9 @@ const INTERACTIVE_ROLES = new Set([
   'tab',
   'treeitem',
   'img',
+  // Chromium 145+ reports `<img>` as `image` (older builds and ARIA say `img`): without it an
+  // image with no alt, which has no name, was dropped from the tree.
+  'image',
   'video',
   'audio',
 ])
@@ -446,22 +449,24 @@ const VALUE_ROLES: Record<string, true> = {
 }
 
 /**
- * `autocomplete` tokens that name a secret (HTML autofill field names): what the browser
- * fills there is a password, a one-time code or card security data.
+ * `autocomplete` tokens that name a secret the page may show in clear (HTML autofill field
+ * names): a one-time code or card security data. The password tokens are not here: a password
+ * field is masked by its `type=password`, and a page that reveals it (an eye toggle switches the
+ * field to `type=text`, keeping `autocomplete="new-password"`) shows the password to the person,
+ * so it is reported as shown.
  */
 const SECRET_AUTOCOMPLETE_TOKENS: Record<string, true> = {
-  'current-password': true,
-  'new-password': true,
   'one-time-code': true,
   'cc-csc': true,
   'cc-number': true,
 }
 
 /**
- * Whether a field's value is a secret by what the author declared in the DOM: `type=password`,
- * or an `autocomplete` token naming a password, one-time code or card number/security code.
- * Fields that draw bullets through CSS (`-webkit-text-security`) are a computed-style fact
- * this DOM row does not carry; observe() reads that style in the isolated world.
+ * Whether a field's value is a secret by what the author declared in the DOM: `type=password`
+ * (only while it is: a revealed password field is `type=text`), or an `autocomplete` token naming
+ * a one-time code or card number/security code. Fields that draw bullets through CSS
+ * (`-webkit-text-security`) are a computed-style fact this DOM row does not carry; observe() reads
+ * that style in the isolated world.
  */
 export function isSecretField(nodeName: string, type: string | undefined, autocomplete: string | undefined): boolean {
   const tag = nodeName.toLowerCase()
@@ -555,6 +560,157 @@ function shiftIndent(nodes: SnapshotNode[], offset: number): SnapshotNode[] {
   })
 }
 
+/**
+ * Roles ARIA names from their content (a button is called what it says). Any other role only gets
+ * a name from its content in Chromium because it is focusable: measured on Chromium 149, a focused
+ * `<li tabindex=0>Echo</li>` turns into listitem "Echo" and a focused `<div tabindex=0>` card into
+ * generic "Quarterly report (Archived) Right-click this card", while the same elements unfocused
+ * have no name. Lowercased Chromium roles, text-level roles included.
+ */
+const NAME_FROM_CONTENT_ROLES: Record<string, true> = {
+  button: true,
+  cell: true,
+  checkbox: true,
+  columnheader: true,
+  gridcell: true,
+  heading: true,
+  link: true,
+  menuitem: true,
+  menuitemcheckbox: true,
+  menuitemradio: true,
+  option: true,
+  radio: true,
+  row: true,
+  rowheader: true,
+  switch: true,
+  tab: true,
+  tooltip: true,
+  treeitem: true,
+  caption: true,
+  legend: true,
+  term: true,
+  sectionhead: true,
+  listboxoption: true,
+  menulistoption: true,
+  disclosuretriangle: true,
+  statictext: true,
+  inlinetextbox: true,
+  linebreak: true,
+  listmarker: true,
+  code: true,
+  emphasis: true,
+  strong: true,
+  deletion: true,
+  insertion: true,
+  subscript: true,
+  superscript: true,
+  mark: true,
+  comment: true,
+}
+
+/**
+ * A name Chromium made from a focusable element's content although its role takes no name from
+ * content (see `NAME_FROM_CONTENT_ROLES`). It is the element's text, not its label: kept as a name,
+ * every text inside it would read as a repeat of it and be dropped, and a focused list item or card
+ * would lose its words.
+ */
+function isFocusEcho(node: Protocol.Accessibility.AXNode, role: string): boolean {
+  if (NAME_FROM_CONTENT_ROLES[role] || INTERACTIVE_ROLES.has(role)) return false
+  if (!node.properties?.some((property) => property.name === 'focusable' && property.value.value === true)) return false
+  const winner = node.name?.sources?.find((source) => source.value !== undefined && !source.superseded && !source.invalid)
+  return winner?.type === 'contents'
+}
+
+/** Image roles: Chromium 145+ says `image`, ARIA (and older Chromium) `img`. */
+const IMAGE_ROLES: Record<string, true> = { img: true, image: true }
+
+/**
+ * Controls whose content is part of what a person reads as the control: an icon inside a
+ * "More actions" button, a logo inside a link, a card-brand image inside a radio's label. An image
+ * in one of them that has a name is not a thing of its own.
+ */
+const CONTENT_CONTROL_ROLES: Record<string, true> = {
+  button: true,
+  link: true,
+  menuitem: true,
+  menuitemcheckbox: true,
+  menuitemradio: true,
+  tab: true,
+  option: true,
+  checkbox: true,
+  radio: true,
+  switch: true,
+  treeitem: true,
+  disclosuretriangle: true,
+}
+
+/**
+ * A nameless image that is not an `<img>`: an inline `<svg>` without `<title>`, a canvas or
+ * `role=img` without a label. An `<img>` without alt is still something to point at (its address
+ * tells it apart); this has nothing to name it by, so it gets no ref. The full tree keeps it so
+ * observe() can count it.
+ */
+function isUnnamedGraphic(node: SnapshotNode, domByBackendId: Map<Protocol.DOM.BackendNodeId, DomNodeInfo>): boolean {
+  if (!IMAGE_ROLES[node.role] || node.name !== '') return false
+  return node.backendNodeId === undefined || domByBackendId.get(node.backendNodeId)?.nodeName.toLowerCase() !== 'img'
+}
+
+/** An image this thin or thinner (CSS px, either side) is not seen: a spacer, a tracking pixel. */
+export const UNSEEN_IMAGE_MAX_SIDE = 1
+
+/** A layout snapshot's documents as `fetchPageGeometry` decodes them: each laid-out node's rendered box, in CSS px. */
+export type LayoutDocuments = ReadonlyArray<{ byBackendId: ReadonlyMap<number, { box: { width: number; height: number } }> }>
+
+/**
+ * Images (AX role `image`/`img`) a person cannot see: their rendered box has a side of at most
+ * `UNSEEN_IMAGE_MAX_SIDE` px (the 14×1 and 0×10 spacer `<img>`s of table layouts, tracking pixels),
+ * or no box at all.
+ *
+ * With `layout` (a layout snapshot of this session taken with the other reads), the box is its
+ * `layout.bounds`: the box as drawn, transforms included, the same box observe() counts decorative
+ * images by; no further read. Without it, one read-only `DOM.getBoxModel` per image: Chrome's
+ * whole-pixel border box before transforms.
+ */
+async function unseenImageIds(
+  session: ICDPSession,
+  axNodes: Protocol.Accessibility.AXNode[],
+  isNodeInScope: (node: Protocol.Accessibility.AXNode) => boolean,
+  layout: LayoutDocuments | undefined,
+): Promise<Set<Protocol.DOM.BackendNodeId>> {
+  const images = axNodes.flatMap((node) =>
+    !node.ignored && node.backendDOMNodeId !== undefined && IMAGE_ROLES[getAxRole(node)] && isNodeInScope(node) ? [node.backendDOMNodeId] : [],
+  )
+  const unseen = new Set<Protocol.DOM.BackendNodeId>()
+  const thin = (box: { width: number; height: number } | null | undefined): boolean =>
+    !box || box.width <= UNSEEN_IMAGE_MAX_SIDE || box.height <= UNSEEN_IMAGE_MAX_SIDE
+  if (layout) {
+    for (const backendNodeId of images) {
+      // Not in any document's layout table: not rendered.
+      let box: { width: number; height: number } | undefined
+      for (const document of layout) {
+        box = document.byBackendId.get(backendNodeId)?.box
+        if (box) break
+      }
+      if (thin(box)) unseen.add(backendNodeId)
+    }
+    return unseen
+  }
+  await Promise.all(
+    images.map(async (backendNodeId) => {
+      const box = await withDeadline(session.send('DOM.getBoxModel', { backendNodeId }), SNAPSHOT_CDP_TIMEOUT_MS, 'measuring an image (DOM.getBoxModel)').then(
+        ({ model }) => model,
+        (error: unknown) => {
+          // No box (not rendered), or no longer in the document: nothing of it is on screen.
+          if (/Could not compute box model/i.test(error instanceof Error ? error.message : String(error)) || isNodeGoneError(error)) return null
+          throw error
+        },
+      )
+      if (thin(box)) unseen.add(backendNodeId)
+    }),
+  )
+  return unseen
+}
+
 export function buildRawSnapshotTree(options: {
   nodeId: Protocol.Accessibility.AXNodeId
   axById: Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>
@@ -563,6 +719,10 @@ export function buildRawSnapshotTree(options: {
   nameSources: Map<Protocol.DOM.BackendNodeId, string>
   /** The role of the control an enclosing label names (inherited down the label's subtree). */
   labels?: string
+  /** Inside a control that has a name (see `CONTENT_CONTROL_ROLES`). */
+  inNamedControl?: true
+  /** Images not to list: nothing of them is seen (see `unseenImageIds`). */
+  unseenImages?: Set<Protocol.DOM.BackendNodeId>
 }): SnapshotNode | null {
   const node = options.axById.get(options.nodeId)
   if (!node) {
@@ -570,8 +730,16 @@ export function buildRawSnapshotTree(options: {
   }
 
   const role = getAxRole(node)
-  const name = getAxValueString(node.name).trim()
+  const name = isFocusEcho(node, role) ? '' : getAxValueString(node.name).trim()
   const labels = (node.backendDOMNodeId !== undefined ? options.nameSources.get(node.backendDOMNodeId) : undefined) ?? options.labels
+  // An image inside a named control, or in the label (or aria-labelledby target) that names one,
+  // is part of that control: its name is in the control's name already (a button named by its
+  // SVG <title> "More actions"), and listed on its own it would take that name from the control.
+  // An image nobody can see (a spacer) is not listed either.
+  if (IMAGE_ROLES[role] && (options.inNamedControl || labels !== undefined || (node.backendDOMNodeId !== undefined && options.unseenImages?.has(node.backendDOMNodeId)))) {
+    return null
+  }
+  const inNamedControl = options.inNamedControl || (CONTENT_CONTROL_ROLES[role] && name !== '' ? true : undefined)
   const children = (node.childIds ?? [])
     .map((childId) => {
       return buildRawSnapshotTree({
@@ -580,6 +748,8 @@ export function buildRawSnapshotTree(options: {
         isNodeInScope: options.isNodeInScope,
         nameSources: options.nameSources,
         ...(labels !== undefined ? { labels } : {}),
+        ...(inNamedControl ? { inNamedControl } : {}),
+        ...(options.unseenImages ? { unseenImages: options.unseenImages } : {}),
       })
     })
     .filter(isTruthy)
@@ -679,7 +849,7 @@ export function filterInteractiveSnapshotTree(options: {
   const nameToUse = hasName && (childNames.has(name) || isSubstringOfAny(name, childNames)) ? '' : name
   const hasNameToUse = nameToUse.length > 0
   const isWrapper = SKIP_WRAPPER_ROLES.has(role)
-  const isInteractive = INTERACTIVE_ROLES.has(role)
+  const isInteractive = INTERACTIVE_ROLES.has(role) && !isUnnamedGraphic(options.node, options.domByBackendId)
   const isContext = CONTEXT_ROLES.has(role)
   const passesRefFilter = !options.refFilter || options.refFilter({ role, name })
   const includeInteractive = isInteractive && passesRefFilter
@@ -796,15 +966,17 @@ export function filterFullSnapshotTree(options: {
   const nameToUse = hasName && (childNames.has(name) || isSubstringOfAny(name, childNames)) ? '' : name
   const hasNameToUse = nameToUse.length > 0
   const isWrapper = SKIP_WRAPPER_ROLES.has(role)
-  const isInteractive = INTERACTIVE_ROLES.has(role)
+  const unnamedGraphic = isUnnamedGraphic(options.node, options.domByBackendId)
+  const isInteractive = INTERACTIVE_ROLES.has(role) && !unnamedGraphic
   const passesRefFilter = !options.refFilter || options.refFilter({ role, name })
   const includeInteractive = isInteractive && passesRefFilter
-  const shouldInclude = includeInteractive || hasNameToUse || hasChildren
+  const shouldInclude = includeInteractive || hasNameToUse || hasChildren || unnamedGraphic
   if (!shouldInclude) {
     return { nodes: childNodes, names: childNames }
   }
 
-  if (isWrapper && !hasNameToUse) {
+  // A focused wrapper stays: where the focus is matters (a focused `<div tabindex=0>` card).
+  if (isWrapper && !hasNameToUse && !options.node.states?.focused) {
     if (!hasChildren) {
       return { nodes: [], names: childNames }
     }
@@ -1067,6 +1239,7 @@ export async function getAriaSnapshot({
   refFilter,
   interactiveOnly = false,
   cdp,
+  prefetched,
 }: {
   page: Page
   frame?: Frame | FrameLocator
@@ -1075,6 +1248,14 @@ export async function getAriaSnapshot({
   refFilter?: (info: { role: string; name: string }) => boolean
   interactiveOnly?: boolean
   cdp?: ICDPSession
+  /**
+   * Reads the caller already made on the same session, for the same frame, moments ago: the pierced
+   * `DOM.getDocument` root, the frame's `Accessibility.getFullAXTree` nodes, and the session's layout
+   * snapshot (images are measured from it instead of one `DOM.getBoxModel` each). Each one given is
+   * not read again. The AX nodes are taken over: they are adjusted in place (popup children dropped,
+   * contenteditable promoted), so the caller must be done reading them.
+   */
+  prefetched?: { domRoot?: Protocol.DOM.Node; axNodes?: Protocol.Accessibility.AXNode[]; layout?: LayoutDocuments }
 }): Promise<AriaSnapshotResult> {
   // Resolve FrameLocator to an actual Frame. FrameLocator (from locator.contentFrame())
   // is a scoping helper without CDP access. We need the real Frame from page.frames()
@@ -1092,12 +1273,10 @@ export async function getAriaSnapshot({
   const pageSession = cdp ?? (await getCDPSessionForPage({ page }))
   const session: ICDPSession = frameSession ?? pageSession
 
-  await withDeadline(session.send('DOM.enable'), SNAPSHOT_CDP_TIMEOUT_MS, 'enabling the DOM domain (DOM.enable)')
-  await withDeadline(
-    session.send('Accessibility.enable'),
-    SNAPSHOT_CDP_TIMEOUT_MS,
-    'enabling the Accessibility domain (Accessibility.enable)',
-  )
+  await Promise.all([
+    withDeadline(session.send('DOM.enable'), SNAPSHOT_CDP_TIMEOUT_MS, 'enabling the DOM domain (DOM.enable)'),
+    withDeadline(session.send('Accessibility.enable'), SNAPSHOT_CDP_TIMEOUT_MS, 'enabling the Accessibility domain (Accessibility.enable)'),
+  ])
 
   // Scope: the locator's element is identified by backendNodeId without writing to the page
   // (element-resolve.ts), and its subtree is taken from the pierced DOM tree's parent links,
@@ -1130,11 +1309,42 @@ export async function getAriaSnapshot({
     }
   }
 
-  const { root: domRoot } = await withDeadline(
-    session.send('DOM.getDocument', { depth: -1, pierce: true }),
-    SNAPSHOT_CDP_TIMEOUT_MS,
-    'reading the DOM (DOM.getDocument)',
-  )
+  // On the OOPIF's own session the document IS the frame, so scoping by frameId is
+  // both unnecessary and wrong (the parent's frame id is unknown there). On the page
+  // session an unscoped call would return the TOP document, so `frameId` is required
+  // whenever a frame was asked for.
+  const axParams = isOopif ? undefined : frameId ? { frameId } : undefined
+  // The two reads are independent: they go out together.
+  const [domRoot, axNodes] = await Promise.all([
+    prefetched?.domRoot ??
+      withDeadline(session.send('DOM.getDocument', { depth: -1, pierce: true }), SNAPSHOT_CDP_TIMEOUT_MS, 'reading the DOM (DOM.getDocument)').then(
+        ({ root }) => root,
+      ),
+    prefetched?.axNodes ??
+      withDeadline(
+        session.send('Accessibility.getFullAXTree', axParams),
+        SNAPSHOT_CDP_TIMEOUT_MS,
+        'reading the accessibility tree (Accessibility.getFullAXTree)',
+      ).then(
+        ({ nodes }) => nodes,
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          // The one failure that used to be invisible: a cross-origin frame that Playwright
+          // holds no session for (so `getCDPSessionForFrame` returned null) is unreachable
+          // from the page session. Say so instead of falling back to the parent's tree.
+          if (frameId && /Frame with the given frameId is not found/i.test(message)) {
+            throw new Error(
+              `getAriaSnapshot: frame ${frameId} (${resolvedFrame?.url() ?? 'unknown url'}) is not reachable from the ` +
+                `page's CDP session, and Playwright holds no separate session for it either. It is a cross-process ` +
+                `iframe whose target was never attached — through the relay, iframe targets are not in ` +
+                `connectedTargets, so no session exists to ask. Refusing to return the parent document's tree in its ` +
+                `place. Original protocol error: ${message}`,
+            )
+          }
+          throw error
+        },
+      ),
+  ])
   const { domByBackendId, childrenByBackendId } = buildDomIndex(domRoot)
 
   const scopeRootBackendId = scopeElement?.backendNodeId ?? null
@@ -1149,32 +1359,6 @@ export async function getAriaSnapshot({
     }
     allowedBackendIds = buildBackendIdSet(scopeElement.backendNodeId, childrenByBackendId)
   }
-
-  // On the OOPIF's own session the document IS the frame, so scoping by frameId is
-  // both unnecessary and wrong (the parent's frame id is unknown there). On the page
-  // session an unscoped call would return the TOP document, so `frameId` is required
-  // whenever a frame was asked for.
-  const axParams = isOopif ? undefined : frameId ? { frameId } : undefined
-  const { nodes: axNodes } = await withDeadline(
-    session.send('Accessibility.getFullAXTree', axParams),
-    SNAPSHOT_CDP_TIMEOUT_MS,
-    'reading the accessibility tree (Accessibility.getFullAXTree)',
-  ).catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error)
-    // The one failure that used to be invisible: a cross-origin frame that Playwright
-    // holds no session for (so `getCDPSessionForFrame` returned null) is unreachable
-    // from the page session. Say so instead of falling back to the parent's tree.
-    if (frameId && /Frame with the given frameId is not found/i.test(message)) {
-      throw new Error(
-        `getAriaSnapshot: frame ${frameId} (${resolvedFrame?.url() ?? 'unknown url'}) is not reachable from the ` +
-          `page's CDP session, and Playwright holds no separate session for it either. It is a cross-process ` +
-          `iframe whose target was never attached — through the relay, iframe targets are not in ` +
-          `connectedTargets, so no session exists to ask. Refusing to return the parent document's tree in its ` +
-          `place. Original protocol error: ${message}`,
-      )
-    }
-    throw error
-  })
 
   const axById = new Map<Protocol.Accessibility.AXNodeId, Protocol.Accessibility.AXNode>()
   for (const node of axNodes) {
@@ -1311,6 +1495,7 @@ export async function getAriaSnapshot({
   }
 
   const nameSources = controlNameSources(axById)
+  const unseenImages = await unseenImageIds(session, axNodes, isNodeInScope, prefetched?.layout)
   let snapshotNodes: SnapshotNode[] = []
   if (rootAxNodeId) {
     const rootNode = axById.get(rootAxNodeId)
@@ -1319,10 +1504,10 @@ export async function getAriaSnapshot({
       rootNode && (rootRole === 'rootwebarea' || rootRole === 'webarea') && rootNode.childIds
         ? rootNode.childIds
             .map((childId) => {
-              return buildRawSnapshotTree({ nodeId: childId, axById, isNodeInScope, nameSources })
+              return buildRawSnapshotTree({ nodeId: childId, axById, isNodeInScope, nameSources, unseenImages })
             })
             .filter(isTruthy)
-        : [buildRawSnapshotTree({ nodeId: rootAxNodeId, axById, isNodeInScope, nameSources })].filter(isTruthy)
+        : [buildRawSnapshotTree({ nodeId: rootAxNodeId, axById, isNodeInScope, nameSources, unseenImages })].filter(isTruthy)
 
     const filtered = rawRoots.flatMap((rawNode) => {
       if (interactiveOnly) {

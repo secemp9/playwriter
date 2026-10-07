@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Closes Itself · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<main>
+  <h1>Closes itself</h1>
+  <!-- Without ?on=: links opening this page in a new tab that closes itself in answer to one input. -->
+  <nav id="openers">
+    <a href="/closes-itself.html?on=pointerdown" target="_blank">Open a tab closing on pointerdown</a>
+    <a href="/closes-itself.html?on=mouseup" target="_blank">Open a tab closing on mouseup</a>
+    <a href="/closes-itself.html?on=click" target="_blank">Open a tab closing on click</a>
+    <a href="/closes-itself.html?on=dblclick" target="_blank">Open a tab closing on dblclick</a>
+    <a href="/closes-itself.html?on=contextmenu" target="_blank">Open a tab closing on contextmenu</a>
+    <a href="/closes-itself.html?on=keydown" target="_blank">Open a tab closing on keydown Enter</a>
+    <a href="/closes-itself.html?on=drop" target="_blank">Open a tab closing on drop (mouseup over Drop here)</a>
+    <a href="/closes-itself.html?on=pointermove" target="_blank">Open a tab closing on pointermove</a>
+  </nav>
+  <!-- With ?on=: the button (or, for drop, the drop target) closes the tab synchronously in that event's handler. -->
+  <div id="closer" hidden>
+    <button type="button" id="close">Close this tab</button>
+    <button type="button" id="target" style="margin-left: 160px">Drop here</button>
+  </div>
+</main>
+<script>
+const on = new URLSearchParams(location.search).get('on');
+if (on) {
+  document.title = 'Closer ' + on + ' · Browser Lab';
+  document.getElementById('openers').hidden = true;
+  document.getElementById('closer').hidden = false;
+  const close = document.getElementById('close');
+  const closeNow = (event) => {
+    event.preventDefault();
+    window.close();
+  };
+  if (on === 'keydown') close.addEventListener('keydown', (event) => event.key === 'Enter' && closeNow(event));
+  else if (on === 'drop') document.getElementById('target').addEventListener('mouseup', closeNow);
+  else if (on === 'pointermove') document.addEventListener('pointermove', closeNow);
+  else close.addEventListener(on, closeNow);
+}
+</script>
+</body>
+</html>

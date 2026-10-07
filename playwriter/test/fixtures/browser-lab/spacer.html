@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spacers · Browser Lab</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<h1>Report</h1>
+<!-- Table-layout spacers (as on Hacker News) and a tracking pixel: nothing a person sees. -->
+<table><tr>
+  <td><img src="/lab/chart.svg" width="14" height="1" id="spacer-wide"></td>
+  <td><img src="/lab/chart.svg" width="0" height="10" id="spacer-zero"></td>
+  <td><img src="/lab/chart.svg" width="1" height="1" alt="" id="pixel-empty-alt"></td>
+  <td><img src="/lab/chart.svg" width="1" height="1" alt="tracking" id="pixel-named"></td>
+</tr></table>
+<!-- The content image next to them: listed by its address. -->
+<img src="/lab/chart.svg" width="320" height="120" id="chart-no-alt">
+<!-- A small but visible icon image: listed. -->
+<img src="/lab/chart.svg" width="16" height="16" alt="Status OK" id="icon">
+</body>
+</html>
