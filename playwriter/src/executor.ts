@@ -225,10 +225,9 @@ export function wrapCode(code: string): string {
   return `(async () => { ${code} })()`
 }
 
-const EXTENSION_NOT_CONNECTED_ERROR = `The Playwriter Chrome extension is not connected. Make sure you have:
-1. Installed the extension: https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe
-2. Clicked the extension icon on a tab to enable it (or refreshed the page if just installed)
-3. Or use a cloud browser instead: run \`playwriter cloud login\` in your terminal to rent a browser in the cloud, with auto CAPTCHA solving, residential proxies and anti-detection built in`
+const EXTENSION_NOT_CONNECTED_ERROR = `The Playwriter Chrome extension is not connected, so there is no Chrome to drive. Ask the user to:
+1. install the extension if they have not: https://chromewebstore.google.com/detail/playwriter-mcp/jfeammnjpkecdekppnclgkkffahnhfhe
+2. open Chrome and click the extension icon on a tab to enable it (or refresh the page if it was just installed)`
 
 const NO_PAGES_AVAILABLE_ERROR =
   'No Playwright pages are available: the browser has no open contexts. Call reset to reconnect.'
@@ -1945,6 +1944,39 @@ export class PlaywrightExecutor {
     }
   }
 
+  /**
+   * Stop driving the browser this executor is bound to (an MCP session switching browsers).
+   *
+   * - Headless: `closeHeadlessContext()` — this session's context closes, and the shared headless
+   *   Chrome closes with it when no other session uses it.
+   * - Relay (the user's Chrome through the extension) and direct CDP: what this session armed in
+   *   the browser is released (`disposeBrowserSideResources`), then Playwright disconnects. The
+   *   Chrome and its tabs stay open: closing a connectOverCDP browser only drops the connection.
+   *
+   * The connection state is cleared either way; `state` is not. A close that fails is logged
+   * through the executor's logger.
+   */
+  async disconnect(): Promise<void> {
+    if (this.isHeadlessMode()) {
+      await this.closeHeadlessContext()
+      return
+    }
+    await this.disposeBrowserSideResources()
+    const browser = this.browser
+    this.clearConnectionState()
+    if (!browser) {
+      return
+    }
+    this.suppressPageCloseWarnings = true
+    try {
+      await browser.close()
+    } catch (e) {
+      this.logger.error('Error disconnecting from the browser:', e)
+    } finally {
+      this.suppressPageCloseWarnings = false
+    }
+  }
+
   private async ensureConnection(): Promise<{ browser: Browser; page: Page }> {
     // In headless mode, also check the shared browser is still alive.
     // After a crash, isConnected() returns false and we need to reconnect.
@@ -3226,9 +3258,11 @@ export class PlaywrightExecutor {
        * The full reference, readable from inside a call. The MCP description carries only the short
        * guide, and not every MCP client lets a model read resources, so the docs travel through
        * execute itself: docs() lists the headings, docs('recording') prints the matching sections.
+       * It is the build's dist/skill-reference.md — skill.md without its `## CLI Usage` section,
+       * so a session is never told to run the CLI or a shell command (`playwriter skill` prints all).
        */
       const docs = async (topic?: string): Promise<{ text: string }> => {
-        const reference = await fs.promises.readFile(path.join(__dirname, '..', 'src', 'skill.md'), 'utf-8')
+        const reference = await fs.promises.readFile(path.join(__dirname, '..', 'dist', 'skill-reference.md'), 'utf-8')
         const text = topic
           ? filterMarkdownSections(reference, topic) ||
             `No reference heading contains "${topic}". docs() lists every heading; pick words from one of them.`

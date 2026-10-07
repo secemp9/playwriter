@@ -8,93 +8,29 @@
  * protocol; a real Playwright client connects over CDP on an ephemeral port.
  */
 
-import net from 'node:net'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import WebSocket from 'ws'
 import type { Browser } from '@xmorse/playwright-core'
 import { startPlayWriterCDPRelayServer, type RelayServer } from './cdp-relay.js'
 import { getChromium } from './playwright-import.js'
+import { connectFakeExtension, freePort, type FakeExtension } from './fake-extension.js'
 
-const EXT_ORIGIN = 'chrome-extension://jfeammnjpkecdekppnclgkkffahnhfhe' // an allowlisted EXTENSION_ID
 const MAC_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
 const LINUX_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'
-
-type Forwarded = { method: string; sessionId?: string; params?: Record<string, unknown> }
-type FakeBrowser = { name: string; ws: WebSocket; forwarded: Forwarded[]; workspace: string }
 
 let port = 0
 let server: RelayServer
 const relayLog: string[] = []
-const fakes: FakeBrowser[] = []
+const fakes: FakeExtension[] = []
 const browsers: Browser[] = []
 
-function freePort(): Promise<number> {
-  const found = Promise.withResolvers<number>()
-  const probe = net.createServer()
-  probe.listen(0, '127.0.0.1', () => {
-    const address = probe.address()
-    probe.close(() => (address && typeof address !== 'string' ? found.resolve(address.port) : found.reject(new Error('no port'))))
-  })
-  return found.promise
-}
-
-function opened(socket: WebSocket): Promise<void> {
-  const open = Promise.withResolvers<void>()
-  socket.once('open', () => open.resolve())
-  socket.once('error', (error) => open.reject(error))
-  return open.promise
-}
-
 /** A fake extension for one browser, with one page tab owned by `workspace`. */
-async function connectFakeBrowser({ name, query, workspace }: { name: string; query: Record<string, string>; workspace: string }): Promise<FakeBrowser> {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/extension?${new URLSearchParams(query).toString()}`, { headers: { origin: EXT_ORIGIN } })
-  const fake: FakeBrowser = { name, ws, forwarded: [], workspace }
-  const event = (method: string, params: unknown, sessionId?: string) => {
-    ws.send(JSON.stringify({ method: 'forwardCDPEvent', params: { method, params, sessionId, workspaceKey: workspace } }))
-  }
-  ws.on('message', (raw: WebSocket.RawData) => {
-    const message: { id?: number; method?: string; params?: Forwarded } = JSON.parse(raw.toString())
-    if (message.id === undefined || !message.method) return
-    const command = message.method === 'forwardCDPCommand' ? message.params : undefined
-    if (command) fake.forwarded.push(command)
-    let result: unknown = {}
-    if (command?.method === 'Page.getFrameTree') {
-      result = {
-        frameTree: {
-          frame: {
-            id: `${name}-target`,
-            loaderId: 'loader',
-            url: 'about:blank',
-            domainAndRegistry: '',
-            securityOrigin: '://',
-            mimeType: 'text/html',
-            secureContextType: 'InsecureScheme',
-            crossOriginIsolatedContextType: 'NotIsolated',
-            gatedAPIFeatures: [],
-          },
-        },
-      }
-    }
-    ws.send(JSON.stringify({ id: message.id, result }))
-    if (command?.method === 'Runtime.enable' && command.sessionId) {
-      event(
-        'Runtime.executionContextCreated',
-        { context: { id: 1, origin: '', name: '', uniqueId: `${name}-ctx`, auxData: { isDefault: true, type: 'default', frameId: `${name}-target` } } },
-        command.sessionId,
-      )
-    }
-  })
-  await opened(ws)
-  event('Target.attachedToTarget', {
-    sessionId: `${name}-tab`,
-    targetInfo: { targetId: `${name}-target`, type: 'page', title: name, url: 'about:blank', attached: true, canAccessOpener: false, browserContextId: 'ctx' },
-    waitingForDebugger: false,
-  })
+async function connectFakeBrowser({ name, query, workspace }: { name: string; query: Record<string, string>; workspace: string }): Promise<FakeExtension> {
+  const fake = await connectFakeExtension({ port, name, query, workspace })
   fakes.push(fake)
   return fake
 }
 
-async function connectPlaywright(fake: FakeBrowser, installId: string, clientId = fake.name): Promise<Browser> {
+async function connectPlaywright(fake: FakeExtension, installId: string, clientId = fake.name): Promise<Browser> {
   const chromium = await getChromium()
   const query = new URLSearchParams({ workspace: fake.workspace, workspaceLabel: fake.name, extensionId: `install:Chrome:${installId}` })
   const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${port}/cdp/${clientId}?${query.toString()}`)
@@ -102,8 +38,8 @@ async function connectPlaywright(fake: FakeBrowser, installId: string, clientId 
   return browser
 }
 
-let mac: FakeBrowser
-let linux: FakeBrowser
+let mac: FakeExtension
+let linux: FakeExtension
 let macBrowser: Browser
 let linuxBrowser: Browser
 

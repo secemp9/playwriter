@@ -158,8 +158,9 @@ export function resolveBrowserExecutablePath({
   })
 
   throw new Error(
-    'Could not find a supported browser binary. Run `playwriter browser install` to download Chrome for Testing, or pass a binary path.' +
-      `\n\nSearched paths:\n- ~/.playwriter/browsers/ (playwriter browser install)\n${searchedPathsText.join('\n')}`,
+    'Could not find a Chrome or Chromium binary to launch. The user can point PLAYWRITER_BROWSER_PATH at one, ' +
+      'or install Google Chrome (or Chrome for Testing, which playwriter keeps in ~/.playwriter/browsers/).' +
+      `\n\nSearched paths:\n- ~/.playwriter/browsers/ (Chrome for Testing installed by playwriter)\n${searchedPathsText.join('\n')}`,
   )
 }
 

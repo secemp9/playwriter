@@ -60,7 +60,7 @@ Reading without Playwright's script is never restricted: `observe`, `find`, `exp
 - On a password field outside localhost, stop and ask the user. Do not touch the user's other tabs.
 - Stuck? `explain(ref)`, `find(…)`, `getLatestLogs({ sinceLastCall: true })`, `net.requests({ failedOnly: true })`, or ask the user. Repeating an action that changed nothing three times is refused.
 
-`state` persists between calls, `page` is the controlled tab. Everything else — the Playwright API, `snapshot()` locators, CSS/React/debugger/trace tools, recording — is in the reference below. **Debug mode** (`playwriter session new --policy debug`, or `PLAYWRITER_POLICY=debug` for the MCP server) allows multi-step scripts and network perturbation; only the user switches it on.
+`state` persists between calls, `page` is the controlled tab. Everything else — the Playwright API, `snapshot()` locators, CSS/React/debugger/trace tools, recording — is in the reference below. **Debug mode** allows multi-step scripts and network perturbation; only the user switches it on (`PLAYWRITER_POLICY=debug` in the configuration that starts playwriter), so ask them when a task needs it.
 
 ---
 
@@ -95,6 +95,8 @@ playwriter session new
 **Always use your own session** - pass `-s <id>` to all commands. Using the same session preserves your `state` between calls. Using a different session gives you a fresh `state`.
 
 Don't create new sessions to "fix" a problem — reuse the same `-s` number. A fresh session throws away the `state` you built up and reconnects to the same browser, so it fixes nothing that `resetPlaywright()` would not fix in place.
+
+Debug mode is the user's call. When they ask for it, start the session with `playwriter session new --policy debug`.
 
 List all active sessions with their state keys:
 
@@ -205,7 +207,7 @@ playwriter -s 1 -e "console.log(await snapshot({ page }))"
 
 Multiple sessions reuse the same headless Chrome process. Recording is not available in headless mode.
 
-If no Chrome binary is found, `playwriter session new --browser headless` will tell you to run `playwriter browser install` first to download Chrome for Testing.
+If `playwriter session new --browser headless` finds no Chrome binary, `playwriter browser install` downloads Chrome for Testing (or point `PLAYWRITER_BROWSER_PATH` at a Chrome binary).
 
 ### Cloud browsers (stealth, proxies, CAPTCHA solving)
 
@@ -319,23 +321,9 @@ playwriter -s 1 -f script.js
 
 The file is read from disk and executed in the same sandbox as `-e`. All context variables (`state`, `page`, `context`, etc.) are available. `-e` and `-f` cannot be used together.
 
-### Debugging playwriter issues
+### Starting Chrome from a terminal
 
-```bash
-playwriter logfile  # prints the relay log path, and the CDP JSONL path beside it
-```
-
-What is in those logs, how to triage them, and where to report a bug: see "debugging playwriter itself" at the end of this document.
-
----
-
-# playwriter best practices
-
-Control user's Chrome browser via playwright code snippets. Prefer single-line code with semicolons between statements. Use playwriter immediately without waiting for user actions; only if you get "extension is not connected" or "no browser tabs have Playwriter enabled" should you ask the user to click the playwriter extension icon on the target tab.
-
-**When to use playwriter instead of webfetch/curl:** If a website is JS-heavy (SPAs like Instagram, Twitter, Facebook, etc.), has cookie consent modals, login walls, lazy-loaded content, carousels, or infinite scroll — **always use playwriter**. Simple fetch/webfetch will return an empty HTML shell with no content. Do NOT waste time trying curl, webfetch, or parsing raw HTML from JS-rendered sites. Go straight to playwriter: navigate with a real browser, dismiss modals, then read the page with `snapshot()` for structure, `pm.query()` when you need tags/attributes/your own fields, or `getPageMarkdown()` for article text. `page.evaluate()` and network interception are the narrower fallbacks for what those cannot see — see "reading a page: pick the narrowest tool".
-
-**If Chrome is not running**, the extension can't connect. Start Chrome from the command line before retrying:
+If Chrome is not running, the extension can't connect. Start it with the profile to drive before retrying:
 
 ```bash
 # macOS
@@ -351,7 +339,7 @@ start chrome.exe --profile-directory=Default
 Start-Process chrome.exe -ArgumentList '--profile-directory=Default'
 ```
 
-To also enable automatic tab capture for screen recording (no manual extension click needed), add the `--allowlisted-extension-id` and `--auto-accept-this-tab-capture` flags:
+To also let `recording.start` capture tabs without a click on the extension icon, add the `--allowlisted-extension-id` and `--auto-accept-this-tab-capture` flags:
 
 ```bash
 # macOS
@@ -364,9 +352,35 @@ google-chrome --profile-directory=Default --allowlisted-extension-id=jfeammnjpke
 start chrome.exe --profile-directory=Default --allowlisted-extension-id=jfeammnjpkecdekppnclgkkffahnhfhe --auto-accept-this-tab-capture
 ```
 
+### Debugging playwriter issues
+
+```bash
+playwriter logfile  # prints the relay log path, and the CDP JSONL path beside it
+```
+
+To summarise CDP traffic by direction and method:
+
+```bash
+jq -r '.direction + "\t" + (.message.method // "response")' ~/.playwriter/cdp.jsonl | uniq -c
+```
+
+To file a playwriter bug, once the user agrees: `gh issue create -R remorses/playwriter --title title --body body`.
+
+What is in those logs, how to triage them, and where to report a bug: see "debugging playwriter itself" at the end of this document.
+
+---
+
+# playwriter best practices
+
+Control user's Chrome browser via playwright code snippets. Prefer single-line code with semicolons between statements. Use playwriter immediately without waiting for user actions; only if you get "extension is not connected" or "no browser tabs have Playwriter enabled" should you ask the user to click the playwriter extension icon on the target tab.
+
+**When to use playwriter instead of webfetch/curl:** If a website is JS-heavy (SPAs like Instagram, Twitter, Facebook, etc.), has cookie consent modals, login walls, lazy-loaded content, carousels, or infinite scroll — **always use playwriter**. Simple fetch/webfetch will return an empty HTML shell with no content. Do NOT waste time trying curl, webfetch, or parsing raw HTML from JS-rendered sites. Go straight to playwriter: navigate with a real browser, dismiss modals, then read the page with `snapshot()` for structure, `pm.query()` when you need tags/attributes/your own fields, or `getPageMarkdown()` for article text. `page.evaluate()` and network interception are the narrower fallbacks for what those cannot see — see "reading a page: pick the narrowest tool".
+
+**If Chrome is not running**, the extension can't connect: ask the user to start Chrome with the profile they want you to use. `recording.start` also needs a click on the extension icon for each tab unless Chrome was started with tab-capture flags: ask the user, or record with `recording.startCdp`, which needs neither.
+
 You can collaborate with the user - they can help with captchas, difficult elements, or reproducing bugs.
 
-**Direct CDP mode (no extension needed):** Playwriter can connect directly to Chrome's DevTools Protocol, bypassing the extension. This is useful in CI, Docker, headless environments, when Chrome has `--remote-debugging-port=9222`, or with cloud browser providers (e.g. `wss://xxx.cdp.browser-use.com`). If the user provides a CDP URL, set `PLAYWRITER_DIRECT` in the MCP client config:
+**Direct CDP mode (no extension needed):** Playwriter can connect directly to Chrome's DevTools Protocol, bypassing the extension. This is useful in CI, Docker, headless environments, when Chrome has `--remote-debugging-port=9222`, or with cloud browser providers (e.g. `wss://xxx.cdp.browser-use.com`). A CDP URL the user provides goes in `PLAYWRITER_DIRECT` in the MCP client config, which the user edits:
 
 ```json
 {
@@ -384,7 +398,9 @@ You can collaborate with the user - they can help with captchas, difficult eleme
 
 `PLAYWRITER_DIRECT` accepts `1` (auto-discover Chrome on port 9222), a `ws://` or `wss://` endpoint (including cloud browser providers), or `host:port`.
 
-**Remote relay (the browser is on another machine):** Chrome, the extension and the relay can all live somewhere else — a desktop, a LAN box, the far end of a tunnel — while you run here. Set `PLAYWRITER_HOST` to that machine's relay URL in the same MCP client `env` block as above, plus `PLAYWRITER_TOKEN` when the relay is exposed beyond localhost. Both are read in MCP mode, not only by the CLI, so this is a real deployment and not a CLI-only trick. The other machine is the one that runs `playwriter serve`. Full guide (Docker, LAN, security): https://playwriter.dev/docs/remote-access
+**Remote relay (the browser is on another machine):** Chrome, the extension and the relay can all live somewhere else — a desktop, a LAN box, the far end of a tunnel — while you run here. The user sets `PLAYWRITER_HOST` to that machine's relay URL in the same MCP client `env` block as above, plus `PLAYWRITER_TOKEN` when the relay is exposed beyond localhost. Both are read in MCP mode, not only by the CLI, so this is a real deployment and not a CLI-only trick. The other machine is the one that runs `playwriter serve`. Full guide (Docker, LAN, security): https://playwriter.dev/docs/remote-access
+
+**Which browser an MCP session drives:** the MCP `browser` tool chooses it. `browser({ action: "list" })` lists the user's Chrome profiles connected through the extension (email, key, attached tabs) and a fresh headless Chrome; `browser({ action: "use", browser: "<email or key>" })` binds one profile; `browser({ action: "new" })` launches a new headless Chrome for the session (no logins, no extensions). Switching releases the previous browser: the user's tabs stay open, a headless Chrome's context is closed. The user can preset the choice with `PLAYWRITER_BROWSER` (`new`, an email or a key) in the MCP client config, and point `PLAYWRITER_BROWSER_PATH` at the Chrome binary `new` launches. With `PLAYWRITER_DIRECT` set, that endpoint is the only browser.
 
 **Screen recording IS available in direct CDP mode — but only one of the two recorders.** `recording.start`/`recording.stop` are unavailable, because they rely on the extension's `chrome.tabCapture` API. `recording.startCdp`/`stopCdp` work in direct CDP and extension sessions alike and need no extension-icon click; see the recording section.
 
@@ -418,7 +434,7 @@ state.page = fresh
 - `/tmp`
 - The OS temp directory (`os.tmpdir()`, e.g. `/var/folders/.../T/` on macOS)
 
-Writing to any other path (e.g. `~/Downloads`, `~/Desktop`) throws `EPERM: operation not permitted, access outside allowed directories`. To save files elsewhere, write to a temp path first, then move the file using a shell command outside the sandbox.
+Writing to any other path (e.g. `~/Downloads`, `~/Desktop`) throws `EPERM: operation not permitted, access outside allowed directories`. To get a file elsewhere, write it to a temp path and tell the user where it is.
 
 Two limits of that scoping worth knowing: paths are checked textually, so an existing **symlink** inside an allowed directory is followed wherever it points (a `node_modules` link to a sibling package still resolves); and Playwright's own file APIs (`page.screenshot({ path })`, `download.saveAs`, `recording.startCdp({ outputPath })`) write through Playwright and ffmpeg, not through the scoped `fs`, so they are not restricted to these directories.
 
@@ -1289,7 +1305,7 @@ Labels are colour-coded by role (links, buttons, inputs, checkboxes, sliders, me
 
 `fit` decides what happens when you give **both** `width` and `height` and they disagree with the source aspect ratio: `'inside'` (default) preserves the ratio and fits within the box, `'cover'` fills the box and crops, `'contain'` pads, `'fill'` stretches. With only one dimension the ratio is preserved and `fit` does nothing.
 
-**recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Requires user to have clicked the Playwriter extension icon on the tab. The viewport is left as it is: a fixed aspect is made afterwards (`ffmpeg -i in.mp4 -vf "pad=ceil(ih*16/9/2)*2:ih:(ow-iw)/2:0" out.mp4`); `aspectRatio: { width, height }` is an explicit opt-in that DOES perturb the page — it resizes the viewport (resize events, media queries), restores it on stop/cancel, and throws on a page with no emulated viewport. `recording.stop()` burns the pointer into the video from the inputs that were dispatched (nothing is added to the page) and returns `pointer: { drawn, samples, segments, pulses, note? }`; `pointer: false` at start turns it off, an object (`sizePx`, `fillColor`, `outlineColor`, `pulseColor`, `pulseMs`) styles it. It needs an ffmpeg with libass: left at the default without libass the pointer is skipped with a note, asked for explicitly it is an error; it is also not drawn (note, or error if explicit) when the video's shape does not match the viewport. Auto-stops after 15 min (override with `maxDurationMs`).
+**recording.start / recording.stop** - record the page as a video at native FPS (30-60fps). Uses `chrome.tabCapture` so **recording survives page navigation**. Requires user to have clicked the Playwriter extension icon on the tab. The viewport is left as it is, so the video has the page's own shape; `aspectRatio: { width, height }` is an explicit opt-in that DOES perturb the page — it resizes the viewport (resize events, media queries), restores it on stop/cancel, and throws on a page with no emulated viewport. `recording.stop()` burns the pointer into the video from the inputs that were dispatched (nothing is added to the page) and returns `pointer: { drawn, samples, segments, pulses, note? }`; `pointer: false` at start turns it off, an object (`sizePx`, `fillColor`, `outlineColor`, `pulseColor`, `pulseMs`) styles it. It needs an ffmpeg with libass: left at the default without libass the pointer is skipped with a note, asked for explicitly it is an error; it is also not drawn (note, or error if explicit) when the video's shape does not match the viewport. Auto-stops after 15 min (override with `maxDurationMs`).
 
 For demos, act through the page (`act.*`) instead of `goto()`, so the recording shows the steps a person would take.
 
@@ -1538,7 +1554,7 @@ const demoPath = await createDemoVideo({
 The user can point at an element instead of describing it: right-click the page (or the extension icon) → **Pin an element for Playwriter**, then click the element in Chrome's element picker (Esc cancels). Nothing is injected into the page.
 
 - `observe()` lists pins under `PINNED`, newest first: the ref of the element, of the control the point is inside, or the text it is on. A pin whose element is gone is reported once, then dropped.
-- The clipboard gets `playwriter -e 'inspectPinnedElement({"url":…,"backendNodeId":N})'`; pasted into the chat, it is the command for you to run.
+- The clipboard gets `inspectPinnedElement({"url":…,"backendNodeId":N})` (inside a `playwriter -e` command line); pasted into the chat, that `inspectPinnedElement(…)` call is the code for your next call.
 - **Copy React component source (click an element next)**, in the same menu, puts the `file:line` of the JSX that rendered the clicked element on the clipboard.
 - `pickElement()` is the same picker started by you, waiting for the click (see utility functions).
 
@@ -1793,13 +1809,7 @@ When running in [Ghost Browser](https://ghostbrowser.com/), the `chrome` object 
 
 When the failure is in playwriter rather than in the page — an internal error, a call that never returns, an extension that will not attach — the relay writes two logs into the user's home directory. Both are recreated every time the server starts, so they describe the current run only:
 
-- `~/.playwriter/relay-server.log` — the extension, the MCP server and the WS server, interleaved. Read it with grep/rg rather than whole.
+- `~/.playwriter/relay-server.log` — the extension, the MCP server and the WS server, interleaved. It is long: search it rather than reading it whole.
 - `~/.playwriter/cdp.jsonl` — every CDP command, response and event, with long strings truncated.
 
-(`playwriter logfile` prints both paths if the CLI is on PATH.) To summarise CDP traffic by direction and method:
-
-```bash
-jq -r '.direction + "\t" + (.message.method // "response")' ~/.playwriter/cdp.jsonl | uniq -c
-```
-
-If it turns out to be a playwriter bug, report it with `gh issue create -R remorses/playwriter --title title --body body`. Ask the user to confirm before opening one.
+If it turns out to be a playwriter bug, tell the user what you found and ask them to report it at https://github.com/remorses/playwriter/issues.

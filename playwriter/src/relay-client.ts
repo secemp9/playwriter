@@ -209,7 +209,7 @@ export function getExtensionOutdatedWarning(extensionPlaywriterVersion: string |
     return null
   }
   if (compareVersions(extensionPlaywriterVersion, VERSION) > 0) {
-    return `Playwriter ${VERSION} is outdated (extension requires ${extensionPlaywriterVersion}). Run \`npm install -g playwriter@latest\` or update the playwriter package in your project.`
+    return `Playwriter ${VERSION} is older than the version the browser extension was built with (${extensionPlaywriterVersion}). Ask the user to update the playwriter package this server runs to ${extensionPlaywriterVersion} or later.`
   }
   return null
 }
@@ -244,12 +244,12 @@ export function getExtensionStaleError(extensionPlaywriterVersion: string | null
   }
   if (compareVersions(extensionPlaywriterVersion, VERSION) < 0) {
     return (
-      `Your Playwriter browser extension is stale: it was built with playwriter ${extensionPlaywriterVersion} ` +
+      `The Playwriter browser extension is stale: it was built with playwriter ${extensionPlaywriterVersion} ` +
       `but the relay is running ${VERSION}. A stale extension no longer reports workspace ownership, so every ` +
       `page it opens is invisible to this session (you would see "no pages anywhere"). An extension built before ` +
       `it reported the browser's user agent also leaves browser.version() wrong and makes Playwright treat a Mac as ` +
       `Linux, so macOS keyboard shortcuts (Meta+A, Meta+ArrowLeft, Alt+Backspace…) do nothing in text fields. ` +
-      `Reload the unpacked extension at chrome://extensions (or rebuild it with \`cd extension && pnpm build\`), then retry.`
+      `Ask the user to reload the unpacked extension at chrome://extensions (rebuilding it first if its build is old), then retry.`
     )
   }
   return null

@@ -1,7 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { Stream } from 'node:stream'
+import type { Stream } from 'node:stream'
 import path from 'node:path'
 import url from 'node:url'
 import type { PolicyMode } from './probe-types.js'
@@ -16,10 +15,17 @@ export interface CreateTransportOptions {
    * (`human`), or whatever PLAYWRITER_POLICY the test process itself runs with.
    */
   policy?: PolicyMode
+  /** More environment for the spawned MCP server (e.g. PLAYWRITER_BROWSER, PLAYWRITER_BROWSER_PATH), applied last. */
+  env?: Record<string, string>
 }
 
-export async function createTransport({ args = [], port, policy }: { args?: string[]; port?: number; policy?: PolicyMode } = {}): Promise<{
-  transport: Transport
+export async function createTransport({
+  args = [],
+  port,
+  policy,
+  env: extraEnv = {},
+}: { args?: string[]; port?: number; policy?: PolicyMode; env?: Record<string, string> } = {}): Promise<{
+  transport: StdioClientTransport
   stderr: Stream | null
 }> {
   const env: Record<string, string> = {
@@ -34,6 +40,7 @@ export async function createTransport({ args = [], port, policy }: { args?: stri
   if (policy) {
     env.PLAYWRITER_POLICY = policy
   }
+  Object.assign(env, extraEnv)
   const transport = new StdioClientTransport({
     command: 'pnpm',
     args: ['vite-node', path.join(path.dirname(__filename), 'cli.ts'), ...args],
@@ -52,13 +59,15 @@ export async function createMCPClient(options?: CreateTransportOptions): Promise
   client: Client
   stderr: string
   cleanup: () => Promise<void>
+  /** The MCP server's process id (the spawned `pnpm vite-node … cli.ts`); what it launches descends from it. */
+  pid: number
 }> {
   const client = new Client({
     name: options?.clientName ?? 'test',
     version: '1.0.0',
   })
 
-  const { transport, stderr } = await createTransport({ port: options?.port, policy: options?.policy })
+  const { transport, stderr } = await createTransport({ port: options?.port, policy: options?.policy, env: options?.env })
 
   let stderrBuffer = ''
   stderr?.on('data', (data) => {
@@ -69,6 +78,10 @@ export async function createMCPClient(options?: CreateTransportOptions): Promise
 
   await client.connect(transport)
   await client.ping()
+  const pid = transport.pid
+  if (pid === null) {
+    throw new Error('The MCP server process has no pid after connecting: it is not running.')
+  }
 
   const cleanup = async () => {
     try {
@@ -83,5 +96,6 @@ export async function createMCPClient(options?: CreateTransportOptions): Promise
     client,
     stderr: stderrBuffer,
     cleanup,
+    pid,
   }
 }

@@ -7,10 +7,8 @@
  */
 
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
-import { shouldUseHeadlessByDefault } from './browser-config.js'
 import type {
   StartRecordingResult,
   StopRecordingResult,
@@ -39,16 +37,6 @@ function recordingHeaders(): Record<string, string> {
     headers['Authorization'] = `Bearer ${token}`
   }
   return headers
-}
-
-/**
- * Generate a CLI command that starts a managed Playwriter browser with the
- * bundled extension preloaded. This enables screen recording without a manual
- * extension click on fresh automation sessions.
- */
-export function getChromeRestartCommand(): string {
-  const headlessFlag = shouldUseHeadlessByDefault({ platform: os.platform() }) ? ' --headless' : ''
-  return `playwriter browser start${headlessFlag}`
 }
 
 /** Default max recording duration: 15 minutes in milliseconds */
@@ -409,14 +397,12 @@ export async function startRecording(options: StartRecordingOptions): Promise<Re
   if (!result.success) {
     const errorMsg = result.error || 'Unknown error'
 
-    // If the error is about missing activeTab permission, provide helpful guidance
+    // Missing activeTab permission: only a click on the extension icon grants it.
     if (isActiveTabPermissionError(errorMsg)) {
-      const restartCmd = getChromeRestartCommand()
       throw new Error(
         `Failed to start recording: ${errorMsg}\n\n` +
-          `For automated recording, start a managed Playwriter browser with the bundled extension loaded:\n\n` +
-          `  ${restartCmd}\n\n` +
-          `Or click the Playwriter extension icon on the tab once to grant permission.`,
+          `recording.start needs the user to click the Playwriter extension icon on this tab once: ask them to. ` +
+          `recording.startCdp records without that click.`,
       )
     }
 

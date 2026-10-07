@@ -294,27 +294,25 @@ describe('the doc parser itself works', () => {
  * stranded items, which is three more than the name check caught.
  *
  * WHY THERE IS NO MIRROR OF THIS CHECK. The obvious symmetry — flag every hard token in
- * the SHIPPED half that looks like argv — does not survive contact with the file. The
- * shipped half legitimately contains `--profile-directory`, `--remote-debugging-port` and
- * `--allowlisted-extension-id` (how you start the user's Chrome), `gh issue create
- * -R remorses/playwriter --title` (how you file the bug), a `jq` pipeline over
- * `~/.playwriter/cdp.jsonl`, and the word `playwriter` in almost every section. Every one
- * of those is a shell string an agent with a Bash tool should absolutely read. What makes
- * `playwriter -s 1 -e` different is not its shape but its SUBJECT: it drives the CLI the
- * agent is not using. No lexical rule separates those two sets, and a check that fires on
- * `--profile-directory` would be trained away inside a week — which is exactly how the
- * name-level check above stopped catching anything. The honest guard here is a periodic
- * read of the shipped half, not a regex.
+ * the SHIPPED half that looks like argv — does not survive contact with the file: the word
+ * `playwriter`, `--remote-debugging-port` (a fact about the user's Chrome) and `PLAYWRITER_*`
+ * names (the user's MCP configuration) legitimately ship. The rule the shipped half follows
+ * is about its SUBJECT, not its shape: an MCP model never runs a command — not the CLI, not
+ * a shell — it asks the user and names the user's action. So starting Chrome from a
+ * terminal, the `jq` triage pipeline and `gh issue create` live in the CLI section, and the
+ * shipped text says "ask the user". No lexical rule separates a command from a fact about
+ * one; the honest guard here is a periodic read of the shipped half, not a regex.
  */
 const CLI_ONLY_BY_DESIGN: Record<string, string> = {
-  // --- headless and cloud: genuinely unreachable from MCP, so not "lost" ---
-  // There is no PLAYWRITER_BROWSER env var and mcp.ts has no headless or cloud branch —
-  // `getOrCreateExecutor` resolves to direct CDP, remote relay, or local relay and nothing
-  // else. An MCP session cannot enter either mode, so documenting them would be dead text.
-  '--browser': 'selects headless/cloud, which an MCP session has no way to enter (no PLAYWRITER_BROWSER env var)',
-  'playwriter session new --browser headless': 'headless mode is CLI-only; MCP has no branch that reaches it',
-  'playwriter browser install': 'downloads Chrome for Testing for headless mode, which MCP cannot enter',
-  'playwriter browser start': 'launches a debugging-enabled Chrome; the MCP equivalent is pointing PLAYWRITER_DIRECT at one',
+  // --- the CLI's spelling of choosing a browser, and cloud: an MCP session has its own ---
+  // An MCP session chooses its browser with the `browser` tool (`list` / `use` / `new`) or the
+  // user's PLAYWRITER_BROWSER, documented in the shipped text and the tool description; cloud
+  // has no MCP branch at all. These argv spellings would only mislead an MCP model.
+  '--browser': 'the CLI flag for choosing a browser; an MCP session uses the `browser` tool or PLAYWRITER_BROWSER (shipped)',
+  'playwriter session new --browser headless': "the CLI way to start headless; MCP's is browser({ action: \"new\" }), shipped",
+  'playwriter browser install':
+    'downloads Chrome for Testing; an MCP model never runs it — the `new` error tells it to ask the user (PLAYWRITER_BROWSER_PATH, or installing Chrome)',
+  'playwriter browser start': 'launches a debugging-enabled Chrome; the MCP equivalent is the user pointing PLAYWRITER_DIRECT at one',
   '--proxy': 'cloud-browser residential proxy region, and cloud mode is unreachable from MCP',
   '--proxy <region>': 'cloud-browser residential proxy region, and cloud mode is unreachable from MCP',
   '--custom-proxy': 'cloud-browser option, and cloud mode is unreachable from MCP',
@@ -336,7 +334,23 @@ const CLI_ONLY_BY_DESIGN: Record<string, string> = {
   MY_SECRET_TOKEN: 'placeholder value in the `playwriter serve` example, not an identifier',
   '//traforo.dev': 'the tunnel the HOST machine runs; the agent only ever sees the resulting URL in PLAYWRITER_HOST',
   'chrome://inspect/#remote-debugging':
-    'a human action in a browser UI, and mcp.ts:124 already puts this exact string in the error an MCP agent gets when PLAYWRITER_DIRECT finds no Chrome',
+    "a human action in a browser UI, and mcp.ts's getDirectCdpConfig already puts this exact string in the error an MCP agent gets when PLAYWRITER_DIRECT finds no Chrome",
+  'playwriter session new': 'the CLI command that starts a session; an MCP process is one session',
+  'playwriter session new --policy debug':
+    'the CLI spelling of debug mode; the shipped guide names PLAYWRITER_POLICY=debug and that only the user switches it on',
+
+  // --- commands for the user's machine: an MCP model asks the user instead of running them ---
+  '--profile-directory': 'starting Chrome from a terminal; the shipped text says to ask the user to start Chrome',
+  '--args': 'macOS `open` syntax for starting Chrome from a terminal',
+  'google-chrome': 'starting Chrome from a terminal on Linux',
+  '--allowlisted-extension-id': 'a Chrome launch flag for click-free tabCapture; the shipped text says to ask the user, or use recording.startCdp',
+  '--auto-accept-this-tab-capture': 'the other Chrome launch flag for click-free tabCapture; see the entry above',
+  jq: 'the shell triage pipeline over ~/.playwriter/cdp.jsonl; the shipped text names the log files only',
+  '\\t': 'inside the jq pipeline and the bash quoting notes, both shell-only',
+  'gh issue create -R remorses/playwriter --title title --body body':
+    'filing the bug from a shell; the shipped text asks the user to report it at the issues URL',
+  '--title': 'a flag of the gh command above',
+  '--body': 'a flag of the gh command above',
 
   // --- bash quoting: about argv, and there is no argv in MCP ---
   //
@@ -346,11 +360,8 @@ const CLI_ONLY_BY_DESIGN: Record<string, string> = {
   // to be written once that leak was closed, which is worth noticing: a reverse leak keeps
   // this guard green on exactly the vocabulary it is leaking.
   //
-  // `\t`, the other escape named in that quoting sentence, is deliberately NOT here: the shipped
-  // half's `jq -r '.direction + "\t" + …'` triage pipeline contains that exact string, so the
-  // token check already reads it as reachable and an entry for it would excuse nothing. That
-  // it is reachable in a completely unrelated sense is caveat 3 above, not something an
-  // allowlist entry can fix — and the liveness test below now refuses entries like it.
+  // `\t`, the other escape named in that quoting sentence, has its entry above with the jq
+  // pipeline: since that pipeline moved into the CLI section, nothing shipped contains it.
   "$'...'": 'a bash quoting form; MCP code is passed as a JSON string with no shell in between',
   "<<'EOF'": 'the bash heredoc opener; there is no shell between an MCP agent and `execute`, so nothing to quote against',
   "'EOF'": 'the quoted heredoc delimiter, and quoting it is what disables bash expansion — a bash-only concern',
@@ -509,7 +520,7 @@ describe('the CLI strip does not strand MCP-relevant facts', () => {
       throw new Error('dist/skill-reference.md is missing — run `pnpm build`. The MCP serves that file.')
     }
     const reference = fs.readFileSync(REFERENCE_MD, 'utf8')
-    const mustReach = ['PLAYWRITER_HOST', '~/.playwriter/relay-server.log', 'gh issue create -R remorses/playwriter']
+    const mustReach = ['PLAYWRITER_HOST', '~/.playwriter/relay-server.log', 'PLAYWRITER_BROWSER_PATH', 'https://github.com/remorses/playwriter/issues']
     const absent = mustReach.filter((token) => shipped.includes(token) && !reference.includes(token))
     expect(absent, 'skill.md un-stranded these but dist/skill-reference.md does not have them — run `pnpm build`').toEqual([])
   })
