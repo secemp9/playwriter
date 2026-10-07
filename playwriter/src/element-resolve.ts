@@ -23,7 +23,7 @@
 
 import type { ElementHandle, Frame, Locator } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
-import { getCDPSessionForFrame } from './cdp-session.js'
+import { FrameGoneError, frameGoneMessage, getCDPSessionForFrame } from './cdp-session.js'
 import type { ICDPSession } from './cdp-session.js'
 import { IsolatedWorld, withDeadline } from './isolated-world.js'
 import type { RefElement } from './page-probe.js'
@@ -142,8 +142,11 @@ interface FrameWorld {
 
 const frameWorlds = new WeakMap<Frame, Promise<FrameWorld>>()
 
+/** Rejects with `FrameGoneError` when the frame left the page while its session was borrowed (see `getCDPSessionForFrame`). */
 async function createFrameWorld(frame: Frame, pageCdp: ICDPSession): Promise<FrameWorld> {
   const own = frame.parentFrame() ? await getCDPSessionForFrame({ frame }) : null
+  // Detached during the borrow: its `framedetached` already fired, so a world made now would never be disposed.
+  if (frame.isDetached()) throw new FrameGoneError(frameGoneMessage(frame))
   const cdp = own ?? pageCdp
   const world = new IsolatedWorld({ cdp, getFrameId: () => frame.frameId() })
   if (frame.parentFrame()) {

@@ -170,9 +170,13 @@ export class SessionDownloads {
       (error: unknown): DownloadOutcome => ({ state: 'unknown', reason: firstLine(error) }),
     )
     const entry: SessionDownload = { id: `d${this.entries.size + 1}`, download, outcome, settled: null }
-    void outcome.then((settled) => {
-      entry.settled = settled
-    })
+    void outcome.then(
+      (settled) => {
+        entry.settled = settled
+      },
+      // `settled` stays null; whoever reads the outcome (`save`, the report line) awaits it and reports why.
+      () => {},
+    )
     this.entries.set(entry.id, entry)
     return entry
   }

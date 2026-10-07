@@ -29,7 +29,16 @@
 
 import type { Frame, Page } from '@xmorse/playwright-core'
 import type { ICDPSession } from './cdp-session.js'
-import { getCDPSessionForFrame } from './cdp-session.js'
+import {
+  FrameGoneError,
+  SealedFrameError,
+  debuggerRefusalReason,
+  frameGoneMessage,
+  getCDPSessionForFrame,
+  isDebuggerRefusal,
+  isFrameGone,
+  sealedFrameReason,
+} from './cdp-session.js'
 import { IsolatedWorld, withDeadline } from './isolated-world.js'
 import { ModelFacingError } from './probe-types.js'
 
@@ -71,6 +80,8 @@ export interface UnreadableFrame {
   name: string
   depth: number
   reason: string
+  /** No debugger may enter its document (another extension's page, a browser page): it is still on the page, and named where it sits. */
+  sealed?: true
 }
 
 /**
@@ -175,11 +186,11 @@ export class PageFrames {
     return () => this.listeners.delete(listener)
   }
 
-  /** The frame `frameId`, resolved to its session and world. Throws when it is no longer in the page. */
+  /** The frame `frameId`, resolved to its session and world. Throws `FrameGoneError` when it is no longer in the page. */
   async handle(frameId: string): Promise<FrameHandle> {
     const frame = this.findFrame(frameId)
     if (!frame) {
-      throw new ModelFacingError(`The iframe this element was in is no longer on the page (it was removed or replaced). Call observe() again.`)
+      throw new FrameGoneError(`The iframe this element was in is no longer on the page (it was removed or replaced). Call observe() again.`)
     }
     return await this.resolve(frame)
   }
@@ -212,11 +223,14 @@ export class PageFrames {
       const frameId = frame.frameId()
       const parent = frame.parentFrame()
       const describe = { frameId, parentId: parent ? parent.frameId() : null, url: frame.url(), name: frame.name(), depth }
+      const sealed = parent ? sealedFrameReason(describe.url) : null
       let entry: FrameEntry | null = null
       if (unreadableAncestor) {
         unreadable.push({ ...describe, reason: 'the iframe around it cannot be read' })
       } else if (frame.isDetached()) {
         unreadable.push({ ...describe, reason: 'it was removed from the page while being read' })
+      } else if (sealed !== null) {
+        unreadable.push({ ...describe, reason: sealed, sealed: true })
       } else {
         try {
           const handle = await this.resolve(frame)
@@ -237,8 +251,16 @@ export class PageFrames {
             }
           }
         } catch (error) {
-          if (frame.isDetached()) unreadable.push({ ...describe, reason: 'it was removed from the page while being read' })
-          else unreadable.push({ ...describe, reason: error instanceof Error ? error.message : String(error) })
+          if (error instanceof FrameGoneError || isFrameGone(frame, error)) {
+            unreadable.push({ ...describe, reason: 'it was removed from the page while being read' })
+          } else if (error instanceof SealedFrameError) {
+            // It navigated to such a document after it was looked at.
+            unreadable.push({ ...describe, reason: error.reason, sealed: true })
+          } else if (isDebuggerRefusal(error)) {
+            unreadable.push({ ...describe, reason: debuggerRefusalReason(describe.url), sealed: true })
+          } else {
+            unreadable.push({ ...describe, reason: error instanceof Error ? error.message : String(error) })
+          }
         }
       }
       for (const child of frame.childFrames()) await visit(child, depth + 1, entry === null)
@@ -265,23 +287,26 @@ export class PageFrames {
       return null
     }
     const url = find(frameTree)
-    if (url === null) throw new ModelFacingError('The iframe is no longer on the page (it was removed or replaced). Call observe() again.')
+    if (url === null) throw new FrameGoneError('The iframe is no longer on the page (it was removed or replaced). Call observe() again.')
     return url
   }
 
-  /** The element that embeds `frameId` in its parent frame. */
+  /** The element that embeds `frameId` in its parent frame. Throws `FrameGoneError` when the frame left the page. */
   async owner(frameId: string): Promise<FrameOwner> {
     const frame = this.findFrame(frameId)
     const parent = frame?.parentFrame()
-    if (!frame || !parent) throw new ModelFacingError('The iframe is no longer on the page (it was removed or replaced). Call observe() again.')
+    if (!frame || !parent) throw new FrameGoneError('The iframe is no longer on the page (it was removed or replaced). Call observe() again.')
     const parentHandle = await this.resolve(parent)
     await this.enableDom(parentHandle.cdp)
-    const { backendNodeId } = await withDeadline(
+    const answer = await withDeadline(
       parentHandle.cdp.send('DOM.getFrameOwner', { frameId }),
       CDP_TIMEOUT_MS,
       `finding the <iframe> element of frame ${frame.url() || frameId} (DOM.getFrameOwner)`,
-    )
-    return { parentId: parent.frameId(), backendNodeId }
+    ).catch((error: unknown) => {
+      if (isFrameGone(frame, error)) throw new FrameGoneError(frameGoneMessage(frame), { cause: error })
+      throw error
+    })
+    return { parentId: parent.frameId(), backendNodeId: answer.backendNodeId }
   }
 
   /**
@@ -363,13 +388,20 @@ export class PageFrames {
   /**
    * The renderer sessions of the page's frames now: the page's own (rooted at the main frame) first,
    * then one per out-of-process frame, in tree order. Same-process frames have none of their own: the
-   * session of the frame around them covers them.
+   * session of the frame around them covers them. A frame that leaves the page while this runs has
+   * no session to list; a frame no debugger may enter (another extension's page) has none we may use.
    */
   async sessions(): Promise<Array<{ cdp: ICDPSession; rootId: string }>> {
     const found: Array<{ cdp: ICDPSession; rootId: string }> = [{ cdp: this.cdp, rootId: this.mainFrameId() }]
     for (const frame of this.page.frames()) {
       if (frame === this.page.mainFrame() || frame.isDetached()) continue
-      const own = await getCDPSessionForFrame({ frame })
+      let own: ICDPSession | null
+      try {
+        own = await getCDPSessionForFrame({ frame })
+      } catch (error) {
+        if (error instanceof FrameGoneError || error instanceof SealedFrameError) continue
+        throw error
+      }
       if (!own || found.some((session) => session.cdp === own)) continue
       this.watchSession(own)
       found.push({ cdp: own, rootId: frame.frameId() })
@@ -407,6 +439,8 @@ export class PageFrames {
       cdp = parentHandle.cdp
       sessionRootId = parentHandle.sessionRootId
     }
+    // It left the page while its session was looked up: a world made now would never be dropped.
+    if (frame.isDetached()) throw new FrameGoneError(frameGoneMessage(frame))
     let slot = this.worlds.get(frameId)
     if (slot && slot.cdp !== cdp) {
       // The frame moved to another process: its old world went with the old session.

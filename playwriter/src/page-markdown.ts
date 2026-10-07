@@ -42,6 +42,7 @@ import type { Page } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import { createSmartDiff } from './diff-utils.js'
 import { withDeadline } from './isolated-world.js'
+import { FrameGoneError } from './cdp-session.js'
 import type { FrameEntry, FrameHandle, PageFrames, UnreadableFrame } from './page-frames.js'
 import { ModelFacingError } from './probe-types.js'
 
@@ -733,7 +734,7 @@ async function readDocument(reading: FrameReading, handle: FrameHandle, article:
           } catch (error) {
             // Gone since the list (no element shows it now), or not readable anyway: an <iframe> still
             // rendered without a frame gets its own not-read line.
-            if ('reason' in frame || frame.frame.isDetached()) return null
+            if ('reason' in frame || error instanceof FrameGoneError || frame.frame.isDetached()) return null
             throw error
           }
         }),
@@ -773,7 +774,7 @@ async function readSlot(reading: FrameReading, slot: FrameSlot, frame: FrameEntr
   try {
     read = await readDocument(reading, await reading.frames.handle(frame.frameId), false)
   } catch (error) {
-    if (frame.frame.isDetached()) return notRead('it was removed from the page while being read')
+    if (error instanceof FrameGoneError || frame.frame.isDetached()) return notRead('it was removed from the page while being read')
     return notRead(error instanceof Error ? error.message : String(error))
   }
   const content = stitchFrames(read.extracted.visible, read.blocks, reading.placeholder)

@@ -97,13 +97,23 @@ export function createCdpLogger({
     }
   }
 
+  /**
+   * Appends the buffered entries. A write that fails loses those entries; it says so on stderr — the
+   * log file is what failed — and leaves the queue usable, so the timer that flushes never leaves a
+   * rejection behind and the next entries are written.
+   */
   const flushBuffer = async (): Promise<void> => {
     if (buffer.length === 0) {
       return
     }
     const lines = buffer
     buffer = []
-    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    try {
+      await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    } catch (error) {
+      process.stderr.write(`[playwriter] ${lines.length} CDP log entr${lines.length === 1 ? 'y' : 'ies'} could not be written to ${resolvedLogFilePath}: ${error instanceof Error ? error.message : String(error)}\n`)
+      return
+    }
     lineCount += lines.length
     if (lineCount > resolvedMaxEntries) {
       await rotate()

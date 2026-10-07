@@ -28,13 +28,22 @@ export function createFileLogger({ logFilePath }: { logFilePath?: string } = {})
   let buffer: string[] = []
   let flushTimer: ReturnType<typeof setInterval> | undefined
 
+  /**
+   * Appends the buffered lines. A write that fails (disk full, the file's folder removed) loses
+   * those lines; it says so on stderr — the log file is what failed — and leaves the queue usable,
+   * so the next lines are written and no caller, timer or exit path is handed a rejection.
+   */
   const flushBuffer = async (): Promise<void> => {
     if (buffer.length === 0) {
       return
     }
     const lines = buffer
     buffer = []
-    await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    try {
+      await fs.promises.appendFile(resolvedLogFilePath, lines.join('\n') + '\n')
+    } catch (error) {
+      process.stderr.write(`[playwriter] ${lines.length} log line(s) could not be written to ${resolvedLogFilePath}: ${error instanceof Error ? error.message : String(error)}\n`)
+    }
   }
 
   const log = (...args: unknown[]): Promise<void> => {

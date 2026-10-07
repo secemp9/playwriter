@@ -70,6 +70,7 @@ import type { Protocol } from 'devtools-protocol'
 import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
 import { BrowserClock } from './browser-clock.js'
 import type { ICDPSession } from './cdp-session.js'
+import { FrameGoneError, SealedFrameError } from './cdp-session.js'
 import { PageUnresponsiveError, withDeadline } from './isolated-world.js'
 import type { IsolatedWorld } from './isolated-world.js'
 import type { FrameChange, FrameEntry, FrameHandle, PageFrames } from './page-frames.js'
@@ -1954,11 +1955,13 @@ export class PageWatch {
       handle = await this.frames.handle(frameId)
     } catch (error) {
       // Removed meanwhile: its `detached` change is next in this frame's queue.
-      if (!this.frames.page.frames().some((frame) => frame.frameId() === frameId)) return
+      if (error instanceof FrameGoneError || !this.frames.page.frames().some((frame) => frame.frameId() === frameId)) return
       // Its session cannot be borrowed, so it is not followed: what the tap holds for it is let go.
       // (A failure of the journal install below is not one: a frame that has just moved to another
       // process fails it, and the follow of its navigation takes the new session.)
       this.tap?.discard(frameId)
+      // No debugger may enter it (another extension's page): not following it is the answer, not a failure.
+      if (error instanceof SealedFrameError) return
       throw error
     }
     if (!this.started) return

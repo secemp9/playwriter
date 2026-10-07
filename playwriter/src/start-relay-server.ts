@@ -13,9 +13,12 @@ const logger = createFileLogger()
  * daemon that exited on a taken port, or crashed, was empty.
  */
 async function exitAfterLog(code: number, ...line: unknown[]): Promise<never> {
-  void logger.log(...line)
-  await logger.flush()
-  process.exit(code)
+  try {
+    void logger.log(...line)
+    await logger.flush()
+  } finally {
+    process.exit(code)
+  }
 }
 
 process.on('uncaughtException', (err) => {
@@ -59,7 +62,11 @@ export async function startServer({
   // process.exit(0) fired in the same tick would orphan that Chrome process.
   const shutdown = async (signal: NodeJS.Signals) => {
     console.log('\nShutting down...')
-    await server.close()
+    try {
+      await server.close()
+    } catch (error) {
+      return exitAfterLog(1, `Shutting down on ${signal} failed:`, error)
+    }
     await exitAfterLog(0, `Shut down on ${signal}`)
   }
 

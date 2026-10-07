@@ -1328,14 +1328,24 @@ cli
 
     process.title = 'playwriter-serve'
 
+    // The logger writes on a timer that process.exit does not wait for: the line is flushed first,
+    // and the exit happens whatever the write does.
     process.on('uncaughtException', async (err) => {
-      await logger.error('Uncaught Exception:', err)
-      process.exit(1)
+      try {
+        await logger.error('Uncaught Exception:', err)
+        await logger.flush()
+      } finally {
+        process.exit(1)
+      }
     })
 
     process.on('unhandledRejection', async (reason) => {
-      await logger.error('Unhandled Rejection:', reason)
-      process.exit(1)
+      try {
+        await logger.error('Unhandled Rejection:', reason)
+        await logger.flush()
+      } finally {
+        process.exit(1)
+      }
     })
 
     const server = await startPlayWriterCDPRelayServer({
@@ -1357,10 +1367,18 @@ cli
     console.log('Press Ctrl+C to stop.')
 
     // close() is awaited before exit(): it closes the shared headless browser, and
-    // process.exit(0) fired in the same tick would orphan that Chrome process.
+    // process.exit(0) fired in the same tick would orphan that Chrome process. A close that fails
+    // is reported and the process still exits.
     const shutdown = async () => {
       console.log('\nShutting down...')
-      await server.close()
+      try {
+        await server.close()
+      } catch (error) {
+        console.error('Shutting down the relay failed:', error)
+        await logger.error('Shutting down the relay failed:', error)
+        await logger.flush()
+        process.exit(1)
+      }
       process.exit(0)
     }
 

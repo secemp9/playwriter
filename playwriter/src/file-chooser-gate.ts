@@ -122,7 +122,7 @@ export class FileChooserGate {
     // An out-of-process iframe that appears while an input still needs interception gets it too.
     this.unlisten.push(
       this.frames.onChange((change) => {
-        if (change.kind !== 'detached' && this.wanted()) void this.arm()
+        if (change.kind !== 'detached' && this.wanted()) this.rearm(`an iframe ${change.kind === 'attached' ? 'appeared' : 'loaded a new document'}`)
       }),
     )
   }
@@ -225,8 +225,9 @@ export class FileChooserGate {
     void applied.then(
       () => {
         for (const state of this.sessions) state.sent = enabled
-        if (!enabled && this.wanted()) void this.arm()
+        if (!enabled && this.wanted()) this.rearm('sandbox code stopped listening for file dialogs')
       },
+      // Playwright did not apply the change: the flag is as it was, and so is what `sent` says of it.
       () => {},
     )
   }
@@ -296,6 +297,18 @@ export class FileChooserGate {
     await Promise.all(sessions.filter((state) => !state.sent).map((state) => this.toggle(state, true)))
   }
 
+  /**
+   * `arm` started by a page event, which has no caller to hand a failure to: the failure is reported
+   * with the next action, like any interception failure. Once the tab is closed or no longer watched
+   * nothing is held back, so there is nothing to report.
+   */
+  private rearm(why: string): void {
+    this.arm().catch((error: unknown) => {
+      if (this.disposed || this.page.isClosed()) return
+      this.failures.push(`holding back the file dialogs of ${this.page.url()} after ${why} failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+
   private scheduleRelease(): void {
     if (this.holders > 0 || this.disposed) return
     if (this.tailTimer) clearTimeout(this.tailTimer)
@@ -312,7 +325,13 @@ export class FileChooserGate {
     }
     // Sandbox code's own listener keeps Playwright's hold on the same flag: releasing it would cut that code off.
     if (this.codeListening() || this.page.isClosed()) return
-    for (const state of this.sessions) if (state.sent) void this.toggle(state, false)
+    for (const state of this.sessions) {
+      if (!state.sent) continue
+      // `toggle` reports a failed release itself; this catches what fails around the send.
+      this.toggle(state, false).catch((error: unknown) => {
+        this.failures.push(`releasing the file dialogs of ${this.page.url()} failed: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    }
   }
 
   /**

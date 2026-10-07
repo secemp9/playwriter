@@ -68,20 +68,34 @@ beforeAll(async () => {
   // extension reports it attached, handling the event right after it emits it, so wait for that.
   const relay = testCtx.relayServer
   const attached = Promise.withResolvers<void>()
+  const attachedUrls: string[] = []
   const onEvent = ({ event }: { event: CDPEventBase }): void => {
     if (event.method !== 'Target.attachedToTarget' || typeof event.params !== 'object' || event.params === null) return
     const targetInfo: unknown = Reflect.get(event.params, 'targetInfo')
-    if (typeof targetInfo === 'object' && targetInfo !== null && Reflect.get(targetInfo, 'url') === `${baseUrl}/`) attached.resolve()
+    const url: unknown = typeof targetInfo === 'object' && targetInfo !== null ? Reflect.get(targetInfo, 'url') : undefined
+    attachedUrls.push(typeof url === 'string' ? url : String(url))
+    if (url === `${baseUrl}/`) attached.resolve()
   }
   relay.on('cdp:event', onEvent)
-  await serviceWorker.evaluate(
-    async ([k, l]) => {
-      await globalThis.toggleExtensionForActiveTab(k, l)
-    },
-    [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+  // Real timer: the extension attaches a real tab in a real browser. If it toggled another tab (the
+  // active one when the toggle ran), the wanted attach never comes; fail naming what did attach
+  // instead of hanging until the hook's own timeout.
+  const deadline = setTimeout(
+    () => attached.reject(new Error(`the extension did not attach ${baseUrl}/ within 60 s; it attached: ${JSON.stringify(attachedUrls)}`)),
+    60_000,
   )
-  await attached.promise
-  relay.off('cdp:event', onEvent)
+  try {
+    await serviceWorker.evaluate(
+      async ([k, l]) => {
+        await globalThis.toggleExtensionForActiveTab(k, l)
+      },
+      [TEST_WORKSPACE.key, TEST_WORKSPACE.label] as [string, string],
+    )
+    await attached.promise
+  } finally {
+    clearTimeout(deadline)
+    relay.off('cdp:event', onEvent)
+  }
   executor = new PlaywrightExecutor({ cdpConfig: { port: TEST_PORT, workspace: TEST_WORKSPACE }, logger: { log: () => {}, error: () => {} }, cwd, policy: 'human' })
 }, 600_000)
 

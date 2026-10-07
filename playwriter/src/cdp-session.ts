@@ -190,6 +190,83 @@ async function borrowForPage(page: Page): Promise<PlaywrightCDPSessionAdapter> {
 const NO_SEPARATE_SESSION = 'does not have a separate CDP session'
 
 /**
+ * A frame left the page — between being listed and being used — so there is nothing of it to
+ * read or act on. Not a failure of the page or the connection: callers that walk a page's frames
+ * skip it; callers that were asked about that frame say it is gone.
+ */
+export class FrameGoneError extends ModelFacingError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'FrameGoneError'
+  }
+}
+
+/**
+ * Playwright's answers when the frame a call names no longer exists on its side: the server
+ * disposed the frame's object when it detached (`frame: no object with guid frame@…`, the
+ * frame was named by a stale reference), or the call ran while it detached.
+ */
+const FRAME_GONE_MESSAGES = ['no object with guid frame@', 'Frame was detached']
+
+/** `error`, from a call about `frame`, means only that the frame left the page. */
+export function isFrameGone(frame: Frame, error: unknown): boolean {
+  if (frame.isDetached()) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return FRAME_GONE_MESSAGES.some((text) => message.includes(text))
+}
+
+/** What the model is told about a frame that left the page. */
+export function frameGoneMessage(frame: Frame): string {
+  const named = frame.url() || frame.name()
+  return `The iframe${named ? ` ${named}` : ''} is no longer on the page (it was removed or replaced). Call observe() again.`
+}
+
+/** What each URL scheme whose documents no debugger may enter is, as the model is told. */
+const SEALED_SCHEMES: ReadonlyArray<{ scheme: string; what: string }> = [
+  { scheme: 'chrome-extension:', what: "a browser extension's frame" },
+  { scheme: 'chrome:', what: "a browser page's frame" },
+  { scheme: 'chrome-untrusted:', what: "a browser page's frame" },
+  { scheme: 'devtools:', what: 'a DevTools frame' },
+]
+
+/**
+ * Why no debugger may read the document at `url` — another extension's page (a password
+ * manager's inline menu), a `chrome:`/`chrome-untrusted:` page, DevTools — or null when one may.
+ * Chrome refuses extension debuggers there ("Cannot access a chrome-extension:// URL of different
+ * extension"), so no session is borrowed for such a frame. Written as the reason clause the model
+ * reads after "not read:".
+ */
+export function sealedFrameReason(url: string): string | null {
+  const sealed = SEALED_SCHEMES.find(({ scheme }) => url.startsWith(scheme))
+  return sealed ? `it is ${sealed.what} (${url}), whose content cannot be read` : null
+}
+
+/** Chrome's refusals when an extension debugger reaches a document it may not enter. */
+const DEBUGGER_REFUSALS = ['Cannot access a chrome-extension:// URL of different extension', 'Cannot access a chrome:// URL']
+
+/** `error` is Chrome refusing the debugger a frame's document (see `sealedFrameReason`). */
+export function isDebuggerRefusal(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return DEBUGGER_REFUSALS.some((text) => message.includes(text))
+}
+
+/** The reason clause for a frame at `url` whose document Chrome refused the debugger. */
+export function debuggerRefusalReason(url: string): string {
+  return sealedFrameReason(url) ?? `its content cannot be read (${url || 'no address'}): Chrome lets no debugger into its document`
+}
+
+/** A frame whose document no debugger may enter (see `sealedFrameReason`): no session is borrowed for it. */
+export class SealedFrameError extends ModelFacingError {
+  /** The reason clause, as `sealedFrameReason` wrote it. */
+  readonly reason: string
+  constructor(reason: string) {
+    super(`The iframe cannot be read: ${reason}.`)
+    this.name = 'SealedFrameError'
+    this.reason = reason
+  }
+}
+
+/**
  * The CDP session that owns a frame's document, or `null` when the frame has none of
  * its own.
  *
@@ -215,10 +292,16 @@ const NO_SEPARATE_SESSION = 'does not have a separate CDP session'
  * released — whoever holds it keeps their listeners — it is just not handed out again;
  * every cached frame adapter is released when its page closes. `null` is never cached:
  * a same-process frame becomes an OOPIF by navigating, and asking costs no wrapper.
+ *
+ * Rejects with `FrameGoneError` when the frame left the page before or while its session was
+ * borrowed, and with `SealedFrameError` — without borrowing — for a frame no debugger may enter.
  */
 export function getCDPSessionForFrame({ frame }: { frame: Frame }): Promise<PlaywrightCDPSessionAdapter | null> {
+  const sealed = sealedFrameReason(frame.url())
+  if (sealed !== null) return Promise.reject(new SealedFrameError(sealed))
   const cached = frameSessions.get(frame)
   if (cached) return cached
+  if (frame.isDetached()) return Promise.reject(new FrameGoneError(frameGoneMessage(frame)))
   const opening = borrowForFrame(frame)
   frameSessions.set(frame, opening)
   opening.then(
@@ -249,6 +332,7 @@ async function borrowForFrame(frame: Frame): Promise<PlaywrightCDPSessionAdapter
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message.includes(NO_SEPARATE_SESSION)) return null
+    if (isFrameGone(frame, error)) throw new FrameGoneError(frameGoneMessage(frame), { cause: error })
     throw error
   }
   const adapter = new PlaywrightCDPSessionAdapter(playwrightSession)

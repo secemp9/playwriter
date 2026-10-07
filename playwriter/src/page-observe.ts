@@ -28,6 +28,7 @@
 import type { Page } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
+import { FrameGoneError, debuggerRefusalReason, isDebuggerRefusal } from './cdp-session.js'
 import { ModelFacingError, type BusySignal, type JsDialogState } from './probe-types.js'
 import { isNodeGoneError, withDeadline, type IsolatedWorld } from './isolated-world.js'
 import type { FrameBox, FrameEntry, PageFrames, UnreadableFrame } from './page-frames.js'
@@ -1063,7 +1064,9 @@ async function readFrames({
   listing: { frames: FrameEntry[]; unreadable: UnreadableFrame[] }
   mainScroll: { x: number; y: number }
 }): Promise<{ reads: Map<string, FrameRead>; notRead: FrameNotRead[] }> {
-  const notRead: FrameNotRead[] = listing.unreadable.map((frame) => ({ frameId: frame.frameId, parentId: frame.parentId, url: frame.url, reason: frame.reason }))
+  const notRead: FrameNotRead[] = listing.unreadable
+    .filter((frame) => !frame.sealed)
+    .map((frame) => ({ frameId: frame.frameId, parentId: frame.parentId, url: frame.url, reason: frame.reason }))
   const sessions = new Map<ICDPSession, Promise<SessionRead>>()
   const sessionRead = (cdp: ICDPSession): Promise<SessionRead> => {
     let reading = sessions.get(cdp)
@@ -1135,6 +1138,22 @@ async function readFrames({
       notRead.push({ frameId: entry.frameId, parentId: entry.parentId, url: entry.url, ...(ownerId !== undefined ? { ownerId } : {}), reason })
     }
   }
+  // A frame no debugger may enter (another extension's inline menu) is still on the page: the
+  // model is told what it is where its <iframe> sits. Its owner is looked up in the parent's session.
+  for (const frame of listing.unreadable) {
+    if (!frame.sealed) continue
+    const unread: FrameNotRead = { frameId: frame.frameId, parentId: frame.parentId, url: frame.url, reason: frame.reason }
+    if (frame.parentId !== null && placed.has(frame.parentId)) {
+      try {
+        unread.ownerId = (await frames.owner(frame.frameId)).backendNodeId
+      } catch (error) {
+        // It left the page meanwhile: there is nothing to name.
+        if (error instanceof FrameGoneError) continue
+        throw error
+      }
+    }
+    notRead.push(unread)
+  }
 
   const reads = new Map<string, FrameRead>()
   await Promise.all(
@@ -1162,11 +1181,13 @@ async function readFrames({
 
 /**
  * Why an iframe could not be read, for the model. The frame going away while it was read is the
- * one expected cause; a model-facing refusal (a rotated iframe) keeps its words; anything else is
- * not the frame's fault and propagates.
+ * one expected cause; Chrome refusing the debugger its document (another extension's page) is
+ * named as such; a model-facing refusal (a rotated iframe) keeps its words; anything else is not
+ * the frame's fault and propagates.
  */
 function frameReadFailure(entry: FrameEntry, error: unknown): string {
-  if (entry.frame.isDetached() || isNodeGoneError(error)) return 'it was removed from the page while being read'
+  if (error instanceof FrameGoneError || entry.frame.isDetached() || isNodeGoneError(error)) return 'it was removed from the page while being read'
+  if (isDebuggerRefusal(error)) return debuggerRefusalReason(entry.url)
   if (error instanceof ModelFacingError) return error.message
   const message = error instanceof Error ? error.message : String(error)
   if (/Frame with the given frameId is not found|No frame for given id found|Execution context was destroyed|Cannot find context with specified id/i.test(message)) {

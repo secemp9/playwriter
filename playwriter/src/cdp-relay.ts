@@ -3191,7 +3191,9 @@ export async function startPlayWriterCDPRelayServer({
     }
   }
 
-  const cloudIdleInterval = setInterval(async () => {
+  // Synchronous: nothing in it is awaited, and a callback that returned a promise would leave a throw
+  // (a malformed cloud URL) as a rejection nobody handles.
+  const cloudIdleInterval = setInterval(() => {
     const now = Date.now()
     // Collect idle sessions first, then process — avoid mutating map during iteration
     const idleSessions: Array<[string, CloudSessionTracking]> = []
@@ -3212,16 +3214,20 @@ export async function startPlayWriterCDPRelayServer({
 
     if (idleSessions.length > 0) {
       for (const [sessionId, tracking] of idleSessions) {
-        logger?.log(
-          pc.yellow(`[Cloud] Stopping idle relay session ${sessionId} (idle > 10 min)`),
-        )
-        // Check if other relay sessions reference the same cloud VM.
-        // Only stop the VM when this is the last relay session for it.
-        const shouldStopVm = !hasOtherCloudReferences(sessionId, tracking.cloudSessionId)
-        cloudSessionTracking.delete(sessionId)
-        executorManager?.deleteExecutor(sessionId)
-        if (shouldStopVm) {
-          disconnectCloudVm(tracking)
+        try {
+          logger?.log(
+            pc.yellow(`[Cloud] Stopping idle relay session ${sessionId} (idle > 10 min)`),
+          )
+          // Check if other relay sessions reference the same cloud VM.
+          // Only stop the VM when this is the last relay session for it.
+          const shouldStopVm = !hasOtherCloudReferences(sessionId, tracking.cloudSessionId)
+          cloudSessionTracking.delete(sessionId)
+          executorManager?.deleteExecutor(sessionId)
+          if (shouldStopVm) {
+            disconnectCloudVm(tracking)
+          }
+        } catch (error) {
+          logger?.error(`[Cloud] Stopping idle relay session ${sessionId} failed:`, error)
         }
       }
       persistCloudSessions()
