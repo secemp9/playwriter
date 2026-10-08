@@ -60,6 +60,22 @@ export function isNodeGoneError(error: unknown): boolean {
   return !(error instanceof PageUnresponsiveError) && NODE_GONE_RE.test(error instanceof Error ? error.message : String(error))
 }
 
+/**
+ * Chrome's answers on a session for a frame that is no longer in it as it was: its document was
+ * replaced while it was read, or Chrome moved the frame into another renderer process (a same-process
+ * iframe that navigates to another site: `Page.frameDetached` with reason 'swap' on the page session).
+ * MEASURED on Chromium 145, on the page session after a swap: Page.createIsolatedWorld "No frame for
+ * given id found", Runtime.evaluate and Runtime.callFunctionOn "Cannot find context with specified id",
+ * Accessibility.getFullAXTree "Frame with the given frameId is not found."; DOM.resolveNode "does not
+ * belong to the document" is `isNodeGoneError`.
+ */
+const FRAME_LEFT_RE = /Frame with the given frameId is not found|No frame for given id found|Execution context was destroyed|Cannot find context with specified id/i
+
+/** A read of a frame failed because the frame is no longer in that session as it was (see FRAME_LEFT_RE). */
+export function isFrameLeftError(error: unknown): boolean {
+  return !(error instanceof PageUnresponsiveError) && FRAME_LEFT_RE.test(error instanceof Error ? error.message : String(error))
+}
+
 interface RemoteObjectLike {
   value?: unknown
   description?: string

@@ -30,7 +30,7 @@ import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
 import { FrameGoneError, debuggerRefusalReason, isDebuggerRefusal } from './cdp-session.js'
 import { ModelFacingError, type BusySignal, type JsDialogState } from './probe-types.js'
-import { isNodeGoneError, withDeadline, type IsolatedWorld } from './isolated-world.js'
+import { isFrameLeftError, isNodeGoneError, withDeadline, type IsolatedWorld } from './isolated-world.js'
 import type { FrameBox, FrameEntry, PageFrames, UnreadableFrame } from './page-frames.js'
 import { formatAxStates, type AxStates } from './ax-states.js'
 import { getAriaSnapshot, isSecretField, UNSEEN_IMAGE_MAX_SIDE } from './aria-snapshot.js'
@@ -1428,10 +1428,7 @@ function frameReadFailure(entry: FrameEntry, error: unknown): string {
   if (error instanceof FrameGoneError || entry.frame.isDetached() || isNodeGoneError(error)) return 'it was removed from the page while being read'
   if (isDebuggerRefusal(error)) return debuggerRefusalReason(entry.url)
   if (error instanceof ModelFacingError) return error.message
-  const message = error instanceof Error ? error.message : String(error)
-  if (/Frame with the given frameId is not found|No frame for given id found|Execution context was destroyed|Cannot find context with specified id/i.test(message)) {
-    return 'it loaded a new document while being read'
-  }
+  if (isFrameLeftError(error)) return 'it loaded a new document while being read'
   throw error
 }
 

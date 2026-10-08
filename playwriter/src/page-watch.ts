@@ -72,7 +72,7 @@ import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.j
 import { BrowserClock } from './browser-clock.js'
 import type { ICDPSession } from './cdp-session.js'
 import { FrameGoneError, SealedFrameError } from './cdp-session.js'
-import { PageUnresponsiveError, withDeadline } from './isolated-world.js'
+import { PageUnresponsiveError, isFrameLeftError, isNodeGoneError, withDeadline } from './isolated-world.js'
 import type { IsolatedWorld } from './isolated-world.js'
 import type { FrameChange, FrameEntry, FrameHandle, PageFrames } from './page-frames.js'
 import {
@@ -1955,7 +1955,7 @@ export class PageWatch {
     return frames
   }
 
-  /** `read` every frame, together; an iframe that went away while being read is left out, any other failure is thrown. */
+  /** `read` every frame, together; an iframe that left while being read (removed, moved to another process, a new document) is left out, any other failure is thrown. */
   private async eachFrame<H extends FrameHandle, T>(handles: H[], read: (handle: H) => Promise<T>): Promise<Array<{ handle: H; value: T }>> {
     const results = await Promise.all(
       handles.map(async (handle): Promise<{ handle: H; value: T } | null> => {
@@ -1970,10 +1970,16 @@ export class PageWatch {
     return results.filter((result): result is { handle: H; value: T } => result !== null)
   }
 
-  /** A read of `handle` failed because the iframe is gone: removed, or (out of process) its session closed when it left that process. */
+  /**
+   * A read of `handle` failed because the iframe left the session it was read through: it was removed;
+   * out of process, its session closed when it left that process; in process, Chrome moved it into a
+   * process of its own (`Page.frameDetached` reason 'swap': the page session answers every later read of
+   * it with an error, measured) or replaced its document during the read. Playwright keeps the same Frame
+   * across a swap, so the next pass lists it on the session it has now and reads it there.
+   */
   private frameGone(handle: FrameHandle, error: unknown): boolean {
     if (handle.parentId === null) return false
-    if (handle.frame.isDetached()) return true
+    if (handle.frame.isDetached() || isFrameLeftError(error) || isNodeGoneError(error)) return true
     return handle.cdp !== this.cdp && CLOSED_RE.test(errorMessage(error))
   }
 
