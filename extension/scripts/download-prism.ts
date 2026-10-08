@@ -1,5 +1,6 @@
 // Downloads Prism.js assets into <outDir>/src/ for the welcome page.
 // Chrome extension CSP blocks external scripts, so we bundle them locally.
+// Runs before `vite build` (package.json): the build id vite writes last hashes these files too.
 import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -36,6 +37,7 @@ function download(url: string, dest: string): Promise<void> {
 }
 
 async function main() {
+  fs.mkdirSync(DEST, { recursive: true })
   await Promise.all(
     files.map(([src, dest]) => {
       return download(BASE + src, path.join(DEST, dest))

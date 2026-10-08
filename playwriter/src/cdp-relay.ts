@@ -1567,6 +1567,8 @@ export async function startPlayWriterCDPRelayServer({
         profile: ext.info ? { email: ext.info.email || '', id: ext.info.id || '' } : null,
         activeTargets: ext.connectedTargets.size,
         playwriterVersion: ext.info?.version || null,
+        build: ext.info.build || null,
+        newerBuild: ext.newerBuild,
       }
     })
     return c.json({ extensions })
@@ -2128,6 +2130,7 @@ export async function startPlayWriterCDPRelayServer({
     const id = c.req.query('id')
     const installId = c.req.query('installId')
     const version = c.req.query('v')
+    const build = c.req.query('build')
     const userAgent = c.req.query('userAgent')
     const browserVersion = c.req.query('browserVersion')
     return {
@@ -2136,6 +2139,7 @@ export async function startPlayWriterCDPRelayServer({
       id: id || undefined,
       installId: installId || undefined,
       version: version || undefined,
+      build: build || undefined,
       userAgent: userAgent || undefined,
       browserVersion: browserVersion || undefined,
     }
@@ -2297,6 +2301,9 @@ export async function startPlayWriterCDPRelayServer({
             )
           } else if (message.method === 'tabVisibility') {
             tabVisibility.report(connectionId, message.params)
+          } else if (message.method === 'newerBuild') {
+            const { build } = message.params
+            store.setState((s) => relayState.setExtensionNewerBuild(s, { extensionId: connectionId, build }))
           } else {
             const extensionEvent = message as ExtensionEventMessage
 

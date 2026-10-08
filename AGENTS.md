@@ -71,13 +71,13 @@ to test CLI changes without publishing:
 
 ### reloading extension during development
 
-after making changes to extension code:
+after making changes to extension code, build it:
 
 ```bash
-pnpm --filter mcp-extension reload  # builds and opens chrome://extensions page
+pnpm --filter mcp-extension build
 ```
 
-then click the reload button on the extension card in Chrome. the extension has a stable dev ID (`pebbngnfojnignonigcnkdilknapkgid`) so you don't need to reconfigure anything.
+the extension reloads itself into the new build: right after it reconnects to the relay, within 30 s, or as soon as it controls no tab (never while an agent controls one). the relay log says `reloading itself: build <old> → <new> (its folder has a newer build)`, and `browser list` shows the build each extension runs. only a build from before self-reload needs one click on the reload button of its card in chrome://extensions, and Developer mode must stay on there. `pnpm --filter mcp-extension dev` rebuilds on every edit and reloads within about a second, without waiting for tabs. the extension has a stable dev ID (`pebbngnfojnignonigcnkdilknapkgid`) so you don't need to reconfigure anything.
 
 ## extension version
 
@@ -240,7 +240,7 @@ If a change touches extension code, still bump `extension/manifest.json` because
 
 ## debugging playwriter mcp issues
 
-sometimes the user will ask you to debug an mcp issue. to do this you may want to add logs to the mcp and server. to do this you will also need to restart the server so we use the latest code. restarting the mcp yourself is not possible. instead you will need to ask the user to do it or write a test case, where the mcp can be reloaded. also making changes in the extension will not work. you will have to write a test case for that to work. you can ask the user to reconnect these too. for reloading the extension you can run the `pnpm build` script and do `osascript -e 'tell application "Google Chrome" to open location "chrome://extensions/?id=pebbngnfojnignonigcnkdilknapkgid"'` to make it easier for the user to reload it
+sometimes the user will ask you to debug an mcp issue. to do this you may want to add logs to the mcp and server. to do this you will also need to restart the server so we use the latest code. restarting the mcp yourself is not possible. instead you will need to ask the user to do it or write a test case, where the mcp can be reloaded. also making changes in the extension will not work. you will have to write a test case for that to work. you can ask the user to reconnect these too. for the extension, run the `pnpm build` script: it reloads itself into the new build once it controls no tab (the relay log says `reloading itself: build …`)
 
 if the problem was in the ws server you can restart that yourself killing process listening on 19988 and sending a new mcp call.
 

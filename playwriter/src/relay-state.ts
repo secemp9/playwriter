@@ -37,6 +37,11 @@ export type ExtensionInfo = {
   installId?: string
   /** playwriter package version the extension was built with (sent as ?v= query param) */
   version?: string
+  /**
+   * Id of the build the extension runs (?build=): the content hash its build compiled in and wrote to
+   * build.json in its folder. Absent from extensions built before they could reload themselves.
+   */
+  build?: string
   /** The browser's own navigator.userAgent (?userAgent=). Absent from extensions built before it was sent. */
   userAgent?: string
   /** The browser's Chromium product version (?browserVersion=), what follows 'Chrome/' in Browser.getVersion's product. */
@@ -83,6 +88,8 @@ export type ExtensionEntry = {
   info: ExtensionInfo
   stableKey: string
   connectedTargets: Map<string, ConnectedTarget>
+  /** A newer build in the extension's folder, which it loads once it controls no tab (its `newerBuild` message). */
+  newerBuild: string | null
   // Runtime I/O fields
   ws: WSContext | null
   pendingRequests: Map<number, ExtensionPendingRequest>
@@ -213,11 +220,23 @@ export function addExtension(
     info,
     stableKey,
     connectedTargets: new Map(),
+    newerBuild: null,
     ws,
     pendingRequests: new Map(),
     messageId: 0,
     pingInterval: null,
   })
+  return { ...state, extensions: newExtensions }
+}
+
+/** What the extension last said of a newer build in its folder (null: none waits). */
+export function setExtensionNewerBuild(state: RelayState, { extensionId, build }: { extensionId: string; build: string | null }): RelayState {
+  const extension = state.extensions.get(extensionId)
+  if (!extension || extension.newerBuild === build) {
+    return state
+  }
+  const newExtensions = new Map(state.extensions)
+  newExtensions.set(extensionId, { ...extension, newerBuild: build })
   return { ...state, extensions: newExtensions }
 }
 

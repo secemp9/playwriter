@@ -138,6 +138,17 @@ export type ExtensionTabVisibilityMessage = {
   params: TabVisibilityReport
 }
 
+/**
+ * The extension's folder holds a newer build than the one it runs, which it loads once it controls no
+ * tab (the extension's self-reload.ts); null when none waits any more. Sent after each connection and
+ * when it changes.
+ */
+export type ExtensionNewerBuildMessage = {
+  id?: undefined
+  method: 'newerBuild'
+  params: { build: string | null }
+}
+
 export type ExtensionMessage =
   | ExtensionResponseMessage
   | ExtensionEventMessage
@@ -148,6 +159,7 @@ export type ExtensionMessage =
   | ExtensionDownloadStateMessage
   | ExtensionDebuggerCutMessage
   | ExtensionTabVisibilityMessage
+  | ExtensionNewerBuildMessage
 
 // Recording command messages (MCP -> Extension via relay)
 export type StartRecordingParams = {

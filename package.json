@@ -8,7 +8,6 @@
     "format": "prettier --write .",
     "cli": "pnpm --filter playwriter cli",
     "build": "pnpm --filter playwriter --filter mcp-extension build",
-    "reload": "pnpm --filter playwriter build && pnpm --filter mcp-extension reload",
     "agents.md": "agentsdotmd ./PLAYWRITER_AGENTS.md core.md typescript.md pnpm.md vitest.md changelog.md docs-writing.md github.md playwright.md zod.md gitchamber.md",
     "release:check-cli-version": "tsx scripts/check-extension-cli-version.ts",
     "release": "pnpm release:check-cli-version && pnpm --filter playwriter build && cd extension && PRODUCTION=true PLAYWRITER_EXTENSION_DIST=dist-release pnpm build && cd dist-release && zip -r ../../playwriter-$(node -p \"require('../manifest.json').version\").zip . && cd ../.. && realpath playwriter-*.zip | pbcopy && open 'https://chrome.google.com/webstore/devconsole/a379d569-9533-44e4-9749-0368f6dbf878/jfeammnjpkecdekppnclgkkffahnhfhe/edit/package'",

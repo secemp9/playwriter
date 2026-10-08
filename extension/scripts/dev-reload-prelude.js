@@ -12,18 +12,24 @@
 // extension stays broken until a human clicks reload. This ordering is what makes a
 // bad edit self-healing instead of terminal.
 //
-// Change detection needs no dev server: `fetch` on a chrome-extension:// URL of an
-// UNPACKED extension reads through to disk, so the running worker can hash the bundle
-// currently on disk — which, after a rebuild, differs from the code it is itself
-// executing. `cache: 'no-store'` stops Chrome serving us our own stale copy.
+// Change detection is the app body's convention (src/self-reload.ts): every build compiles its
+// id into background.js (RUNNING_BUILD below, filled in by vite.config.mts) and
+// writes it to build.json in its folder, last, so the folder holds a newer build exactly when
+// build.json names another id. `fetch` on a chrome-extension:// URL of an UNPACKED extension reads
+// through to disk; `cache: 'no-store'` stops Chrome serving us our own stale copy. A missing or
+// unreadable build.json (a folder from before build ids) reloads nothing.
+//
+// Unlike the body, it reloads without waiting for the extension to control no tab: it runs ahead
+// of the body, also when the body threw, so it cannot see the body's tabs or in-flight work, and
+// in a dev build the developer who rebuilt is the one waiting for the new code. That is also why
+// the body's own self-reload is off in dev builds.
 //
 // NOTE: dynamic `import()` is disallowed in a ServiceWorkerGlobalScope, which is why
 // the body is concatenated rather than imported.
 ;(() => {
   const ALARM = 'playwriter-dev-reload'
-  const BASELINE_KEY = 'playwriterDevReloadBaseline'
   const ERROR_KEY = 'playwriterDevBodyError'
-  const WATCHED = ['background.js', 'offscreen.js']
+  const RUNNING_BUILD = __PLAYWRITER_BUILD_ID__
 
   globalThis.__playwriterDevReport = (err) => {
     const message = err instanceof Error ? `${err.message}\n${err.stack || ''}` : String(err)
@@ -61,51 +67,34 @@
     })()
   }
 
-  async function hashBuild() {
-    let acc = 0
-    let sawAny = false
-    for (const file of WATCHED) {
-      try {
-        const res = await fetch(chrome.runtime.getURL(file), { cache: 'no-store' })
-        if (!res.ok) continue
-        const text = await res.text()
-        sawAny = true
-        for (let i = 0; i < text.length; i++) acc = ((acc << 5) - acc + text.charCodeAt(i)) | 0
-        acc = (acc * 31 + text.length) | 0
-      } catch {}
+  // The id in the folder's build.json, or null while it names none (missing, half-written, or a
+  // folder from before build ids).
+  async function folderBuild() {
+    try {
+      const res = await fetch(chrome.runtime.getURL('build.json'), { cache: 'no-store' })
+      if (!res.ok) return null
+      const { id } = await res.json()
+      return typeof id === 'string' && /^[0-9a-f]{8}$/.test(id) ? id : null
+    } catch {
+      return null
     }
-    return sawAny ? String(acc) : null
   }
 
-  // The baseline must outlive the worker: MV3 kills an idle SW in ~20s, taking module
-  // state and every setInterval with it, so an in-memory baseline would re-arm on wake
-  // to the ALREADY-rebuilt hash and never see the change. storage.local survives worker
-  // restarts AND chrome.runtime.reload() (storage.session is wiped by the reload itself).
+  // No baseline to keep: the running build's id is compiled in, so a worker woken after a
+  // rebuild still compares the folder with the code it runs.
   async function poll() {
     try {
-      const token = await hashBuild()
-      if (!token) return
-      const got = await chrome.storage.local.get(BASELINE_KEY)
-      const baseline = got && typeof got[BASELINE_KEY] === 'string' ? got[BASELINE_KEY] : null
-      if (baseline === null) {
-        await chrome.storage.local.set({ [BASELINE_KEY]: token })
-        console.log(`[playwriter] dev live-reload armed, build=${token}`)
-        return
-      }
-      if (token !== baseline) {
-        console.log(`[playwriter] dev live-reload: dist changed ${baseline} -> ${token}, RELOADING`)
-        // Persist BEFORE reloading, or the fresh worker re-arms on the old baseline,
-        // sees the same diff again, and reload-loops forever.
-        await chrome.storage.local.set({ [BASELINE_KEY]: token })
-        chrome.runtime.reload()
-      }
+      const build = await folderBuild()
+      if (build === null || build === RUNNING_BUILD) return
+      console.log(`[playwriter] dev live-reload: build ${RUNNING_BUILD} -> ${build}, RELOADING`)
+      chrome.runtime.reload()
     } catch (err) {
       console.debug('[playwriter] dev live-reload poll failed', err)
     }
   }
 
   try {
-    console.log('[playwriter] dev live-reload starting (self-hash, no server)')
+    console.log(`[playwriter] dev live-reload starting (build ${RUNNING_BUILD}, no server)`)
     // setInterval alone dies with the worker; the alarm wakes a terminated worker so
     // edits are still picked up after an idle period. 0.5 min is Chrome's floor.
     chrome.alarms.create(ALARM, { periodInMinutes: 0.5 })

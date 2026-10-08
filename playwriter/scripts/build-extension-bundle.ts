@@ -59,7 +59,12 @@ async function main(): Promise<void> {
 
   fs.rmSync(bundledExtensionDir, { recursive: true, force: true })
   fs.mkdirSync(path.dirname(bundledExtensionDir), { recursive: true })
-  fs.cpSync(extensionOutDir, bundledExtensionDir, { recursive: true })
+  // build.json last, renamed into place, as the build itself writes it: an extension running from this
+  // copy reloads itself into the build build.json names, which must then be on disk in full.
+  const buildJson = path.join(extensionOutDir, 'build.json')
+  fs.cpSync(extensionOutDir, bundledExtensionDir, { recursive: true, filter: (source) => source !== buildJson })
+  fs.copyFileSync(buildJson, path.join(bundledExtensionDir, 'build.json.tmp'))
+  fs.renameSync(path.join(bundledExtensionDir, 'build.json.tmp'), path.join(bundledExtensionDir, 'build.json'))
 }
 
 main().catch((error) => {

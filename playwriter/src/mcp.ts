@@ -177,6 +177,8 @@ const connectedExtensionSchema = z.object({
   profile: z.object({ email: z.string(), id: z.string() }).nullable(),
   activeTargets: z.number(),
   playwriterVersion: z.string().nullable(),
+  build: z.string().nullable(),
+  newerBuild: z.string().nullable(),
 })
 type ConnectedExtension = z.infer<typeof connectedExtensionSchema>
 const extensionsStatusSchema = z.object({ extensions: z.array(connectedExtensionSchema) })
@@ -237,10 +239,14 @@ const NEW_CALL = 'browser({ action: "new" })'
 
 function describeExtension(extension: ConnectedExtension): string {
   const tabs = extension.activeTargets === 1 ? '1 attached tab' : `${extension.activeTargets} attached tabs`
-  return (
-    `- ${emailOf(extension) || '(not signed in)'} — key ${extension.stableKey} · ${extension.browser ?? 'browser not reported'} · ` +
-    `extension built with playwriter ${extension.playwriterVersion ?? '(version not reported)'} · ${tabs}`
-  )
+  const built = `extension built with playwriter ${extension.playwriterVersion ?? '(version not reported)'}`
+  const build =
+    extension.build === null
+      ? `${built}, before it could reload itself: ask the user to click ↻ on its card in chrome://extensions once`
+      : extension.newerBuild === null
+        ? `${built}, build ${extension.build}`
+        : `${built}, build ${extension.build} (a newer build is in its folder; it reloads itself once it controls no tab)`
+  return `- ${emailOf(extension) || '(not signed in)'} — key ${extension.stableKey} · ${extension.browser ?? 'browser not reported'} · ${build} · ${tabs}`
 }
 
 /** The list lines: every connected profile, then the `new` choice. */

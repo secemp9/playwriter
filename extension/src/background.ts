@@ -5,10 +5,10 @@ declare const __PLAYWRITER_VERSION__: string
 // Bundled automation builds should not burn a tab on the welcome page, especially
 // in headless/VPS flows where the extension is installed only to attach to the relay.
 declare const __PLAYWRITER_OPEN_WELCOME_PAGE__: boolean
-// Dev live-reload: true only in `npm run dev` builds (PLAYWRITER_DEV_RELOAD=1). Read here
-// solely to report the mode in diagnostics — the reloader itself is the prelude described
-// at the bottom of this file, and needs no cooperation from this module. Never set in
-// production/store builds, so none of it ships to users.
+// Dev live-reload: true only in `npm run dev` builds (PLAYWRITER_DEV_RELOAD=1). Those builds are
+// reloaded by the prelude described at the bottom of this file, which needs no cooperation from
+// this module, so the self-reload below stays off in them. Never set in production/store builds,
+// so none of it ships to users.
 declare const __PLAYWRITER_DEV_RELOAD__: boolean
 
 import { createStore } from 'zustand/vanilla'
@@ -41,6 +41,7 @@ import {
   handleCancelRecording,
   cleanupRecordingForTab,
 } from './recording'
+import { createSelfReload, RUNNING_BUILD, type SelfReloadOutcome } from './self-reload'
 
 const RELAY_HOST = '127.0.0.1'
 const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
@@ -410,6 +411,10 @@ function flushRecordingChunkBuffer(ws: WebSocket): void {
   }
 }
 
+// Messages from the relay whose handling has not finished (commands, attaches, recordings): the
+// self-reload never cuts one.
+let relayMessagesInFlight = 0
+
 class ConnectionManager {
   ws: WebSocket | null = null
   private connectionPromise: Promise<void> | null = null
@@ -513,6 +518,7 @@ class ConnectionManager {
     if (typeof __PLAYWRITER_VERSION__ !== 'undefined') {
       relayUrl.searchParams.set('v', __PLAYWRITER_VERSION__)
     }
+    relayUrl.searchParams.set('build', RUNNING_BUILD)
     logger.debug(`[worker ${workerInstanceId}] Creating WebSocket connection to:`, relayUrl)
     const socket = new WebSocket(relayUrl.toString())
 
@@ -573,7 +579,7 @@ class ConnectionManager {
 
     this.ws = socket
 
-    this.ws.onmessage = async (event: MessageEvent) => {
+    const onMessage = async (event: MessageEvent) => {
       let message: any
       try {
         message = JSON.parse(event.data)
@@ -772,6 +778,13 @@ class ConnectionManager {
       // logger.debug('Sending response:', response)
       sendMessage(response)
     }
+    // Counted for the self-reload, which waits until no command of the relay is being handled.
+    this.ws.onmessage = (event: MessageEvent) => {
+      relayMessagesInFlight++
+      void onMessage(event).finally(() => {
+        relayMessagesInFlight--
+      })
+    }
 
     this.ws.onclose = (event: CloseEvent) => {
       // Stale-socket guard: only the socket the manager currently owns may drive state
@@ -791,6 +804,7 @@ class ConnectionManager {
     chrome.debugger.onDetach.addListener(onDebuggerDetach)
 
     logger.debug(`[worker ${workerInstanceId}] Connection established (up ${workerUptimeS()}s)`)
+    selfReload?.connected()
   }
 
   private handleClose(reason: string, code: number): void {
@@ -1004,6 +1018,8 @@ declare global {
   var disconnectEverything: () => Promise<void>
   /** Start Chrome's element picker on a connected tab, as the context menu does. */
   var startElementPick: (tabId: number, purpose: PickPurpose) => Promise<void>
+  /** Run the self-reload's check now, as a connection or the periodic wake does (self-reload.ts). Absent in dev builds. */
+  var checkForNewerBuild: () => Promise<SelfReloadOutcome>
 }
 
 const MAX_LOG_STRING_LENGTH = 2000
@@ -2777,12 +2793,15 @@ logger.log(
   `[worker ${workerInstanceId}] START`,
   `v=${typeof __PLAYWRITER_VERSION__ !== 'undefined' ? __PLAYWRITER_VERSION__ : '?'}`,
   `relayPort=${RELAY_PORT}`,
-  `devReload=${typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__ ? 'on:self-hash' : 'off'}`,
+  `build=${RUNNING_BUILD}`,
+  `devReload=${typeof __PLAYWRITER_DEV_RELOAD__ !== 'undefined' && __PLAYWRITER_DEV_RELOAD__ ? 'on' : 'off'}`,
   `ua=${navigator.userAgent.slice(0, 60)}`,
 )
 
 // Log WHY the worker (re)started: install / update / chrome start / periodic wake vs a
-// plain idle respawn. onInstalled also tells us when a live-reload actually took effect.
+// plain idle respawn. onInstalled also tells us when a reload actually took effect: MEASURED
+// (Chrome for Testing 145, Chrome 149), chrome.runtime.reload() of an unpacked extension fires it
+// with reason 'update', never 'install', so the welcome page below stays closed.
 chrome.runtime.onInstalled.addListener((details) => {
   logger.log(`[worker ${workerInstanceId}] onInstalled reason=${details.reason}`, details.previousVersion ? `prev=${details.previousVersion}` : '')
 })
@@ -2790,10 +2809,62 @@ chrome.runtime.onStartup.addListener(() => {
   logger.log(`[worker ${workerInstanceId}] onStartup (browser launch)`)
 })
 
+// The self-reload (self-reload.ts): off in dev builds, whose prelude reloads them.
+const selfReload = __PLAYWRITER_DEV_RELOAD__
+  ? null
+  : createSelfReload({
+      isConnected: () => connectionManager.ws?.readyState === WebSocket.OPEN,
+      isIdle: () =>
+        store.getState().tabs.size === 0 &&
+        attachesInFlight.size === 0 &&
+        attachSetupInProgress.size === 0 &&
+        getActiveRecordings().size === 0 &&
+        relayMessagesInFlight === 0,
+      // The tab-group clean-up of the last released tab: storage.session, where the group ids live,
+      // is wiped by the reload (MEASURED, Chrome for Testing 145, Chrome 149), so a group left behind
+      // would never be removed.
+      settle: async () => {
+        let queued: Promise<void>
+        do {
+          queued = tabGroupQueue
+          await queued
+        } while (queued !== tabGroupQueue)
+      },
+      reload: async () => {
+        // The log line before the reload is on the socket; the closing handshake ends only once the
+        // relay has read everything sent before it.
+        const socket = connectionManager.ws
+        if (socket !== null && socket.readyState === WebSocket.OPEN) {
+          const closed = Promise.withResolvers<void>()
+          socket.addEventListener('close', () => closed.resolve(), { once: true })
+          // A real timer: a relay that never answers the closing handshake must not keep the newer
+          // build from loading.
+          const timer = setTimeout(() => closed.resolve(), 2000)
+          socket.close(1000, 'Extension reloading itself')
+          await closed.promise
+          clearTimeout(timer)
+        }
+        chrome.runtime.reload()
+      },
+      report: (build) => {
+        sendMessage({ method: 'newerBuild', params: { build } })
+      },
+      log: (message) => {
+        logger.log(`[worker ${workerInstanceId}] ${message}`)
+      },
+    })
+
+if (selfReload !== null) {
+  globalThis.checkForNewerBuild = selfReload.check
+}
+
 const RECONNECT_ALARM = 'playwriter-reconnect'
 void chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener((alarm) => {
   logger.debug(`[worker ${workerInstanceId}] alarm woke worker: ${alarm.name} (up ${workerUptimeS()}s)`)
+  if (alarm.name === RECONNECT_ALARM) {
+    void selfReload?.check()
+  }
 })
 
 // Worker heartbeat. The service worker's console is not observable from outside the
@@ -2939,6 +3010,10 @@ store.subscribe((state, prevState) => {
     tabGroupQueue = tabGroupQueue.then(syncTabGroups).catch((e) => {
       logger.debug('syncTabGroups error:', e)
     })
+  }
+  // After the clean-up is queued: the self-reload waits for it before reloading.
+  if (state.tabs.size === 0 && prevState.tabs.size > 0) {
+    selfReload?.released()
   }
 })
 

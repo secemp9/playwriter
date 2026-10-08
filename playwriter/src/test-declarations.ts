@@ -1,4 +1,5 @@
 import type { ExtensionState } from 'mcp-extension/src/types.js'
+import type { SelfReloadOutcome } from 'mcp-extension/src/self-reload.js'
 
 declare global {
   var toggleExtensionForActiveTab: (
@@ -7,6 +8,7 @@ declare global {
   ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
+  var checkForNewerBuild: () => Promise<SelfReloadOutcome>
 
   // Browser globals used in evaluate() calls
   var window: any

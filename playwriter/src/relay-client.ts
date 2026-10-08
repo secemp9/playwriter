@@ -23,6 +23,10 @@ export type ExtensionStatus = {
   profile: { email: string; id: string } | null
   activeTargets: number
   playwriterVersion: string | null
+  /** Id of the build the extension runs; null from an extension built before it could reload itself. */
+  build: string | null
+  /** A newer build in the extension's folder, loaded once it controls no tab. */
+  newerBuild: string | null
 }
 
 export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<string | null> {
@@ -114,6 +118,9 @@ export async function getExtensionsStatus(port: number = RELAY_PORT): Promise<Ex
           profile: fallbackData.profile,
           activeTargets: fallbackData.activeTargets,
           playwriterVersion: fallbackData.playwriterVersion || null,
+          // A relay without /extensions/status predates build ids: it reports none.
+          build: null,
+          newerBuild: null,
         },
       ]
     }

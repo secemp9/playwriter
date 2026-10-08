@@ -47,7 +47,7 @@ cli
       try {
         // Avoid loading playwright-core during generic CLI startup/help. This command
         // is the only path that needs browser discovery and bundled extension launch.
-        const [{ getBrowserLaunchArgs, getDefaultBrowserUserDataDir, startBrowserProcess }, { resolveBrowserExecutablePath, shouldUseHeadlessByDefault }, { getBundledExtensionPath }] = await Promise.all([
+        const [{ enableDeveloperMode, getBrowserLaunchArgs, getDefaultBrowserUserDataDir, startBrowserProcess }, { resolveBrowserExecutablePath, shouldUseHeadlessByDefault }, { getBundledExtensionPath }] = await Promise.all([
           import('./browser-launch.js'),
           import('./browser-config.js'),
           import('./package-paths.js'),
@@ -65,7 +65,9 @@ cli
           headless,
           noSandbox: options.disableSandbox,
         })
-
+        // The bundled extension reloads itself when a playwriter update replaces its folder, which
+        // keeps it enabled only with Developer mode on (enableDeveloperMode).
+        enableDeveloperMode(userDataDir)
         const { pid } = startBrowserProcess({
           browserPath,
           args,
@@ -220,6 +222,9 @@ async function fetchExtensionsStatus({ host, token }: { host?: string; token?: s
           profile: fallbackData?.profile,
           activeTargets: fallbackData?.activeTargets,
           playwriterVersion: fallbackData?.playwriterVersion || null,
+          // A relay without /extensions/status predates build ids: it reports none.
+          build: null,
+          newerBuild: null,
         },
       ]
     }
