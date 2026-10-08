@@ -26,6 +26,8 @@
  *     that do nothing to the page (browser-side reads like cookies or console messages, waits, tabs).
  */
 
+import { ALLOWED_IN_FAST_OR_DEBUG } from './code-policy.js'
+
 /** What a refused call does, in plain words, completing "it …". */
 export type CallEffect =
   | { kind: 'none' }
@@ -413,11 +415,11 @@ export function refusalFor(effect: RefusedCallEffect, protocol: string): string 
         `${effect.instead}, with a ref from observe(). It was not run.`
       )
     case 'pageWrite':
-      return `${head} ${effect.does}, which a person browsing cannot do. Changing the page on purpose needs debug mode (ask the user). It was not run.`
+      return `${head} ${effect.does}, which a person browsing cannot do. Changing the page on purpose needs ${ALLOWED_IN_FAST_OR_DEBUG}. It was not run.`
     case 'forced':
       return (
         `${head} ${effect.does}: the conditions under test become ones a user cannot hit. Faking conditions on purpose ` +
-        'needs debug mode (ask the user). It was not run.'
+        `needs ${ALLOWED_IN_FAST_OR_DEBUG}. It was not run.`
       )
     case 'rawCdp':
       return (

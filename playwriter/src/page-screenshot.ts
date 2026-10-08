@@ -34,6 +34,7 @@ import type { Page } from '@xmorse/playwright-core'
 import type sharpModule from 'sharp'
 import type { ICDPSession } from './cdp-session.js'
 import { withDeadline, type IsolatedWorld } from './isolated-world.js'
+import { ALLOWED_IN_FAST_OR_DEBUG } from './code-policy.js'
 import { LLM_MAX_DIMENSION, resizeImageForAgent } from './aria-snapshot.js'
 import type { Observation } from './page-observe.js'
 import { decodePng, encodePng, type DecodedPng } from './png-pixels.js'
@@ -431,7 +432,7 @@ async function capture(deps: ScreenshotDeps, call: string, mode: { fullPage?: bo
     throw new ModelFacingError(
       `Refused (human mode): ${call}({ fullPage: true }) — ${BEYOND_VIEWPORT_EVENTS}, so the app can re-render, close menus or log it; a ` +
         'person never makes the page do that by looking. Take the window with screenshot(), act.scroll(\'down\') and screenshot() again; ' +
-        'getPageMarkdown() reads the whole text. Full-page captures need debug mode (ask the user). It was not run.',
+        `getPageMarkdown() reads the whole text. Full-page captures need ${ALLOWED_IN_FAST_OR_DEBUG}. It was not run.`,
     )
   }
   const [metrics, view] = await Promise.all([

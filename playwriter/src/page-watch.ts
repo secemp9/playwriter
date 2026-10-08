@@ -19,7 +19,9 @@
  *    finished, or say exactly why not (which requests are still open, which element is still
  *    changing, what still looks busy). `waitForIdle` additionally waits until nothing
  *    STRONGLY says "still working" — that is how an agent waits for an AI reply to finish
- *    streaming before reading it.
+ *    streaming before reading it. At fast pace (fast mode, for testing on localhost) the SETTLE
+ *    step has no quiet windows: it lets every frame's page run the work it has queued, reads
+ *    what that work did, and awaits the action's requests by their own events.
  *
  * Ground truth only. "Busy" comes from what the page states (the accessibility tree's
  * `busy`, a progressbar's value and whether it moves, endlessly repeating animations on
@@ -84,6 +86,7 @@ import {
   type NavigationRecord,
   type NetworkRecord,
   type PendingRequest,
+  type FastSettleEvidence,
   type SettleResult,
   type WatchCheckpoint,
   type WatchEvents,
@@ -125,6 +128,26 @@ const IFRAME_DOCUMENT_MS = 2000
  * window is moving (the journal's churn gap: an element still changing changed within 2 s).
  */
 const PROGRESS_MOVING_MS = 2000
+/**
+ * MessageChannel round trips in a whole fast-settle pass. A round trip posts a message in the
+ * frame's isolated world and waits for it: tasks the page queued before it run first, and the
+ * microtask checkpoint after every task drains the microtask queues (Vue's and Svelte's
+ * schedulers render there). Unlike a chain of setTimeout(0) it has no 4 ms clamp when nested
+ * (measured, Chromium 145: 20 round trips 1–2.5 ms, 20 nested setTimeout(0) 58 ms); unlike
+ * requestAnimationFrame it does not depend on the tab rendering frames. Under Playwright every
+ * tab reports `visible` (measured, a background tab opened by Target.createTarget, without
+ * Playwright's anti-throttling switches), so a hidden tab's throttling was not measured here.
+ * MEASURED (Chromium 145.0.7632.18, headless shell and full build, 5 runs of each scenario, the
+ * click dispatched through CDP with the first round trip pipelined behind it): the longest run of
+ * round trips with no DOM mutation before one came was 3 — a handler's three nested
+ * setTimeout(0), React 19.2.7's time-sliced transition (a ~100 ms and a ~500 ms render), React's
+ * setTimeout → setState → effect → setState chain — and at most 2 for plain handlers (a task, a
+ * promise chain, a MessageChannel), React 19 sync updates and effect chains, Vue 3.5.39 and
+ * Svelte 4.2.19. A pass of 3 round trips with no mutation is past every reaction measured.
+ */
+const FLUSH_ROUND_TRIPS = 3
+/** What a fast settle's wait answers when its cap (timeoutMs, its one timer) came first. */
+const CAPPED: unique symbol = Symbol('the settle cap')
 const SETUP_NAME = 'page-watch'
 const READER = '__playwriterWatch'
 
@@ -209,6 +232,8 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
   var roots = [];
   var spinnerSets = {};
   var nextSpinnerSet = 1;
+  // Fast-settle passes waiting in this world: each hears of every content batch as it is recorded.
+  var contentWaiters = [];
 
   function norm(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
   function clip(s, n) { return s.length > n ? s.slice(0, n - 1) + '\u2026' : s; }
@@ -514,6 +539,10 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     targets.forEach(function (t) { noteStreak(t, now); });
     var seenTexts = {};
     watched.forEach(function (role, el) { recordLive(el, role, now, seenTexts); });
+    if (content && contentWaiters.length) {
+      var recorded = batches[batches.length - 1];
+      contentWaiters.slice().forEach(function (notify) { notify(recorded); });
+    }
   }
 
   // What an endless animation is, from what the animated element shows and how it moves. One on an
@@ -645,21 +674,65 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     return { streaming: streaming, announced: announced, spinners: spinners() };
   }
 
+  /** The journal's state: arg.cutoff excludes earlier churn; arg.from with arg.labels names the ambient changes since then. */
+  function stateOf(arg) {
+    var last = lastContent(arg.cutoff);
+    return {
+      token: token, now: Date.now(), installedAt: installedAt, lastContentAt: last.at,
+      hot: arg.labels ? placeOf(last.el) : null,
+      ambient: arg.labels && arg.from !== null ? ambientSince(arg.cutoff, arg.from) : [],
+      content: totals.content, cosmetic: totals.cosmetic,
+      loading: arg.loading ? loading() : null
+    };
+  }
+
+  /**
+   * One fast-settle pass: the page runs the work it has queued, arg.roundTrips MessageChannel round
+   * trips, while content batches are watched. Resolves on the first batch that counts as content
+   * (not cosmetic, not ambient, not only elements churning since before arg.cutoff), or when the
+   * round trips are done. arg.after is the newest batch the previous pass saw in this document: a
+   * counting batch recorded since then ends the pass at once. Answers with the state at its end.
+   */
+  function pass(arg) {
+    var after = arg.after && arg.after.token === token ? arg.after.last : null;
+    function counts(b) { return b.content > 0 && batchTarget(b, arg.cutoff) !== false; }
+    function result(records) {
+      var out = stateOf({ cutoff: arg.cutoff, from: arg.from, labels: true, loading: true });
+      out.records = records;
+      out.last = nextBatchId - 1;
+      return out;
+    }
+    if (after !== null) {
+      for (var i = batches.length - 1; i >= 0 && batches[i].id > after; i--) if (counts(batches[i])) return Promise.resolve(result(true));
+    }
+    return new Promise(function (resolve) {
+      var left = arg.roundTrips, done = false;
+      function finish(records) {
+        if (done) return;
+        done = true;
+        contentWaiters.splice(contentWaiters.indexOf(onBatch), 1);
+        resolve(result(records));
+      }
+      function onBatch(b) { if (counts(b)) finish(true); }
+      contentWaiters.push(onBatch);
+      (function trip() {
+        var channel = new MessageChannel();
+        channel.port1.onmessage = function () {
+          channel.port1.close();
+          if (done) return;
+          if (--left > 0) trip(); else finish(false);
+        };
+        channel.port2.postMessage(0);
+      })();
+    });
+  }
+
   observeRoot(document);
   adopt(document, null);
 
   globalThis.__playwriterWatch = {
     version: VERSION,
-    state: function (arg) {
-      var last = lastContent(arg.cutoff);
-      return {
-        token: token, now: Date.now(), installedAt: installedAt, lastContentAt: last.at,
-        hot: arg.labels ? placeOf(last.el) : null,
-        ambient: arg.labels && arg.from !== null ? ambientSince(arg.cutoff, arg.from) : [],
-        content: totals.content, cosmetic: totals.cosmetic,
-        loading: arg.loading ? loading() : null
-      };
-    },
+    state: stateOf,
     read: function (sinceAt) {
       var outLive = [];
       for (var i = 0; i < live.length; i++) {
@@ -675,6 +748,7 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
       return { token: token, now: Date.now(), live: outLive, batches: outBatches, droppedAt: lastDroppedAt, liveDroppedAt: liveDroppedAt };
     },
     busy: busy,
+    pass: pass,
     spinnerTargets: function (set) { var els = spinnerSets[set] || []; delete spinnerSets[set]; return els; },
     valueChangedAt: function (el) { return el ? valueChangedAt.get(el) || null : null; },
     /** A shadow root found through CDP: a closed one, invisible to script. */
@@ -807,6 +881,18 @@ interface WorldBusy {
   spinners: { set: number; list: WorldSpinner[] }
 }
 
+/** One frame's fast-settle pass: its journal's state at the end, whether content changed during it, and the newest batch id it saw. */
+interface WorldPass extends WorldState {
+  records: boolean
+  last: number
+}
+
+/** The newest journal batch a pass saw in a frame's document (its journal `token`): the next pass counts what came after it. */
+interface JournalMark {
+  token: string
+  last: number
+}
+
 /** What this module keeps per frame document once read, so a navigation does not erase what the old document showed. */
 interface DocumentJournal {
   frameId: string
@@ -902,15 +988,27 @@ interface ConsoleEntry {
   owner: Promise<ContextOwner>
 }
 
-export interface SettleOptions {
+interface SettleBaseOptions {
   /** The checkpoint taken right before the action's first input: requests started after it are the action's. */
   since?: WatchCheckpoint
-  /** Epoch ms when the last dispatched input ended; quiet windows are measured from here. Default: now. */
+  /** Epoch ms when the last dispatched input ended; quiet windows (fast: `coveredMs`) are measured from here. Default: now. */
   origin?: number
   timeoutMs?: number
+}
+
+/** Human pace, the default: content and the action's requests quiet for fixed windows. */
+export interface HumanSettleOptions extends SettleBaseOptions {
+  pace?: 'human'
   domQuietMs?: number
   networkQuietMs?: number
 }
+
+/** Fast pace (fast mode, for testing on localhost): settled on evidence, no quiet windows (FastSettleEvidence). */
+export interface FastSettleOptions extends SettleBaseOptions {
+  pace: 'fast'
+}
+
+export type SettleOptions = HumanSettleOptions | FastSettleOptions
 
 export interface IdleOptions {
   /** The last dispatched action's checkpoint: what was already running before it is ambient, not "still working". */
@@ -962,6 +1060,53 @@ interface QuietGoal {
 }
 
 type Raced<T> = { value: T } | { dialog: true }
+
+/** settle({ pace: 'fast' }) as its loop runs it. */
+interface FastGoal {
+  timeoutMs: number
+  /** End of the last input (this process's clock): `coveredMs` is measured from here, ambient changes are named from here. */
+  origin: number
+  /** Requests started at/after this are the action's own. */
+  causalFrom: number
+  /** Churn that predates this is ambient. */
+  since?: WatchCheckpoint
+}
+
+/** What a fast settle has seen so far. */
+interface FastRun {
+  passes: number
+  /** Every frame's journal state at the end of the last pass, and when it arrived (this process's clock). */
+  state: ContentState | null
+  readAt: number
+  /** The last pass ended on a content mutation. */
+  changed: boolean
+  loading: LoadingLog
+}
+
+/** How a settle result says it waited. */
+type Paced = { pace: 'human' } | { pace: 'fast'; fast: FastSettleEvidence }
+const HUMAN: { pace: 'human' } = { pace: 'human' }
+
+/** Loading indicators the reads of a settle step saw: what was shown while it waited and is gone at the end is reported. */
+class LoadingLog {
+  /** Key → latest label, and the first and last read that showed it. */
+  private readonly seen = new Map<string, { label: string; first: number; last: number }>()
+  /** The keys the latest read showed. */
+  private shown = new Set<string>()
+
+  note(loading: LoadingIndicator[], at: number): void {
+    this.shown = new Set(loading.map(({ key }) => key))
+    for (const { key, label } of loading) {
+      const seen = this.seen.get(key)
+      if (seen) Object.assign(seen, { label, last: at })
+      else this.seen.set(key, { label, first: at, last: at })
+    }
+  }
+
+  gone(): Array<{ label: string; seenMs: number }> {
+    return [...this.seen].filter(([key]) => !this.shown.has(key)).map(([, seen]) => ({ label: seen.label, seenMs: seen.last - seen.first }))
+  }
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -1120,6 +1265,8 @@ export class PageWatch {
   private readonly wakers = new Set<() => void>()
   /** Woken on every dialog change. */
   private readonly dialogWaiters = new Set<() => void>()
+  /** Requests a fast settle awaits → resolved when the request is answered (response headers) or ends. */
+  private readonly answerWaiters = new WeakMap<RequestEntry, PromiseWithResolvers<void>>()
 
   constructor(options: {
     frames: PageFrames
@@ -1313,17 +1460,24 @@ export class PageWatch {
   }
 
   /**
-   * Wait until the page has finished reacting to the action: content quiet for `domQuietMs`
-   * in every frame and the requests the action caused (any frame's) quiet for
-   * `networkQuietMs`, both measured from `origin` (the end of the last input; default now).
-   * Requests that started before `since` (or before `origin` without it) are reported in
-   * `uncaused`, never waited on. A dialog the agent must answer returns `js-dialog` at once;
-   * one the policy answers is waited out and the quiet windows start again after it closed. A
-   * cross-document navigation in progress is waited for first and the new document is
+   * Wait until the page has finished reacting to the action.
+   *
+   * Human pace (the default): content quiet for `domQuietMs` in every frame and the requests the
+   * action caused (any frame's) quiet for `networkQuietMs`, both measured from `origin` (the end of
+   * the last input; default now). Requests that started before `since` (or before `origin` without
+   * it) are reported in `uncaused`, never waited on. A dialog the agent must answer returns
+   * `js-dialog` at once; one the policy answers is waited out and the quiet windows start again after
+   * it closed. A cross-document navigation in progress is waited for first and the new document is
    * measured afresh.
+   *
+   * Fast pace (`pace: 'fast'`): no quiet windows — see `waitSettledFast`. The same causality, the
+   * same dialog and navigation handling, the same `timeoutMs` cap and reasons.
    */
   async settle(options: SettleOptions = {}): Promise<SettleResult> {
     const origin = options.origin ?? Date.now()
+    if (options.pace === 'fast') {
+      return await this.waitSettledFast({ timeoutMs: options.timeoutMs ?? 5000, origin, causalFrom: options.since?.at ?? origin, since: options.since })
+    }
     return await this.waitQuiet({
       timeoutMs: options.timeoutMs ?? 5000,
       domQuietMs: options.domQuietMs ?? 300,
@@ -1492,25 +1646,15 @@ export class PageWatch {
   private async waitQuiet(goal: QuietGoal): Promise<SettleResult> {
     const startedAt = Date.now()
     const deadline = startedAt + goal.timeoutMs
-    // Endpoints that were already open when the action began: a re-poll of one is the page's
-    // background channel reconnecting, not the action's effect.
-    const openAtStart = new Set(
-      this.requestLog
-        .filter((r) => this.clock.toLocal(r.chainIssuedAt) < goal.causalFrom && (r.endedAt ?? Infinity) >= goal.causalFrom)
-        .map((r) => `${r.method} ${r.url}`),
-    )
+    const openAtStart = this.openEndpoints(goal.causalFrom)
     let origin = goal.origin
     let rootsLookedAt = 0
     // A busy read walks the whole accessibility tree; the next poll waits at least as long as it took.
     let busyReadMs = 0
-    // Loading indicators the polls saw (key → latest label, first and last poll that showed it) and
-    // the keys the latest poll showed: what was shown while waiting and is gone at the end is reported.
-    const loadingSeen = new Map<string, { label: string; first: number; last: number }>()
-    let loadingNow = new Set<string>()
-    const goneLoading = (): Array<{ label: string; seenMs: number }> =>
-      [...loadingSeen].filter(([key]) => !loadingNow.has(key)).map(([, seen]) => ({ label: seen.label, seenMs: seen.last - seen.first }))
+    // Loading indicators the polls saw: what was shown while waiting and is gone at the end is reported.
+    const loadingLog = new LoadingLog()
     for (;;) {
-      const blocked = this.blockedResult(startedAt, goal, openAtStart)
+      const blocked = this.blockedResult(startedAt, goal.causalFrom, openAtStart, HUMAN)
       if (blocked) return blocked
       if (this.dialogs.current()) {
         // The policy answers this one by itself; the page is frozen until it closes and then
@@ -1528,15 +1672,9 @@ export class PageWatch {
           const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, null, PROBE_TIMEOUT_MS, false, true))
           if ('dialog' in raced) continue
           state = raced.value
-          const sampledAt = Date.now()
-          loadingNow = new Set((state.loading ?? []).map(({ key }) => key))
-          for (const { key, label } of state.loading ?? []) {
-            const seen = loadingSeen.get(key)
-            if (seen) Object.assign(seen, { label, last: sampledAt })
-            else loadingSeen.set(key, { label, first: sampledAt, last: sampledAt })
-          }
+          loadingLog.note(state.loading ?? [], Date.now())
         } catch (error) {
-          const ended = this.endedResult(startedAt, error)
+          const ended = this.endedResult(startedAt, error, HUMAN)
           if (ended) return ended
           // A document was replaced between the loading check and the read: measure the new one next round.
           if (!DEAD_CONTEXT_RE.test(errorMessage(error))) throw error
@@ -1560,8 +1698,9 @@ export class PageWatch {
               if ('dialog' in ambient) continue
               const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
               const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
-              const gone = goneLoading()
+              const gone = loadingLog.gone()
               return {
+                pace: 'human',
                 settled: true,
                 waitedMs: Date.now() - startedAt,
                 reason: 'quiet',
@@ -1577,7 +1716,7 @@ export class PageWatch {
           }
         }
       }
-      if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, goneLoading())
+      if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, loadingLog.gone())
       await this.pause(Math.min(Math.max(POLL_MS, busyReadMs), Math.max(0, deadline - Date.now())))
       busyReadMs = 0
     }
@@ -1593,16 +1732,16 @@ export class PageWatch {
         if (goal.needIdle) busy = this.networkBusy()
       } else {
         const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS, true))
-        if ('dialog' in raced) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
+        if ('dialog' in raced) return this.blockedResult(startedAt, goal.causalFrom, openAtStart, HUMAN) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
         state = raced.value
         if (goal.needIdle) {
           const signals = await this.unlessDialog(this.busySignals({ since: goal.since }))
-          if ('dialog' in signals) return this.blockedResult(startedAt, goal, openAtStart) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
+          if ('dialog' in signals) return this.blockedResult(startedAt, goal.causalFrom, openAtStart, HUMAN) ?? (await this.timeoutResult(startedAt, goal, origin, openAtStart, gone))
           busy = signals.value
         }
       }
     } catch (error) {
-      const ended = this.endedResult(startedAt, error)
+      const ended = this.endedResult(startedAt, error, HUMAN)
       if (ended) return ended
       throw error
     }
@@ -1612,6 +1751,7 @@ export class PageWatch {
     const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
     const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
     return {
+      pace: 'human',
       settled: false,
       waitedMs: now - startedAt,
       reason: 'timeout',
@@ -1627,18 +1767,19 @@ export class PageWatch {
   }
 
   /** page-closed / js-dialog results, checked before every probe so a frozen page is never probed. */
-  private blockedResult(startedAt: number, goal: QuietGoal, openAtStart: Set<string>): SettleResult | null {
+  private blockedResult(startedAt: number, causalFrom: number, openAtStart: Set<string>, paced: Paced): SettleResult | null {
     if (this.isClosed?.()) {
-      return { settled: false, waitedMs: Date.now() - startedAt, reason: 'page-closed', pendingRequests: [], busy: [] }
+      return { ...paced, settled: false, waitedMs: Date.now() - startedAt, reason: 'page-closed', pendingRequests: [], busy: [] }
     }
     const dialog = this.dialogs.current()
     if (dialog?.handling === 'agent') {
       const now = Date.now()
       return {
+        ...paced,
         settled: false,
         waitedMs: now - startedAt,
         reason: 'js-dialog',
-        pendingRequests: this.heldRequests(now, goal.causalFrom, openAtStart).map((r) => this.pending(r, now)),
+        pendingRequests: this.heldRequests(now, causalFrom, openAtStart).map((r) => this.pending(r, now)),
         busy: [],
         dialog,
       }
@@ -1647,13 +1788,168 @@ export class PageWatch {
   }
 
   /** A probe failed: if the page closed meanwhile, that is the answer. */
-  private endedResult(startedAt: number, error: unknown): SettleResult | null {
+  private endedResult(startedAt: number, error: unknown, paced: Paced): SettleResult | null {
     // Without an isClosed callback, the protocol's own "target closed" wording is the evidence.
     const closed = this.isClosed ? this.isClosed() : CLOSED_RE.test(errorMessage(error))
     if (closed) {
-      return { settled: false, waitedMs: Date.now() - startedAt, reason: 'page-closed', pendingRequests: [], busy: [] }
+      return { ...paced, settled: false, waitedMs: Date.now() - startedAt, reason: 'page-closed', pendingRequests: [], busy: [] }
     }
     return null
+  }
+
+  // ---------------------------------------------------------------------------
+  // fast settle: on evidence, no quiet windows
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Settle on evidence (FastSettleEvidence): passes — every readable frame's page runs the work it
+   * has queued (FLUSH_ROUND_TRIPS MessageChannel round trips) while its journal's MutationObserver
+   * listens — repeated until a whole pass records no content mutation and no request the action
+   * caused awaits its answer. Every wait is on a state change: a pass on its round trips or the
+   * first content mutation; a caused request on its answer or end (Network.responseReceived,
+   * loadingFinished, loadingFailed, a redirect); a cross-document navigation on the main frame's
+   * frameNavigated/frameStoppedLoading/loadEventFired; a dialog the policy answers on its close; a
+   * closed page on Playwright's `close`. The one timer is the `timeoutMs` cap.
+   *
+   * What it cannot know: work the page starts later on a timer (a debounced search,
+   * `setTimeout(…, 300)`, a reply ticking in on an interval); `coveredMs` says how far past the
+   * input its evidence reaches. A request the server answered but whose body stays open (a
+   * long-poll, a stream) is not waited for and is listed in `openStreams`; one never answered is
+   * awaited up to the cap.
+   */
+  private async waitSettledFast(goal: FastGoal): Promise<SettleResult> {
+    const startedAt = Date.now()
+    const openAtStart = this.openEndpoints(goal.causalFrom)
+    const marks = new Map<string, JournalMark>()
+    const run: FastRun = { passes: 0, state: null, readAt: startedAt, changed: false, loading: new LoadingLog() }
+    const paced = (): Paced => ({ pace: 'fast', fast: this.fastEvidence(goal, openAtStart, run, []) })
+    // The cap: the one timer of a fast settle. Every wait below races it.
+    const cap = Promise.withResolvers<typeof CAPPED>()
+    const capTimer = setTimeout(() => cap.resolve(CAPPED), goal.timeoutMs)
+    // A page that closes while a wait below is pending wakes it; the loop then reports it.
+    const onClose = (): void => this.wake()
+    this.frames.page.once('close', onClose)
+    try {
+      for (;;) {
+        const blocked = this.blockedResult(startedAt, goal.causalFrom, openAtStart, paced())
+        if (blocked) return blocked
+        if (this.dialogs.current() || this.mainFrameLoading) {
+          // A dialog the policy answers froze the page until it closes; a cross-document navigation
+          // replaces the document until the main frame stops loading. Their events wake this.
+          if ((await this.untilWoken(cap.promise, [])) === CAPPED) return this.fastVerdict(startedAt, goal, openAtStart, run, 'timeout')
+          continue
+        }
+        let pass: { state: ContentState; records: boolean }
+        try {
+          const raced = await this.orCap(this.unlessDialog(this.fastPass(goal, marks)), cap.promise)
+          if (raced === CAPPED) return this.fastVerdict(startedAt, goal, openAtStart, run, 'timeout')
+          if ('dialog' in raced) continue
+          pass = raced.value
+        } catch (error) {
+          const ended = this.endedResult(startedAt, error, paced())
+          if (ended) return ended
+          // A document was replaced during the pass: the next pass reads the new one.
+          if (!DEAD_CONTEXT_RE.test(errorMessage(error))) throw error
+          continue
+        }
+        run.passes++
+        run.state = pass.state
+        run.readAt = Date.now()
+        run.changed = pass.records
+        run.loading.note(pass.state.loading ?? [], run.readAt)
+        // Content changed during the pass, or a navigation began in it (measured: the main frame's
+        // frameStartedLoading arrives before the pass's answer): the page is still at work.
+        if (pass.records || this.mainFrameLoading) continue
+        const awaited = this.awaitedRequests(goal.causalFrom, openAtStart)
+        if (awaited.length === 0) return this.fastVerdict(startedAt, goal, openAtStart, run, 'quiet')
+        if ((await this.untilWoken(cap.promise, awaited.map((entry) => this.untilAnswered(entry)))) === CAPPED) {
+          return this.fastVerdict(startedAt, goal, openAtStart, run, 'timeout')
+        }
+      }
+    } finally {
+      clearTimeout(capTimer)
+      this.frames.page.off('close', onClose)
+    }
+  }
+
+  /** One pass in every readable frame (the journal's `pass`): their states at its end, combined, and whether content changed in any. */
+  private async fastPass(goal: FastGoal, marks: Map<string, JournalMark>): Promise<{ state: ContentState; records: boolean }> {
+    const cutoff = goal.since ? await this.onBrowserClock(goal.since.at) : null
+    const from = await this.onBrowserClock(goal.origin)
+    const entries = await this.readableFrames()
+    const reads = await this.eachFrame(entries, async (entry) => {
+      const arg = JSON.stringify({ cutoff, from, after: marks.get(entry.frameId) ?? null, roundTrips: FLUSH_ROUND_TRIPS })
+      const read = await this.callReader<WorldPass>(entry.world, `pass(${arg})`, PROBE_TIMEOUT_MS, `letting the page run its queued work${this.inFrame(entry)}`, true)
+      this.noteDocument(entry, read.token)
+      marks.set(entry.frameId, { token: read.token, last: read.last })
+      return read
+    })
+    for (const frameId of [...marks.keys()]) {
+      if (!entries.some((entry) => entry.frameId === frameId)) marks.delete(frameId)
+    }
+    return { state: this.combineStates(reads, true), records: reads.some(({ value }) => value.records) }
+  }
+
+  /** The requests the action caused that a fast settle awaits: not answered yet, and waited on by what they are. */
+  private awaitedRequests(causalFrom: number, openAtStart: Set<string>): RequestEntry[] {
+    return this.requestLog.filter((r) => r.headersAt === undefined && this.waitedOn(r) && this.caused(r, causalFrom, openAtStart))
+  }
+
+  private fastEvidence(goal: FastGoal, openAtStart: Set<string>, run: FastRun, stalledAssets: PendingRequest[]): FastSettleEvidence {
+    const now = Date.now()
+    // Answered, body still open: a long-poll or a stream, which a fast settle does not wait for.
+    const openStreams = this.requestLog
+      .filter((r) => r.headersAt !== undefined && this.waitedOn(r) && this.caused(r, goal.causalFrom, openAtStart))
+      .map((r) => this.pending(r, now))
+    return {
+      passes: run.passes,
+      roundTrips: FLUSH_ROUND_TRIPS,
+      coveredMs: now - goal.origin,
+      ...(openStreams.length ? { openStreams } : {}),
+      ...(stalledAssets.length ? { stalledAssets } : {}),
+    }
+  }
+
+  /** A fast settle's verdict: quiet, or the cap — with every request still awaited named by what is known of it then. */
+  private fastVerdict(startedAt: number, goal: FastGoal, openAtStart: Set<string>, run: FastRun, reason: 'quiet' | 'timeout'): SettleResult {
+    const now = Date.now()
+    const awaited = reason === 'timeout' ? this.awaitedRequests(goal.causalFrom, openAtStart) : []
+    // Only to name them, at the end, never to stop waiting: Chrome holding an iframe's document and
+    // an asset that stalled are told apart from a server that has not answered.
+    const iframeDocuments = awaited.filter((r) => this.undeliveredIframeDocument(r, now))
+    const stalled = awaited.filter((r) => !this.undeliveredIframeDocument(r, now) && this.stalledAsset(r, now))
+    const unanswered = awaited.filter((r) => !this.undeliveredIframeDocument(r, now) && !this.stalledAsset(r, now))
+    const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
+    const state = run.state
+    // Two durations, each on one clock: in the page until the last pass read it, here since.
+    const msSince = state && state.lastContentAt !== null ? state.now - state.lastContentAt + (now - run.readAt) : undefined
+    const gone = run.loading.gone()
+    return {
+      pace: 'fast',
+      fast: this.fastEvidence(goal, openAtStart, run, stalled.map((r) => this.pending(r, now))),
+      settled: reason === 'quiet',
+      waitedMs: now - startedAt,
+      reason,
+      pendingRequests: unanswered.map((r) => this.pending(r, now)),
+      ...(iframeDocuments.length ? { iframeDocuments: iframeDocuments.map((r) => this.pending(r, now)) } : {}),
+      ...(uncaused.length ? { uncaused } : {}),
+      ...(state && state.ambient.length ? { ambient: state.ambient } : {}),
+      ...(reason === 'timeout' && run.changed && state?.hot ? { domChangingIn: state.hot } : {}),
+      ...(msSince !== undefined ? { msSinceLastContentMutation: msSince } : {}),
+      ...(gone.length ? { busyWhileSettling: gone } : {}),
+    }
+  }
+
+  /**
+   * Endpoints that were already open when the action began: a re-poll of one is the page's
+   * background channel reconnecting, not the action's effect.
+   */
+  private openEndpoints(causalFrom: number): Set<string> {
+    return new Set(
+      this.requestLog
+        .filter((r) => this.clock.toLocal(r.chainIssuedAt) < causalFrom && (r.endedAt ?? Infinity) >= causalFrom)
+        .map((r) => `${r.method} ${r.url}`),
+    )
   }
 
   /** The action's own requests: the chain started at/after `causalFrom`, and not a re-poll of an endpoint already open then. */
@@ -1668,14 +1964,25 @@ export class PageWatch {
 
   /** Whether an open request is one a person would wait on, from Chrome's own facts about it. */
   private holdsQuiet(entry: RequestEntry, now: number): boolean {
+    return this.waitedOn(entry) && !this.stalledAsset(entry, now) && !this.undeliveredIframeDocument(entry, now)
+  }
+
+  /**
+   * Whether an open request is one a person would wait on by what it is, whatever its age: not a
+   * worker's script, an ad, traffic Chrome classifies as never awaited (NEVER_HOLDS) or an event stream.
+   */
+  private waitedOn(entry: RequestEntry): boolean {
     if (entry.workerScript) return false
     if (entry.endedAt !== undefined || entry.isAdRelated) return false
     const type = entry.resourceType
     if (type !== undefined && NEVER_HOLDS[type]) return false
-    if (entry.mimeType === EVENT_STREAM_MIME) return false
-    if (type !== undefined && STALLABLE[type] && now - (entry.lastDataAt ?? this.startOf(entry)) > STALLED_ASSET_MS) return false
-    if (this.undeliveredIframeDocument(entry, now)) return false
-    return true
+    return entry.mimeType !== EVENT_STREAM_MIME
+  }
+
+  /** An image, font or media request that received nothing for STALLED_ASSET_MS: a stalled asset, not the action's effect. */
+  private stalledAsset(entry: RequestEntry, now: number): boolean {
+    const type = entry.resourceType
+    return type !== undefined && STALLABLE[type] === true && now - (entry.lastDataAt ?? this.startOf(entry)) > STALLED_ASSET_MS
   }
 
   /** The iframe `entry` loads a document into, when it is an iframe's document request (not the main frame's). */
@@ -2002,6 +2309,14 @@ export class PageWatch {
       this.noteDocument(entry, state.token)
       return state
     })
+    return this.combineStates(reads, loading)
+  }
+
+  /**
+   * Frame journals' states, combined: counts summed, the newest change and journal install of any
+   * frame, the ambient elements and (with `loading`) the loading indicators of all, named by iframe.
+   */
+  private combineStates(reads: Array<{ handle: FrameEntry; value: WorldState }>, loading: boolean): ContentState {
     const combined: ContentState = { now: 0, installedAt: 0, lastContentAt: null, hot: null, ambient: [], content: 0, cosmetic: 0, loading: loading ? [] : null }
     let newest = -Infinity
     for (const { handle, value } of reads) {
@@ -2052,13 +2367,16 @@ export class PageWatch {
 
   /**
    * Call a method of a frame's in-page reader, installing the journal first if this world copy has
-   * none. Every call is a timed round trip that measures the browser's clock.
+   * none. Every call is a timed round trip that measures the browser's clock. `awaited`: the method
+   * answers with a promise (a fast-settle pass), and the browser's clock is read when it settles.
    */
-  private async callReader<T>(world: IsolatedWorld, call: string, timeoutMs: number, what: string): Promise<T> {
-    const expression = `globalThis.${READER} ? { now: Date.now(), ok: true, value: globalThis.${READER}.${call} } : { now: Date.now(), ok: false }`
+  private async callReader<T>(world: IsolatedWorld, call: string, timeoutMs: number, what: string, awaited = false): Promise<T> {
+    const expression = awaited
+      ? `globalThis.${READER} ? Promise.resolve(globalThis.${READER}.${call}).then(function (value) { return { now: Date.now(), ok: true, value: value } }) : { now: Date.now(), ok: false }`
+      : `globalThis.${READER} ? { now: Date.now(), ok: true, value: globalThis.${READER}.${call} } : { now: Date.now(), ok: false }`
     for (let attempt = 0; attempt < 2; attempt++) {
       const sentAt = Date.now()
-      const result = await world.evaluate<{ now: number; ok: boolean; value?: T }>(expression, { timeoutMs, what })
+      const result = await world.evaluate<{ now: number; ok: boolean; value?: T }>(expression, { timeoutMs, what, awaitPromise: awaited })
       this.clock.roundTrip(sentAt, result.now, Date.now())
       if (result.ok) return result.value as T
       // The world was created before start() registered the setup (setups only run in new copies).
@@ -2437,6 +2755,7 @@ export class PageWatch {
         previous.endedAt = arrivedAt
         this.noteEnd(previous, e.timestamp)
       }
+      this.answered(previous)
       previous.redirectedTo = entry.id
       entry.redirectedFrom = previous.id
     }
@@ -2471,6 +2790,7 @@ export class PageWatch {
     entry.headersAt = arrivedAt
     if (e.response.fromDiskCache || e.response.fromPrefetchCache) entry.fromCache = true
     this.noteResponse(entry, e.response)
+    this.answered(entry)
   }
 
   /** What a response (the final one, or a redirect's) says about its hop: status text, headers, protocol, server, timing. */
@@ -2510,6 +2830,7 @@ export class PageWatch {
     const entry = this.reportedBy(session, e.requestId)
     if (!entry || entry.endedAt !== undefined) return
     entry.endedAt = arrivedAt
+    this.answered(entry)
     this.noteEnd(entry, e.timestamp)
     if (!('errorText' in e)) {
       entry.facts.encodedBytes = e.encodedDataLength
@@ -2821,6 +3142,47 @@ export class PageWatch {
       clearTimeout(timer)
       this.dialogWaiters.delete(onChange)
     }
+  }
+
+  /** `work`, or CAPPED if the cap (a fast settle's one timer) comes first; a rejection of `work` after the cap is dropped. */
+  private async orCap<T>(work: Promise<T>, cap: Promise<typeof CAPPED>): Promise<T | typeof CAPPED> {
+    work.catch(() => {})
+    return await Promise.race([work, cap])
+  }
+
+  /**
+   * Until a state change: wake() (a dialog opened or closed, a navigation committed, the main frame
+   * stopped loading, the page closed during a fast settle, the watch was disposed), one of `answers`
+   * resolved, or CAPPED when the cap comes first.
+   */
+  private async untilWoken(cap: Promise<typeof CAPPED>, answers: Array<Promise<void>>): Promise<typeof CAPPED | 'woken'> {
+    const woken = Promise.withResolvers<'woken'>()
+    const onWake = (): void => woken.resolve('woken')
+    this.wakers.add(onWake)
+    try {
+      return await Promise.race([cap, woken.promise, ...answers.map((answer) => answer.then(() => 'woken' as const))])
+    } finally {
+      this.wakers.delete(onWake)
+    }
+  }
+
+  /** Resolves once `entry` is answered (Network.responseReceived, or a redirect response) or ends (loadingFinished, loadingFailed). */
+  private untilAnswered(entry: RequestEntry): Promise<void> {
+    if (entry.headersAt !== undefined || entry.endedAt !== undefined) return Promise.resolve()
+    let waiter = this.answerWaiters.get(entry)
+    if (!waiter) {
+      waiter = Promise.withResolvers<void>()
+      this.answerWaiters.set(entry, waiter)
+    }
+    return waiter.promise
+  }
+
+  /** `entry` was answered or ended: what awaits it goes on. */
+  private answered(entry: RequestEntry): void {
+    const waiter = this.answerWaiters.get(entry)
+    if (!waiter) return
+    this.answerWaiters.delete(entry)
+    waiter.resolve()
   }
 
   private async pause(ms: number): Promise<void> {

@@ -87,6 +87,12 @@ export interface HoverCrossing {
 }
 
 export interface HumanMoveResult {
+  /**
+   * `human`: the planned path below. `fast` (the driver of a fast-mode session): one move straight
+   * to `to` — no path was planned, so the Fitts and plan fields are 0, `submovements` is empty and
+   * `seed` is 0; `achievedDurationMs` and `probeDispatchMs` are that one move's round trip.
+   */
+  pace: 'human' | 'fast'
   from: Point
   to: Point
   /** What Fitts's law asked for (ms). */
@@ -476,8 +482,15 @@ export function createHumanMouseApi(options: {
   /** Where a ref's element is drawn (read over CDP). Without it, `{ ref }` is refused. */
   resolveRef?: (ref: number | string) => Promise<RefBoxes>
   defaults?: HumanMouseDefaults
+  /**
+   * `human` (default): every move follows a planned human path at a person's pace. `fast` (a
+   * fast-mode session): every move is one straight move to the target (see `moveStraight`); `plan`
+   * still returns the human plan.
+   */
+  pace?: 'human' | 'fast'
 }): HumanMouseApi {
   const { defaultPage, getCdpSession, resolveRef } = options
+  const pace = options.pace ?? 'human'
 
   // The seed counter makes consecutive moves in one session differ (a user does not trace
   // the identical arc twice) while staying reproducible: pass an explicit `seed` to pin a
@@ -522,12 +535,8 @@ export function createHumanMouseApi(options: {
     return creating
   }
 
-  async function buildPlan(moveOptions: HumanMoveOptions): Promise<{
-    trajectory: HumanTrajectory
-    page: Page
-    from: Point
-    to: Point
-  }> {
+  /** The page, start point and target of a move, before any path is planned. */
+  async function resolveMove(moveOptions: HumanMoveOptions): Promise<{ page: Page; from: Point; target: ResolvedTarget }> {
     if (moveOptions.ref !== undefined && moveOptions.locator) {
       throw new Error('humanMouse: pass { ref } or { locator }, not both.')
     }
@@ -547,6 +556,16 @@ export function createHumanMouseApi(options: {
       position: moveOptions.position,
     })
     const from = await resolveStartPoint({ page, explicit: moveOptions.from, getCdpSession })
+    return { page, from, target }
+  }
+
+  async function buildPlan(moveOptions: HumanMoveOptions): Promise<{
+    trajectory: HumanTrajectory
+    page: Page
+    from: Point
+    to: Point
+  }> {
+    const { page, from, target } = await resolveMove(moveOptions)
 
     const trajectory = planHumanTrajectory({
       from,
@@ -561,17 +580,87 @@ export function createHumanMouseApi(options: {
     return { trajectory, page, from, to: target.point }
   }
 
+  /** Arms the hover-crossing recorder when the move reports crossings. */
+  async function armCrossings(page: Page, moveOptions: HumanMoveOptions): Promise<{ world: IsolatedWorld; armedContextId: number } | undefined> {
+    if (!(moveOptions.reportCrossings ?? defaults.reportCrossings ?? false)) return undefined
+    const world = await hoverWorldFor(page)
+    return { world, armedContextId: await armHoverRecorder(world) }
+  }
+
+  /** The crossings the recorder saw, or undefined (with a warning) when a navigation lost them. */
+  async function collectCrossings(hover: { world: IsolatedWorld; armedContextId: number } | undefined, warnings: string[]): Promise<HoverCrossing[] | undefined> {
+    if (!hover) return undefined
+    const collection = await collectHoverRecorder(hover.world, hover.armedContextId)
+    if (collection.kind === 'collected') return collection.crossed
+    warnings.push(
+      'The page navigated during the move: the hover crossings recorded on the previous document were lost ' +
+        'with it, so `crossed` is unavailable for this move. Repeat the move after the navigation settles.',
+    )
+    return undefined
+  }
+
+  /**
+   * Fast pace: one move straight to the target, no planned path and no wall-clock pacing. It is
+   * Playwright's own `page.mouse.move` — one awaited `Input.dispatchMouseEvent` carrying the buttons
+   * Playwright pressed — so Playwright's pointer bookkeeping and the pointer track (its
+   * onMouseAction hook) follow it with no extra sync move. Its round trip is timed, so a throttled
+   * renderer is still told.
+   */
+  async function moveStraight(moveOptions: HumanMoveOptions): Promise<{ result: HumanMoveResult; page: Page }> {
+    const { page, from, target } = await resolveMove(moveOptions)
+    const to = target.point
+    const warnings: string[] = []
+    const hover = await armCrossings(page, moveOptions)
+    const ghostCursor = await playGhostCursorPath({ page, samples: [{ tMs: 0, x: to.x, y: to.y }] })
+    if (isGhostCursorShown(page) && !ghostCursor.playing) {
+      warnings.push('The ghost cursor overlay is shown on this page but did not play the path (page navigating or not ready).')
+    }
+    const startedAt = Date.now()
+    await page.mouse.move(to.x, to.y)
+    const achievedDurationMs = Date.now() - startedAt
+    const rendererThrottled = achievedDurationMs > THROTTLED_RENDERER_PROBE_MS
+    if (rendererThrottled) {
+      warnings.push(
+        `Renderer is throttled: one Input.dispatchMouseEvent acked in ${achievedDurationMs}ms (a tab the user can see acks in ~16ms). ` +
+          `The tab is probably not visible to the user: ${HIDDEN_TAB_EFFECT}`,
+      )
+    }
+    const crossed = await collectCrossings(hover, warnings)
+    const distancePx = Math.hypot(to.x - from.x, to.y - from.y)
+    const result: HumanMoveResult = {
+      pace: 'fast',
+      from,
+      to,
+      fittsDurationMs: 0,
+      plannedDurationMs: 0,
+      achievedDurationMs,
+      durationDriftMs: achievedDurationMs,
+      distancePx,
+      effectiveWidthPx: 0,
+      indexOfDifficultyBits: 0,
+      pathLengthPx: distancePx,
+      sampleCount: 1,
+      sampleRateHz: 0,
+      sampleRateReduced: false,
+      dispatchedEvents: 1,
+      submovements: [],
+      seed: 0,
+      probeDispatchMs: achievedDurationMs,
+      rendererThrottled,
+      ghostCursor,
+      crossed,
+      warnings,
+    }
+    return { result, page }
+  }
+
   async function move(moveOptions: HumanMoveOptions): Promise<{ result: HumanMoveResult; page: Page }> {
+    if (pace === 'fast') return await moveStraight(moveOptions)
     const { trajectory, page, from, to } = await buildPlan(moveOptions)
     const cdp = await getCdpSession({ page })
     const warnings: string[] = []
 
-    const reportCrossings = moveOptions.reportCrossings ?? defaults.reportCrossings ?? false
-    let hover: { world: IsolatedWorld; armedContextId: number } | undefined
-    if (reportCrossings) {
-      const world = await hoverWorldFor(page)
-      hover = { world, armedContextId: await armHoverRecorder(world) }
-    }
+    const hover = await armCrossings(page, moveOptions)
 
     // Probe BEFORE the move: one awaited dispatch at the starting point (a no-op position
     // change) tells us whether this renderer acks within a frame or is throttled to 1Hz.
@@ -625,20 +714,10 @@ export function createHumanMouseApi(options: {
       )
     }
 
-    let crossed: HoverCrossing[] | undefined
-    if (hover) {
-      const collection = await collectHoverRecorder(hover.world, hover.armedContextId)
-      if (collection.kind === 'collected') {
-        crossed = collection.crossed
-      } else {
-        warnings.push(
-          'The page navigated during the move: the hover crossings recorded on the previous document were lost ' +
-            'with it, so `crossed` is unavailable for this move. Repeat the move after the navigation settles.',
-        )
-      }
-    }
+    const crossed = await collectCrossings(hover, warnings)
 
     const result: HumanMoveResult = {
+      pace: 'human',
       from,
       to,
       fittsDurationMs: trajectory.fittsDurationMs,

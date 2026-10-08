@@ -4,8 +4,9 @@
  * policy refuses, with nothing marking it, costs a refused call and teaches the wrong habit.
  *
  * Each ```js block goes through the same static policy execute() applies. A refused block must say
- * `debug mode` in a comment, or be a first load of a blank tab (allowed on one, and saying so). A block
- * that does not parse must be a signature (`fn({ a?, b? })`), not a broken example.
+ * `debug mode` in a comment, say `fast mode` and pass fast mode's policy, or be a first load of a blank
+ * tab (allowed on one, and saying so). A block that does not parse must be a signature
+ * (`fn({ a?, b? })`), not a broken example.
  */
 
 import fs from 'node:fs'
@@ -53,7 +54,7 @@ describe('skill.md code examples and the human-mode policy', () => {
     expect(examples.length).toBeGreaterThan(80)
   })
 
-  it('runs every example as written in human mode, or marks it debug mode', () => {
+  it('runs every example as written in human mode, or marks it fast or debug mode', () => {
     const unmarked: string[] = []
     for (const example of examples) {
       // A signature line (`fn({ a?, b? })`, optional parameters written `name?`) is not code: it is
@@ -71,6 +72,7 @@ describe('skill.md code examples and the human-mode policy', () => {
       const verdict = checkPolicy(analysis, { mode: 'human', pageIsBlank: false })
       if (verdict.allowed) continue
       if (/\/\/[^\n]*debug mode/i.test(example.code)) continue
+      if (/\/\/[^\n]*fast mode/i.test(example.code) && checkPolicy(analysis, { mode: 'fast', pageIsBlank: false }).allowed) continue
       const onBlankTab = checkPolicy(analysis, { mode: 'human', pageIsBlank: true })
       if (onBlankTab.allowed && /\/\/[^\n]*blank tab/i.test(example.code)) continue
       unmarked.push(`line ${example.line} (${example.heading}): ${(verdict.refusal ?? '').replace(/\s+/g, ' ').slice(0, 240)}`)

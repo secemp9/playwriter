@@ -25,10 +25,16 @@ export class ModelFacingError extends Error {
  * (route/fulfill, DOM/style writes, synthetic events, direct API calls). Every input
  * action is followed by a settle and a "what changed" report.
  *
+ * `fast` — for testing on localhost: everything `debug` allows (multi-action scripts, page.route,
+ * init scripts, storage and DOM writes, raw Playwright), and act.* without human pacing — one
+ * straight pointer move, keys without delays, no pauses — with the same hit tests, cover and
+ * disabled checks, busy guard, dialog handling and reports. Its settle is event-driven
+ * (page-watch `pace: 'fast'`).
+ *
  * `debug` — everything allowed (multi-step scripts, network perturbation, DOM probes);
  * the same reports are still produced.
  */
-export type PolicyMode = 'human' | 'debug'
+export type PolicyMode = 'human' | 'fast' | 'debug'
 
 /** Something on the page that tells a person "it is still working, wait". */
 export interface BusySignal {
@@ -223,13 +229,15 @@ export interface PendingRequest {
   answered?: true
 }
 
-export interface SettleResult {
+/** What a settle step found, at either pace. */
+export interface SettleOutcome {
   settled: boolean
   waitedMs: number
   /**
-   * quiet — DOM content and network both quiet for their windows (and, for waitForIdle,
-   * no strong busy signal). timeout — the cap was reached. js-dialog — a native dialog
-   * blocks the page. page-closed — the page went away.
+   * quiet — settled: at human pace DOM content and network both quiet for their windows (and,
+   * for waitForIdle, no strong busy signal); at fast pace a whole pass with no new content
+   * mutation and no caused request awaiting its answer. timeout — the cap was reached.
+   * js-dialog — a native dialog blocks the page. page-closed — the page went away.
    */
   reason: 'quiet' | 'timeout' | 'js-dialog' | 'page-closed'
   pendingRequests: PendingRequest[]
@@ -268,3 +276,38 @@ export interface SettleResult {
   /** The open dialog when reason is js-dialog. */
   dialog?: JsDialogState
 }
+
+/**
+ * The evidence a fast settle's verdict rests on (page-watch `settle({ pace: 'fast' })`). It has no
+ * quiet windows: it lets every readable frame's page run the work it has queued and reads what that
+ * work did, and it awaits the requests the action caused by their own CDP events.
+ */
+export interface FastSettleEvidence {
+  /**
+   * Passes run. In a pass every readable frame's page runs `roundTrips` MessageChannel round trips
+   * (its queued tasks, and the microtasks after each) while its journal's MutationObserver watches;
+   * the first content mutation ends the pass and starts another. Settled: the last pass ended with
+   * no content mutation and no caused request awaiting its answer.
+   */
+  passes: number
+  /** MessageChannel round trips in a whole pass. */
+  roundTrips: number
+  /**
+   * From the end of the input to the verdict, ms. Work the page starts later on a timer (a debounced
+   * search, `setTimeout(…, 300)`, a reply ticking in on an interval) was not waited for.
+   */
+  coveredMs: number
+  /**
+   * Requests the action caused whose server answered (response headers) and whose body was still
+   * open at the verdict: a long-poll or a stream. Not waited for.
+   */
+  openStreams?: PendingRequest[]
+  /**
+   * At the cap: unanswered requests for images, fonts or media that received nothing for 3 s
+   * (page-watch STALLED_ASSET_MS) — a stalled asset, told apart from a server that has not answered.
+   */
+  stalledAssets?: PendingRequest[]
+}
+
+/** `pace` says how the step waited: `human` with quiet windows, `fast` on evidence (see FastSettleEvidence). */
+export type SettleResult = (SettleOutcome & { pace: 'human' }) | (SettleOutcome & { pace: 'fast'; fast: FastSettleEvidence })

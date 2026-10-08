@@ -505,6 +505,11 @@ export interface ExecuteRun {
    * print is the settled page the report describes, not a page caught halfway through loading.
    */
   settleForRead?: () => Promise<void>
+  /**
+   * Tabs and downloads the tabs this call watches have opened so far. None before the action scope
+   * starts watching (beginActionScope replaces this with its own count).
+   */
+  openings: () => number
 }
 
 /** What the executor tracks between "before the code ran" and the action report. */
@@ -580,6 +585,21 @@ function idleExecuteRun(): ExecuteRun {
     probeOutput: [],
     actActivity: { depth: 0 },
     rawActions: [],
+    openings: () => 0,
+  }
+}
+
+/**
+ * Fast mode, several actions in one call: the reports act already made for earlier actions
+ * (ActionRecord.report) in order, the records the call's own report still covers (after the last of
+ * them), and where that last one ended — the call's report starts there.
+ */
+function reportedSplit(records: ActionRecord[]): { reports: string[]; rest: ActionRecord[]; since: ActionRecord['report'] } {
+  const last = records.findLastIndex((record) => record.report !== undefined)
+  return {
+    reports: records.slice(0, last + 1).flatMap((record) => (record.report ? [record.report.text] : [])),
+    rest: records.slice(last + 1),
+    since: last >= 0 ? records[last].report : undefined,
   }
 }
 
@@ -799,18 +819,20 @@ export interface ExecutorOptions {
   cloudSession?: CloudSessionInfo
   /**
    * `human` (default): one input action per call, no goto/reload after the first load, no forced
-   * state, every action followed by a settle + "what changed" report. `debug`: everything allowed.
+   * state, every action followed by a settle + "what changed" report. `fast`: everything debug
+   * allows, act.* without human pacing, an event-driven settle and a report per action — for
+   * testing on localhost. `debug`: everything allowed.
    * Falls back to the PLAYWRITER_POLICY environment variable, then `human`.
    */
   policy?: PolicyMode
 }
 
-/** PLAYWRITER_POLICY=human|debug, or undefined when unset. Anything else is a configuration error. */
+/** PLAYWRITER_POLICY=human|fast|debug, or undefined when unset. Anything else is a configuration error. */
 export function policyFromEnv(): PolicyMode | undefined {
   const raw = process.env.PLAYWRITER_POLICY
   if (raw === undefined || raw === '') return undefined
-  if (raw === 'human' || raw === 'debug') return raw
-  throw new Error(`PLAYWRITER_POLICY must be "human" or "debug" (got ${JSON.stringify(raw)}).`)
+  if (raw === 'human' || raw === 'fast' || raw === 'debug') return raw
+  throw new Error(`PLAYWRITER_POLICY must be "human", "fast" or "debug" (got ${JSON.stringify(raw)}).`)
 }
 
 function isRegExp(value: any): value is RegExp {
@@ -3282,10 +3304,12 @@ export class PlaywrightExecutor {
 
       // Human pointer motion. OFF unless called: a real trajectory fires mouseover on
       // everything it crosses, which is a behaviour change, not a visual nicety. act.* drives
-      // the driver itself; sandbox code gets `humanMouse` below.
+      // the driver itself; sandbox code gets `humanMouse` below. In a fast-mode session every
+      // move is one straight move to the target (no human pacing), act's and humanMouse's alike.
       const humanMouseDriver = createHumanMouseApi({
         defaultPage: page,
         getCdpSession: getCDPSession,
+        pace: self.policy === 'fast' ? 'fast' : 'human',
         // A ref's element is measured over CDP (content quads, mapped through its iframes), clipped
         // to the viewport: nothing runs in the page.
         resolveRef: async (ref) => {
@@ -3657,6 +3681,7 @@ export class PlaywrightExecutor {
             await self.noteCutDuringCall(run)
             return self.debuggerCuts.wasCut(target)
           },
+          openings: () => run.openings(),
         }),
         ),
       )
@@ -3687,6 +3712,7 @@ export class PlaywrightExecutor {
         const result = await probe.watch.settle({
           since: run.start?.page === target ? run.start.checkpoint : probe.watch.checkpoint(),
           timeoutMs: options.timeout ?? 30_000,
+          pace: self.settlePace(),
         })
         const minWait = options.minWait ?? 0
         if (result.settled && Date.now() - startedAt < minWait) {
@@ -4584,6 +4610,7 @@ export class PlaywrightExecutor {
       watchFailures: [],
       detach: async () => {},
     }
+    run.openings = () => scope.popups.length + scope.downloads.length
 
     const instrumentation = clientInstrumentationOf(page)
     const outgoing = outgoingCallsOf(page)
@@ -4779,19 +4806,26 @@ export class PlaywrightExecutor {
     return this.debuggerCuts.wasCut(page) ? 'Chrome took the debugger off the tab (DEBUGGER CUT above)' : 'the page was closed'
   }
 
+  /** How this session's settles wait: event-driven in fast mode (page-watch `pace: 'fast'`), quiet windows otherwise. */
+  private settlePace(): 'human' | 'fast' {
+    return this.policy === 'fast' ? 'fast' : 'human'
+  }
+
   /**
    * The settle the action report waits for after the input sent so far: on the tab the first input
    * went to, causes counted from the journal position right before it, quiet measured from the end
    * of the last one. It is kept for the run until more input is sent, so a read the code makes after
    * an action (observe(), find(), readPage(), …) waits for the very settle the report then shows,
-   * and the report does not wait a second time.
+   * and the report does not wait a second time. In fast mode it covers what act's own reports of
+   * earlier actions did not (reportedSplit), and waits at the fast pace.
    */
   private async settleActions(scope: ActionScope, run: ExecuteRun): Promise<ActionSettle> {
-    const dispatchedRecords = run.actRecords.filter((record) => record.dispatched)
+    const { rest, since } = reportedSplit(run.actRecords)
+    const dispatchedRecords = rest.filter((record) => record.dispatched)
     const endings = dispatchedRecords.map((record) => record.endedAt).filter((endedAt) => endedAt > 0)
     if (run.rawEndedAt !== undefined) endings.push(run.rawEndedAt)
     const origin = endings.length > 0 ? Math.max(...endings) : undefined
-    const key = `${dispatchedRecords.length}/${run.rawActions.length}/${origin}`
+    const key = `${run.actRecords.length - rest.length}/${dispatchedRecords.length}/${run.rawActions.length}/${origin}`
     const held = this.actionSettles.get(run)
     if (held?.key === key) return await held.outcome
     const outcome = (async (): Promise<ActionSettle> => {
@@ -4800,14 +4834,18 @@ export class PlaywrightExecutor {
       const firstRaw = scope.rawTargets.values().next().value
       const rawFirst = firstRaw !== undefined && (!first?.checkpoint || firstRaw.at < first.checkpoint.at)
       const firstPage = !rawFirst && first?.targetId ? this.probes.pageOf(first.targetId) : null
-      const reportPage = rawFirst ? firstRaw.page : (firstPage ?? scope.page)
+      // Where act's last report of an earlier action ended: this report starts there, not before the code.
+      const sincePage = since ? this.probes.pageOf(since.targetId) : null
+      const reportPage = rawFirst ? firstRaw.page : (firstPage ?? sincePage ?? scope.page)
       // The pre-code picture is of the controlled tab only: another tab the code acted on has no
       // "before", so its report has no diff and makes no claim that nothing changed.
       const baseline: ActionSettle['baseline'] = rawFirst
-        ? { before: firstRaw.page === scope.page ? scope.codeBefore : null, checkpoint: firstRaw.checkpoint }
+        ? { before: since ? (sincePage === firstRaw.page ? since.after : null) : firstRaw.page === scope.page ? scope.codeBefore : null, checkpoint: firstRaw.checkpoint }
         : first
           ? { before: first.before ?? null, checkpoint: first.checkpoint ?? null }
-          : { before: scope.codeBefore, checkpoint: scope.checkpoint }
+          : since
+            ? { before: since.after, checkpoint: since.checkpoint }
+            : { before: scope.codeBefore, checkpoint: scope.checkpoint }
 
       let probe: PageProbe | null = null
       let probeError: string | undefined
@@ -4834,6 +4872,7 @@ export class PlaywrightExecutor {
             since: baseline.checkpoint ?? scope.checkpoint,
             origin,
             timeoutMs: Math.min(5000, Math.max(1500, remaining - 1000)),
+            pace: this.settlePace(),
           })
         } catch (error) {
           settleError = await this.explainFailure(error, reportPage)
@@ -4855,9 +4894,13 @@ export class PlaywrightExecutor {
    * and the quiet windows start when the last input ended. Every section that fails says so on its own
    * line (`NOT SETTLED — …`, `EVENTS UNAVAILABLE — …`, `AFTER-STATE UNAVAILABLE — …`); the records
    * and everything else are still reported.
+   *
+   * Fast mode, several actions in one call: act has made the reports of the earlier actions as the
+   * next one started (ActionRecord.report); they come first, in order, and this report covers the
+   * rest — from where the last of them ended.
    */
   private async finishActionScope({ scope, run, context }: { scope: ActionScope; run: ExecuteRun; context: BrowserContext }): Promise<string> {
-    const records = run.actRecords
+    const { reports, rest: records } = reportedSplit(run.actRecords)
     const dispatchedRecords = records.filter((record) => record.dispatched)
     // Refused before anything reached the page (busy, covered, stale ref, disabled): the report is
     // the refusal alone. A settle and diff here would credit the page's own changes to an action
@@ -4869,7 +4912,7 @@ export class PlaywrightExecutor {
       records.some((record) => (record.kind === 'waitForIdle' || record.kind === 'wait') && record.ok)
     if (!dispatched) {
       await scope.detach()
-      return renderActionReport({
+      const refusal = renderActionReport({
         records,
         rawInputs: run.rawActions,
         settle: null,
@@ -4880,6 +4923,7 @@ export class PlaywrightExecutor {
         downloads: [],
         fileDialogs: [...(await this.fileDialogLines(scope)).lines, ...scope.watchFailures.map((failure) => `watch: ${failure}`)],
       })
+      return [...reports, refusal].join('\n\n')
     }
 
     const { reportPage, baseline, probe, probeError, settle, settleError } = await this.settleActions(scope, run)
@@ -5026,22 +5070,25 @@ export class PlaywrightExecutor {
 
     const fileDialogs = [...dialogs.lines, ...scope.watchFailures.map((failure) => `watch: ${failure}`)]
 
-    return renderActionReport({
-      records,
-      rawInputs,
-      settle,
-      settleError,
-      events,
-      eventsError,
-      after,
-      afterError,
-      diff,
-      newTabs,
-      downloads,
-      fileDialogs,
-      changed,
-      shifts,
-    })
+    return [
+      ...reports,
+      renderActionReport({
+        records,
+        rawInputs,
+        settle,
+        settleError,
+        events,
+        eventsError,
+        after,
+        afterError,
+        diff,
+        newTabs,
+        downloads,
+        fileDialogs,
+        changed,
+        shifts,
+      }),
+    ].join('\n\n')
   }
 
   /**
@@ -5096,6 +5143,7 @@ export class PlaywrightExecutor {
       probeOutput: [],
       actActivity: { depth: 0 },
       rawActions: [],
+      openings: () => 0,
     }
     let scope: ActionScope | null = null
     let reportText = ''

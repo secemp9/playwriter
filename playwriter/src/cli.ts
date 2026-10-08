@@ -381,7 +381,7 @@ interface BrowserOption {
 }
 
 /**
- * The session's human/debug policy as the CLI user chose it: `--policy`, else PLAYWRITER_POLICY.
+ * The session's human/fast/debug policy as the CLI user chose it: `--policy`, else PLAYWRITER_POLICY.
  * Absent means the relay's default (human). It travels in the session-creation request because the
  * relay is a separate, long-lived process whose own environment belongs to whoever started it.
  */
@@ -403,12 +403,12 @@ cli
   .option('--disable-proxy-bandwidth-acceleration', 'Allow loading images, video, and fonts when proxy is enabled (they are blocked by default to save proxy bandwidth)')
   .option(
     '--policy <policy>',
-    'human (default): one input action per call, no page.goto after the first load, no faked conditions, a settle + "what changed" report after every action. debug: everything allowed',
+    'human (default): one input action per call, no page.goto after the first load, no faked conditions, a settle + "what changed" report after every action. fast: for testing on localhost — everything debug allows, act.* without human pacing, an event-driven settle and a report per action. debug: everything allowed',
   )
   .action(async (options) => {
     if (options.policy !== undefined) {
-      if (options.policy !== 'human' && options.policy !== 'debug') {
-        console.error(`--policy must be "human" or "debug" (got ${JSON.stringify(options.policy)})`)
+      if (options.policy !== 'human' && options.policy !== 'fast' && options.policy !== 'debug') {
+        console.error(`--policy must be "human", "fast" or "debug" (got ${JSON.stringify(options.policy)})`)
         process.exit(1)
       }
       process.env.PLAYWRITER_POLICY = options.policy

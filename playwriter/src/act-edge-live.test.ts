@@ -167,7 +167,7 @@ describe("Chrome's colour chooser that does not open", () => {
     const result = await executor.execute(`await act.fill(${colour}, '#ff0000')`, 60000)
     expect(result.isError).toBe(true)
     expect(result.text).toContain(
-      `Clicked [${colour}] colorwell "Favourite colour", but Chrome's colour chooser did not open: 1 s later it is still closed, and the input reads #000000. ` +
+      `Clicked [${colour}] colorwell "Favourite colour", but Chrome's colour chooser did not open: it was still closed once the click was done, and the input reads #000000. ` +
         'Chrome does not open it in a tab behind another one: if this tab is not in front, page.bringToFront() brings it there, then call act.fill again. ' +
         `explain(${colour}) shows whether the page itself listens for clicks on it.`,
     )

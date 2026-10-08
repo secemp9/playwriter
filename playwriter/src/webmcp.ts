@@ -511,8 +511,9 @@ export function createWebMcpApi(deps: WebMcpDeps): WebMcpApi {
     )
   }
 
+  /** The busy guard of human and fast mode (act's): no tool runs while the page shows a strong busy signal. */
   async function busyGuard(probe: ActProbe, whileBusy: boolean | undefined): Promise<void> {
-    if (deps.mode !== 'human' || whileBusy) return
+    if (deps.mode === 'debug' || whileBusy) return
     const last = [...probe.history].reverse().find((record) => record.dispatched)
     const signals = await probe.watch.busySignals({ since: last?.checkpoint })
     const busy = signals.filter((signal) => signal.strength === 'strong' && BLOCKING_BUSY_KINDS.has(signal.kind))

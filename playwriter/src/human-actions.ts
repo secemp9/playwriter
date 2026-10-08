@@ -66,7 +66,7 @@ import {
   type WatchEvents,
 } from './probe-types.js'
 import type { Observation, ObservationDiff, ObservedElement, SemanticContainer, TextBlock } from './page-observe.js'
-import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, describeIframe, iframeRef, liveContext, renderObservationDiff } from './page-observe.js'
+import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, describeIframe, diffObservations, iframeRef, liveContext, renderObservationDiff } from './page-observe.js'
 import { CLICK_LABEL_FN } from './label-control.js'
 import { EDITOR_BLOCK_FN, EDITOR_CARET_BLOCK_FN, EDITOR_PARTS_FN, type EditorBlockFacts } from './editor-block.js'
 import { REACHES_TARGET_FN } from './composed-hit.js'
@@ -265,6 +265,14 @@ export interface ActionRecord {
   repeatKey?: string
   /** scroll only: how far the scroller moved, in CSS px (0 when it did not move). */
   scrollMoved?: number
+  /**
+   * Fast mode, several actions in one call: the report of the records from the previous report up
+   * to this one — their ACTION lines, a fast SETTLED line, their events and change list — made when
+   * the call's next input action started. The call's report prints it in their place, in order.
+   * `after` and `checkpoint` are where it ended, on tab `targetId`: the picture and journal position
+   * the next report starts from.
+   */
+  report?: { text: string; after: Observation; checkpoint: WatchCheckpoint; targetId: string }
 }
 
 /** What act needs from the executor's per-page probe. The executor's PageProbe satisfies it structurally. */
@@ -331,6 +339,12 @@ export interface ActDeps {
    * false for a tab that really closed, and always in a launched browser.
    */
   debuggerCut: (page: Page) => Promise<boolean>
+  /**
+   * Tabs and downloads the tabs this call watches have opened so far (the executor's action scope).
+   * Fast mode makes a report of its own for an action only when it opened none: those lines come
+   * with the call's report.
+   */
+  openings: () => number
 }
 
 export interface ClickOptions {
@@ -1128,6 +1142,157 @@ const COLOUR_INPUT_FN = `function(_args, el) {
 const KEY_MEAN_MS = 70
 
 /**
+ * What one key typed with no pacing costs (fast mode), for refusing typing that cannot finish in
+ * the call: Playwright's keyboard.type sends a key as two awaited Input.dispatchKeyEvent (keyDown
+ * with its text, keyUp). Measured on Chrome 145 headless: 2.5–2.9 ms per key; through the relay
+ * and the extension each Input.dispatchKeyEvent acks in ~4.8 ms (human-mouse-driver.ts), ~10 ms a key.
+ */
+const FAST_KEY_MS = 10
+
+/**
+ * Fast mode: the held-button moves of a drag, evenly spaced along the straight line. Measured on
+ * Chrome 145 headless with an HTML drag (draggable=true), 5 of 5: Chrome's Input.dragIntercepted
+ * arrives after the first held move's ack and before the second's, so with two or more moves the
+ * drag data is in before the last ack — nothing has to be waited for. Five also give pointer-driven
+ * drags (sliders, sortable lists) the several pointermoves their libraries look for.
+ */
+const FAST_DRAG_MOVES = 5
+
+/**
+ * The cap on waiting for a wheel or swipe to finish scrolling (SCROLL_WATCH_AWAIT_JS), labelled as a
+ * cap: requestAnimationFrame does not run in a tab the user cannot see, and a smooth scroll that
+ * never ends must not hang the action. The same 900 ms the position polls it replaced allowed.
+ */
+const SCROLL_WAIT_CAP_MS = 900
+
+/**
+ * Armed in the scroller's frame's isolated world right before a wheel or swipe: notes a `scroll`
+ * and a `scrollend` of anything in that document (capture listeners on the window see the
+ * document's and every element's). Page scripts cannot see an isolated world's listeners.
+ */
+const SCROLL_WATCH_ARM_JS = `(() => {
+  const key = '__playwriterScrollWatch'
+  if (globalThis[key]) globalThis[key].off()
+  const watch = { scrolled: false, ended: false, onEnd: null, off: null }
+  const onScroll = () => { watch.scrolled = true }
+  const onEnd = () => { watch.ended = true; if (watch.onEnd) watch.onEnd() }
+  addEventListener('scroll', onScroll, { capture: true, passive: true })
+  addEventListener('scrollend', onEnd, { capture: true, passive: true })
+  watch.off = () => {
+    removeEventListener('scroll', onScroll, { capture: true })
+    removeEventListener('scrollend', onEnd, { capture: true })
+  }
+  globalThis[key] = watch
+  return true
+})()`
+
+/**
+ * After the wheel or swipe was acknowledged: resolves 'ended' at the scroll's `scrollend`, 'none'
+ * when by the second animation frame no `scroll` started (the input moved nothing), 'cap' at
+ * SCROLL_WAIT_CAP_MS, 'unarmed' in a document the watch was not armed in (it navigated). Measured
+ * on Chrome 145 headless, 12 of 12 wheels of 300–3000 px: the scroll and its scrollend both fire
+ * before the first animation frame after the wheel's ack; a wheel that cannot scroll fires neither.
+ */
+const SCROLL_WATCH_AWAIT_JS = `(() => {
+  const key = '__playwriterScrollWatch'
+  const watch = globalThis[key]
+  if (!watch) return 'unarmed'
+  const { promise, resolve } = Promise.withResolvers()
+  let done = false
+  const finish = (how) => {
+    if (done) return
+    done = true
+    watch.off()
+    if (globalThis[key] === watch) delete globalThis[key]
+    resolve(how)
+  }
+  if (watch.ended) {
+    finish('ended')
+    return promise
+  }
+  watch.onEnd = () => finish('ended')
+  let frames = 0
+  const tick = () => {
+    if (done) return
+    frames += 1
+    if (!watch.scrolled && frames >= 2) return finish('none')
+    requestAnimationFrame(tick)
+  }
+  requestAnimationFrame(tick)
+  // The cap (SCROLL_WAIT_CAP_MS), a real timer on purpose: frames stop in a hidden tab.
+  setTimeout(() => finish('cap'), ${SCROLL_WAIT_CAP_MS})
+  return promise
+})()`
+
+/**
+ * After a click meant to toggle `el`: resolves true once it reads `wanted` (a native control's
+ * checked state, else aria-checked), false at the cap. Re-read at each change of it: its `input`
+ * and `change` events and every mutation of its subtree's attributes and text. Measured on Chrome
+ * 145: a native checkbox reads toggled right after the click's ack, so this only waits for a page
+ * that toggles later (an app that sets the state after a request).
+ */
+const CHECKED_WHEN_FN = `function(args, el) {
+  if (!el || !el.isConnected) return Promise.resolve(false)
+  const read = () => {
+    const native = el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')
+    if (native) return el.indeterminate ? 'mixed' : el.checked
+    const aria = el.getAttribute('aria-checked')
+    return aria === 'mixed' ? 'mixed' : aria === 'true'
+  }
+  if (read() === args.wanted) return Promise.resolve(true)
+  const { promise, resolve } = Promise.withResolvers()
+  let done = false
+  const observer = new MutationObserver(() => check())
+  const finish = (value) => {
+    if (done) return
+    done = true
+    observer.disconnect()
+    el.removeEventListener('input', check, true)
+    el.removeEventListener('change', check, true)
+    resolve(value)
+  }
+  function check() { if (read() === args.wanted) finish(true) }
+  observer.observe(el, { attributes: true, subtree: true, childList: true, characterData: true })
+  el.addEventListener('input', check, true)
+  el.addEventListener('change', check, true)
+  // The cap (CHECKED_WAIT_CAP_MS), a real timer on purpose: a page that never toggles must not hang the action.
+  setTimeout(() => finish(false), args.capMs)
+  return promise
+}`
+
+/** The cap on CHECKED_WHEN_FN, labelled as a cap: the 1200 ms the poll it replaced allowed. */
+const CHECKED_WAIT_CAP_MS = 1200
+
+/** How long a choice in a select is watched after it was made (confirmChoice): a person's glance. */
+const SELECT_WATCH_MS = 500
+
+/**
+ * Resolves 'changed' at the next change of select `el` — its `input` or `change` event, or a
+ * mutation of its subtree (options, attributes, text) — and 'cap' after `args.capMs`.
+ */
+const SELECT_CHANGE_FN = `function(args, el) {
+  if (!el || !el.isConnected) return Promise.resolve('changed')
+  const { promise, resolve } = Promise.withResolvers()
+  let done = false
+  const observer = new MutationObserver(() => finish('changed'))
+  const onEvent = () => finish('changed')
+  function finish(how) {
+    if (done) return
+    done = true
+    observer.disconnect()
+    el.removeEventListener('input', onEvent, true)
+    el.removeEventListener('change', onEvent, true)
+    resolve(how)
+  }
+  observer.observe(el, { attributes: true, subtree: true, childList: true, characterData: true })
+  el.addEventListener('input', onEvent, true)
+  el.addEventListener('change', onEvent, true)
+  // The end of the watch window (SELECT_WATCH_MS), a real timer on purpose: it is how long a glance lasts.
+  setTimeout(() => finish('cap'), args.capMs)
+  return promise
+}`
+
+/**
  * Chrome's ignoredReasons (Accessibility.AXNode) that mean a person cannot use the element right
  * now. The other reasons (uninteresting, presentational, label containers, empty alt/text) only
  * mean the node adds nothing to the accessibility tree; the element itself is usable.
@@ -1318,6 +1483,36 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   const remainingMs = (): number => deps.deadlineAt - Date.now()
+
+  /**
+   * A fast-mode session (the model chose it for testing on localhost): no human pacing. Every pause
+   * a person takes is skipped, keys go out without delays, the pointer moves straight (the driver's
+   * pace); every check stays.
+   */
+  const fast = deps.mode === 'fast'
+
+  /** A person's pause of `min`–`max` ms; none in fast mode. */
+  async function pause(min: number, max: number): Promise<void> {
+    if (fast) return checkAbort()
+    await sleep(randomBetween(min, max))
+  }
+
+  /**
+   * Arm the scroll watch (SCROLL_WATCH_ARM_JS) in `world` before a wheel or swipe; the function it
+   * returns waits, after the input, until the scroll it started ended or none started
+   * (SCROLL_WATCH_AWAIT_JS, capped). A native dialog the page opens meanwhile ends the wait at once:
+   * nothing in a frozen page can be read.
+   */
+  async function watchScroll(probe: ActProbe, world: IsolatedWorld, record: ActionRecord): Promise<() => Promise<void>> {
+    await world.evaluate<boolean>(SCROLL_WATCH_ARM_JS, { what: 'arming the scroll watch' })
+    return async () => {
+      await untilDialog(
+        probe,
+        world.evaluate<string>(SCROLL_WATCH_AWAIT_JS, { awaitPromise: true, timeoutMs: SCROLL_WAIT_CAP_MS + CDP_TIMEOUT_MS, what: 'waiting for the scroll to end' }),
+        record,
+      )
+    }
+  }
 
   async function send<T>(cdp: ICDPSession, method: string, params: object | undefined, what: string): Promise<T> {
     return (await withDeadline(cdp.send(method as never, params as never) as Promise<unknown>, CDP_TIMEOUT_MS, what)) as T
@@ -1539,24 +1734,6 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /**
-   * The target's position once smooth scrolling has come to rest: two equal readings 50ms apart,
-   * at most ~900ms. Measuring right after a wheel event reads the start of an animation, which is
-   * how a working wheel gets mistaken for one the page ignores.
-   */
-  async function restingPosition(probe: ActProbe, target: RefTarget): Promise<Rect | null> {
-    let last: Rect | null = null
-    const deadline = Date.now() + 900
-    for (;;) {
-      const now = (await quadsOf(probe, target))[0] ?? null
-      if (!now) return null
-      if (last && Math.abs(now.x - last.x) < 0.5 && Math.abs(now.y - last.y) < 0.5) return now
-      if (Date.now() > deadline) return now
-      last = now
-      await sleep(50)
-    }
-  }
-
-  /**
    * A finger swipe from `at` (a point over the scroller the input reaches) that scrolls about
    * (scrollX, scrollY) px, positive down/right: the finger moves the other way, at most `limit` px
    * and 60% of the screen, never off it (touch-input.ts). What really moved is the caller's to measure.
@@ -1653,20 +1830,28 @@ export function createActApi(deps: ActDeps): ActApi {
       // The plan's point is in the frame's own viewport.
       const at = inIframe ? onScreen({ ...plan.point, width: 0, height: 0 }, await probe.frames.box(target.frameId)) : plan.point
       const before = rects[0]
-      const stepY = Math.sign(plan.dy) * Math.min(Math.abs(plan.dy), randomBetween(220, 460))
-      const stepX = Math.sign(plan.dx) * Math.min(Math.abs(plan.dx), randomBetween(160, 320))
+      // Fast mode: the whole way in one wheel turn — measured on Chrome 145 headless, one mouseWheel
+      // event of up to 15000 px scrolls all of it, and the plan never asks past what the scroller holds.
+      const stepY = fast ? plan.dy : Math.sign(plan.dy) * Math.min(Math.abs(plan.dy), randomBetween(220, 460))
+      const stepX = fast ? plan.dx : Math.sign(plan.dx) * Math.min(Math.abs(plan.dx), randomBetween(160, 320))
       record.dispatched = true
+      // Measured where the scroll has ended (or none started): right after the input, an animation
+      // would still be at its start, which is how a working wheel gets mistaken for one the page ignores.
+      let scrollEnded: () => Promise<void>
       if (isTouchPage(page)) {
         // A touch screen has no wheel and no pointer over the page: a person swipes from that point.
+        scrollEnded = await watchScroll(probe, frame.world, record)
         await swipe(step, at, stepX, stepY)
       } else {
         if (!pointerAt || Math.hypot(pointerAt.x - at.x, pointerAt.y - at.y) > 4) {
           await deps.humanMouse.moveTo({ page, x: at.x, y: at.y })
           pointerAt = { x: at.x, y: at.y }
         }
+        scrollEnded = await watchScroll(probe, frame.world, record)
         await page.mouse.wheel(stepX, stepY)
       }
-      const after = await restingPosition(probe, target)
+      await scrollEnded()
+      const after = (await quadsOf(probe, target))[0] ?? null
       if (!after) {
         throw new ActError(`${describeTarget(target)} stopped being rendered while scrolling to it. Call observe() again.`)
       }
@@ -1690,7 +1875,7 @@ export function createActApi(deps: ActDeps): ActApi {
         idleWheels = 0
         scrolled.set(label, (scrolled.get(label) ?? 0) + moved)
       }
-      await sleep(randomBetween(40, 110))
+      await pause(40, 110)
     }
     throw new ActError(
       `Could not bring ${describeTarget(target)} into view after 40 wheel flicks: it keeps moving away (an infinite list or a layout that ` +
@@ -1858,7 +2043,7 @@ export function createActApi(deps: ActDeps): ActApi {
     return ` To press that spot anyway (it lands on what is on top): { ref: ${coverTarget.ref}, x: ${spot.x}, y: ${spot.y} }.`
   }
 
-  /** Refuse what the page's state forbids now. Returns the busy read it made (human mode's busy guard), for the before-picture. */
+  /** Refuse what the page's state forbids now. Returns the busy read it made (the busy guard of human and fast mode), for the before-picture. */
   async function guard(probe: ActProbe, kind: ActKind, options: { whileBusy?: boolean } = {}): Promise<BusyRead | undefined> {
     checkAbort()
     const dialog = probe.dialogs.current()
@@ -1878,7 +2063,7 @@ export function createActApi(deps: ActDeps): ActApi {
         )
       }
     }
-    if (deps.mode === 'human' && BUSY_GUARDED_KINDS[kind] && !options.whileBusy) {
+    if (deps.mode !== 'debug' && BUSY_GUARDED_KINDS[kind] && !options.whileBusy) {
       const read = await probe.watch.readBusy({ since: lastDispatched(probe)?.checkpoint })
       const busy = read.signals.filter((s) => s.strength === 'strong' && BLOCKING_BUSY_KINDS.has(s.kind))
       if (busy.length > 0) {
@@ -2003,6 +2188,54 @@ export function createActApi(deps: ActDeps): ActApi {
     return target
   }
 
+  /** How many tabs and downloads the call had opened when each record started (deps.openings). */
+  const openingsAtStart = new WeakMap<ActionRecord, number>()
+
+  /**
+   * Fast mode, several actions in one call: when an input action starts, the records since the last
+   * report (the previous action, and any wait between) get a report of their own — a fast settle
+   * (page-watch `pace: 'fast'`), their events, a fresh look and the change list against the first
+   * action's before-picture — so each action's report is printed in order. The last action's report
+   * is the call's, as always. Not made (the call's report then covers these records) when it could
+   * not be told apart or read: raw Playwright input in the call, actions run concurrently, a tab or
+   * download they opened (those lines come with the call's report), a native dialog on the page or
+   * the page closed. Returns where it ended — the next action's before-picture and checkpoint.
+   */
+  async function reportEarlier(current: ActionRecord): Promise<(NonNullable<ActionRecord['report']> & { page: Page }) | null> {
+    if (!fast || UNCOUNTED_KINDS[current.kind] || deps.rawActions.length > 0 || deps.activity.depth !== 1) return null
+    const at = deps.records.indexOf(current)
+    const from = deps.records.findLastIndex((record, index) => index < at && record.report !== undefined) + 1
+    const records = deps.records.slice(from, at)
+    const dispatched = records.filter((record) => record.dispatched)
+    const first = dispatched[0]
+    if (!first?.targetId || !first.checkpoint || !first.before || records.some((record) => record.endedAt === 0)) return null
+    if (deps.openings() !== openingsAtStart.get(first)) return null
+    const page = deps.pageOf(first.targetId)
+    if (!page || page.isClosed()) return null
+    const probe = await deps.getProbe(page)
+    if (probe.dialogs.current()) return null
+    const settle = await probe.watch.settle({
+      pace: 'fast',
+      since: first.checkpoint,
+      origin: Math.max(...dispatched.map((record) => record.endedAt)),
+      timeoutMs: Math.min(5000, Math.max(1500, remainingMs() - 1000)),
+    })
+    if (settle.reason === 'js-dialog' || settle.reason === 'page-closed' || page.isClosed() || probe.dialogs.current()) return null
+    if (deps.openings() !== openingsAtStart.get(first)) return null
+    const events = await probe.watch.since(first.checkpoint)
+    const checkpoint = probe.watch.checkpoint()
+    const after = await deps.observeQuietly(page)
+    const diff = diffObservations(first.before, after)
+    const changed = events.navigations.length > 0 || events.dialogs.length > 0 || renderObservationDiff(diff) !== ''
+    for (const record of records) {
+      if (record.ok && record.kind !== 'wait' && record.kind !== 'waitForIdle') record.effect = changed ? 'changed' : 'no-change'
+    }
+    const text = renderActionReport({ records, rawInputs: [], settle, events, after, diff, newTabs: [], downloads: [], fileDialogs: [], changed })
+    const report = { text, after, checkpoint, targetId: first.targetId }
+    records[records.length - 1].report = report
+    return { ...report, page }
+  }
+
   /** Run one act method: guard, take the before-picture, check the refs, perform, record (also on failure). */
   async function run(
     kind: ActKind,
@@ -2016,11 +2249,13 @@ export function createActApi(deps: ActDeps): ActApi {
       enumerable: false,
     })
     deps.records.push(record)
+    openingsAtStart.set(record, deps.openings())
     deps.activity.depth += 1
     let probe: ActProbe | null = null
     let window: ChooserWindow | undefined
     try {
       oneActionPerCall(kind)
+      const reported = await reportEarlier(record)
       const refs = options.refs ?? []
       const resolved = refs.map((ref) => {
         const resolution = deps.registry.resolve(ref)
@@ -2038,9 +2273,15 @@ export function createActApi(deps: ActDeps): ActApi {
         record.checkpoint = probe.watch.checkpoint()
         record.before = probe.lastFullObservation ?? undefined
       } else if (!UNCOUNTED_KINDS[kind]) {
-        // Checkpoint first: whatever happens while the picture is taken belongs to this action.
-        record.checkpoint = probe.watch.checkpoint()
-        before = await deps.observeQuietly(page, busyRead)
+        if (reported?.page === page) {
+          // The earlier action's report just looked at this page, settled, and nothing ran since.
+          record.checkpoint = reported.checkpoint
+          before = reported.after
+        } else {
+          // Checkpoint first: whatever happens while the picture is taken belongs to this action.
+          record.checkpoint = probe.watch.checkpoint()
+          before = await deps.observeQuietly(page, busyRead)
+        }
         record.before = before
       }
       const targets = before ? refs.map((ref, index) => boundTarget(ref, resolved[index], before)) : resolved
@@ -2083,22 +2324,38 @@ export function createActApi(deps: ActDeps): ActApi {
    * documents the same stall for its own click). The dispatch itself already happened; its
    * acknowledgement arrives once the dialog is answered, and is left to settle on its own. A dialog
    * the policy answers by itself (an alert) closes on its own: the dispatch is waited for.
+   * Event-driven: the dialog controller's change event, the work settling, or the call's timeout.
    */
   async function untilDialog<T>(probe: ActProbe, work: Promise<T>, record: ActionRecord): Promise<T | undefined> {
-    let settled = false
-    const finished = work.finally(() => {
-      settled = true
-    })
-    finished.catch(() => {})
-    while (!settled) {
-      const dialog = probe.dialogs.current()
-      if (dialog?.handling === 'agent') {
-        record.notes.push(dialogNote(dialog))
+    work.catch(() => {})
+    if (deps.signal.aborted) throw new ActError('Not executed: this execute() call already timed out.')
+    const blocked = Promise.withResolvers<JsDialogState>()
+    const stopped = Promise.withResolvers<never>()
+    const check = (dialog: JsDialogState | null): void => {
+      if (dialog?.handling === 'agent') blocked.resolve(dialog)
+    }
+    const onAbort = (): void => stopped.reject(new ActError('Stopped: this execute() call timed out while the action was in progress.'))
+    const off = probe.dialogs.onChange(check)
+    deps.signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      check(probe.dialogs.current())
+      const first = await Promise.race([
+        work.then(
+          () => null,
+          () => null,
+        ),
+        blocked.promise,
+        stopped.promise,
+      ])
+      if (first !== null) {
+        record.notes.push(dialogNote(first))
         return undefined
       }
-      await Promise.race([finished.then(() => undefined, () => undefined), sleep(30)])
+      return await work
+    } finally {
+      off()
+      deps.signal.removeEventListener('abort', onAbort)
     }
-    return await work
   }
 
   /** The isolated world of the frame `target`'s node is in. */
@@ -2203,7 +2460,7 @@ export function createActApi(deps: ActDeps): ActApi {
     const touch = isTouchPage(page)
     const clicking: Promise<HumanMoveResult | null> = touch
       ? tap(step.probe.cdp, page, point, clickCount, { sleep, onPress }).then(() => null)
-      : deps.humanMouse.click({ page, x: point.x, y: point.y, button, clickCount, delayMs: Math.round(randomBetween(45, 110)), onPress })
+      : deps.humanMouse.click({ page, x: point.x, y: point.y, button, clickCount, delayMs: fast ? 0 : Math.round(randomBetween(45, 110)), onPress })
     const input = `the ${clickCount === 2 ? `double ${touch ? 'tap' : 'click'}` : touch ? 'tap' : 'click'}${record.hit ? ` on ${record.hit}` : ''}`
     const isAction = record.kind === 'click' || record.kind === 'dblclick'
     let move: HumanMoveResult | null | undefined
@@ -2302,9 +2559,17 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * The way of a drag from `from` to `to`, timed: the human plan gives a person's pace either way;
    * 'straight' keeps its timing and puts every sample on the straight line, at the minimum-jerk
-   * fraction of the way for its time. Ends exactly at `to`.
+   * fraction of the way for its time. Ends exactly at `to`. 'fast' (a mouse drag in fast mode):
+   * FAST_DRAG_MOVES evenly spaced points of the straight line, all at time 0 — each sent once the
+   * previous one was acknowledged.
    */
-  async function dragSamples(page: Page, from: Point, to: Point, path: 'human' | 'straight'): Promise<Array<{ tMs: number; x: number; y: number }>> {
+  async function dragSamples(page: Page, from: Point, to: Point, path: 'human' | 'straight' | 'fast'): Promise<Array<{ tMs: number; x: number; y: number }>> {
+    if (path === 'fast') {
+      return Array.from({ length: FAST_DRAG_MOVES }, (_, index) => {
+        const s = (index + 1) / FAST_DRAG_MOVES
+        return { tMs: 0, x: from.x + (to.x - from.x) * s, y: from.y + (to.y - from.y) * s }
+      })
+    }
     const trajectory = await deps.humanMouse.plan({ page, from, x: to.x, y: to.y })
     const endMs = trajectory.samples.at(-1)?.tMs ?? 0
     const samples =
@@ -2318,7 +2583,8 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /** The report's line for a drag's way, `travelled` px along it. */
-  function dragPathNote(path: 'human' | 'straight', held: string, travelled: number, distance: number): string {
+  function dragPathNote(path: 'human' | 'straight' | 'fast', held: string, travelled: number, distance: number): string {
+    if (path === 'fast') return `${held} path: a straight line of ${Math.round(distance)} px in ${FAST_DRAG_MOVES} moves, no pacing (fast mode)`
     return path === 'straight'
       ? `${held} path: a straight line of ${Math.round(distance)} px`
       : `${held} path: ${Math.round(travelled)} px of a person's curved path for ${Math.round(distance)} px between the two points; ` +
@@ -2371,8 +2637,8 @@ export function createActApi(deps: ActDeps): ActApi {
     for (const char of text) {
       checkAbort()
       await page.keyboard.type(char)
-      const pause = /[\s,.;:!?]/.test(char) ? KEY_MEAN_MS * randomBetween(1.4, 2.6) : KEY_MEAN_MS * randomBetween(0.55, 1.35)
-      await sleep(pause)
+      if (/[\s,.;:!?]/.test(char)) await pause(KEY_MEAN_MS * 1.4, KEY_MEAN_MS * 2.6)
+      else await pause(KEY_MEAN_MS * 0.55, KEY_MEAN_MS * 1.35)
     }
   }
 
@@ -2390,8 +2656,8 @@ export function createActApi(deps: ActDeps): ActApi {
     for (const line of rest) {
       if (newline === undefined) throw new ActError('A line break reached the keyboard without a newline key to type it as; the text after it was not typed.')
       checkAbort()
-      await page.keyboard.press(newline, { delay: Math.round(randomBetween(40, 90)) })
-      await sleep(KEY_MEAN_MS * randomBetween(1.4, 2.6))
+      await page.keyboard.press(newline, { delay: fast ? 0 : Math.round(randomBetween(40, 90)) })
+      await pause(KEY_MEAN_MS * 1.4, KEY_MEAN_MS * 2.6)
       await typeHuman(page, line)
     }
   }
@@ -2426,21 +2692,21 @@ export function createActApi(deps: ActDeps): ActApi {
     const pressed = { key: key.key, code: key.code, windowsVirtualKeyCode: key.windowsVirtualKeyCode }
     const chord = `${modifier.label}${key.label}`
     await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: modifier.mask, ...held }, `pressing ${chord}`)
-    await sleep(randomBetween(30, 70))
+    await pause(30, 70)
     await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: modifier.mask, ...pressed, commands }, `pressing ${chord}`)
-    await sleep(randomBetween(40, 90))
+    await pause(40, 90)
     await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: modifier.mask, ...pressed }, `releasing ${chord}`)
     await send(probe.cdp, 'Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 0, ...held }, `releasing ${chord}`)
     return chord
   }
 
-  /** Refuse key-by-key input that cannot finish at a person's pace before this call times out. */
+  /** Refuse key-by-key input that cannot finish before this call times out: at a person's pace, or in fast mode at Chrome's (FAST_KEY_MS). */
   function refuseIfTooSlow(keys: number, what: string, alternative: string): void {
-    const needed = Math.round(keys * KEY_MEAN_MS * 1.25) + 3000
+    const needed = Math.round(keys * (fast ? FAST_KEY_MS : KEY_MEAN_MS) * 1.25) + 3000
     const left = remainingMs() - 6000
     if (needed > left) {
       throw new ActError(
-        `${what} at a person's pace takes about ${Math.ceil(needed / 1000)}s, but this call has ${Math.max(0, Math.floor(left / 1000))}s left for it. ` +
+        `${what} ${fast ? 'key by key' : "at a person's pace"} takes about ${Math.ceil(needed / 1000)}s, but this call has ${Math.max(0, Math.floor(left / 1000))}s left for it. ` +
           `Give the call a larger timeout (about ${Math.ceil((needed + 10_000) / 1000) * 1000} ms)${alternative}.`,
       )
     }
@@ -2733,7 +2999,7 @@ export function createActApi(deps: ActDeps): ActApi {
       if (segment.kind === 'ampm') {
         for (let presses = 0; presses < 2 && (await segmentValue(fieldCdp, segment)) !== wanted; presses++) {
           await page.keyboard.press('ArrowUp')
-          await sleep(KEY_MEAN_MS * randomBetween(0.8, 1.6))
+          await pause(KEY_MEAN_MS * 0.8, KEY_MEAN_MS * 1.6)
         }
       } else {
         await typeHuman(page, segment.kind === 'year' ? pad(wanted, 4) : pad(wanted, String(segment.max).length))
@@ -2746,7 +3012,7 @@ export function createActApi(deps: ActDeps): ActApi {
         )
       }
     }
-    await sleep(randomBetween(80, 160))
+    await pause(80, 160)
     const after = await readField(probe, target)
     if (after.value !== value.normalized) {
       throw new ActError(`Filled the parts of ${describeTarget(target)}, but its value reads "${after.value ?? ''}" instead of "${value.normalized}": the page changed or rejected it.`)
@@ -2810,13 +3076,13 @@ export function createActApi(deps: ActDeps): ActApi {
     refuseIfTooSlow(Math.abs(route.presses) + 1, `Moving the slider ${Math.abs(route.presses)} steps`, '')
     if (route.start) {
       await page.keyboard.press(route.start)
-      await sleep(KEY_MEAN_MS * randomBetween(0.8, 1.6))
+      await pause(KEY_MEAN_MS * 0.8, KEY_MEAN_MS * 1.6)
     }
     const key = route.presses > 0 ? 'ArrowUp' : 'ArrowDown'
     for (let pressed = 0; pressed < Math.abs(route.presses); pressed++) {
       checkAbort()
       await page.keyboard.press(key)
-      await sleep(KEY_MEAN_MS * randomBetween(0.55, 1.35))
+      await pause(KEY_MEAN_MS * 0.55, KEY_MEAN_MS * 1.35)
     }
     const after = await world.callFunctionOnNodes<{ value: number } | null>([target.backendNodeId], RANGE_FN, { what: `reading ${describeTarget(target)}` })
     if (!after) throw goneError(target)
@@ -2877,17 +3143,8 @@ export function createActApi(deps: ActDeps): ActApi {
       if (!facts) throw goneError(target)
       return facts
     }
-    /** Read until the chooser is open (`wanted`) or closed, or `ms` have passed: the last reading. */
-    const readWhen = async (open: boolean, ms: number): Promise<{ value: string; swatches: boolean; open: boolean }> => {
-      const deadline = Date.now() + ms
-      for (;;) {
-        const facts = await readColour()
-        if (facts.open === open || Date.now() > deadline) return facts
-        await sleep(50)
-      }
-    }
-    /** One key to the open chooser, at a person's pace; refused once it has closed, since the key would act on the page. */
-    const pressInChooser = async (key: string, pause: number): Promise<void> => {
+    /** One key to the open chooser, at a person's pace (none in fast mode); refused once it has closed, since the key would act on the page. */
+    const pressInChooser = async (key: string, min: number, max: number): Promise<void> => {
       checkAbort()
       const now = await readColour()
       if (!now.open) {
@@ -2900,7 +3157,7 @@ export function createActApi(deps: ActDeps): ActApi {
       await untilDialog(probe, key.length === 1 ? page.keyboard.type(key) : page.keyboard.press(key), record)
       sent.push(key)
       stopIfDialog()
-      await sleep(pause)
+      await pause(min, max)
     }
     let before = await readColour()
     if (before.swatches) {
@@ -2932,7 +3189,7 @@ export function createActApi(deps: ActDeps): ActApi {
         sent.push('Escape')
         escapes += 1
         stopIfDialog()
-        await sleep(randomBetween(150, 260))
+        await pause(150, 260)
         before = await readColour()
       }
       record.notes.push(
@@ -2945,17 +3202,21 @@ export function createActApi(deps: ActDeps): ActApi {
     }
     refuseIfTooSlow(wanted.length + 4, `Choosing ${wanted} in the colour chooser`, '')
     await clickTarget(step, target, 1, 'left')
-    const opened = await readWhen(true, 1000)
+    // Chrome opens the chooser while it handles the click: measured on Chrome 145, the input reads
+    // :open as soon as the click's release is acknowledged (5 of 5), so this reads it once, no wait.
+    const opened = await readColour()
     if (!opened.open) {
       throw new ActError(
         colourChooserNotOpened({ target: describeTarget(target), ref: target.ref, value: opened.value, visibility: await deps.tabVisibility(probe) }),
       )
     }
-    // A person takes in the chooser before reaching for the keys; its script is up by then too.
-    await sleep(randomBetween(450, 800))
-    for (const key of ['Shift+Tab', 'ArrowUp', 'Shift+Tab']) await pressInChooser(key, KEY_MEAN_MS * randomBetween(1.2, 2.2))
-    for (const char of wanted) await pressInChooser(char, KEY_MEAN_MS * randomBetween(0.55, 1.35))
-    await sleep(randomBetween(80, 160))
+    // A person takes in the chooser before reaching for the keys. Fast mode sends them at once:
+    // measured on Chrome 145, keys sent right after the click's ack reach its hex field (5 of 5).
+    await pause(450, 800)
+    for (const key of ['Shift+Tab', 'ArrowUp', 'Shift+Tab']) await pressInChooser(key, KEY_MEAN_MS * 1.2, KEY_MEAN_MS * 2.2)
+    for (const char of wanted) await pressInChooser(char, KEY_MEAN_MS * 0.55, KEY_MEAN_MS * 1.35)
+    // Measured on Chrome 145: the input holds the typed colour as soon as the last key is acknowledged (5 of 5).
+    await pause(80, 160)
     const typed = await readColour()
     if (typed.value !== wanted) {
       let escapes = 0
@@ -2964,7 +3225,7 @@ export function createActApi(deps: ActDeps): ActApi {
         sent.push('Escape')
         escapes += 1
         stopIfDialog()
-        await sleep(randomBetween(150, 260))
+        await pause(150, 260)
       }
       const now = await readColour()
       const cancelled =
@@ -2988,7 +3249,8 @@ export function createActApi(deps: ActDeps): ActApi {
       // until it is answered, and the report names it.
       if (probe.dialogs.current()?.handling === 'agent') return
     }
-    const after = await readWhen(false, 1000)
+    // Measured on Chrome 145: the chooser is closed (:open false) as soon as Enter is acknowledged (5 of 5).
+    const after = await readColour()
     if (after.open) {
       throw new ActError(
         `${describeTarget(target)} reads ${after.value}, but Chrome's colour chooser is still open after Enter, and keys go to it rather than the page. ` +
@@ -3050,7 +3312,7 @@ export function createActApi(deps: ActDeps): ActApi {
     }
     const point = await aimAt(step, block, facts.end)
     await clickAt(step, point, 1, 'left')
-    await sleep(randomBetween(60, 140))
+    await pause(60, 140)
     const now = await editorBlock(probe, target, editor.block, editor.host)
     const field = await readField(probe, block)
     if (!now.hostFocused || !field.selection || !field.selection.collapsed || !field.selection.atEnd) {
@@ -3161,7 +3423,7 @@ export function createActApi(deps: ActDeps): ActApi {
         }
         if (!append && focused.value) {
           const chord = await pressEditingChord(probe, 'select all')
-          await sleep(randomBetween(60, 140))
+          await pause(60, 140)
           const selected = (await readField(probe, field)).selection
           if (selected && !(selected.atStart && selected.atEnd)) {
             throw new ActError(
@@ -3177,7 +3439,7 @@ export function createActApi(deps: ActDeps): ActApi {
         } else if (append && !placed && focused.value) {
           // End only reaches the end of the clicked line in a text area or editor; this reaches the end of the text.
           const chord = await pressEditingChord(probe, 'end of text')
-          await sleep(randomBetween(40, 90))
+          await pause(40, 90)
           const caret = (await readField(probe, field)).selection
           if (caret && !(caret.collapsed && caret.atEnd)) {
             throw new ActError(
@@ -3196,7 +3458,7 @@ export function createActApi(deps: ActDeps): ActApi {
           if (lineBreaks > 0) record.notes.push(`typed ${lineBreaks} line break${lineBreaks === 1 ? '' : 's'} as ${options.newline}`)
           if (typedSecret) record.notes.push('typed a secret (masked in this report)')
         }
-        await sleep(randomBetween(80, 160))
+        await pause(80, 160)
         let after: FieldFacts | null
         if (point) {
           const read = await fieldUnderCaret(step, field, point, 'while the text was typed')
@@ -3244,14 +3506,23 @@ export function createActApi(deps: ActDeps): ActApi {
           return
         }
         await clickTarget(step, target, 1, 'left')
-        const deadline = Date.now() + 1200
-        while (Date.now() < deadline) {
-          await sleep(100)
-          const now = await checkedState(step.probe, target)
-          if (now.checked === wanted) {
-            step.record.notes.push(`now ${wanted ? 'checked' : 'unchecked'}`)
-            return
-          }
+        // The control's own state, re-read at each change of it (CHECKED_WHEN_FN), capped. A dialog
+        // the page opened on the click freezes it: the report names the dialog, nothing more is read.
+        const world = await worldOf(step.probe, target)
+        const reads = await untilDialog(
+          step.probe,
+          world.callFunctionOnNodes<boolean>([target.backendNodeId], CHECKED_WHEN_FN, {
+            args: { wanted, capMs: CHECKED_WAIT_CAP_MS },
+            timeoutMs: CHECKED_WAIT_CAP_MS + CDP_TIMEOUT_MS,
+            what: `waiting for ${describeTarget(target)} to be ${wanted ? 'checked' : 'unchecked'}`,
+          }),
+          step.record,
+        )
+        if (reads === undefined) return
+        const now = await checkedState(step.probe, target)
+        if (now.checked === wanted) {
+          step.record.notes.push(`now ${wanted ? 'checked' : 'unchecked'}`)
+          return
         }
         throw new ActError(
           `Clicked ${describeTarget(target)} but it is still ${wanted ? 'unchecked' : 'checked'}: the click did not toggle it ` +
@@ -3262,22 +3533,11 @@ export function createActApi(deps: ActDeps): ActApi {
     )
   }
 
-  /** Scroll state of node `scrollerId` (in the frame of `world`) along `axis`, once smooth scrolling has come to rest (its raw offset still). */
-  async function restingOffset(world: IsolatedWorld, scrollerId: number, axis: 'x' | 'y', gone: () => ActError): Promise<ScrollOffset> {
-    const read = async (): Promise<ScrollOffset> => {
-      const offset = await world.callFunctionOnNodes<ScrollOffset | null>([scrollerId], SCROLL_OFFSET_FN, { args: { axis }, what: 'reading the scroll position' })
-      if (!offset) throw gone()
-      return offset
-    }
-    let last = await read()
-    const deadline = Date.now() + 900
-    while (Date.now() < deadline) {
-      await sleep(50)
-      const now = await read()
-      if (Math.abs(now.raw - last.raw) < 0.5) return now
-      last = now
-    }
-    return last
+  /** Scroll state of node `scrollerId` (in the frame of `world`) along `axis`, read now. */
+  async function readOffset(world: IsolatedWorld, scrollerId: number, axis: 'x' | 'y', gone: () => ActError): Promise<ScrollOffset> {
+    const offset = await world.callFunctionOnNodes<ScrollOffset | null>([scrollerId], SCROLL_OFFSET_FN, { args: { axis }, what: 'reading the scroll position' })
+    if (!offset) throw gone()
+    return offset
   }
 
   /**
@@ -3366,7 +3626,7 @@ export function createActApi(deps: ActDeps): ActApi {
           `the pointer is over ${aim.blockedBy} instead, which scrolls something else or nothing. Deal with that first (observe() shows it).`,
       )
     }
-    const before = await restingOffset(frame.world, scrollerId, axis, goneScroller)
+    const before = await readOffset(frame.world, scrollerId, axis, goneScroller)
     const requested = Math.max(40, screens * before.client)
     // As far as it can still move: a wheel beyond its edge would scroll what contains it.
     const room = Math.max(0, Math.floor(dir > 0 ? before.size - before.at - before.client : before.at))
@@ -3382,25 +3642,31 @@ export function createActApi(deps: ActDeps): ActApi {
       for (let swipes = 0; swipes < 40 && idle < 2 && Math.abs(total) - Math.abs(progress) > 16; swipes++) {
         checkAbort()
         const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(progress), randomBetween(180, 420))
+        const scrollEnded = await watchScroll(probe, frame.world, record)
         await swipe(step, point, axis === 'x' ? flick : 0, axis === 'y' ? flick : 0, before.client * 0.45)
-        const now = (await restingOffset(frame.world, scrollerId, axis, goneScroller)).raw - before.raw
+        await scrollEnded()
+        const now = (await readOffset(frame.world, scrollerId, axis, goneScroller)).raw - before.raw
         idle = Math.abs(now - progress) < 1 ? idle + 1 : 0
         progress = now
-        await sleep(randomBetween(70, 150))
+        await pause(70, 150)
       }
     } else if (total !== 0) {
       await deps.humanMouse.moveTo({ page, x: point.x, y: point.y })
       let done = 0
       while (Math.abs(done) < Math.abs(total)) {
         checkAbort()
-        const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(done), randomBetween(180, 420))
+        // Fast mode: all of it in one wheel turn (measured on Chrome 145 headless: one mouseWheel event
+        // of up to 15000 px scrolls the whole delta); `total` is already cut to what the scroller holds.
+        const flick = fast ? total : Math.sign(total) * Math.min(Math.abs(total) - Math.abs(done), randomBetween(180, 420))
+        const scrollEnded = await watchScroll(probe, frame.world, record)
         if (axis === 'y') await page.mouse.wheel(0, flick)
         else await page.mouse.wheel(flick, 0)
+        await scrollEnded()
         done += flick
-        await sleep(randomBetween(70, 150))
+        await pause(70, 150)
       }
     }
-    const after = await restingOffset(frame.world, scrollerId, axis, goneScroller)
+    const after = await readOffset(frame.world, scrollerId, axis, goneScroller)
     // Chrome's own offset: the distance from the top or left edge of an area that starts at its
     // bottom or right edge also grows when the page adds content there while it scrolls (a chat
     // log loading older messages).
@@ -3427,18 +3693,19 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * Press an arrow key `presses` times (positive: ↓, negative: ↑) the way a person does: a few taps,
    * or the key held down for many (the first press, the keyboard's repeat delay, then auto-repeated
-   * presses at its ~30 per second). False when a native dialog the page opened stopped the keys.
+   * presses at its ~30 per second). Fast mode: plain presses, one after the other's ack, no delays.
+   * False when a native dialog the page opened stopped the keys.
    */
   async function pressArrows(step: Step, presses: number): Promise<boolean> {
     const { page, probe, record } = step
     const key = presses > 0 ? 'ArrowDown' : 'ArrowUp'
     const count = Math.abs(presses)
-    if (count <= 6) {
+    if (fast || count <= 6) {
       for (let pressed = 0; pressed < count; pressed++) {
         checkAbort()
-        await untilDialog(probe, page.keyboard.press(key, { delay: Math.round(randomBetween(40, 80)) }), record)
+        await untilDialog(probe, page.keyboard.press(key, { delay: fast ? 0 : Math.round(randomBetween(40, 80)) }), record)
         if (probe.dialogs.current()?.handling === 'agent') return false
-        await sleep(randomBetween(90, 180))
+        await pause(90, 180)
       }
       return true
     }
@@ -3497,7 +3764,9 @@ export function createActApi(deps: ActDeps): ActApi {
       record.notes.push('its list was open already')
     } else {
       await clickTarget(step, target, 1, 'left')
-      await sleep(randomBetween(120, 220))
+      // A person looks at the list. Fast mode reads it at once: measured on Chrome 145, a select
+      // reads :open as soon as the click's release is acknowledged (5 of 5).
+      await pause(120, 220)
       state = await readState()
       if (state.index !== plan.selectedIndex) {
         record.notes.push(`the click itself chose "${state.selected}": Chrome took the button release as a choice in the list it opened`)
@@ -3549,7 +3818,7 @@ export function createActApi(deps: ActDeps): ActApi {
       checkAbort()
       await untilDialog(probe, page.keyboard.type(char), record)
       if (probe.dialogs.current()?.handling === 'agent') return
-      await sleep(KEY_MEAN_MS * randomBetween(0.55, 1.35))
+      await pause(KEY_MEAN_MS * 0.55, KEY_MEAN_MS * 1.35)
     }
     state = await readState()
     const arrows = arrowPresses(options, state.index, index)
@@ -3561,21 +3830,34 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * After choosing `label` (option `index`): watch the select for half a second, as a person glances
    * at it. Chrome applies the choice at once; a page that refuses it puts its own value back — which
-   * is said only when the choice was seen taken and then undone.
+   * is said only when the choice was seen taken and then undone. Event-driven: the select is read
+   * again at each change of it (SELECT_CHANGE_FN), never polled. Fast mode does not glance: a choice
+   * read as taken right away is done (the report's change list shows what the page did after);
+   * one not taken yet is watched the same half second for the page to take it.
    */
-  async function confirmChoice(step: Step, target: RefTarget, plan: SelectPlan, readState: () => Promise<SelectState>, how: string): Promise<void> {
+  async function confirmChoice(step: Step, target: RefTarget, plan: SelectPlan, readState: () => Promise<SelectState>, how: string, world: IsolatedWorld): Promise<void> {
     const { probe, record } = step
     const label = plan.label ?? ''
     const watchedFrom = Date.now()
     let seenAt: number | null = null
-    let after: SelectState
-    for (;;) {
-      // A native dialog the change opened freezes the page: the report names it, nothing more is read.
-      if (probe.dialogs.current()?.handling === 'agent') return
+    // A native dialog the change opened freezes the page: the report names it, nothing more is read.
+    if (probe.dialogs.current()?.handling === 'agent') return
+    let after = await readState()
+    if (after.chosen) seenAt = Date.now()
+    for (let left = SELECT_WATCH_MS; left > 0 && !(fast && after.chosen); left = SELECT_WATCH_MS - (Date.now() - watchedFrom)) {
+      const changed = await untilDialog(
+        probe,
+        world.callFunctionOnNodes<'changed' | 'cap'>([target.backendNodeId], SELECT_CHANGE_FN, {
+          args: { capMs: left },
+          timeoutMs: left + CDP_TIMEOUT_MS,
+          what: `watching ${describeTarget(target)}`,
+        }),
+        record,
+      )
+      if (changed === undefined) return
+      if (changed === 'cap') break
       after = await readState()
       if (after.chosen) seenAt ??= Date.now()
-      if (Date.now() - watchedFrom >= 500) break
-      await sleep(50)
     }
     if (!after.chosen) {
       if (seenAt !== null) {
@@ -3723,7 +4005,7 @@ export function createActApi(deps: ActDeps): ActApi {
           }
           if (!plan.listBox) {
             await chooseInMenuList(step, target, plan, readState)
-            await confirmChoice(step, target, plan, readState, 'Pressed Enter on')
+            await confirmChoice(step, target, plan, readState, 'Pressed Enter on', world)
             return
           }
           // A list box draws its options in the page: a person clicks the one they want, holding
@@ -3747,14 +4029,14 @@ export function createActApi(deps: ActDeps): ActApi {
             record.dispatched = true
             await page.keyboard.down(modifier)
             try {
-              await sleep(randomBetween(60, 140))
+              await pause(60, 140)
               await clickAt(step, point, 1, 'left')
             } finally {
               await page.keyboard.up(modifier)
             }
             record.notes.push(`held ${modifier === 'Meta' ? '⌘' : 'Ctrl'} to add it to the options already selected`)
           }
-          await confirmChoice(step, target, plan, readState, 'Clicked')
+          await confirmChoice(step, target, plan, readState, 'Clicked', world)
         },
         { refs: [ref], whileBusy: options.whileBusy, detail: `"${option}"` },
       ),
@@ -3947,10 +4229,11 @@ export function createActApi(deps: ActDeps): ActApi {
               await send(probe.cdp, 'Input.setInterceptDrags', { enabled: true }, 'arming drag interception')
               await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: at.x, y: at.y, button: 'left', buttons: 1, clickCount: 1 }, 'pressing the mouse button')
               pressed = true
-              await sleep(randomBetween(120, 220))
+              await pause(120, 220)
               toPoint = await dragEndPoint(probe, to, toEnd.offset, record)
               const start = at
-              const samples = await dragSamples(page, start, toPoint, path)
+              const way = fast ? 'fast' : path
+              const samples = await dragSamples(page, start, toPoint, way)
               let travelled = 0
               const startedAt = Date.now()
               for (const sample of samples) {
@@ -3961,12 +4244,17 @@ export function createActApi(deps: ActDeps): ActApi {
                 travelled += Math.hypot(sample.x - at.x, sample.y - at.y)
                 at = { x: sample.x, y: sample.y }
               }
-              record.notes.push(dragPathNote(path, 'held-button', travelled, Math.hypot(toPoint.x - start.x, toPoint.y - start.y)))
+              record.notes.push(dragPathNote(way, 'held-button', travelled, Math.hypot(toPoint.x - start.x, toPoint.y - start.y)))
               at = toPoint
-              await sleep(randomBetween(80, 160))
+              await pause(80, 160)
             } finally {
-              probe.cdp.off('Input.dragIntercepted', onIntercepted)
-              await send(probe.cdp, 'Input.setInterceptDrags', { enabled: false }, 'disarming drag interception')
+              // Measured on Chrome 145 (5 of 5): Input.dragIntercepted arrives before the ack of the next
+              // command on the session, so once this disarm is acknowledged the drag data, if any, is in.
+              try {
+                await send(probe.cdp, 'Input.setInterceptDrags', { enabled: false }, 'disarming drag interception')
+              } finally {
+                probe.cdp.off('Input.dragIntercepted', onIntercepted)
+              }
             }
             const data: Protocol.Input.DragData | null = dragData
             if (data) {
@@ -4053,21 +4341,45 @@ export function createActApi(deps: ActDeps): ActApi {
         const to = history.entries[history.currentIndex - 1]
         record.detail = `to ${shortUrl(to.url)}`
         record.dispatched = true
-        await untilDialog(probe, send(probe.cdp, 'Page.navigateToHistoryEntry', { entryId: to.id }, 'going back'), record)
-        const deadline = Date.now() + Math.max(1000, Math.min(10_000, remainingMs() - 4000))
-        for (;;) {
-          const dialog = probe.dialogs.current()
-          if (dialog?.handling === 'agent') {
+        // Event-driven: the main frame's navigation committing (a new or restored document, or a
+        // same-document entry), a dialog that holds it, or the cap.
+        const moved = Promise.withResolvers<'moved'>()
+        const held = Promise.withResolvers<JsDialogState>()
+        const capped = Promise.withResolvers<'cap'>()
+        const onNavigated = (event: Protocol.Page.FrameNavigatedEvent): void => {
+          if (!event.frame.parentId) moved.resolve('moved')
+        }
+        const onWithinDocument = (event: Protocol.Page.NavigatedWithinDocumentEvent): void => {
+          if (event.frameId === probe.frames.mainFrameId()) moved.resolve('moved')
+        }
+        const onDialog = (dialog: JsDialogState | null): void => {
+          if (dialog?.handling === 'agent') held.resolve(dialog)
+        }
+        probe.cdp.on('Page.frameNavigated', onNavigated)
+        probe.cdp.on('Page.navigatedWithinDocument', onWithinDocument)
+        const offDialog = probe.dialogs.onChange(onDialog)
+        // The cap, a real timer on purpose: a page that holds the navigation must not hang the call.
+        const timer = setTimeout(() => capped.resolve('cap'), Math.max(1000, Math.min(10_000, remainingMs() - 4000)))
+        try {
+          await untilDialog(probe, send(probe.cdp, 'Page.navigateToHistoryEntry', { entryId: to.id }, 'going back'), record)
+          onDialog(probe.dialogs.current())
+          const outcome = await Promise.race([moved.promise, held.promise, capped.promise])
+          if (typeof outcome !== 'string') {
             // A beforeunload holds the navigation until it is answered: that is the outcome to report.
-            if (!record.notes.includes(dialogNote(dialog))) record.notes.push(dialogNote(dialog))
+            if (!record.notes.includes(dialogNote(outcome))) record.notes.push(dialogNote(outcome))
             return
           }
-          const now = await send<Protocol.Page.GetNavigationHistoryResponse>(probe.cdp, 'Page.getNavigationHistory', undefined, "reading this tab's history")
-          if (now.entries[now.currentIndex]?.id !== from.id) break
-          if (Date.now() > deadline) {
-            throw new ActError(`Went back from ${shortUrl(from.url)}, but the tab is still on it: the page refused or held the navigation. observe() shows the page now.`)
+          if (outcome === 'cap') {
+            const now = await send<Protocol.Page.GetNavigationHistoryResponse>(probe.cdp, 'Page.getNavigationHistory', undefined, "reading this tab's history")
+            if (now.entries[now.currentIndex]?.id === from.id) {
+              throw new ActError(`Went back from ${shortUrl(from.url)}, but the tab is still on it: the page refused or held the navigation. observe() shows the page now.`)
+            }
           }
-          await sleep(50)
+        } finally {
+          clearTimeout(timer)
+          offDialog()
+          probe.cdp.off('Page.frameNavigated', onNavigated)
+          probe.cdp.off('Page.navigatedWithinDocument', onWithinDocument)
         }
         const sameDocument = URL.canParse(from.url) && URL.canParse(to.url) && new URL(from.url).href.split('#')[0] === new URL(to.url).href.split('#')[0]
         record.notes.push(
@@ -4392,18 +4704,34 @@ function settleLine(settle: SettleResult, after: Observation | null): string {
   const notWaited = iframes.length
     ? `\n        not waited for: ${iframes.length === 1 ? 'an iframe still loading its document' : `${iframes.length} iframes still loading their documents`} — ${shownIframes.join(' · ')}${otherIframes.length ? ` · +${otherIframes.length} more: ${otherIframes.join(' ')}` : ''}`
     : ''
-  if (settle.settled) return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet${notWaited}${meanwhile}`
+  const requestText = (r: PendingRequest): string => `${r.method} ${shortUrl(r.url)} (${(r.ageMs / 1000).toFixed(1)}s)`
+  // Fast pace (a fast-mode session): settled on evidence, not quiet windows; it says what it did not wait for.
+  const streams = settle.pace === 'fast' && settle.fast.openStreams?.length
+    ? `\n        not waited for: ${settle.fast.openStreams.length === 1 ? 'a stream or long-poll the action opened' : `${settle.fast.openStreams.length} streams or long-polls the action opened`} (answered, still open) — ${settle.fast.openStreams.slice(0, 4).map(requestText).join(', ')}`
+    : ''
+  const stalled = settle.pace === 'fast' && settle.fast.stalledAssets?.length
+    ? `\n        stalled (nothing received for 3s): ${settle.fast.stalledAssets.slice(0, 4).map(requestText).join(', ')}`
+    : ''
+  if (settle.settled) {
+    if (settle.pace === 'human') return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet${notWaited}${meanwhile}`
+    const covered = Math.round(settle.fast.coveredMs)
+    return (
+      `SETTLED ${Math.round(settle.waitedMs)}ms (fast settle, ${settle.fast.passes} pass${settle.fast.passes === 1 ? '' : 'es'}: the page ran its queued work and nothing ` +
+      `it caused was still changing or loading) — not waited for: work the page starts later on a timer, more than ${covered}ms after the input ` +
+      `(a debounced search, a delayed request); act.waitForIdle() waits for that${streams}${notWaited}${meanwhile}`
+    )
+  }
   if (settle.reason === 'js-dialog') return 'NOT SETTLED — a native dialog is blocking the page'
   if (settle.reason === 'page-closed') return 'NOT SETTLED — the page was closed'
   const pending = settle.pendingRequests
     .slice(0, 4)
-    .map((r) => (r.iframe !== undefined ? iframeDocumentText(r, after) : `${r.method} ${shortUrl(r.url)} (${(r.ageMs / 1000).toFixed(1)}s)`))
+    .map((r) => (r.iframe !== undefined ? iframeDocumentText(r, after) : requestText(r)))
   const more = settle.pendingRequests.length - pending.length
   const parts = [
     pending.length ? `waiting on ${pending.join(', ')}${more > 0 ? ` +${more} more` : ''}` : '',
     settle.domChangingIn ? `content still changing in ${settle.domChangingIn}` : '',
   ].filter(Boolean)
-  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${parts.length ? ` — ${parts.join(' · ')}` : ''}${notWaited}${meanwhile}`
+  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${settle.pace === 'fast' ? ' (fast settle)' : ''}${parts.length ? ` — ${parts.join(' · ')}` : ''}${streams}${stalled}${notWaited}${meanwhile}`
 }
 
 function navLine(nav: WatchEvents['navigations'][number]): string {

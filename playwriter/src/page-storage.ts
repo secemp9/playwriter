@@ -33,6 +33,7 @@ import type { Protocol } from 'devtools-protocol'
 import { z } from 'zod'
 import type { ICDPSession } from './cdp-session.js'
 import { getCDPSessionForPage } from './cdp-session.js'
+import { ALLOWED_IN_FAST_OR_DEBUG } from './code-policy.js'
 import { ActError } from './human-actions.js'
 import { withDeadline } from './isolated-world.js'
 import type { FrameEntry, FrameHandle, UnreadableFrame } from './page-frames.js'
@@ -199,7 +200,7 @@ function refuseInHumanMode(deps: StorageGlobalsDeps, call: string, what: string,
   throw new ActError(
     `Refused (human mode): ${call} ${what}: forged state the page never made, so what the page does next is not ` +
       `something a user can reach. ${read} Change it the way a user would, through the page (act.* with refs from ` +
-      'observe()). Writing it directly needs debug mode (ask the user). It was not run.',
+      `observe()). Writing it directly needs ${ALLOWED_IN_FAST_OR_DEBUG}. It was not run.`,
   )
 }
 

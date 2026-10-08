@@ -47,7 +47,7 @@ describe('a tab that did not answer in time', () => {
 
 describe("Chrome's colour chooser did not open after the click", () => {
   const facts = { target: '[17] colorwell "Favourite colour"', ref: 17, value: '#000000' }
-  const head = `Clicked [17] colorwell "Favourite colour", but Chrome's colour chooser did not open: 1 s later it is still closed, and the input reads #000000.`
+  const head = `Clicked [17] colorwell "Favourite colour", but Chrome's colour chooser did not open: it was still closed once the click was done, and the input reads #000000.`
 
   it('names a hidden tab as the cause, with its fix', () => {
     expect(colourChooserNotOpened({ ...facts, visibility: read({ active: false, frontTab: 'Inbox' }) })).toBe(

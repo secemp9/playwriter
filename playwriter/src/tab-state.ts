@@ -121,7 +121,7 @@ export function hiddenTabNote(report: TabVisibilityReport): string {
  */
 export function colourChooserNotOpened(facts: { target: string; ref: number; value: string; visibility: TabVisibility | null }): string {
   const { target, ref, value, visibility } = facts
-  const head = `Clicked ${target}, but Chrome's colour chooser did not open: 1 s later it is still closed, and the input reads ${value}.`
+  const head = `Clicked ${target}, but Chrome's colour chooser did not open: it was still closed once the click was done, and the input reads ${value}.`
   if (visibility?.kind === 'read' && tabIsHidden(visibility.report)) {
     const restore = visibility.report.windowState === 'minimized' ? 'ask the user to restore the window' : 'page.bringToFront() brings the tab to the front'
     return `${head} This tab is not visible to the user — ${hiddenBecause(visibility.report)} — and Chrome does not open its colour chooser there: ${restore}, then call act.fill again.`

@@ -1387,6 +1387,9 @@ export function hasExplicitReturn(code: string): boolean {
 
 const REFUSED = 'Refused (human mode):'
 
+/** Where what human mode refuses on purpose (faked conditions, page and storage writes) is allowed: the end of every such refusal. */
+export const ALLOWED_IN_FAST_OR_DEBUG = "a fast-mode session — for testing on localhost, the browser tool's use or new with mode: 'fast' — or debug mode (ask the user)"
+
 function siteList(sites: CodeSite[]): string {
   return sites.map((site) => `${site.api} on line ${site.line}`).join(', ')
 }
@@ -1466,7 +1469,8 @@ function describeAnalysis(analysis: CodeAnalysis): string[] {
 }
 
 /**
- * `debug` allows everything and only describes it. `human` allows one input action per
+ * `debug` and `fast` allow everything and only describe it (fast mode is for testing on localhost:
+ * several actions per call, page.route, DOM writes and raw Playwright are its point). `human` allows one input action per
  * call (navigations count), none in a loop or a repeated helper, no full-document or history
  * navigation once a page is loaded except `act.open(url, { reason })` / `act.back()`, no URL
  * change from page code (only act.spaNavigate / a link click), no forced state, no direct
@@ -1475,7 +1479,7 @@ function describeAnalysis(analysis: CodeAnalysis): string[] {
  * read. Waits and reads that do not touch the page are never limited.
  */
 export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode; pageIsBlank: boolean }): PolicyVerdict {
-  if (context.mode === 'debug') {
+  if (context.mode !== 'human') {
     const notes = describeAnalysis(analysis)
     if (analysis.parseError) notes.unshift(`the code does not parse: ${analysis.parseError}`)
     return { allowed: true, notes }
@@ -1562,7 +1566,7 @@ export function checkPolicy(analysis: CodeAnalysis, context: { mode: PolicyMode;
         'happens next is not something a user can hit. Reproduce it the way a user would: one act.* step per call, ' +
         'act.waitForIdle() while the app works, then observe() and the backend log to see the outcome. Reading is ' +
         'fine (readPage(fn), getLatestLogs(), net.requests()). Faking conditions on purpose needs ' +
-        'debug mode (ask the user).',
+        `${ALLOWED_IN_FAST_OR_DEBUG}.`,
     )
   }
 

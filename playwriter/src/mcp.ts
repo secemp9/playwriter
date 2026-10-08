@@ -22,7 +22,7 @@ import { deriveWorkspace } from './workspace-key.js'
 import { discoverChromeInstances, resolveDirectInput, appendSessionToWsUrl } from './chrome-discovery.js'
 import { newBrowserOptionShapes, type NewBrowserOptions } from './new-browser-options.js'
 import type { NewBrowserPlan } from './new-browser.js'
-import { ModelFacingError } from './probe-types.js'
+import { ModelFacingError, type PolicyMode } from './probe-types.js'
 import { exitOnStdinEnd } from './mcp-lifecycle.js'
 import type { BrowserContext, Page } from '@xmorse/playwright-core'
 import crypto from 'node:crypto'
@@ -49,13 +49,15 @@ function loadExecutorModule(): Promise<ExecutorModule> {
 // getOrCreateExecutor); `browser use` / `browser new` replace them, releasing the previous one.
 let executor: PlaywrightExecutor | null = null
 
-type Binding =
+/** Which browser this session drives, and the code policy its executor runs with (`mode`). */
+type Binding = (
   /** PLAYWRITER_DIRECT: the server config names the browser; the model cannot change it. */
   | { kind: 'direct'; endpoint: string }
   /** One of the user's Chrome profiles, through its Playwriter extension and the relay. */
   | { kind: 'extension'; key: string; email: string }
   /** A headless Chrome launched for this session (CdpConfig.headless). */
   | { kind: 'headless'; executablePath: string }
+) & { mode: PolicyMode }
 
 let binding: Binding | null = null
 
@@ -269,15 +271,27 @@ function choiceCalls(extensions: ConnectedExtension[]): string {
   return [...extensions.map((extension) => useCall(choiceFor(extension, extensions))), NEW_CALL].map((call) => `  ${call}`).join('\n')
 }
 
+/** What a session in `mode` does, for the `browser` replies and list. */
+function describeMode(mode: PolicyMode): string {
+  switch (mode) {
+    case 'human':
+      return "human mode: a person's pace, one input action per call, nothing faked"
+    case 'fast':
+      return 'fast mode, for testing on localhost: no human pacing, several actions per call (a report per action), page.route, DOM and storage writes and raw Playwright allowed'
+    case 'debug':
+      return "debug mode (PLAYWRITER_POLICY=debug in this server's configuration): everything allowed, at a person's pace"
+  }
+}
+
 function describeBinding(current: Binding): string {
   switch (current.kind) {
     case 'direct':
-      return `the Chrome at ${current.endpoint} (PLAYWRITER_DIRECT)`
+      return `the Chrome at ${current.endpoint} (PLAYWRITER_DIRECT), in ${describeMode(current.mode)}`
     case 'extension':
-      return `${current.email || '(not signed in)'} (key ${current.key})`
+      return `${current.email || '(not signed in)'} (key ${current.key}), in ${describeMode(current.mode)}`
     case 'headless': {
       const options = executor?.describeNewBrowser() ?? []
-      return [`a new Chrome launched for this session (${current.executablePath})`, ...options.map((line) => `  ${line}`)].join('\n')
+      return [`a new Chrome launched for this session (${current.executablePath}), in ${describeMode(current.mode)}`, ...options.map((line) => `  ${line}`)].join('\n')
     }
   }
 }
@@ -329,8 +343,8 @@ async function releaseBinding(): Promise<string | null> {
   }
 }
 
-/** Bind this session to a connected Chrome profile: the relay routes it to that extension by key. */
-async function bindExtension(extension: ConnectedExtension): Promise<{ exec: PlaywrightExecutor; released: string | null }> {
+/** Bind this session to a connected Chrome profile, its executor in `mode`: the relay routes it to that extension by key. */
+async function bindExtension(extension: ConnectedExtension, mode: PolicyMode): Promise<{ exec: PlaywrightExecutor; released: string | null }> {
   const released = await releaseBinding()
   const remote = getRemoteConfig()
   // The workspace and the extension key ride on cdpConfig and reach the relay via getCdpUrl
@@ -340,20 +354,21 @@ async function bindExtension(extension: ConnectedExtension): Promise<{ exec: Pla
     cdpConfig: { ...(remote || { port: RELAY_PORT }), workspace, extensionId: extension.stableKey },
     logger: mcpLogger,
     cwd: process.cwd(),
+    policy: mode,
   })
   executor = exec
-  binding = { kind: 'extension', key: extension.stableKey, email: emailOf(extension) }
+  binding = { kind: 'extension', key: extension.stableKey, email: emailOf(extension), mode }
   return { exec, released }
 }
 
 /**
- * Bind this session to a new browser launched for it with `options` (new-browser.ts). The options are
- * checked before the current browser is released: a refused option leaves the session as it was.
- * Refuses, telling the model to ask the user, when no Chrome binary exists.
+ * Bind this session to a new browser launched for it with `options` (new-browser.ts), its executor in
+ * `mode`. The options are checked before the current browser is released: a refused option leaves
+ * the session as it was. Refuses, telling the model to ask the user, when no Chrome binary exists.
  */
-async function bindNewBrowser(options: NewBrowserOptions): Promise<{ exec: PlaywrightExecutor; released: string | null; plan: NewBrowserPlan }> {
+async function bindNewBrowser(options: NewBrowserOptions, mode: PolicyMode): Promise<{ exec: PlaywrightExecutor; released: string | null; plan: NewBrowserPlan }> {
   const { PlaywrightExecutor } = await loadExecutorModule()
-  const exec = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: mcpLogger, cwd: process.cwd() })
+  const exec = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: mcpLogger, cwd: process.cwd(), policy: mode })
   let plan: NewBrowserPlan
   try {
     plan = await exec.planNewBrowser(options)
@@ -368,15 +383,15 @@ async function bindNewBrowser(options: NewBrowserOptions): Promise<{ exec: Playw
   }
   const released = await releaseBinding()
   executor = exec
-  binding = { kind: 'headless', executablePath: plan.executablePath }
+  binding = { kind: 'headless', executablePath: plan.executablePath, mode }
   return { exec, released, plan }
 }
 
 /**
  * The executor execute/reset run on. Before any `browser` call it applies the default: PLAYWRITER_DIRECT,
- * else PLAYWRITER_BROWSER (`new`, an email or a key), else the only connected profile. No profile, or
- * several, is a model-facing error saying how to choose — never a guess. Concurrent callers (the startup
- * prelaunch and a first execute) share one creation.
+ * else PLAYWRITER_BROWSER (`new`, an email or a key), else the only connected profile, in the mode
+ * PLAYWRITER_POLICY names, else human. No profile, or several, is a model-facing error saying how to
+ * choose — never a guess. Concurrent callers (the startup prelaunch and a first execute) share one creation.
  */
 async function getOrCreateExecutor(): Promise<PlaywrightExecutor> {
   if (executor) {
@@ -392,6 +407,8 @@ let creatingExecutor: Promise<PlaywrightExecutor> | null = null
 
 async function createDefaultExecutor(): Promise<PlaywrightExecutor> {
   const configured = process.env.PLAYWRITER_BROWSER?.trim() || null
+  const { PlaywrightExecutor, policyFromEnv } = await loadExecutorModule()
+  const mode = policyFromEnv() ?? 'human'
   const directConfig = await getDirectCdpConfig()
   if (directConfig) {
     if (configured) {
@@ -400,23 +417,22 @@ async function createDefaultExecutor(): Promise<PlaywrightExecutor> {
           'Ask the user to remove one of them.',
       )
     }
-    const { PlaywrightExecutor } = await loadExecutorModule()
-    const exec = new PlaywrightExecutor({ cdpConfig: directConfig, logger: mcpLogger, cwd: process.cwd() })
+    const exec = new PlaywrightExecutor({ cdpConfig: directConfig, logger: mcpLogger, cwd: process.cwd(), policy: mode })
     executor = exec
-    binding = { kind: 'direct', endpoint: directConfig.directCdpUrl }
+    binding = { kind: 'direct', endpoint: directConfig.directCdpUrl, mode }
     return exec
   }
 
   if (configured === 'new') {
-    return (await bindNewBrowser({})).exec
+    return (await bindNewBrowser({}, mode)).exec
   }
   // execute and reset have already started the local relay (ensureLocalRelay) before calling this.
   const extensions = await fetchConnectedExtensions()
   if (configured) {
-    return (await bindExtension(resolveChoice(configured, extensions, 'PLAYWRITER_BROWSER'))).exec
+    return (await bindExtension(resolveChoice(configured, extensions, 'PLAYWRITER_BROWSER'), mode)).exec
   }
   if (extensions.length === 1) {
-    return (await bindExtension(extensions[0])).exec
+    return (await bindExtension(extensions[0], mode)).exec
   }
   if (extensions.length === 0) {
     throw new ModelFacingError(
@@ -431,14 +447,15 @@ async function createDefaultExecutor(): Promise<PlaywrightExecutor> {
   )
 }
 
-/** The reply to `use` / `new`: what is driven now, its pages, and that the session was reset. */
-function boundReply({ headline, released, page, context }: { headline: string; released: string | null; page: Page; context: BrowserContext }): string {
+/** The reply to `use` / `new`: what is driven now and in which mode, its pages, and that the session was reset. */
+function boundReply({ headline, mode, released, page, context }: { headline: string; mode: PolicyMode; released: string | null; page: Page; context: BrowserContext }): string {
   const pages = context.pages().length
   return [
     ...(released ? [released] : []),
     headline,
+    `Mode: ${describeMode(mode)}.`,
     `${pages === 1 ? '1 page' : `${pages} pages`} open; current page: ${page.url()}`,
-    'The page, context and state were reset: `state` is empty and globals added by earlier calls are gone.',
+    'The page, context and state were reset: `state` is empty, globals added by earlier calls are gone, and refs from earlier observe()/find() no longer resolve (observe() again).',
   ].join('\n')
 }
 
@@ -675,9 +692,17 @@ server.tool(
 )
 
 /** What the `browser` tool does for one call; throws ModelFacingError for every refusal. */
-async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string | undefined, options: NewBrowserOptions): Promise<string> {
+async function runBrowserAction(
+  action: 'list' | 'use' | 'new',
+  choice: string | undefined,
+  requestedMode: 'human' | 'fast' | undefined,
+  options: NewBrowserOptions,
+): Promise<string> {
   if (action !== 'use' && choice !== undefined) {
     throw new ModelFacingError(`\`browser\` is only read by use; ${action} takes no browser.`)
+  }
+  if (action === 'list' && requestedMode !== undefined) {
+    throw new ModelFacingError('`mode` is only read by use and new; list takes none. Nothing was changed.')
   }
   const given = Object.entries(options).flatMap(([name, value]) => (value === undefined ? [] : [name]))
   if (action !== 'new' && given.length > 0) {
@@ -694,14 +719,17 @@ async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string |
     return `${configuredDirect}\nThis session drives: ${binding ? describeBinding(binding) : 'that browser, from the first execute or reset'}`
   }
 
+  // The mode the call asked for, else this server's PLAYWRITER_POLICY, else human.
+  const mode = requestedMode ?? (await loadExecutorModule()).policyFromEnv() ?? 'human'
   if (action === 'new') {
-    const { exec, released, plan } = await bindNewBrowser(options)
+    const { exec, released, plan } = await bindNewBrowser(options, mode)
     const { page, context } = await exec.reset()
     return boundReply({
       headline: [
         `Now driving a new ${plan.headed ? 'headed' : 'headless'} Chrome launched for this session: no logins, no extensions, nothing shared with the user's browsers.`,
         ...(exec.describeNewBrowser() ?? []).map((line) => `  ${line}`),
       ].join('\n'),
+      mode,
       released,
       page,
       context,
@@ -725,10 +753,11 @@ async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string |
     throw new ModelFacingError(`use needs \`browser\`: a profile email or a key. The choices are:\n${describeChoices(extensions)}\nChoose with:\n${choiceCalls(extensions)}`)
   }
   const extension = resolveChoice(wanted, extensions, 'use')
-  const { exec, released } = await bindExtension(extension)
+  const { exec, released } = await bindExtension(extension, mode)
   const { page, context } = await exec.reset()
   return boundReply({
     headline: `Now driving ${emailOf(extension) || '(not signed in)'} (key ${extension.stableKey}): the user's Chrome, through its Playwriter extension.`,
+    mode,
     released,
     page,
     context,
@@ -738,24 +767,33 @@ async function runBrowserAction(action: 'list' | 'use' | 'new', choice: string |
 server.tool(
   'browser',
   dedent`
-    Chooses which browser this session drives; execute and reset then run on it.
+    Chooses which browser this session drives, and in which mode; execute and reset then run on it.
 
-    - \`{ action: "list" }\`: every browser you can drive — each of the user's Chrome profiles connected through the Playwriter extension (email, key, attached tabs) and \`new\` — and which one this session drives now.
+    - \`{ action: "list" }\`: every browser you can drive — each of the user's Chrome profiles connected through the Playwriter extension (email, key, attached tabs) and \`new\` — and which one this session drives now, in which mode.
     - \`{ action: "use", browser: "<email or key>" }\`: drive that Chrome profile, the user's real logged-in browser.
     - \`{ action: "new" }\`: launch a fresh Chrome for this session: no logins, no extensions, nothing shared with the user's browsers. Pages see a normal Chrome of that version on this computer (no automation flag, no "HeadlessChrome").
       Options (only with new, all optional): \`viewport: { width, height }\` (default 1280×720) or \`device: "Pixel 7"\` (a phone/tablet/desktop Chrome preset; an unknown name lists them), \`userAgent\`, \`locale: "fr-FR"\`, \`timezone: "America/New_York"\`, \`colorScheme: "dark"\`, \`headed: true\` (a visible window; needs a display), \`allowedDomains: ["example.com"]\` (other hosts are blocked and the report says so), \`downloads: "/tmp/dl"\` (every download is also saved there under its own name).
       Example: \`{ action: "new", device: "Pixel 7", locale: "de-DE" }\`.
+
+    \`mode\` (with use or new): \`"human"\` or \`"fast"\`; without it, this server's default (human unless its configuration says otherwise).
+    - human: a person's pace, one input action per call, nothing faked, nothing a site can tell from a person. For real sites, recordings with captions, and anything that must look like a person.
+    - fast: for testing on localhost. act.* keeps every check (hit tests, covers, disabled, busy, dialogs) and its report, without human pacing: one straight pointer move, keys without delays, no pauses, waits on page events instead of quiet windows. Several actions per call, each with its own report in order; page.route, init scripts, DOM and storage writes and raw Playwright are allowed. A recording shows the fast input as it happened.
+    Switching mode is a new use or new call. use reconnects to the same profile: its tabs stay open and are not reloaded. new launches a fresh Chrome and closes the one this session launched before. Either way refs from earlier observe()/find() no longer resolve: observe() again.
 
     Switching releases the previous browser (the user's tabs stay open; a Chrome this session launched is closed) and resets page, context and \`state\`.
   `,
   {
     action: z.enum(['list', 'use', 'new']).describe('list the choices, use a connected Chrome profile, or launch a new Chrome'),
     browser: z.string().optional().describe('With use: a profile email (case-insensitive) or a key, as list shows them.'),
+    mode: z
+      .enum(['human', 'fast'])
+      .optional()
+      .describe("With use or new: 'human' (a person's pace; real sites, recordings) or 'fast' (testing on localhost: no pacing, several actions per call)."),
     ...newBrowserOptionShapes,
   },
-  async ({ action, browser: choice, ...options }) => {
+  async ({ action, browser: choice, mode, ...options }) => {
     try {
-      return { content: [{ type: 'text', text: await runBrowserAction(action, choice, options) }] }
+      return { content: [{ type: 'text', text: await runBrowserAction(action, choice, mode, options) }] }
     } catch (error) {
       const text =
         error instanceof ModelFacingError

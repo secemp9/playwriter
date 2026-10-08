@@ -2952,11 +2952,11 @@ export async function startPlayWriterCDPRelayServer({
         /** Block images/video/fonts to save proxy bandwidth */
         blockProxyResources?: boolean
       }
-      /** human (default) or debug — fixed for the session by whoever creates it, never by the model. */
+      /** human (default), fast or debug — fixed for the session by whoever creates it. */
       policy?: string
     }
-    if (body.policy !== undefined && body.policy !== 'human' && body.policy !== 'debug') {
-      return c.json({ error: `policy must be "human" or "debug" (got ${JSON.stringify(body.policy)})` }, 400)
+    if (body.policy !== undefined && body.policy !== 'human' && body.policy !== 'fast' && body.policy !== 'debug') {
+      return c.json({ error: `policy must be "human", "fast" or "debug" (got ${JSON.stringify(body.policy)})` }, 400)
     }
     const policy = body.policy
     const sessionId = String(nextSessionNumber++)
