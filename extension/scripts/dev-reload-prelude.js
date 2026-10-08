@@ -30,6 +30,9 @@
   const ALARM = 'playwriter-dev-reload'
   const ERROR_KEY = 'playwriterDevBodyError'
   const RUNNING_BUILD = __PLAYWRITER_BUILD_ID__
+  const BUILD_ID = /^[0-9a-f]{8}$/
+  // The body's key (src/self-reload.ts FOLDER_BUILD_AT_LOAD_KEY): one baseline per loaded build.
+  const FOLDER_BUILD_AT_LOAD_KEY = 'selfReloadFolderBuildAtLoad'
 
   globalThis.__playwriterDevReport = (err) => {
     const message = err instanceof Error ? `${err.message}\n${err.stack || ''}` : String(err)
@@ -86,6 +89,20 @@
     try {
       const build = await folderBuild()
       if (build === null || build === RUNNING_BUILD) return
+      // A background.js that kept the build-id placeholder: its build stopped before its last step and
+      // Chrome loaded it anyway. Its id matches no build.json, so it reloads only into a build written
+      // after it was loaded, or it would reload into the same files every second (src/self-reload.ts,
+      // writtenAfterUnfinishedLoad).
+      if (!BUILD_ID.test(RUNNING_BUILD)) {
+        const stored = await chrome.storage.session.get(FOLDER_BUILD_AT_LOAD_KEY)
+        const seen = stored[FOLDER_BUILD_AT_LOAD_KEY]
+        if (typeof seen !== 'string') {
+          await chrome.storage.session.set({ [FOLDER_BUILD_AT_LOAD_KEY]: build })
+          console.log(`[playwriter] dev live-reload: this build did not finish; reloading into the next build written to its folder (now ${build})`)
+          return
+        }
+        if (seen === build) return
+      }
       console.log(`[playwriter] dev live-reload: build ${RUNNING_BUILD} -> ${build}, RELOADING`)
       chrome.runtime.reload()
     } catch (err) {

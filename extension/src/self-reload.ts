@@ -22,12 +22,26 @@ export const RUNNING_BUILD = __PLAYWRITER_BUILD_ID__
 /** What vite.config.mts writes: the first 8 hex digits of a SHA-256. */
 const BUILD_ID = /^[0-9a-f]{8}$/
 
+/** How the logs name the build this worker runs. */
+const RUNNING = BUILD_ID.test(RUNNING_BUILD) ? `build ${RUNNING_BUILD}` : 'a build that did not finish'
+
 /**
- * How long `chrome.management.getSelf()` may take. chrome.* calls have been observed never to settle
- * in a wedged worker (INSTALL_ID_STORAGE_TIMEOUT_MS in background.ts); a real timer, because a check
- * that never ends would leave every later check waiting on it.
+ * How long a chrome.* call may take. chrome.* calls have been observed never to settle in a wedged
+ * worker (INSTALL_ID_STORAGE_TIMEOUT_MS in background.ts); a real timer, because a check that never
+ * ends would leave every later check waiting on it.
  */
-const GET_SELF_TIMEOUT_MS = 1500
+const CHROME_CALL_TIMEOUT_MS = 1500
+
+/** `call`'s answer, or null when Chrome has not answered within CHROME_CALL_TIMEOUT_MS. */
+async function answered<T>(call: Promise<T>): Promise<{ value: T } | null> {
+  const expired = Promise.withResolvers<null>()
+  const timer = setTimeout(() => expired.resolve(null), CHROME_CALL_TIMEOUT_MS)
+  try {
+    return await Promise.race([call.then((value) => ({ value })), expired.promise])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 /**
  * The id in build.json of the extension's folder, or null when there is none to read: no file (a
@@ -63,14 +77,28 @@ export async function readFolderBuild(): Promise<string | null> {
  * Extensions.loadUnpacked), and getSelf needs no "management" permission.
  */
 async function isUnpacked(): Promise<boolean | null> {
-  const expired = Promise.withResolvers<null>()
-  const timer = setTimeout(() => expired.resolve(null), GET_SELF_TIMEOUT_MS)
-  try {
-    const self = await Promise.race([chrome.management.getSelf(), expired.promise])
-    return self === null ? null : self.installType === 'development'
-  } finally {
-    clearTimeout(timer)
-  }
+  const self = await answered(chrome.management.getSelf())
+  return self === null ? null : self.value.installType === 'development'
+}
+
+/** storage.session key: the folder's build when a worker of an unfinished build first checked. */
+const FOLDER_BUILD_AT_LOAD_KEY = 'selfReloadFolderBuildAtLoad'
+
+/**
+ * Whether the folder's `build` was written after Chrome loaded this worker's unfinished build: a
+ * background.js that still holds the build-id placeholder because its build stopped before its last
+ * step (vite.config.mts `build-id`), loaded anyway at a Chrome restart or a ↻. Its id matches no
+ * build.json, so the plain comparison would reload it into the same files on every check, forever.
+ * It reloads only into a build written after it was loaded: the folder's build it saw first is kept
+ * in storage.session, which a worker restart keeps and a reload wipes (MEASURED, Chrome for Testing
+ * 145 and Chrome 149). Null: Chrome did not answer in time.
+ */
+async function writtenAfterUnfinishedLoad(build: string): Promise<boolean | null> {
+  const stored = await answered(chrome.storage.session.get(FOLDER_BUILD_AT_LOAD_KEY))
+  if (stored === null) return null
+  const seen: unknown = stored.value[FOLDER_BUILD_AT_LOAD_KEY]
+  if (typeof seen === 'string') return seen !== build
+  return (await answered(chrome.storage.session.set({ [FOLDER_BUILD_AT_LOAD_KEY]: build }))) === null ? null : false
 }
 
 export type SelfReloadOutcome =
@@ -84,6 +112,8 @@ export type SelfReloadOutcome =
   | { kind: 'unreadable' }
   /** The folder holds the build this worker runs. */
   | { kind: 'current' }
+  /** This worker runs a build that did not finish, and no build was written to its folder since it was loaded. */
+  | { kind: 'unfinished' }
   /** The folder holds a newer build, loaded once the extension controls no tab. */
   | { kind: 'waiting'; build: string }
   /** The extension is reloading into the folder's build. */
@@ -125,6 +155,7 @@ export function createSelfReload({
   // Said once per worker, not on every check.
   let loggedWaiting: string | null = null
   let loggedUnreadable = false
+  let loggedUnfinished = false
 
   const tell = (build: string | null): void => {
     waiting = build
@@ -142,7 +173,7 @@ export function createSelfReload({
     if (build === null) {
       if (!loggedUnreadable) {
         loggedUnreadable = true
-        log(`build ${RUNNING_BUILD}: its folder has no build.json naming a build; it reloads itself once one does`)
+        log(`${RUNNING}: its folder has no build.json naming a build; it reloads itself once one does`)
       }
       tell(null)
       return { kind: 'unreadable' }
@@ -151,18 +182,30 @@ export function createSelfReload({
       tell(null)
       return { kind: 'current' }
     }
+    if (!BUILD_ID.test(RUNNING_BUILD)) {
+      const later = await writtenAfterUnfinishedLoad(build)
+      if (later === null) return { kind: 'unanswered' }
+      if (!later) {
+        if (!loggedUnfinished) {
+          loggedUnfinished = true
+          log(`this worker runs a build that did not finish (its background.js has no build id); it reloads itself into the next build written to its folder (now ${build})`)
+        }
+        tell(null)
+        return { kind: 'unfinished' }
+      }
+    }
     if (isIdle()) {
       await settle()
     }
     if (!isIdle() || !isConnected()) {
       if (loggedWaiting !== build) {
         loggedWaiting = build
-        log(`build ${RUNNING_BUILD}: a newer build ${build} is in its folder; it reloads itself once it controls no tab`)
+        log(`${RUNNING}: a newer build ${build} is in its folder; it reloads itself once it controls no tab`)
       }
       tell(build)
       return { kind: 'waiting', build }
     }
-    log(`reloading itself: build ${RUNNING_BUILD} → ${build} (its folder has a newer build)`)
+    log(`reloading itself: ${RUNNING} → ${build} (its folder has a newer build)`)
     await reload()
     return { kind: 'reloading', build }
   }

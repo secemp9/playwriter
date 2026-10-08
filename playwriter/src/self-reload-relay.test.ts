@@ -304,4 +304,50 @@ describe('an unpacked extension whose folder gets a newer build', () => {
       old.close()
     }
   }, 60_000)
+
+  it('a worker of a build that did not finish reloads neither into the same files nor in a loop, and reloads into the next build', async () => {
+    // What a build leaves when it stops before its last step: background.js still holding the build-id
+    // placeholder (extension/vite.config.mts BUILD_ID_PLACEHOLDER) next to the build.json of an earlier
+    // build. Chrome loads it at a restart or a ↻; here the running build reloads into it.
+    const placeholder = '__PLAYWRITER_BUILD_ID_PLACEHOLDER__'
+    const logStart = (await relayLog()).length
+    const running = await getExtensionServiceWorker(context)
+    expect(await running.evaluate(() => globalThis.checkForNewerBuild())).toEqual({ kind: 'current' })
+    const background = fs.readFileSync(path.join(loaded, 'background.js'), 'utf-8')
+    expect(background).toContain(buildA)
+    fs.writeFileSync(path.join(loaded, 'background.js.tmp'), background.replaceAll(buildA, placeholder))
+    fs.renameSync(path.join(loaded, 'background.js.tmp'), path.join(loaded, 'background.js'))
+    writeBuildJson(`${JSON.stringify({ id: buildB })}\n`)
+
+    await restartRelay()
+    await waitForExtension('the extension on the unfinished build', (extension) => extension.build === placeholder)
+    // A real timer: a worker that reloads into the same files is back within about a second each time
+    // (RELOAD_BOUND_MS), so 5 s of quiet shows there is no loop.
+    await sleep(5000)
+    const unfinished = await getExtensionServiceWorker(context)
+    expect(await unfinished.evaluate(() => globalThis.checkForNewerBuild())).toEqual({ kind: 'unfinished' })
+    const waited = (await relayLog()).slice(logStart)
+    expect(occurrences(waited, 'reloading itself:')).toBe(1)
+    expect(occurrences(waited, `reloading itself: build ${buildA} → ${buildB} (its folder has a newer build)`)).toBe(1)
+    expect(
+      occurrences(
+        waited,
+        `this worker runs a build that did not finish (its background.js has no build id); it reloads itself into the next build written to its folder (now ${buildB})`,
+      ),
+    ).toBe(1)
+    expect(await browserList()).toContain(
+      `extension built with playwriter ${VERSION}, from a build that did not finish (it reloads itself into the next build written to its folder) · 0 attached tabs`,
+    )
+
+    // The next build that finishes: the extension reloads into it by itself.
+    expect(await build({ outDir: loaded, testing: true })).toBe(buildA)
+    await restartRelay()
+    await waitForExtension(`the extension back on build ${buildA}`, (extension) => extension.build === buildA)
+    const healed = (await relayLog()).slice(logStart)
+    expect(occurrences(healed, 'reloading itself:')).toBe(2)
+    expect(occurrences(healed, `reloading itself: a build that did not finish → ${buildA} (its folder has a newer build)`)).toBe(1)
+    const after = await getExtensionServiceWorker(context)
+    expect(await after.evaluate(() => globalThis.checkForNewerBuild())).toEqual({ kind: 'current' })
+    expect(await welcomeTabsAndGroups(after)).toEqual({ welcomeTabs: 0, groups: 0 })
+  }, 180_000)
 })

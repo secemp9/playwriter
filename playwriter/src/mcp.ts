@@ -237,15 +237,20 @@ function useCall(choice: string): string {
 
 const NEW_CALL = 'browser({ action: "new" })'
 
+/** A build id as the extension's vite `build-id` plugin writes it (extension/src/self-reload.ts BUILD_ID). */
+const BUILD_ID = /^[0-9a-f]{8}$/
+
 function describeExtension(extension: ConnectedExtension): string {
   const tabs = extension.activeTargets === 1 ? '1 attached tab' : `${extension.activeTargets} attached tabs`
   const built = `extension built with playwriter ${extension.playwriterVersion ?? '(version not reported)'}`
   const build =
     extension.build === null
       ? `${built}, before it could reload itself: ask the user to click ↻ on its card in chrome://extensions once`
-      : extension.newerBuild === null
-        ? `${built}, build ${extension.build}`
-        : `${built}, build ${extension.build} (a newer build is in its folder; it reloads itself once it controls no tab)`
+      : !BUILD_ID.test(extension.build)
+        ? `${built}, from a build that did not finish (it reloads itself into the next build written to its folder)`
+        : extension.newerBuild === null
+          ? `${built}, build ${extension.build}`
+          : `${built}, build ${extension.build} (a newer build is in its folder; it reloads itself once it controls no tab)`
   return `- ${emailOf(extension) || '(not signed in)'} — key ${extension.stableKey} · ${extension.browser ?? 'browser not reported'} · ${build} · ${tabs}`
 }
 
