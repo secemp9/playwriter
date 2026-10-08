@@ -228,7 +228,9 @@ describe('fast settle', () => {
   it('a confirm the agent must answer ends it at once with js-dialog, as at human pace', async () => {
     const { page, watch, dialogs } = await openWatched('/confirm')
     const cp = watch.checkpoint()
-    await page.click('#delete')
+    // The confirm stays open for the agent to answer: Playwright's wait for navigations after the
+    // click cannot end before that (seen hanging 30 s under a full test run), so it is skipped.
+    await page.click('#delete', { noWaitAfter: true })
     const fast = await watch.settle({ pace: 'fast', since: cp, origin: Date.now() })
     const human = await watch.settle({ since: cp })
     expect(fast).toMatchObject({ pace: 'fast', settled: false, reason: 'js-dialog', dialog: { type: 'confirm', message: 'Delete this thread?' } })

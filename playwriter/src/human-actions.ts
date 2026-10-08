@@ -3830,10 +3830,12 @@ export function createActApi(deps: ActDeps): ActApi {
   /**
    * After choosing `label` (option `index`): watch the select for half a second, as a person glances
    * at it. Chrome applies the choice at once; a page that refuses it puts its own value back — which
-   * is said only when the choice was seen taken and then undone. Event-driven: the select is read
-   * again at each change of it (SELECT_CHANGE_FN), never polled. Fast mode does not glance: a choice
-   * read as taken right away is done (the report's change list shows what the page did after);
-   * one not taken yet is watched the same half second for the page to take it.
+   * is said only when the choice was seen taken and then undone. The select is read again at each
+   * change of it (SELECT_CHANGE_FN), and once more when the glance ends: a value the page puts back
+   * from script (`select.value = …`) fires no event and changes no attribute, so only that last read
+   * shows it. Fast mode does not glance: a choice read as taken right away is done (the report's
+   * change list shows what the page did after); one not taken yet is watched the same half second
+   * for the page to take it.
    */
   async function confirmChoice(step: Step, target: RefTarget, plan: SelectPlan, readState: () => Promise<SelectState>, how: string, world: IsolatedWorld): Promise<void> {
     const { probe, record } = step
@@ -3856,6 +3858,11 @@ export function createActApi(deps: ActDeps): ActApi {
       )
       if (changed === undefined) return
       if (changed === 'cap') break
+      after = await readState()
+      if (after.chosen) seenAt ??= Date.now()
+    }
+    // The end of the glance (see above): the read that sees a value the page put back from script.
+    if (!(fast && after.chosen)) {
       after = await readState()
       if (after.chosen) seenAt ??= Date.now()
     }
