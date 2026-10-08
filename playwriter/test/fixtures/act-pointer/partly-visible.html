@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Partly visible targets</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; }
+  /* The document ends where #page ends; what overflows it is clipped, so it can never be scrolled to. */
+  #page { display: flow-root; position: relative; overflow: clip; height: 2500px; }
+  #cut { position: absolute; left: 500px; top: 2481px; height: 38px; }
+  #gone { position: absolute; left: 700px; top: 2520px; height: 38px; }
+  .menu { position: fixed; list-style: none; margin: 0; padding: 0; background: #fff; border: 1px solid #888; width: 180px; }
+  .menu button { display: block; width: 100%; height: 38px; border: 0; background: #fff; text-align: left; }
+  /* A context menu opened near the bottom edge: its last item sticks out 18px below the window. */
+  #fixed-menu { left: 20px; bottom: -19px; }
+  /* A fixed list that is taller than what is left of the window: its lower part is below the window. */
+  #scroll-menu { left: 260px; bottom: -100px; height: 300px; overflow-y: auto; }
+  /* A fixed layer entirely below the window. */
+  #hidden-menu { left: 900px; bottom: -200px; }
+</style>
+</head>
+<body>
+<div id="page">
+  <p id="status" role="status">Nothing clicked</p>
+  <button id="cut">Half at the end</button>
+  <button id="gone">Past the end</button>
+</div>
+<ul class="menu" id="fixed-menu" role="menu" aria-label="Card actions">
+  <li role="none"><button role="menuitem">Open</button></li>
+  <li role="none"><button role="menuitem">Duplicate</button></li>
+  <li role="none"><button role="menuitem">Archive</button></li>
+</ul>
+<ul class="menu" id="scroll-menu" role="menu" aria-label="Long list">
+  <li role="none"><button role="menuitem">Item 1</button></li>
+  <li role="none"><button role="menuitem">Item 2</button></li>
+  <li role="none"><button role="menuitem">Item 3</button></li>
+  <li role="none"><button role="menuitem">Item 4</button></li>
+  <li role="none"><button role="menuitem">Item 5</button></li>
+  <li role="none"><button role="menuitem">Item 6</button></li>
+  <li role="none"><button role="menuitem">Item 7</button></li>
+  <li role="none"><button role="menuitem">Item 8</button></li>
+  <li role="none"><button role="menuitem">Item 9</button></li>
+  <li role="none"><button role="menuitem">Item 10</button></li>
+  <li role="none"><button role="menuitem">Item 11</button></li>
+  <li role="none"><button role="menuitem">Item 12</button></li>
+</ul>
+<ul class="menu" id="hidden-menu" role="menu" aria-label="Out of reach">
+  <li role="none"><button role="menuitem">Unreachable</button></li>
+</ul>
+<script>
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('button')
+    if (button) document.getElementById('status').textContent = 'Clicked: ' + button.textContent
+  })
+</script>
+</body>
+</html>

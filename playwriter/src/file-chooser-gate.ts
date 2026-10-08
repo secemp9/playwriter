@@ -42,6 +42,13 @@ import { ModelFacingError } from './probe-types.js'
 /** How long an input's transient user activation lasts in Chromium (Blink's `kActivationLifespan`; measured 5019 ms). */
 export const ACTIVATION_LIFESPAN_MS = 5000
 const CDP_TIMEOUT_MS = 5000
+/**
+ * Answers that say a session no longer exists: Playwright's for a session whose target detached
+ * (measured: `Target page, context or browser has been closed` after an iframe's document moved into
+ * its parent's process), Chrome's for an unknown session id, and the extension's (`No tab found for
+ * method … sessionId: …`, measured on MDN after the iframe of the page left behind went away).
+ */
+const SESSION_GONE_RE = /Target page, context or browser has been closed|Target closed|Session closed|Session with given id not found|No tab found for method/
 
 /** In the frame's isolated world: whether the input a chooser was opened for is still in its document. */
 const INPUT_CONNECTED_FN = 'function (_args, input) { return !!input && input.isConnected }'
@@ -278,16 +285,43 @@ export class FileChooserGate {
     return state
   }
 
-  /** Sessions whose renderer still has frames of this page; the others are forgotten. */
+  /**
+   * The sessions that carry this page's documents now; the others are forgotten. An iframe's session
+   * departs with its document — the iframe was removed, the page left the document that had it, or its
+   * next document went to another renderer process (the frame stays, its session does not): nothing is
+   * held back there any more, so nothing is armed or released there.
+   */
   private async liveSessions(): Promise<SessionState[]> {
-    for (const { cdp, rootId } of await this.frames.sessions()) this.track(cdp, rootId === this.frames.mainFrameId() ? null : rootId)
-    const frameIds = new Set(this.page.frames().map((frame) => frame.frameId()))
+    const listed = await this.frames.sessions()
+    for (const { cdp, rootId } of listed) this.track(cdp, rootId === this.frames.mainFrameId() ? null : rootId)
     for (const state of [...this.sessions]) {
-      if (state.rootId === null || frameIds.has(state.rootId)) continue
-      state.cdp.off('Page.fileChooserOpened', state.onOpened)
-      this.sessions.splice(this.sessions.indexOf(state), 1)
+      if (state.rootId === null || listed.some((session) => session.cdp === state.cdp)) continue
+      this.forget(state)
     }
     return [...this.sessions]
+  }
+
+  private forget(state: SessionState): void {
+    const index = this.sessions.indexOf(state)
+    if (index === -1) return
+    state.cdp.off('Page.fileChooserOpened', state.onOpened)
+    this.sessions.splice(index, 1)
+  }
+
+  /**
+   * Whether a toggle on `state` failed because its session departed with its document (see
+   * `liveSessions`) — or the tab closed — rather than in a session that still carries a frame of this
+   * page. A session that no longer exists says so (`SESSION_GONE_RE`); through the extension that
+   * answer can arrive before the frame's departure reaches Playwright. Otherwise the sessions are
+   * listed again: one no longer listed departed.
+   */
+  private async departed(state: SessionState, error: unknown): Promise<boolean> {
+    if (this.page.isClosed()) return true
+    if (state.rootId === null) return false
+    if (!this.page.frames().some((frame) => frame.frameId() === state.rootId)) return true
+    if (SESSION_GONE_RE.test(error instanceof Error ? error.message : String(error))) return true
+    const listed = await this.frames.sessions()
+    return !listed.some((session) => session.cdp === state.cdp)
   }
 
   /** Turn interception on in every session that does not have it. Waits for Chrome's answer unless a JS dialog freezes the page. */
@@ -344,10 +378,15 @@ export class FileChooserGate {
     const what = `${enabled ? 'holding back' : 'releasing'} the file dialogs of ${state.rootId === null ? this.page.url() : `an iframe of ${this.page.url()}`}`
     const answered = state.cdp.send('Page.setInterceptFileChooserDialog', { enabled }).then(
       () => 'answered' as const,
-      (error: unknown) => {
-        if (!this.page.isClosed() && (state.rootId === null || this.page.frames().some((frame) => frame.frameId() === state.rootId))) {
-          this.failures.push(`${what} failed: ${error instanceof Error ? error.message : String(error)}`)
-        }
+      async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        // Its session went with its document: nothing is held back there any more, nothing to say.
+        const gone = await this.departed(state, error).catch((listing: unknown) => {
+          this.failures.push(`${what} failed: ${message} (and listing the page's sessions to tell whether its iframe left failed: ${listing instanceof Error ? listing.message : String(listing)})`)
+          return null
+        })
+        if (gone) this.forget(state)
+        else if (gone === false) this.failures.push(`${what} failed: ${message}`)
         return 'answered' as const
       },
     )

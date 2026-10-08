@@ -34,6 +34,7 @@ import {
   PERF_NODES_FN,
   PERF_OBSERVERS_SOURCE,
   PERF_READ_EXPRESSION,
+  type PerfEvent,
   type PerfInteraction,
   type PerfLoaf,
   type PerfNodeRequest,
@@ -254,11 +255,59 @@ function largestSessionWindow(shifts: PerfShift[]): { value: number; shifts: Per
   return best
 }
 
+/** One interaction with web-vitals' INP attribution taken over its event entries. */
+interface AttributedInteraction {
+  id: number
+  /** Its event types in the order they happened (`pointerdown/pointerup/click`). */
+  name: string
+  /** The longest event's start: when the input the interaction is measured from happened. */
+  startTime: number
+  /** The longest event's duration, which is the interaction's latency. */
+  duration: number
+  inputDelay: number
+  processing: number
+  presentation: number
+  /** The events whose handlers ran 1 ms or more in the measured frame, with that time. */
+  handlers: Array<{ name: string; ms: number }>
+}
+
+/** Chrome rounds event durations to 8 ms: entries whose next paint is this close share a frame. */
+const SAME_FRAME_MS = 8
+
+/**
+ * web-vitals' INP attribution over an interaction's entries (grouped by interactionId). The longest
+ * entry is the latency and its start is the input time; the entries painted in the same frame are
+ * the ones it waited for (a pointerdown held before its pointerup paints a frame of its own).
+ * inputDelay = first processingStart − start; processing = first processingStart → last
+ * processingEnd; presentation = start + duration − last processingEnd.
+ */
+function attribute(interaction: PerfInteraction): AttributedInteraction | null {
+  const events = [...interaction.events].sort((a, b) => a.startTime - b.startTime)
+  const longest = events.reduce<PerfEvent | null>((best, event) => (best === null || event.duration > best.duration ? event : best), null)
+  if (longest === null) return null
+  const paint = longest.startTime + longest.duration
+  const frame = events.filter((event) => Math.abs(event.startTime + event.duration - paint) <= SAME_FRAME_MS)
+  const startTime = Math.min(...frame.map((event) => event.startTime))
+  const processingStart = Math.min(...frame.map((event) => event.processingStart))
+  const processingEnd = Math.max(...frame.map((event) => event.processingEnd))
+  const end = Math.max(startTime + longest.duration, processingEnd)
+  return {
+    id: interaction.id,
+    name: [...new Set(events.map((event) => event.name))].join('/'),
+    startTime,
+    duration: longest.duration,
+    inputDelay: Math.max(processingStart - startTime, 0),
+    processing: processingEnd - processingStart,
+    presentation: end - processingEnd,
+    handlers: frame.filter((event) => event.processingEnd - event.processingStart >= 1).map((event) => ({ name: event.name, ms: event.processingEnd - event.processingStart })),
+  }
+}
+
 /**
  * INP the way web-vitals computes it: each interaction's longest event, then the 98th percentile —
  * the slowest one, skipping one per 50 interactions of the page (`performance.interactionCount`).
  */
-function inpOf(interactions: PerfInteraction[], interactionCount: number | null): PerfInteraction | null {
+function inpOf(interactions: AttributedInteraction[], interactionCount: number | null): AttributedInteraction | null {
   if (interactions.length === 0) return null
   const sorted = [...interactions].sort((a, b) => b.duration - a.duration)
   const skip = Math.floor((interactionCount ?? interactions.length) / 50)
@@ -289,7 +338,8 @@ export interface VitalsResult {
   fcp: VitalMetric
   lcp: VitalMetric & { element?: string; resource?: string }
   cls: VitalMetric & { shifts?: Array<{ at: number; value: number; moved: string }> }
-  inp: VitalMetric & { interaction?: string; interactions?: number }
+  /** The INP interaction's web-vitals breakdown: input delay + processing + presentation = ms. */
+  inp: VitalMetric & { interaction?: string; interactions?: number; inputDelayMs?: number; processingMs?: number; presentationMs?: number }
   longTasks: { count: number; longestMs: number | null }
   longAnimationFrames: Array<{ at: number; ms: number; blockingMs: number; script: string }>
   domContentLoaded: number | null
@@ -306,12 +356,12 @@ async function vitals(deps: InstrumentDeps, page: Page): Promise<VitalsResult> {
   const world = probe.frames.main.world
   const { read } = await readTimeline(world)
   const window = largestSessionWindow(read.shifts)
-  const inp = inpOf(read.interactions, read.interactionCount)
-  const slowest = [...read.interactions].sort((a, b) => b.duration - a.duration).slice(0, 1)
+  const interactions = read.interactions.map(attribute).filter((entry) => entry !== null)
+  const inp = inpOf(interactions, read.interactionCount)
   const request: PerfNodeRequest = {
     lcp: read.lcp !== null,
     shifts: window.shifts.map((shift) => ({ id: shift.id, sources: Math.min(shift.sources.length, SOURCES_SHOWN) })),
-    interactions: inp ? [inp.id] : slowest.map((entry) => entry.id),
+    interactions: inp ? [inp.id] : [],
   }
   const observation = await deps.probes.observe(page, deps.context, {}, false)
   const placed = await placeNodes(deps.probes, page, world, observation, request)
@@ -410,18 +460,20 @@ async function vitals(deps: InstrumentDeps, page: Page): Promise<VitalsResult> {
     result.inp = { unknown: 'this browser does not report event timing' }
     lines.push(`  INP   unknown: ${result.inp.unknown}`)
   } else if (inp) {
-    const before = read.interactions.filter((entry) => entry.startTime < read.startedAt).length
-    const breakdown =
-      `input delay ${ms(inp.processingStart - inp.startTime)}, processing ${ms(inp.processingEnd - inp.processingStart)}, ` +
-      `presentation ${ms(inp.startTime + inp.duration - inp.processingEnd)}`
+    const before = interactions.filter((entry) => entry.startTime < read.startedAt).length
+    const handlers = inp.handlers.length > 0 ? ` (${inp.handlers.map((handler) => `${handler.name} ${ms(handler.ms)}`).join(', ')})` : ''
+    const breakdown = `input delay ${ms(inp.inputDelay)}, processing ${ms(inp.processing)}${handlers}, presentation ${ms(inp.presentation)}`
     result.inp = {
       ms: Math.round(inp.duration),
       rating: rating('inp', inp.duration),
       interaction: `${inp.name} on ${interactionTarget}`,
-      interactions: read.interactions.length,
+      interactions: interactions.length,
+      inputDelayMs: Math.round(inp.inputDelay),
+      processingMs: Math.round(inp.processing),
+      presentationMs: Math.round(inp.presentation),
     }
     lines.push(
-      `  INP   ${ms(inp.duration)} (${rating('inp', inp.duration)}) over ${read.interactions.length} measured interaction${read.interactions.length === 1 ? '' : 's'}` +
+      `  INP   ${ms(inp.duration)} (${rating('inp', inp.duration)}) over ${interactions.length} measured interaction${interactions.length === 1 ? '' : 's'}` +
         (before > 0 ? ` (${before} from before playwriter observed the page, kept by Chrome because they took 104 ms or more)` : '') +
         ` — ${inp.name} on ${interactionTarget}: ${breakdown}`,
     )

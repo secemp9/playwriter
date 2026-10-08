@@ -47,6 +47,8 @@ export interface BusySignal {
   kind: 'aria-busy' | 'progressbar' | 'status-text' | 'spinner' | 'skeleton' | 'dom-streaming' | 'network-streaming' | 'network-waiting'
   /** What a person would notice, e.g. `region "Search results" [aria-busy]`, `progressbar "Upload" (indeterminate)` or `6 skeleton placeholders (animation shimmer) in area "Products"`. */
   label: string
+  /** Of `network-waiting` for an iframe's document: the frame id of that iframe (observe() puts all of them on one line, by their refs). */
+  iframe?: string
 }
 
 /** A native JS dialog (alert/confirm/prompt/beforeunload). While one is open the page's JS is frozen. */
@@ -215,6 +217,10 @@ export interface PendingRequest {
   /** CDP ResourceType when Chrome stated it. */
   resourceType?: string
   ageMs: number
+  /** An iframe's document request: the frame id of that iframe (the main frame's own document has none). */
+  iframe?: string
+  /** Of an iframe's document: Chrome reported its response; its body is still arriving. */
+  answered?: true
 }
 
 export interface SettleResult {
@@ -227,6 +233,11 @@ export interface SettleResult {
    */
   reason: 'quiet' | 'timeout' | 'js-dialog' | 'page-closed'
   pendingRequests: PendingRequest[]
+  /**
+   * Documents of iframes the action caused that Chrome had not answered after a bound (page-watch
+   * IFRAME_DOCUMENT_MS): not waited for — the page around them settles without them — and listed.
+   */
+  iframeDocuments?: PendingRequest[]
   /**
    * Requests still open that the action did not cause (started before it: a long-poll, a
    * stream, a poller's call): listed, never waited on.

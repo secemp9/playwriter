@@ -633,6 +633,19 @@ function truncate(text: string, max: number): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
 }
 
+/**
+ * Page text with its whitespace collapsed but the line breaks the page renders kept as \n (pre-wrap
+ * text: a chat message of two lines). Chromium's accessible text only holds a \n where a line breaks
+ * on screen; the report shows it as ⏎ (`quote`).
+ */
+function keepLineBreaks(text: string): string {
+  return text
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .join('\n')
+    .trim()
+}
+
 function ordinal(n: number): string {
   const tens = n % 100
   if (tens >= 11 && tens <= 13) return `${n}th`
@@ -746,7 +759,8 @@ function gatherText(node: PageModelNode, max: number, includeLinks = true): stri
     for (const child of current.children) visit(child)
   }
   visit(node)
-  return truncate(pieces.join(' '), max)
+  const text = keepLineBreaks(pieces.join(' '))
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
 /**
@@ -1523,6 +1537,8 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
     title: string
     reads: Map<string, FrameRead>
     notRead: FrameNotRead[]
+    /** Frame id → its document's pointer listeners (`readPointerListeners`); absent when its snapshot named no document. */
+    listeners: Map<string, Map<number, string[]>>
   }
   let read: PageRead | undefined
   for (let attempt = 1; !read; attempt++) {
@@ -1549,13 +1565,25 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       MODEL_TIMEOUT_MS,
       'reading the page and its iframes (Accessibility.getFullAXTree + DOMSnapshot.captureSnapshot per frame)',
     )
+    // Each document's pointer listeners, read before the documents are checked again: a frame that
+    // commits another document during this read is one that moved (its old document is no longer
+    // its frame's, and Chrome refuses to resolve it), and is read again like any other.
+    const listeners = new Map<string, Map<number, string[]>>()
+    const gone = new Set<string>()
+    for (const frameRead of reads.values()) {
+      const documentBackendId = frameRead.frame.nodeBackendIds?.[0]
+      if (documentBackendId === undefined) continue
+      const found = await readPointerListeners({ cdp: frameRead.entry.cdp, documentBackendId, timeoutMs: PROBE_TIMEOUT_MS })
+      if (found) listeners.set(frameRead.entry.frameId, found)
+      else gone.add(frameRead.entry.frameId)
+    }
     const after = await frames.list()
     const afterMain = after.frames[0]
-    if (afterMain && afterMain.parentId === null && afterMain.loaderId === mainEntry.loaderId) {
+    if (afterMain && afterMain.parentId === null && afterMain.loaderId === mainEntry.loaderId && !gone.has(mainEntry.frameId)) {
       // An iframe that loaded another document meanwhile was read half in each: read the page
       // again; on the last attempt that frame alone is reported unread.
       const now = new Map(after.frames.map((frame) => [frame.frameId, frame.loaderId]))
-      const moved = [...reads.values()].filter((frameRead) => now.get(frameRead.entry.frameId) !== frameRead.entry.loaderId)
+      const moved = [...reads.values()].filter((frameRead) => now.get(frameRead.entry.frameId) !== frameRead.entry.loaderId || gone.has(frameRead.entry.frameId))
       if (moved.length === 0 || attempt === MAX_OBSERVE_ATTEMPTS) {
         for (const frameRead of moved) {
           if (frameRead.entry.parentId === null) continue
@@ -1568,7 +1596,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
             reason: 'it keeps loading new documents (observe() again once it settles)',
           })
         }
-        read = { listing, metrics, title, reads, notRead }
+        read = { listing, metrics, title, reads, notRead, listeners }
       }
     } else if (attempt === MAX_OBSERVE_ATTEMPTS) {
       throw new ModelFacingError(
@@ -1577,7 +1605,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
       )
     }
   }
-  const { listing, metrics, title, reads, notRead } = read
+  const { listing, metrics, title, reads, notRead, listeners } = read
   const mainRead = reads.get(listing.frames[0].frameId)!
   const mainFrameId = mainRead.entry.frameId
   const documentId = mainRead.entry.loaderId
@@ -1600,12 +1628,7 @@ export async function observePage(options: ObservePageOptions): Promise<Observat
   let decorativeImages = 0
   let unnamedGraphics = 0
   for (const frameRead of reads.values()) {
-    const documentBackendId = frameRead.frame.nodeBackendIds?.[0]
-    const listeners =
-      documentBackendId === undefined
-        ? undefined
-        : await readPointerListeners({ cdp: frameRead.entry.cdp, documentBackendId, timeoutMs: PROBE_TIMEOUT_MS })
-    const collected = collectCandidates({ model: frameRead.model, frame: frameRead.frame, viewport: frameRead.frame.viewport, listeners })
+    const collected = collectCandidates({ model: frameRead.model, frame: frameRead.frame, viewport: frameRead.frame.viewport, listeners: listeners.get(frameRead.entry.frameId) })
     // `alt=""` says "decoration": such images are not listed, only counted, so the model knows they
     // are there. A spacer or tracking pixel nobody sees is not counted (see UNSEEN_IMAGE_MAX_SIDE).
     const visibility = new Map<number, boolean>()
@@ -2425,7 +2448,7 @@ function collectCandidates({
     // A run with no letter or digit ("|", ",", "·") is layout punctuation between links, not
     // something to read.
     if (pendingText && /[\p{L}\p{N}]/u.test(pendingText.text)) {
-      pendingText.text = pendingText.text.replace(/\s+/g, ' ').trim()
+      pendingText.text = keepLineBreaks(pendingText.text)
       texts.push(pendingText)
     }
     pendingText = null
@@ -2605,7 +2628,7 @@ function collectCandidates({
             key: node.key,
             frameId: node.frameId,
             role,
-            text: blockText.replace(/\s+/g, ' ').trim(),
+            text: keepLineBreaks(blockText),
             order: placed.order,
             ...(placed.nodeIndex !== undefined ? { nodeIndex: placed.nodeIndex } : {}),
             measured: measuredFromRuntime(node),
@@ -3153,12 +3176,25 @@ function assignContexts({
 const ON_SCREEN: Record<string, true> = { 'in-view': true, 'partly-covered': true, covered: true }
 
 /**
- * Text for the model, quoted. Whitespace is collapsed and a longer text is cut at `max` with how
- * much was left out — `"Free shipping on orders over…" (+212 chars)` — so a reader knows there is
- * more (find() searches the whole text).
+ * A value or text on one report line: each line break shown as ⏎ (a multi-line value reads as
+ * such, and stays on its line), other runs of whitespace collapsed to one space, the ends trimmed.
+ * The one notation of line breaks everywhere a value or text is printed (act's reports too).
+ */
+function oneLine(text: string): string {
+  return text
+    .split(/\r\n|\r|\n|\u2028|\u2029/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .join('⏎')
+    .replace(/^⏎+|⏎+$/g, '')
+}
+
+/**
+ * Text for the model, quoted, on one line (`oneLine`: a line break is ⏎). A longer text is cut at
+ * `max` with how much was left out — `"Free shipping on orders over…" (+212 chars)` — so a reader
+ * knows there is more (find() searches the whole text).
  */
 export function quote(text: string, max = NAME_MAX_CHARS): string {
-  const clean = text.replace(/\s+/g, ' ').trim()
+  const clean = oneLine(text)
   if (clean.length <= max) return `"${clean.replace(/"/g, '\\"')}"`
   return `"${clean.slice(0, max - 1).replace(/"/g, '\\"')}…" (+${clean.length - max + 1} chars)`
 }
@@ -3512,6 +3548,23 @@ function fitToBudget(head: string[], body: string[], tail: string[], maxChars: n
   return [...out, `… truncated: ${all.length - out.length} more lines not shown (${maxChars} char budget) — ${hint}`].join('\n')
 }
 
+/** The `<iframe>` element `obs` lists for frame `frameId`, if it lists it. */
+function iframeElement(obs: Observation | null | undefined, frameId: string): ObservedElement | undefined {
+  return obs?.elements.find((element) => element.frame?.frameId === frameId)
+}
+
+/** `[12] iframe "Example"` for frame `frameId` as `obs` lists it, or `an iframe` when it does not list it. */
+export function describeIframe(obs: Observation | null | undefined, frameId: string): string {
+  const element = iframeElement(obs, frameId)
+  return element ? `[${element.ref}] iframe${element.name ? ` ${quote(element.name)}` : ''}` : 'an iframe'
+}
+
+/** `[12]` for frame `frameId`'s `<iframe>` as `obs` lists it, or `(an iframe not listed)`. */
+export function iframeRef(obs: Observation | null | undefined, frameId: string): string {
+  const element = iframeElement(obs, frameId)
+  return element ? `[${element.ref}]` : '(an iframe not listed)'
+}
+
 export function renderObservation(obs: Observation, options: { all?: boolean; maxChars?: number; scope?: number } = {}): string {
   const maxChars = options.maxChars ?? 6000
   const head = pageHeader(obs)
@@ -3536,8 +3589,17 @@ export function renderObservation(obs: Observation, options: { all?: boolean; ma
     )
   }
 
+  // Iframes whose documents Chrome has not delivered yet: one line for all of them, by their refs.
+  const loadingIframes = obs.busy.flatMap((signal) => (signal.iframe === undefined ? [] : [signal.iframe]))
   for (const signal of obs.busy) {
+    if (signal.iframe !== undefined) continue
     head.push(signal.strength === 'strong' ? `BUSY  ${signal.label} (wait before acting)` : `BUSY? ${signal.label} (weak signal; may be idle)`)
+  }
+  if (loadingIframes.length === 1) {
+    head.push(`BUSY? ${describeIframe(obs, loadingIframes[0]!)} is still loading its document: Chrome has not delivered it yet (weak signal; may be idle)`)
+  } else if (loadingIframes.length > 1) {
+    const refs = loadingIframes.map((frameId) => iframeRef(obs, frameId))
+    head.push(`BUSY? ${loadingIframes.length} iframes still loading their documents: ${refs.join(' ')} — Chrome has not delivered them yet (weak signal; may be idle)`)
   }
 
   let elements = obs.elements
@@ -3927,10 +3989,17 @@ export function diffObservations(before: Observation, after: Observation): Obser
   // Meaning, not node identity: a page that re-renders a table or a list replaces its nodes, so the
   // keys of rows that read the same change. A removed and an added item that read the same — role,
   // name or text, value and state, context, container, region — are that one item re-rendered.
+  // A container still in the document is the same container whatever it is called now: a table
+  // whose caption counts its rows ("Showing 1–6 of 12 invoices" → "… of 11 …") re-renders the rows
+  // that did not change. Only a container that was itself replaced is known by its label.
+  const containersBefore = new Set([...before.elements, ...before.text].flatMap((item) => (item.container ? [item.container.key] : [])))
+  const containersKept = new Set([...after.elements, ...after.text].flatMap((item) => (item.container && containersBefore.has(item.container.key) ? [item.container.key] : [])))
+  const containerOf = (container: SemanticContainer | undefined): string =>
+    container === undefined ? '' : containersKept.has(container.key) ? `node ${container.key}` : `label ${container.label}`
   const elementMeaning = (e: ObservedElement): string =>
-    [e.frameId, e.role, e.name, e.value ?? '', e.href ?? '', statesWithoutFocus(e), e.context ?? '', e.region ?? '', e.container?.label ?? '', visibilityClass(e.visibility), e.inModal ? 'modal' : ''].join('\u0000')
+    [e.frameId, e.role, e.name, e.value ?? '', e.href ?? '', statesWithoutFocus(e), e.context ?? '', e.region ?? '', containerOf(e.container), visibilityClass(e.visibility), e.inModal ? 'modal' : ''].join('\u0000')
   const textMeaning = (t: TextBlock): string =>
-    [t.frameId, t.role, t.text, t.level ?? '', t.region ?? '', t.live ?? '', t.container?.label ?? '', t.inModal ? 'modal' : ''].join('\u0000')
+    [t.frameId, t.role, t.text, t.level ?? '', t.region ?? '', t.live ?? '', containerOf(t.container), t.inModal ? 'modal' : ''].join('\u0000')
   const rerenderedElements = pairByMeaning(diff.removed, diff.added, elementMeaning)
   const rerenderedText = pairByMeaning(diff.textRemoved, diff.textAdded, textMeaning)
   if (rerenderedElements.length > 0 || rerenderedText.length > 0) {
@@ -4067,7 +4136,7 @@ export function renderObservationDiff(diff: ObservationDiff, options: { maxChars
 
 /** The part of `text` around the first query term, with how much was left out on each side. */
 function excerpt(text: string, terms: string[]): string {
-  const clean = text.replace(/\s+/g, ' ').trim()
+  const clean = oneLine(text)
   if (clean.length <= TEXT_SHOWN_CHARS) return quote(clean, TEXT_SHOWN_CHARS)
   const lower = clean.toLowerCase()
   const at = Math.max(0, lower.indexOf(terms[0]))

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Products</title>
+<style>
+  body { margin: 0; font: 16px/1.4 sans-serif; padding: 16px; }
+  .skeleton { height: 48px; margin: 8px 0; border-radius: 6px; background: linear-gradient(90deg, #eee, #f8f8f8, #eee); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  .product { display: block; margin: 8px 0; }
+</style>
+</head>
+<body>
+<main id="view" aria-label="Products" aria-busy="true">
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+  <div class="skeleton"></div>
+</main>
+<script>
+  // The products arrive from a request the server answers after about 800 ms, the way a client-rendered list does.
+  fetch('/api/products')
+    .then((response) => response.json())
+    .then((products) => {
+      const view = document.getElementById('view')
+      view.replaceChildren(
+        ...products.map((name) => {
+          const button = document.createElement('button')
+          button.className = 'product'
+          button.textContent = 'Add ' + name
+          return button
+        }),
+      )
+      view.removeAttribute('aria-busy')
+    })
+</script>
+</body>
+</html>

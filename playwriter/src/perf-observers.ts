@@ -65,8 +65,9 @@ export const PERF_OBSERVERS_SOURCE = `(() => {
   observe('layout-shift', function (entry) { keep(store.shifts, 'shifts', entry) })
   observe('longtask', function (entry) { keep(store.longTasks, 'longTasks', entry) })
   observe('long-animation-frame', function (entry) { keep(store.loafs, 'loafs', entry) })
-  // One record per interaction: its longest event (the interaction's duration), the first event
-  // target Chrome gives (a pointerup can come without one) and the names of its events.
+  // One record per interaction (web-vitals groups the event entries by interactionId): all its
+  // events, so its delay, processing and presentation can be taken over them, and the first event
+  // target Chrome gives (a pointerup can come without one).
   function interaction(entry) {
     if (!entry.interactionId) return
     var known = store.interactions.get(entry.interactionId)
@@ -75,12 +76,16 @@ export const PERF_OBSERVERS_SOURCE = `(() => {
         store.interactions.delete(store.interactions.keys().next().value)
         store.dropped.interactions++
       }
-      known = { id: store.nextId++, entry: entry, target: null, names: [] }
+      known = { id: store.nextId++, entries: [], target: null }
       store.interactions.set(entry.interactionId, known)
     }
-    if (entry.duration > known.entry.duration) known.entry = entry
+    // 'first-input' repeats the event entry of the same event.
+    for (var i = 0; i < known.entries.length; i++) {
+      var seen = known.entries[i]
+      if (seen.name === entry.name && seen.startTime === entry.startTime && seen.processingStart === entry.processingStart) return
+    }
+    if (known.entries.length < 16) known.entries.push(entry)
     if (!known.target && entry.target) known.target = entry.target
-    if (known.names.indexOf(entry.name) < 0) known.names.push(entry.name)
   }
   observe('event', interaction, { durationThreshold: 16 })
   observe('first-input', interaction)
@@ -105,16 +110,21 @@ export interface PerfShift {
   sources: Array<{ previous: PerfRect; current: PerfRect; hasNode: boolean }>
 }
 
-export interface PerfInteraction {
-  id: number
-  interactionId: number
-  /** The interaction's event names, in the order Chrome reported them (`pointerdown/pointerup/click`). */
+/** One event timing entry of an interaction (ms since the document's time origin). */
+export interface PerfEvent {
   name: string
-  /** Timing of its longest event, which is the interaction's duration. */
   startTime: number
+  /** Until the next paint after its handlers, rounded by Chrome to 8 ms. */
   duration: number
   processingStart: number
   processingEnd: number
+}
+
+export interface PerfInteraction {
+  id: number
+  interactionId: number
+  /** Its event entries (`pointerdown`, `pointerup`, `click`…), in the order Chrome reported them. */
+  events: PerfEvent[]
   hasTarget: boolean
 }
 
@@ -188,10 +198,9 @@ export const PERF_READ_EXPRESSION = `(() => {
   var fcp = performance.getEntriesByName('first-contentful-paint', 'paint')[0]
   var lcp = s.lcp
   var interactions = []
-  s.interactions.forEach(function (kept) {
-    var e = kept.entry
-    interactions.push({ id: kept.id, interactionId: e.interactionId, name: kept.names.join('/'), startTime: e.startTime, duration: e.duration,
-      processingStart: e.processingStart, processingEnd: e.processingEnd, hasTarget: !!kept.target })
+  s.interactions.forEach(function (kept, interactionId) {
+    interactions.push({ id: kept.id, interactionId: interactionId, hasTarget: !!kept.target,
+      events: kept.entries.map(function (e) { return { name: e.name, startTime: e.startTime, duration: e.duration, processingStart: e.processingStart, processingEnd: e.processingEnd } }) })
   })
   return {
     url: location.href,

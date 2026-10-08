@@ -78,6 +78,13 @@ export async function startNetworkLab(): Promise<NetworkLab> {
         res.end(LAB_REPORT_CSV)
         return
       }
+      // The documents of play-runners.html's iframes (MDN's live examples): on MDN, Chrome delivered
+      // them one by one over a minute (they answer with Clear-Site-Data, and Chrome clears the site's
+      // data first). A test browser holds such a document only when that clearing starts within its
+      // first ~5 s (measured, Chromium 145 headless: 4 s after launch, held 45 s and more; 7 s and later,
+      // delivered in ~0.1 s), which no test run guarantees. The lab never answers it instead: Chrome
+      // has sent the request and has no response, on any machine, until the frame goes away.
+      if (url.pathname === '/play-runner.html') return
       const file = path.join(ROOT, path.normalize(url.pathname).replace(/^(\.\.[/\\])+/, ''))
       if (file.startsWith(ROOT) && fs.existsSync(file) && fs.statSync(file).isFile()) {
         res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] ?? 'application/octet-stream', 'Cache-Control': 'no-store' })

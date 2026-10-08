@@ -230,6 +230,14 @@ type ParseOutcome = { ok: true; parsed: ParsedCode } | { ok: false; reason: stri
 
 interface PageCodeCache {
   sourceMaps: LruCache<Promise<LoadedSourceMap>>
+  /**
+   * Reads of served scripts' sources still in flight, by their parse key. The handlers and components
+   * of one explain are located together and usually live in one bundle: they share one read. Two reads
+   * of a 1 MB bundle used to overlap, and the first one's Babel parse — seconds of this thread under a
+   * full test run's load — outlasted the second one's deadline although Chrome had answered it
+   * ("The page did not respond within 3000ms while reading the source of …/app.js").
+   */
+  sourceReads: Map<string, Promise<string>>
   parsed: LruCache<ParseOutcome>
 }
 
@@ -661,9 +669,21 @@ async function servedCode(ctx: ExplainContext, script: ScriptMeta): Promise<Pars
   const key = `served:${script.scriptId}:${script.hash}`
   let outcome = ctx.cache.parsed.get(key)
   if (!outcome) {
+    let reading = ctx.cache.sourceReads.get(key)
+    if (!reading) {
+      const read = send(ctx.cdp.send('Debugger.getScriptSource', { scriptId: script.scriptId }), `reading the source of ${scriptName(script)}`).then(
+        (answer) => answer.scriptSource,
+      )
+      const forget = (): void => {
+        if (ctx.cache.sourceReads.get(key) === read) ctx.cache.sourceReads.delete(key)
+      }
+      read.then(forget, forget)
+      ctx.cache.sourceReads.set(key, read)
+      reading = read
+    }
     let source: string
     try {
-      source = (await send(ctx.cdp.send('Debugger.getScriptSource', { scriptId: script.scriptId }), `reading the source of ${scriptName(script)}`)).scriptSource
+      source = await reading
     } catch (error) {
       if (error instanceof PageUnresponsiveError) throw error
       note(ctx, `The source of ${scriptName(script)} could not be read (${errorText(error)}); its functions are located but not summarised.`)
@@ -1758,7 +1778,7 @@ export async function explainElement(options: {
   const documentOrigin: string | null = origin === 'null' ? null : origin
   let cache = pageCodeCaches.get(page)
   if (!cache) {
-    cache = { sourceMaps: new LruCache(MAX_CACHED_SOURCEMAPS), parsed: new LruCache(MAX_CACHED_PARSES) }
+    cache = { sourceMaps: new LruCache(MAX_CACHED_SOURCEMAPS), sourceReads: new Map(), parsed: new LruCache(MAX_CACHED_PARSES) }
     pageCodeCaches.set(page, cache)
   }
   const objectGroup = `playwriter-explain-${Date.now()}-${Math.random().toString(36).slice(2)}`

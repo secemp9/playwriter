@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Colour that does not open</title>
+</head>
+<body>
+<!-- The page cancels clicks on the swatch, so Chrome never opens its colour chooser for it. -->
+<label>Favourite colour <input type="color" id="colour" value="#000000"></label>
+<script>
+  document.getElementById('colour').addEventListener('click', (event) => event.preventDefault())
+</script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Touch · Browser Lab</title>
+<link rel="icon" href="data:,">
+<style>
+  body { margin: 0; font: 16px/1.4 system-ui, sans-serif; padding: 16px; }
+  button { font: inherit; padding: 14px 18px; margin: 8px 0; }
+  .slider { position: relative; width: 300px; height: 40px; touch-action: none; cursor: pointer; background: #eef1f7; border-radius: 6px; margin: 16px 0; }
+  .rail { position: absolute; left: 0; right: 0; top: 18px; height: 4px; background: #c8cfe0; }
+  .thumb { position: absolute; top: 5px; left: 0; width: 30px; height: 30px; border-radius: 50%; background: #3557d4; }
+  .spacer { height: 1800px; border-left: 4px dashed #ccd; margin: 12px 0; }
+</style>
+</head>
+<body>
+<h1>Touch witness</h1>
+<p id="status" role="status">Nothing tapped</p>
+<button id="tap" type="button">Tap target</button>
+<button id="twice" type="button">Double tap target</button>
+<div class="slider" id="track" role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+  <div class="rail"></div>
+  <div class="thumb" id="thumb"></div>
+</div>
+<p id="value">Volume: 0</p>
+<div class="spacer"></div>
+<button id="far" type="button">Far target</button>
+<!-- What the page itself saw, for the test to read: every input event (type, pointerType, trusted, target) and, per click, the
+     mouse moves and mouseover targets since the previous click, the way the lab witness counts them. -->
+<script type="application/json" id="seen">{"events":[],"clicks":[]}</script>
+<script>
+  const seen = { events: [], clicks: [] }
+  const out = document.getElementById('seen')
+  let moves = 0
+  let entered = new Set()
+  // pointerenter/mouseenter and the leave events do not propagate to a listener on window: not listed.
+  const types = ['pointerover', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'pointerout',
+    'touchstart', 'touchmove', 'touchend', 'touchcancel', 'mouseover', 'mousemove', 'mousedown', 'mouseup',
+    'click', 'dblclick', 'contextmenu', 'wheel']
+  for (const type of types) {
+    window.addEventListener(type, (event) => {
+      if (type === 'mousemove') moves++
+      if (type === 'mouseover') entered.add(event.target)
+      const last = seen.events[seen.events.length - 1]
+      const pointerType = event.pointerType || null
+      // Runs of moves are kept as one entry with a count.
+      if (last && last.type === type && last.pointerType === pointerType && /move$/.test(type)) last.count++
+      else seen.events.push({ type, pointerType, trusted: event.isTrusted, target: event.target && event.target.id ? event.target.id : null, count: 1 })
+      if (type === 'click') {
+        seen.clicks.push({ target: event.target.id || null, pointerType, moves, entered: entered.size, trusted: event.isTrusted })
+        moves = 0
+        entered = new Set()
+      }
+      out.textContent = JSON.stringify(seen)
+    }, { capture: true, passive: true })
+  }
+  const status = document.getElementById('status')
+  let taps = 0
+  document.getElementById('tap').addEventListener('click', () => { status.textContent = `Tapped ${++taps}` })
+  document.getElementById('twice').addEventListener('dblclick', () => { status.textContent = 'Double tapped' })
+  document.getElementById('far').addEventListener('click', () => { status.textContent = 'Far target tapped' })
+  const track = document.getElementById('track')
+  const thumb = document.getElementById('thumb')
+  let dragging = null
+  // A typical custom slider: pressing anywhere on it (the thumb included) grabs the thumb; it follows the pointer until release.
+  const follow = (event) => {
+    const box = track.getBoundingClientRect()
+    const value = Math.round(Math.max(0, Math.min(1, (event.clientX - box.left - 15) / (box.width - 30))) * 100)
+    thumb.style.left = `${(value / 100) * (box.width - 30)}px`
+    track.setAttribute('aria-valuenow', String(value))
+    document.getElementById('value').textContent = `Volume: ${value}`
+  }
+  track.addEventListener('pointerdown', (event) => { dragging = event.pointerId; track.setPointerCapture(event.pointerId) })
+  track.addEventListener('pointermove', (event) => { if (dragging === event.pointerId) follow(event) })
+  track.addEventListener('pointerup', (event) => { if (dragging === event.pointerId) follow(event); dragging = null })
+</script>
+</body>
+</html>

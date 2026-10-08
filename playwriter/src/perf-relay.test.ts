@@ -119,6 +119,7 @@ describe('perf.* and pdf() through the extension relay', () => {
     expect(profile).toMatch(/TOP SELF TIME/)
     const vitals = await run('await perf.vitals()')
     expect(vitals).toMatch(new RegExp(`INP {3}(?:[3-9]\\d\\d|\\d{4,}) ms .* on \\[${heavy}\\] button "Run heavy task \\(300 ms\\)"`))
+    expect(vitals).toMatch(/processing (?:[3-9]\d\d|\d{4,}) ms \(click (?:[3-9]\d\d|\d{4,}) ms\), presentation \d+ ms/)
   }, 120000)
 
   it('raw CDP reads of Performance and Profiler pass in human mode', async () => {

@@ -25,7 +25,7 @@ import {
 import { createElementPicker, type PickPurpose } from './element-pick'
 import { copyTextViaOffscreen, readTextViaOffscreen } from './offscreen-document'
 import { TabDownloads } from './tab-downloads'
-import { DebuggerCuts, type ReattachOutcome } from './debugger-cut'
+import { DebuggerCuts, type LoadingFrame, type ReattachOutcome } from './debugger-cut'
 import { REATTACH_CUT_TAB } from 'playwriter/src/debugger-cut'
 import { TabVisibilityTracker } from './tab-visibility'
 import { READ_TAB_VISIBILITY } from 'playwriter/src/tab-visibility'
@@ -1641,12 +1641,12 @@ function onDebuggerEvent(source: chrome.debugger.DebuggerSession, method: string
     }
   }
 
-  // The last address no other extension's debugger may be in, loading in this tab: the cause of a cut
-  // that follows (the detach itself says only `target_closed`).
+  // The last address no other extension's debugger may be in, loading in this tab, and the frame
+  // loading it: the cause of a cut that follows (the detach itself says only `target_closed`).
   if (source.tabId !== undefined && (method === 'Page.frameRequestedNavigation' || method === 'Page.frameStartedNavigating')) {
-    debuggerCuts.noteNavigation(source.tabId, params?.url)
+    debuggerCuts.noteNavigation(source.tabId, params?.url, params?.frameId)
   } else if (source.tabId !== undefined && method === 'Page.frameNavigated') {
-    debuggerCuts.noteNavigation(source.tabId, params?.frame?.url)
+    debuggerCuts.noteNavigation(source.tabId, params?.frame?.url, params?.frame?.id)
   }
 
   // A cut tab has no Playwright session (debugger-cut.ts): what an interim attach of it says — the one
@@ -1848,8 +1848,12 @@ async function keepCutTab({
   debuggerCuts.start(tabId)
 }
 
-/** One re-attach of a cut tab: never touches the page (the other extension's frame is the user's), and announces the tab again. */
-async function reattachCutTab(tabId: number): Promise<ReattachOutcome> {
+/**
+ * One re-attach of a cut tab: never touches the page (the other extension's frame is the user's), and
+ * announces the tab again — unless `loading`, the frame that cut it, is still loading another
+ * extension's page (debugger-cut.ts LoadingFrame).
+ */
+async function reattachCutTab(tabId: number, loading: LoadingFrame | null): Promise<ReattachOutcome> {
   const tab = store.getState().tabs.get(tabId)
   if (!tab || tab.state !== 'connecting') {
     return { ok: false, error: 'Playwriter no longer tracks this tab', ended: 'disconnected' }
@@ -1859,7 +1863,7 @@ async function reattachCutTab(tabId: number): Promise<ReattachOutcome> {
   }
   const attempt = async (): Promise<ReattachOutcome> => {
     try {
-      const { sessionId } = await attachTab(tabId, { keepForeignFrames: true })
+      const { sessionId } = await attachTab(tabId, { keepForeignFrames: true, loadingFrame: loading })
       return { ok: true, sessionId }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -1896,6 +1900,13 @@ type AttachTabOptions = {
    * removed from the page to make it succeed — Chrome's refusal is the answer, and it is reported.
    */
   keepForeignFrames?: boolean
+  /**
+   * A cut tab's re-attach: the frame whose load of another extension's page cut it. While the attached
+   * session still lists that frame with no document of its own, the load has not committed: Chrome
+   * lets the attach through but refuses the session the moment it does (debugger-cut.ts LoadingFrame),
+   * so the attach fails here instead of announcing a tab that is about to be cut again.
+   */
+  loadingFrame?: LoadingFrame | null
 }
 
 /**
@@ -2002,9 +2013,19 @@ async function removeRestrictedIframes(tabId: number): Promise<number> {
   }
 }
 
+/** Frame `frameId` in `tree`, or null when it has left the page. */
+function frameInTree(tree: Protocol.Page.FrameTree, frameId: string): Protocol.Page.Frame | null {
+  if (tree.frame.id === frameId) return tree.frame
+  for (const child of tree.childFrames ?? []) {
+    const found = frameInTree(child, frameId)
+    if (found) return found
+  }
+  return null
+}
+
 async function attachTabNow(
   tabId: number,
-  { skipAttachedEvent = false, keepForeignFrames = false }: AttachTabOptions,
+  { skipAttachedEvent = false, keepForeignFrames = false, loadingFrame = null }: AttachTabOptions,
 ): Promise<AttachTabResult> {
   const debuggee = { tabId }
   let debuggerAttached = false
@@ -2110,6 +2131,18 @@ async function attachTabNow(
         'targetInfo:',
         JSON.stringify(targetInfo),
       )
+    }
+
+    // A cut tab whose frame is still loading another extension's page: Chrome refuses this session
+    // the moment that load commits (debugger-cut.ts LoadingFrame), so the tab is not announced. Until
+    // then the frame has no document of its own: Page.getFrameTree gives it no address (measured: ":"
+    // for a password manager's menu iframe loading its page).
+    if (loadingFrame) {
+      const { frameTree } = (await setupCommand('Page.getFrameTree')) as Protocol.Page.GetFrameTreeResponse
+      const frame = frameInTree(frameTree, loadingFrame.frameId)
+      if (frame && (frame.url === '' || frame.url === ':' || frame.url === 'about:blank')) {
+        throw new Error(`another extension's frame is still loading ${loadingFrame.url} in the tab, and Chrome refuses the debugger once it has loaded`)
+      }
     }
 
     const attachOrder = nextSessionId

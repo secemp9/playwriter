@@ -913,8 +913,8 @@ describe('Relay Core Tests', () => {
 
     const errorOutput = (errorLogsResult as any).content[0].text
     expect(errorOutput).toContain('[error] Test error 67890')
-    // With context lines (5 above/below), nearby logs are also included
-    expect(errorOutput).toContain('[log] Test log 12345')
+    // Only the matching entries: a log line without "error" is not returned as context.
+    expect(errorOutput).not.toContain('[log] Test log 12345')
 
     // Test that logs persist across page reload
     await client.callTool({

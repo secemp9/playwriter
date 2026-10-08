@@ -188,7 +188,7 @@ export class PageProbes {
    * page's `document.visibilityState`: under Playwright's focus emulation it reads `visible` in a
    * background tab.
    */
-  async visibility(probe: PageProbe): Promise<TabVisibility | null> {
+  async visibility(probe: { targetId: string }): Promise<TabVisibility | null> {
     if (!this.readTabVisibility) return null
     return await this.readTabVisibility(probe.targetId).catch(
       (error: unknown): TabVisibility => ({ kind: 'unreadable', error: error instanceof Error ? error.message : String(error) }),

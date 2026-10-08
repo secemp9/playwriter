@@ -109,6 +109,31 @@ describe('what changed, by meaning', () => {
     expect(rendered).toMatch(/^- row: "lab-step \| 2"$/m)
   })
 
+  it('rows re-rendered unchanged in a table whose caption changed are not reported (the table node stayed)', () => {
+    const invoices = { key: 'F:1' as NodeKey, label: 'table "Showing 1–6 of 12 invoices"' }
+    const renamed = { key: 'F:1' as NodeKey, label: 'table "Showing 1–6 of 11 invoices"' }
+    const before = observation({
+      text: [
+        text(1, 'table', 'Showing 1–6 of 12 invoices', { region: 'main' }),
+        text(100, 'row', 'INV-1001 | Acme Corp', { region: 'main', container: invoices }),
+        text(101, 'row', 'INV-1003 | Initech', { region: 'main', container: invoices }),
+      ],
+    })
+    const after = observation({
+      text: [
+        text(1, 'table', 'Showing 1–6 of 11 invoices', { region: 'main' }),
+        text(200, 'row', 'INV-1001 | Acme Corp', { region: 'main', container: renamed, isNew: true }),
+        text(201, 'row', 'INV-1007 | Hooli', { region: 'main', container: renamed, isNew: true }),
+      ],
+    })
+    const rendered = renderObservationDiff(diffObservations(before, after))
+    expect(rendered).toMatch(/^~ table "Showing 1–6 of 11 invoices" \(was "Showing 1–6 of 12 invoices"\)$/m)
+    expect(rendered).toMatch(/^- row: "INV-1003 \| Initech"$/m)
+    expect(rendered).toMatch(/^\+ row: "INV-1007 \| Hooli"$/m)
+    expect(rendered).not.toMatch(/Acme/)
+    expect(rendered).toMatch(/^~ re-rendered with the same content: 1 text block \(not listed\)$/m)
+  })
+
   it('controls re-rendered with the same content are one line naming their new refs', () => {
     const before = observation({
       elements: [el(12, 112, 'button', 'Delete', { context: 'in row "Initech"', container: COOKIES }), el(13, 113, 'button', 'Delete', { context: 'in row "Globex"', container: COOKIES })],

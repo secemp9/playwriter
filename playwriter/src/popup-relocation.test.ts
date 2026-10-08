@@ -96,7 +96,9 @@ describe('Popup window relocation', () => {
 
     expect(clickOutput).toContain('/target')
     expect((clickResult as any).isError).not.toBe(true)
-    expect(clickOutput).toContain('[WARNING] New page opened from current page')
+    // The popup is reported once, on the action's POPUP line, with the call that works in it (H7).
+    expect(clickOutput).toMatch(/POPUP {3}a popup window opened by this page .*\/target — act\.switchTab\(1\) to work in it/)
+    expect(clickOutput).not.toContain('New page opened from current page')
     expect(clickOutput).not.toContain('Popup window detected')
     expect(clickOutput).not.toContain('cannot be controlled by playwriter')
 

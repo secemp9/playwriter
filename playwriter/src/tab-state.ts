@@ -100,6 +100,45 @@ export function hiddenTabNote(report: TabVisibilityReport): string {
   return `HIDDEN  this tab is not visible to the user: ${hiddenBecause(report)}. ${HIDDEN_TAB_EFFECT}${minimised}`
 }
 
+/**
+ * Why Chrome's colour chooser did not open after a click on its input, from facts only.
+ *
+ * MEASURED (Chrome 149 stable and Chrome for Testing 145, headed under Xvfb, through the extension
+ * and relay, act.fill on `<input type=color>`):
+ * - a background tab: the chooser never opens; the extension reports the tab hidden.
+ * - a window shown again without the input focus (no window manager: unmapped, then mapped): the
+ *   chooser never opens, twice in a row, while chrome.windows says state 'normal', focused true, and
+ *   the tab is active. page.bringToFront() gives the window the focus, and then it opens.
+ * - a window on an i3 workspace that is not shown (i3 unmaps it: WM_STATE Withdrawn), and a shown
+ *   window another program has the focus of: the chooser opens. chrome.windows says state 'normal',
+ *   focused false, the same bounds, for both.
+ * - chrome.windows.update({ state: 'minimized' }) under i3 or with no window manager: the window
+ *   stays on screen and its state 'normal'.
+ * - The page's own document.visibilityState, read over raw CDP with no focus emulation, stays
+ *   'visible' while the window is unmapped.
+ * So a hidden tab is the one cause this session can see; a window off the screen or without the
+ * focus reads like any other, and the message says so rather than guessing, and never blames the page.
+ */
+export function colourChooserNotOpened(facts: { target: string; ref: number; value: string; visibility: TabVisibility | null }): string {
+  const { target, ref, value, visibility } = facts
+  const head = `Clicked ${target}, but Chrome's colour chooser did not open: 1 s later it is still closed, and the input reads ${value}.`
+  if (visibility?.kind === 'read' && tabIsHidden(visibility.report)) {
+    const restore = visibility.report.windowState === 'minimized' ? 'ask the user to restore the window' : 'page.bringToFront() brings the tab to the front'
+    return `${head} This tab is not visible to the user — ${hiddenBecause(visibility.report)} — and Chrome does not open its colour chooser there: ${restore}, then call act.fill again.`
+  }
+  const listeners = `explain(${ref}) shows whether the page itself listens for clicks on it.`
+  // A launched browser has no user and no window manager to ask: only the tab's place can be fixed from here.
+  if (!visibility) {
+    return `${head} Chrome does not open it in a tab behind another one: if this tab is not in front, page.bringToFront() brings it there, then call act.fill again. ${listeners}`
+  }
+  return (
+    `${head} Chrome opens the chooser as a pop-up of its window, and does not when that window cannot take the focus — likely a window on a ` +
+    'workspace or desktop the user is not looking at, or one shown again without the focus. Chrome reports such a window like any other, ' +
+    'so it cannot be checked from here. page.bringToFront() asks for the front and the focus; if act.fill still fails after it, ask the user ' +
+    `to show the browser window on their screen, then try again. ${listeners}`
+  )
+}
+
 const BUSY_ADVICE = "the page's main thread is busy (a long-running script) or the connection to the browser is slow — act.waitForIdle(), then retry."
 
 /**

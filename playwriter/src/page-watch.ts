@@ -114,6 +114,13 @@ const HELD_REQUEST_MS = 2000
 /** Image/Font/Media requests that received nothing for this long stop holding quiet (a stalled asset, not the action's effect). */
 const STALLED_ASSET_MS = 3000
 /**
+ * An iframe's document Chrome has not answered for this long stops holding quiet: what a person waits
+ * for is the page around it, which shows the iframe empty meanwhile. Settling ends when the rest is
+ * quiet, and says which iframes are still loading (measured: MDN's live examples, whose documents
+ * Chrome delivered one by one over a minute after the page itself had loaded).
+ */
+const IFRAME_DOCUMENT_MS = 2000
+/**
  * Without an action to measure from, a determinate progressbar whose value changed within this
  * window is moving (the journal's churn gap: an element still changing changed within 2 s).
  */
@@ -315,9 +322,14 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     var position = getComputedStyle(el).position;
     return position === 'fixed' || position === 'sticky' ? 'overlay' : null;
   }
+  /** \`el\`'s text as shown, with the line breaks it renders kept (a two-line chat message), other whitespace collapsed. */
+  function linesOf(el, n) {
+    var t = typeof el.innerText === 'string' ? el.innerText : el.textContent;
+    return clip(String(t == null ? '' : t).split(/\r\n|\r|\n/).map(function (line) { return norm(line); }).join('\n').replace(/^\n+|\n+$/g, ''), n);
+  }
   function recordLive(el, role, now, seenTexts) {
     if (!shown(el, false)) { shownText.delete(el); return; }
-    var text = textOf(el, 300);
+    var text = linesOf(el, 300);
     if (!text) { shownText.delete(el); return; }
     if (shownText.get(el) === text) return;
     shownText.set(el, text);
@@ -1547,12 +1559,14 @@ export class PageWatch {
               const ambient = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS))
               if ('dialog' in ambient) continue
               const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
+              const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
               const gone = goneLoading()
               return {
                 settled: true,
                 waitedMs: Date.now() - startedAt,
                 reason: 'quiet',
                 pendingRequests: [],
+                ...(iframeDocuments.length ? { iframeDocuments } : {}),
                 ...(uncaused.length ? { uncaused } : {}),
                 ...(ambient.value.ambient.length ? { ambient: ambient.value.ambient } : {}),
                 ...(state.lastContentAt !== null ? { msSinceLastContentMutation: state.now - state.lastContentAt } : {}),
@@ -1596,11 +1610,13 @@ export class PageWatch {
     const msSince = state && state.lastContentAt !== null ? state.now - state.lastContentAt : undefined
     const stillChanging = state !== undefined && msSinceContent(state) < goal.domQuietMs
     const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
+    const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
     return {
       settled: false,
       waitedMs: now - startedAt,
       reason: 'timeout',
       pendingRequests: this.heldRequests(now, goal.causalFrom, openAtStart).map((r) => this.pending(r, now)),
+      ...(iframeDocuments.length ? { iframeDocuments } : {}),
       ...(uncaused.length ? { uncaused } : {}),
       ...(state && state.ambient.length ? { ambient: state.ambient } : {}),
       ...(stillChanging && state?.hot ? { domChangingIn: state.hot } : {}),
@@ -1658,7 +1674,18 @@ export class PageWatch {
     if (type !== undefined && NEVER_HOLDS[type]) return false
     if (entry.mimeType === EVENT_STREAM_MIME) return false
     if (type !== undefined && STALLABLE[type] && now - (entry.lastDataAt ?? this.startOf(entry)) > STALLED_ASSET_MS) return false
+    if (this.undeliveredIframeDocument(entry, now)) return false
     return true
+  }
+
+  /** The iframe `entry` loads a document into, when it is an iframe's document request (not the main frame's). */
+  private iframeOf(entry: RequestEntry): string | undefined {
+    return entry.resourceType === 'Document' && entry.frameId !== this.frames.mainFrameId() ? entry.frameId : undefined
+  }
+
+  /** An iframe's document Chrome has not answered (no response) after IFRAME_DOCUMENT_MS: listed with its iframe, not waited for. */
+  private undeliveredIframeDocument(entry: RequestEntry, now: number): boolean {
+    return entry.endedAt === undefined && entry.headersAt === undefined && !entry.isAdRelated && this.iframeOf(entry) !== undefined && now - this.startOf(entry) > IFRAME_DOCUMENT_MS
   }
 
   private heldRequests(now: number, causalFrom: number, openAtStart: Set<string>): RequestEntry[] {
@@ -1670,8 +1697,20 @@ export class PageWatch {
     return this.requestLog.filter((r) => this.holdsQuiet(r, now) && !this.caused(r, causalFrom, openAtStart)).map((r) => this.pending(r, now))
   }
 
+  /** The action's iframe documents that stopped holding quiet (`undeliveredIframeDocument`): what settling did not wait for. */
+  private undeliveredIframeDocuments(now: number, causalFrom: number, openAtStart: Set<string>): PendingRequest[] {
+    return this.requestLog.filter((r) => this.undeliveredIframeDocument(r, now) && this.caused(r, causalFrom, openAtStart)).map((r) => this.pending(r, now))
+  }
+
   private pending(entry: RequestEntry, now: number): PendingRequest {
-    return { method: entry.method, url: entry.url, ...(entry.resourceType !== undefined ? { resourceType: entry.resourceType } : {}), ageMs: Math.round(now - this.startOf(entry)) }
+    const iframe = this.iframeOf(entry)
+    return {
+      method: entry.method,
+      url: entry.url,
+      ...(entry.resourceType !== undefined ? { resourceType: entry.resourceType } : {}),
+      ageMs: Math.round(now - this.startOf(entry)),
+      ...(iframe !== undefined ? { iframe, ...(entry.headersAt !== undefined ? { answered: true as const } : {}) } : {}),
+    }
   }
 
   private networkQuietFor(now: number, origin: number, causalFrom: number, openAtStart: Set<string>): number {
@@ -1697,8 +1736,14 @@ export class PageWatch {
         if (streamable && r.lastDataAt !== undefined && now - r.lastDataAt < STREAM_RECENT_MS) {
           out.push({ strength: 'strong', kind: 'network-streaming', label: `response still arriving (${age}): ${r.method} ${this.shortUrl(r.url)}` })
         }
-      } else if (this.holdsQuiet(r, now) && now - this.startOf(r) > HELD_REQUEST_MS) {
-        out.push({ strength: 'weak', kind: 'network-waiting', label: `no response yet after ${age}: ${r.method} ${this.shortUrl(r.url)}` })
+      } else if ((this.holdsQuiet(r, now) || this.undeliveredIframeDocument(r, now)) && now - this.startOf(r) > HELD_REQUEST_MS) {
+        const iframe = this.iframeOf(r)
+        out.push({
+          strength: 'weak',
+          kind: 'network-waiting',
+          label: `${iframe !== undefined ? "an iframe's document: " : ''}no response yet after ${age}: ${r.method} ${this.shortUrl(r.url)}`,
+          ...(iframe !== undefined ? { iframe } : {}),
+        })
       }
     }
     return out

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live examples · Browser Lab</title>
+<link rel="icon" href="data:,">
+<style>iframe { display: block; width: 480px; height: 70px; border: 1px solid #888; margin: 6px 0 }</style>
+</head>
+<body>
+<!-- Not a lab page: MDN's live examples (mdn-play-runner) as they load. Each example renders an
+     about:blank iframe first, then, once its code is hashed (after the page's load event, as MDN's
+     components do), replaces that element with a new iframe whose document comes from another site:
+     http://<hash>.play.localhost:<port>/play-runner.html (cross-site to this page, so an
+     out-of-process iframe), which the lab never answers: Chrome has not delivered those documents
+     (network-lab-fixture.ts). "Run" replaces it again, as MDN's runner does per run. ?count=N sets how
+     many examples the page has (15, as on MDN's text-transform page). -->
+<main>
+  <h1>Live examples</h1>
+  <div id="examples"></div>
+</main>
+<script>
+const count = Number(new URLSearchParams(location.search).get('count') || 15)
+const examples = document.getElementById('examples')
+
+function render(slot, src) {
+  const frame = document.createElement('iframe')
+  frame.title = 'runner'
+  frame.src = src
+  const old = slot.querySelector('iframe')
+  if (old) old.replaceWith(frame)
+  else slot.append(frame)
+}
+
+async function runnerUrl(code, run) {
+  const bytes = new TextEncoder().encode(code + ' run ' + run)
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-1', bytes))
+  const hash = Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return 'http://' + hash + '.play.localhost:' + location.port + '/play-runner.html?code=' + encodeURIComponent(code)
+}
+
+for (let i = 0; i < count; i++) {
+  const slot = document.createElement('section')
+  const code = 'example ' + (i + 1)
+  let run = 0
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.textContent = 'Run ' + code
+  button.addEventListener('click', async () => render(slot, await runnerUrl(code, ++run)))
+  slot.append(button)
+  examples.append(slot)
+  render(slot, 'about:blank')
+  addEventListener('load', () => runnerUrl(code, run).then((url) => render(slot, url)), { once: true })
+}
+</script>
+</body>
+</html>

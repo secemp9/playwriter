@@ -160,6 +160,8 @@ describe('perf.* and pdf() in human mode', () => {
     // (419 ms measured in a full-suite run), and another long task may then be the longest.
     const atLeast300 = '(?:[3-9]\\d\\d|\\d{4,})'
     expect(text).toMatch(new RegExp(`INP {3}${atLeast300} ms \\((needs improvement|poor)\\) over 1 measured interaction — [\\w/]*click[\\w/]* on \\[${heavy}\\] button "Run heavy task \\(300 ms\\)"`))
+    // web-vitals' attribution over all the interaction's events: the 300 ms handler is processing, not presentation.
+    expect(text).toMatch(new RegExp(`input delay \\d+ ms, processing ${atLeast300} ms \\(click ${atLeast300} ms\\), presentation \\d+ ms`))
     expect(text).toMatch(/LONG TASKS {2}[1-9]\d*, longest \d+ ms/)
     expect(text).toMatch(new RegExp(`${atLeast300} ms at \\d+ ms \\(blocking \\d+ ms\\) — script BUTTON#heavy\\.onclick`))
   }, 60000)

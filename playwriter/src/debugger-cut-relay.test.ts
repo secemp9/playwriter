@@ -30,6 +30,7 @@ const LOGIN = `<!doctype html><html><head><meta charset="utf-8"><title>Log in</t
 <body><main><h1>Log in</h1>
 <p><label>Work email <input type="email" id="work" data-pm-flash></label></p>
 <p><label>Email <input type="email" id="email"></label></p>
+<p><label>Recovery email <input type="email" id="recovery" data-pm-slow></label></p>
 <p><label>Password <input type="password" id="password"></label></p>
 <p><button id="other" type="button">Need help?</button></p>
 </main>
@@ -45,6 +46,8 @@ let server: http.Server
 let port = 0
 let cwd = ''
 let pmDir = ''
+/** How late the Recovery email field's menu page loads (fake-password-manager.ts `slowMenuMs`). */
+const SLOW_MENU_MS = 500
 
 /** The ref printed in front of the first line matching `pattern`. */
 function refOf(text: string, pattern: RegExp): number {
@@ -69,7 +72,7 @@ beforeAll(async () => {
   port = address.port
   cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'debugger-cut-relay-'))
   pmDir = fs.mkdtempSync(path.join(os.tmpdir(), 'debugger-cut-pm-'))
-  writeFakePasswordManager({ dir: pmDir, inlineMenu: true })
+  writeFakePasswordManager({ dir: pmDir, inlineMenu: true, slowMenuMs: SLOW_MENU_MS })
 })
 
 afterAll(async () => {
@@ -146,6 +149,11 @@ describe('a password manager menu cuts the debugger off the tab', () => {
       `DEBUGGER CUT — Chrome took the debugger off this tab because another extension's frame (chrome-extension://${pmId}, e.g. a password manager's autofill menu) is in the page; the tab is still open. Re-attached after `,
     )
     expect(result.text).toMatch(/Re-attached after \d+\.\d s; refs from before are gone — observe\(\) again\./)
+    // A cut is no close: the click says Chrome took the debugger off, never that the tab closed
+    // (measured before: "The tab closed while the mouse button was being pressed … cannot be told").
+    expect(result.text).toContain('ACTION  ✗ click')
+    expect(result.text).toContain('Chrome took the debugger off this tab (DEBUGGER CUT above; the tab is still open)')
+    expect(result.text).not.toMatch(/tab closed/i)
 
     const after = await run('await observe()')
     expect(after.isError, after.text).toBe(false)
@@ -172,6 +180,10 @@ describe('a password manager menu cuts the debugger off the tab', () => {
     expect(result.text).toContain('Cannot access a chrome-extension:// URL of different extension')
     expect(result.text).toMatch(/ask the user to close it/)
     expect(result.text).toContain('PLAYWRITER_DIRECT')
+    // A cut is no close (measured before: "✓ click … — the tab closed (the page closed itself in response)").
+    expect(result.text).toContain('ACTION  ✗ click')
+    expect(result.text).toContain('Chrome took the debugger off this tab (DEBUGGER CUT above; the tab is still open)')
+    expect(result.text).not.toMatch(/tab closed/i)
     // The extension kept the tab: it is still tracked, waiting to re-attach.
     expect(await tabsSeenByTheExtension()).toEqual([{ id: tabId, state: 'connecting' }])
 
@@ -190,6 +202,35 @@ describe('a password manager menu cuts the debugger off the tab', () => {
     expect(back.isError, back.text).toBe(false)
     expect(back.text).toMatch(/DEBUGGER CUT — .* Re-attached after \d+\.\d s; refs from before are gone — observe\(\) again\./)
     expect(back.text).toContain('Log in')
+    expect(back.text).toContain(`127.0.0.1:${port}/login`)
+    expect(testCtx!.browserContext.pages().length).toBe(pagesBefore)
+    expect(await tabsSeenByTheExtension()).toEqual([{ id: tabId, state: 'connected' }])
+  }, 120_000)
+
+  // MEASURED: Chrome cuts the debugger when the menu starts loading and refuses it once the page has
+  // loaded; in between it lets an attach through. A full test run's load once widened that window enough
+  // for the extension to announce a re-attach ("Re-attached after 0.1 s") that Chrome then refused on
+  // every read ("Chrome lets no debugger into its document"). This menu's page loads SLOW_MENU_MS late,
+  // so the window is that wide on any machine.
+  it('a menu that loads slowly: an attach Chrome lets through while it loads is no re-attach', async () => {
+    const pagesBefore = testCtx!.browserContext.pages().length
+    const fresh = await run('await observe()')
+    expect(fresh.isError, fresh.text).toBe(false)
+    const recovery = refOf(fresh.text, /textbox "Recovery email"/)
+    const result = await run(`await act.click(${recovery})`)
+    console.log(`[debugger-cut] slow menu click:\n${result.text}`)
+    expect(result.text).toContain(
+      `DEBUGGER CUT — Chrome took the debugger off this tab because another extension's frame (chrome-extension://${pmId}, e.g. a password manager's autofill menu) is in the page; the tab is still open. Not re-attached yet`,
+    )
+    expect(result.text).not.toContain('Re-attached after')
+    expect(result.text).not.toContain('Chrome lets no debugger into its document')
+    expect(result.text).toContain('Chrome took the debugger off this tab (DEBUGGER CUT above; the tab is still open)')
+    expect(await tabsSeenByTheExtension()).toEqual([{ id: tabId, state: 'connecting' }])
+
+    await userPage!.keyboard.press('Escape')
+    const back = await run('await observe()')
+    expect(back.isError, back.text).toBe(false)
+    expect(back.text).toMatch(/DEBUGGER CUT — .* Re-attached after \d+\.\d s; refs from before are gone — observe\(\) again\./)
     expect(back.text).toContain(`127.0.0.1:${port}/login`)
     expect(testCtx!.browserContext.pages().length).toBe(pagesBefore)
     expect(await tabsSeenByTheExtension()).toEqual([{ id: tabId, state: 'connected' }])

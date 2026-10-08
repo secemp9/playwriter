@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { analyzeCode, checkPolicy } from './code-policy.js'
 import { PageUnresponsiveError } from './isolated-world.js'
-import { hiddenTabNote, unresponsiveDiagnosis, type TabVisibility } from './tab-state.js'
+import { colourChooserNotOpened, hiddenTabNote, unresponsiveDiagnosis, type TabVisibility } from './tab-state.js'
 import type { TabVisibilityReport } from './tab-visibility.js'
 
 const shown: TabVisibilityReport = { tabId: 7, targetId: 'T7', active: true, windowId: 1, windowState: 'normal', windowFocused: true, frontTab: null }
@@ -42,6 +42,40 @@ describe('a tab that did not answer in time', () => {
         'If this line is still here after it, its window stayed minimised: ask the user to restore it.',
     )
     expect(hiddenTabNote({ ...shown, active: false, frontTab: null })).toMatch(/^HIDDEN {2}this tab is not visible to the user: another tab is in front of it in its window\. Chrome throttles/)
+  })
+})
+
+describe("Chrome's colour chooser did not open after the click", () => {
+  const facts = { target: '[17] colorwell "Favourite colour"', ref: 17, value: '#000000' }
+  const head = `Clicked [17] colorwell "Favourite colour", but Chrome's colour chooser did not open: 1 s later it is still closed, and the input reads #000000.`
+
+  it('names a hidden tab as the cause, with its fix', () => {
+    expect(colourChooserNotOpened({ ...facts, visibility: read({ active: false, frontTab: 'Inbox' }) })).toBe(
+      `${head} This tab is not visible to the user — the tab "Inbox" is in front of it in its window — and Chrome does not open its colour chooser there: ` +
+        'page.bringToFront() brings the tab to the front, then call act.fill again.',
+    )
+    expect(colourChooserNotOpened({ ...facts, visibility: read({ windowState: 'minimized' }) })).toMatch(
+      /— its window is minimised — and Chrome does not open its colour chooser there: ask the user to restore the window, then call act\.fill again\.$/,
+    )
+  })
+
+  it('for a tab Chrome calls visible, says the window cannot be checked from here and to ask the user to show it — never that the page handled the click', () => {
+    for (const visibility of [read({ windowFocused: false }), { kind: 'unreadable', error: 'relay down' } satisfies TabVisibility]) {
+      const message = colourChooserNotOpened({ ...facts, visibility })
+      expect(message).toBe(
+        `${head} Chrome opens the chooser as a pop-up of its window, and does not when that window cannot take the focus — likely a window on a ` +
+          'workspace or desktop the user is not looking at, or one shown again without the focus. Chrome reports such a window like any other, ' +
+          'so it cannot be checked from here. page.bringToFront() asks for the front and the focus; if act.fill still fails after it, ask the user ' +
+          'to show the browser window on their screen, then try again. explain(17) shows whether the page itself listens for clicks on it.',
+      )
+    }
+  })
+
+  it('in a launched browser, names the one thing it can fix: the tab in front', () => {
+    expect(colourChooserNotOpened({ ...facts, visibility: null })).toBe(
+      `${head} Chrome does not open it in a tab behind another one: if this tab is not in front, page.bringToFront() brings it there, then call act.fill again. ` +
+        'explain(17) shows whether the page itself listens for clicks on it.',
+    )
   })
 })
 

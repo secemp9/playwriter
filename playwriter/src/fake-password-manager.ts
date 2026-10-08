@@ -9,7 +9,11 @@
  * only (Bitwarden was measured inserting it and removing it ~26 ms later). Every `chrome.debugger`
  * client on the tab is cut off while that iframe is in the page (debugger-cut.ts).
  *
- * Without `inlineMenu` the extension only serves `menu.html`, for a page that embeds it itself.
+ * With `slowMenuMs`, a field marked `data-pm-slow` gets a menu whose page loads that much later: the
+ * extension's worker answers it only then. Chrome cuts the debugger when the menu starts loading and
+ * refuses it once the page has loaded; in between it lets an attach through (measured: ~15 ms on an
+ * idle machine, longer under load — extension/src/debugger-cut.ts LoadingFrame). A slow menu makes
+ * that window wide on any machine.
  *
  * Extensions need full Chromium (`channel: 'chromium'`), not the headless shell.
  */
@@ -31,7 +35,7 @@ function open(field) {
   const shadow = host.attachShadow({ mode: 'closed' })
   const frame = document.createElement('iframe')
   frame.title = 'Password manager menu'
-  frame.src = chrome.runtime.getURL('menu.html')
+  frame.src = chrome.runtime.getURL(field.hasAttribute('data-pm-slow') ? 'menu.html?slow' : 'menu.html')
   shadow.appendChild(frame)
   document.body.appendChild(host)
   if (field.hasAttribute('data-pm-flash')) flashTimer = setTimeout(close, 26)
@@ -47,7 +51,7 @@ document.addEventListener('keydown', (event) => {
 `
 
 /** Writes the extension into `dir` (which must exist), ready for `--load-extension`. */
-export function writeFakePasswordManager({ dir, inlineMenu }: { dir: string; inlineMenu: boolean }): void {
+export function writeFakePasswordManager({ dir, inlineMenu, slowMenuMs }: { dir: string; inlineMenu: boolean; slowMenuMs?: number }): void {
   fs.writeFileSync(
     path.join(dir, 'manifest.json'),
     JSON.stringify({
@@ -59,7 +63,16 @@ export function writeFakePasswordManager({ dir, inlineMenu }: { dir: string; inl
       ...(inlineMenu ? { content_scripts: [{ matches: ['<all_urls>'], js: ['content.js'], run_at: 'document_idle' }] } : {}),
     }),
   )
-  fs.writeFileSync(path.join(dir, 'worker.js'), '')
+  // An extension's worker answers the fetches of its own pages, an iframe's navigation included.
+  const worker = slowMenuMs
+    ? `self.addEventListener('fetch', (event) => {
+  if (new URL(event.request.url).search !== '?slow') return
+  const answered = Promise.withResolvers()
+  setTimeout(() => answered.resolve(fetch(event.request)), ${slowMenuMs})
+  event.respondWith(answered.promise)
+})`
+    : ''
+  fs.writeFileSync(path.join(dir, 'worker.js'), worker)
   fs.writeFileSync(path.join(dir, 'menu.html'), '<!doctype html><title>Menu</title><button>Fill password</button>')
   if (inlineMenu) fs.writeFileSync(path.join(dir, 'content.js'), CONTENT_SCRIPT)
 }

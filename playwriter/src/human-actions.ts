@@ -51,19 +51,22 @@ import { dialogAnswerText, dialogLabel, type BeforeUnloadPolicy, type DialogCont
 import { chooserOpener, describeOpener, type ChooserWindow, type FileChooserGate, type FileChooserRecord } from './file-chooser-gate.js'
 import type { HumanMouseApi, HumanMoveResult } from './human-mouse-driver.js'
 import { minimumJerkPosition } from './human-mouse.js'
+import { isTouchPage, swipeFor, swipeSamples, tap, touchStroke } from './touch-input.js'
 import { axStatesFromNode, type AxStates } from './ax-states.js'
 import { isSecretField } from './aria-snapshot.js'
+import { colourChooserNotOpened, type TabVisibility } from './tab-state.js'
 import {
   ModelFacingError,
   type BusySignal,
   type JsDialogState,
+  type PendingRequest,
   type PolicyMode,
   type SettleResult,
   type WatchCheckpoint,
   type WatchEvents,
 } from './probe-types.js'
 import type { Observation, ObservationDiff, ObservedElement, SemanticContainer, TextBlock } from './page-observe.js'
-import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, liveContext, renderObservationDiff } from './page-observe.js'
+import { MIN_CLICKABLE_SIDE, SCROLL_ORIGIN_JS, describeIframe, iframeRef, liveContext, renderObservationDiff } from './page-observe.js'
 import { CLICK_LABEL_FN } from './label-control.js'
 import { EDITOR_BLOCK_FN, EDITOR_CARET_BLOCK_FN, EDITOR_PARTS_FN, type EditorBlockFacts } from './editor-block.js'
 import { REACHES_TARGET_FN } from './composed-hit.js'
@@ -81,6 +84,13 @@ const WAIT_CAP_MS = 30_000
  * moment after the input event it closed itself in answer to.
  */
 const CLOSE_AFTER_INPUT_MS = 1000
+/**
+ * How an input a debugger cut (debugger-cut.ts) stopped is told: the tab did not close, and the
+ * executor's DEBUGGER CUT line, first in the call's output, says why and what to do.
+ */
+const CUT_OFF = 'Chrome took the debugger off this tab (DEBUGGER CUT above; the tab is still open)'
+/** What tells what an input a debugger cut stopped did: its tab is still there to read. */
+const LOOK_AFTER_CUT = 'observe() shows what it did once the tab is back.'
 
 /** An action the agent asked for could not be done as asked. The message is for the model: specific and actionable. */
 export class ActError extends ModelFacingError {
@@ -313,6 +323,14 @@ export interface ActDeps {
     policy: 'accept' | 'dismiss' | 'pending',
     options: { beforeunload?: BeforeUnloadPolicy; promptText?: string },
   ) => DialogPolicySettings
+  /** Whether the user can see the tab, as the extension reads it (never rejects); null for a launched browser. */
+  tabVisibility: (probe: ActProbe) => Promise<TabVisibility | null>
+  /**
+   * `page`, which closed during an input, belongs to a tab that is still open: Chrome only took the
+   * debugger off it (debugger-cut.ts). Waits, within the call's time, for the relay to say which;
+   * false for a tab that really closed, and always in a launched browser.
+   */
+  debuggerCut: (page: Page) => Promise<boolean>
 }
 
 export interface ClickOptions {
@@ -365,6 +383,11 @@ export interface FillOptions {
   at?: 'caret'
 }
 
+/**
+ * On a page that emulates a touch screen (a phone or tablet preset of a new browser) a finger does the
+ * pointer's work (touch-input.ts): click is a tap, dblclick a double tap, drag a finger drag, scroll and
+ * scrolling into view are swipes; hover and right/middle clicks are refused with the reason.
+ */
 export interface ActApi {
   /** Click `target`: a ref (a point of the element that receives the pointer) or `{ ref, x, y }`, exactly that point of the element. */
   click(target: number | string | ElementPoint, options?: ClickOptions): Promise<ActionRecord>
@@ -530,9 +553,14 @@ function targetSummary(target: RefTarget): RecordTarget {
   return { ref: target.ref, role: target.role, name: target.name, ...(target.context !== undefined ? { context: target.context } : {}), key: target.key }
 }
 
+/**
+ * Typed text or a value for the report: masked when secret, else cut at 80 with each line break shown
+ * as ⏎, the notation of every report line (page-observe's `quote`), so it stays on its line.
+ */
 function maskIfSecret(text: string, secret: boolean): string {
   if (secret) return text ? '••••' : ''
-  return text.length > 80 ? `${text.slice(0, 77)}…` : text
+  const shown = text.replace(/\r\n|\r|\n|\u2028|\u2029/g, '⏎')
+  return shown.length > 80 ? `${shown.slice(0, 77)}…` : shown
 }
 
 function errorMessage(error: unknown): string {
@@ -708,6 +736,13 @@ const WHEEL_HELPERS = `
  * element taller than two thirds of the area gets its top edge brought in instead. Also returns the
  * hit-tested point to wheel at (see WHEEL_HELPERS).
  *
+ * Scrolling only goes as far as it can: dy/dx are cut to what each scroller has left to scroll, so
+ * at the end of a list or of the page the plan settles for the part of the element already in view
+ * (`atEnd` says the page could not go further). An element in a layer fixed to the window
+ * (position: fixed, itself or an ancestor) does not move when the page scrolls: only the scrollers
+ * inside that layer are wheeled, judged by the part of them inside the window, and `pinnedIn` names
+ * the layer.
+ *
  * `fn({ spot }, el)`: bring point `spot` of `el` (in this frame's viewport) into view instead: a
  * fingertip-sized square around it, all of it inside the visible area — as far as scrolling can
  * bring it in. At each level only the part of the square inside the scroller's content (or the
@@ -738,6 +773,19 @@ const SCROLL_PLAN_FN = `function(args, el) {
     const right = Math.min(c.right, vw), bottom = Math.min(c.bottom, vh)
     return right > x && bottom > y ? { x, y, width: right - x, height: bottom - y } : null
   }
+  // \`d\` px of scrolling for scroller \`n\` along \`axis\` (positive: down/right), cut to what it has left; 0 when it is at that end.
+  const room = (n, d, axis) => {
+    if (d === 0) return 0
+    const at = axis === 'y' ? fromTop(n) : fromLeft(n)
+    const max = axis === 'y' ? n.scrollHeight - n.clientHeight : n.scrollWidth - n.clientWidth
+    const cut = d > 0 ? Math.min(d, max - at) : Math.max(d, -at)
+    return Math.abs(cut) < 1 ? 0 : cut
+  }
+  const up = (n) => n.parentElement || (n.getRootNode().host ?? null)
+  // The layer fixed to the window that el is in (el itself or an ancestor): no scroller outside it moves el.
+  let layer = null
+  for (let n = el; n && n !== document.documentElement; n = up(n)) if (getComputedStyle(n).position === 'fixed') { layer = n; break }
+  const beyond = layer ? up(layer) : null
   const plan = (scroller, area, dy, dx, label) => {
     const axis = Math.abs(dy) >= Math.abs(dx) ? 'y' : 'x'
     const dir = Math.sign(axis === 'y' ? dy : dx)
@@ -746,24 +794,31 @@ const SCROLL_PLAN_FN = `function(args, el) {
   // Walk outwards. A scroller that is itself out of sight cannot be wheeled; a person first
   // scrolls what contains IT, so its rect becomes the thing to bring into view one level up.
   let target = r
-  for (let n = el.parentElement || (el.getRootNode().host ?? null); n && n !== document.body && n !== document.documentElement; n = n.parentElement || (n.getRootNode().host ?? null)) {
+  for (let n = up(el); n && n !== document.body && n !== document.documentElement; n = up(n)) {
+    if (layer && n === beyond) break
     const s = getComputedStyle(n)
     const canY = overflowScrolls(s.overflowY) && n.scrollHeight > n.clientHeight + 1
     const canX = overflowScrolls(s.overflowX) && n.scrollWidth > n.clientWidth + 1
     if (!canY && !canX) continue
     const c = n.getBoundingClientRect()
-    target = reachable(target, n, false)
-    const dy = canY ? need(target.top, target.bottom, c.top, c.bottom) : 0
-    const dx = canX ? need(target.left, target.right, c.left, c.right) : 0
-    if (dy === 0 && dx === 0) continue
     const area = clipToViewport(c)
+    // In a fixed layer only the part of the scroller inside the window counts: nothing brings the rest in.
+    if (layer && !area) { target = c; continue }
+    const box = layer ? { top: area.y, bottom: area.y + area.height, left: area.x, right: area.x + area.width } : c
+    target = reachable(target, n, false)
+    const dy = canY ? room(n, need(target.top, target.bottom, box.top, box.bottom), 'y') : 0
+    const dx = canX ? room(n, need(target.left, target.right, box.left, box.right), 'x') : 0
+    if (dy === 0 && dx === 0) continue
     if (area) return plan(n, area, dy, dx, labelOf(n))
     target = c
   }
-  target = reachable(target, document.scrollingElement || document.documentElement, true)
-  const dy = need(target.top, target.bottom, 0, vh), dx = need(target.left, target.right, 0, vw)
-  if (dy === 0 && dx === 0) return { container: null, dy, dx, label: 'page' }
-  return plan(document.scrollingElement || document.documentElement, { x: 0, y: 0, width: vw, height: vh }, dy, dx, 'page')
+  if (layer) return { container: null, dy: 0, dx: 0, label: 'page', pinnedIn: labelOf(layer) }
+  const page = document.scrollingElement || document.documentElement
+  target = reachable(target, page, true)
+  const wantY = need(target.top, target.bottom, 0, vh), wantX = need(target.left, target.right, 0, vw)
+  const dy = room(page, wantY, 'y'), dx = room(page, wantX, 'x')
+  if (dy === 0 && dx === 0) return { container: null, dy, dx, label: 'page', atEnd: wantY !== 0 || wantX !== 0 }
+  return plan(page, { x: 0, y: 0, width: vw, height: vh }, dy, dx, 'page')
 }`
 
 /**
@@ -847,6 +902,10 @@ interface ScrollPlan {
   label: string
   point?: Point
   blockedBy?: string
+  /** The layer fixed to the window the element is in, when it is in one: page scrolling does not move it. */
+  pinnedIn?: string
+  /** The page had to scroll further to show the element, but it is already at that end. */
+  atEnd?: boolean
 }
 
 /** What WHEEL_POINT_FN returns. */
@@ -1498,12 +1557,26 @@ export function createActApi(deps: ActDeps): ActApi {
   }
 
   /**
+   * A finger swipe from `at` (a point over the scroller the input reaches) that scrolls about
+   * (scrollX, scrollY) px, positive down/right: the finger moves the other way, at most `limit` px
+   * and 60% of the screen, never off it (touch-input.ts). What really moved is the caller's to measure.
+   */
+  async function swipe(step: Step, at: Point, scrollX: number, scrollY: number, limit = Infinity): Promise<void> {
+    const screen = step.page.viewportSize() ?? (await visibleArea(step.probe, step.probe.frames.mainFrameId()))
+    const { dx } = swipeFor(at, 'x', scrollX, screen, Math.min(limit, screen.width * 0.6))
+    const { dy } = swipeFor(at, 'y', scrollY, screen, Math.min(limit, screen.height * 0.6))
+    await untilDialog(step.probe, touchStroke(step.probe.cdp, step.page, swipeSamples(at, dx, dy), randomBetween(100, 160), { sleep }), step.record)
+  }
+
+  /**
    * Wheel until the target is in view, the way a person does: over the scroller that clips it
    * (an outer one first when that scroller is itself off-screen), at a point the wheel really
    * reaches (hit-tested, so not over a sticky header or a nested list), one flick at a time.
-   * There is no programmatic scroll behind this: when the page ignores the wheel the action stops
-   * and says so. With `offset` (CSS px in the target's border box, see `borderBox`) it is that
-   * point of the target that is brought into view.
+   * There is no programmatic scroll behind this. Where scrolling cannot go further (the end of the
+   * page or list, a layer fixed to the window, a page that ignores the wheel) the part of the
+   * target already in view is used, as a person points at what they see; only when none of it is
+   * in view does the action stop, saying why. With `offset` (CSS px in the target's border box, see
+   * `borderBox`) it is that point of the target that is brought into view.
    */
   async function bringIntoView(step: Step, target: RefTarget, offset?: Point): Promise<{ rects: Rect[]; viewport: Rect; notes: string[] }> {
     const { page, probe, record } = step
@@ -1516,6 +1589,22 @@ export function createActApi(deps: ActDeps): ActApi {
     const scrolled = new Map<string, number>()
     let pointerAt: Point | null = null
     let idleWheels = 0
+    const what = offset ? `(${offset.x}, ${offset.y}) of ${describeTarget(target)}` : describeTarget(target)
+    // Nothing of the target a person could point at is inside `viewport`: its box (or the chosen point of it), else null.
+    const outOfSight = async (rects: Rect[], viewport: Rect): Promise<Rect | null> => {
+      if (offset) {
+        const at = (await borderBox(probe, target)).at(offset)
+        const inside = at.x >= viewport.x && at.x < viewport.x + viewport.width && at.y >= viewport.y && at.y < viewport.y + viewport.height
+        return inside ? null : { ...at, width: 0, height: 0 }
+      }
+      return rects.some((rect) => intersectRects(rect, viewport) !== null) ? null : rects[0]
+    }
+    const reached = (rects: Rect[], viewport: Rect): { rects: Rect[]; viewport: Rect; notes: string[] } => {
+      if (scrolled.size > 0) {
+        notes.push(`scrolled with ${isTouchPage(page) ? 'finger swipes' : 'the mouse wheel'} to reach it: ${[...scrolled].map(([where, px]) => `${Math.round(px)}px in ${where}`).join(', then ')}`)
+      }
+      return { rects, viewport, notes }
+    }
     for (let flick = 0; flick < 40; flick++) {
       checkAbort()
       const rects = await quadsOf(probe, target)
@@ -1538,10 +1627,19 @@ export function createActApi(deps: ActDeps): ActApi {
       // In an iframe the plan's "page" is the iframe's own document.
       const label = inIframe && plan.label === 'page' ? 'the iframe' : plan.label
       if (Math.abs(plan.dy) < 1 && Math.abs(plan.dx) < 1) {
-        if (scrolled.size > 0) {
-          notes.push(`scrolled with the mouse wheel to reach it: ${[...scrolled].map(([where, px]) => `${Math.round(px)}px in ${where}`).join(', then ')}`)
-        }
-        return { rects, viewport, notes }
+        // Scrolling cannot go further. Some of the target in view is enough: a person points at that part.
+        const box = plan.pinnedIn || plan.atEnd ? await outOfSight(rects, viewport) : null
+        if (!box) return reached(rects, viewport)
+        const where =
+          box.y >= viewport.y + viewport.height ? 'below' : box.y + box.height <= viewport.y ? 'above' : box.x >= viewport.x + viewport.width ? 'right of' : 'left of'
+        throw new ActError(
+          plan.pinnedIn
+            ? `Not done: ${what} is ${where} the visible part of the page, and no scrolling brings it in: it is inside ${plan.pinnedIn}, ` +
+                'a layer fixed to the window (position: fixed) that stays put when the page scrolls. Nothing was done. A person could not ' +
+                'reach it with the mouse either; a larger window would show it, or the keyboard may reach it where the page supports that.'
+            : `Not done: ${what} is ${where} the visible part of ${label}, and ${label} is already scrolled as far as it goes that way, ` +
+                'so no part of it can be brought into view. Nothing was done. find() or observe() shows where it is.',
+        )
       }
       if (!plan.point) {
         throw new ActError(
@@ -1551,16 +1649,20 @@ export function createActApi(deps: ActDeps): ActApi {
       }
       // The plan's point is in the frame's own viewport.
       const at = inIframe ? onScreen({ ...plan.point, width: 0, height: 0 }, await probe.frames.box(target.frameId)) : plan.point
-      if (!pointerAt || Math.hypot(pointerAt.x - at.x, pointerAt.y - at.y) > 4) {
-        record.dispatched = true
-        await deps.humanMouse.moveTo({ page, x: at.x, y: at.y })
-        pointerAt = { x: at.x, y: at.y }
-      }
       const before = rects[0]
       const stepY = Math.sign(plan.dy) * Math.min(Math.abs(plan.dy), randomBetween(220, 460))
       const stepX = Math.sign(plan.dx) * Math.min(Math.abs(plan.dx), randomBetween(160, 320))
       record.dispatched = true
-      await page.mouse.wheel(stepX, stepY)
+      if (isTouchPage(page)) {
+        // A touch screen has no wheel and no pointer over the page: a person swipes from that point.
+        await swipe(step, at, stepX, stepY)
+      } else {
+        if (!pointerAt || Math.hypot(pointerAt.x - at.x, pointerAt.y - at.y) > 4) {
+          await deps.humanMouse.moveTo({ page, x: at.x, y: at.y })
+          pointerAt = { x: at.x, y: at.y }
+        }
+        await page.mouse.wheel(stepX, stepY)
+      }
       const after = await restingPosition(probe, target)
       if (!after) {
         throw new ActError(`${describeTarget(target)} stopped being rendered while scrolling to it. Call observe() again.`)
@@ -1569,8 +1671,14 @@ export function createActApi(deps: ActDeps): ActApi {
       if (moved < 1) {
         idleWheels += 1
         if (idleWheels >= 2) {
+          const now = await quadsOf(probe, target)
+          const area = await visibleArea(probe, target.frameId)
+          if (now.length > 0 && (await outOfSight(now, area)) === null) {
+            notes.push(`the mouse wheel did not move ${label} any further (twice), so only part of it is in view: aimed at that part`)
+            return reached(now, area)
+          }
           throw new ActError(
-            `The page did not scroll when the mouse wheel turned over ${label} (twice), so ${describeTarget(target)} stays out of view: ` +
+            `The page did not scroll when the mouse wheel turned over ${label} (twice), and no part of ${what} is in view: ` +
               'the page handles the wheel itself, or that area cannot scroll further. A person would try the keyboard ' +
               "(act.press('PageDown') once focus is in that area) or find another way to it (find()).",
           )
@@ -1610,16 +1718,18 @@ export function createActApi(deps: ActDeps): ActApi {
       { x: box.x + box.width * 0.3, y: box.y + box.height * 0.7 },
       { x: box.x + box.width * 0.7, y: box.y + box.height * 0.7 },
     ]
-    let cover: { frameId: string; backendNodeId: number } | null = null
+    let cover: { hit: { frameId: string; backendNodeId: number }; point: Point } | null = null
     for (const candidate of candidates) {
       const over = await coverAt(probe, target, candidate)
       if (over === null) return { point: candidate, hit: describeTarget(target) }
-      cover ??= over
+      cover ??= { hit: over, point: candidate }
     }
-    const coverLabel = cover !== null ? await labelNode(probe, cover.frameId, cover.backendNodeId) : 'another element'
+    const coverLabel = cover !== null ? await labelNode(probe, cover.hit.frameId, cover.hit.backendNodeId) : 'another element'
     throw new ActError(
       `Not done: ${describeTarget(target)} is covered by ${coverLabel} at every point a person could click. ` +
-        'A person would first deal with what is on top (close it, accept it, or scroll it away). observe() lists the covering layer and its controls.',
+        'A person would first deal with what is on top (close it, accept it, or scroll it away). observe() lists the covering layer and its controls.' +
+        // As a point target's refusal: the centre, as a point of what covers it, when that has a ref.
+        (cover !== null ? await coverSpot(probe, cover.hit, cover.point) : ''),
     )
   }
 
@@ -2053,58 +2163,96 @@ export function createActApi(deps: ActDeps): ActApi {
    * The tab closed in answer to `input`, an input of `step` whose press Chrome confirmed. When that
    * input is the action itself (a click, a key press, a drag's drop or release), the closing is its
    * effect; any other action stops there and says so.
+   *
+   * A debugger cut (debugger-cut.ts) closes the page but not its tab: Chrome only took the debugger off
+   * it, and the executor takes the tab back. Nothing closed then: the input went through whole
+   * (`unconfirmed` null), or the page got its press and `unconfirmed` says what Chrome did not confirm —
+   * the tab is there to look at, so nothing is left untellable.
    */
-  function closedByOwnInput(step: Step, input: string, isAction: boolean): void {
+  async function closedByOwnInput(step: Step, input: string, isAction: boolean, unconfirmed: string | null): Promise<void> {
+    if (await deps.debuggerCut(step.page)) {
+      if (unconfirmed !== null) throw new ActError(`Not finished: ${CUT_OFF} during ${input}: ${unconfirmed}. ${LOOK_AFTER_CUT}`)
+      if (!isAction) throw new ActError(`Not finished: ${CUT_OFF} right after ${input}: the rest of this ${step.record.kind} was not done. ${LOOK_AFTER_CUT}`)
+      step.record.notes.push(`right after ${input}, ${CUT_OFF}`)
+      return
+    }
     step.record.closedTab = true
     if (!isAction) throw new ActError(`${input} closed the tab (the page closed itself in response): the rest of this ${step.record.kind} was not done.`)
   }
 
   /**
-   * Press a mouse button at `point` (the pointer is already there), dialog-safe. A page that closes
-   * its tab in answer to the press or the release takes Chrome's confirmation of the release with
-   * it: once the press was confirmed, that closing is what the click did, not a failure.
+   * Press a mouse button at `point` (the pointer is already there), dialog-safe — or, on a page
+   * that emulates a touch screen (a phone preset), tap there with a finger: no pointer travels
+   * before the touch (touch-input.ts). A page that closes its tab in answer to the press or the
+   * release takes Chrome's confirmation of the release with it: once the press was confirmed, that
+   * closing is what the click did, not a failure. A debugger cut is no close (closedByOwnInput).
    */
   async function clickAt(step: Step, point: Point, clickCount: number, button: 'left' | 'right' | 'middle'): Promise<void> {
     checkAbort()
     const { page, record } = step
     record.dispatched = true
     const press: { stage: PressStage } = { stage: 'not sent' }
-    const clicking = deps.humanMouse.click({
-      page,
-      x: point.x,
-      y: point.y,
-      button,
-      clickCount,
-      delayMs: Math.round(randomBetween(45, 110)),
-      onPress: (stage) => {
-        // The pointer's travel does not wait for a tab that closes under it: a press that went out
-        // after the close never reached the page.
-        if (stage === 'acknowledged' || !page.isClosed()) press.stage = stage
-      },
-    })
-    const input = `the ${clickCount === 2 ? 'double click' : 'click'}${record.hit ? ` on ${record.hit}` : ''}`
+    const onPress = (stage: 'sent' | 'acknowledged'): void => {
+      // The pointer's travel does not wait for a tab that closes under it: a press that went out
+      // after the close never reached the page.
+      if (stage === 'acknowledged' || !page.isClosed()) press.stage = stage
+    }
+    const touch = isTouchPage(page)
+    const clicking: Promise<HumanMoveResult | null> = touch
+      ? tap(step.probe.cdp, page, point, clickCount, { sleep, onPress }).then(() => null)
+      : deps.humanMouse.click({ page, x: point.x, y: point.y, button, clickCount, delayMs: Math.round(randomBetween(45, 110)), onPress })
+    const input = `the ${clickCount === 2 ? `double ${touch ? 'tap' : 'click'}` : touch ? 'tap' : 'click'}${record.hit ? ` on ${record.hit}` : ''}`
     const isAction = record.kind === 'click' || record.kind === 'dblclick'
-    let move: HumanMoveResult | undefined
+    let move: HumanMoveResult | null | undefined
     try {
       move = await untilDialog(step.probe, clicking, record)
     } catch (error) {
       // A press that went out and failed is waited on for the close; anything before it is decided now.
       if (!(press.stage === 'not sent' ? page.isClosed() : await closesSoon(page))) throw error
-      if (press.stage === 'not sent') throw new ActError('Not done: the tab closed before the mouse button was pressed (while the pointer moved to it); nothing was clicked.')
-      if (press.stage === 'sent') {
-        throw new ActError('The tab closed while the mouse button was being pressed: Chrome closed it before confirming the press, so whether the page got it cannot be told.')
+      if (press.stage !== 'acknowledged' && (await deps.debuggerCut(page))) {
+        throw new ActError(
+          press.stage === 'not sent'
+            ? `Not done: ${CUT_OFF} before the ${touch ? 'finger touched the screen' : 'mouse button was pressed'}; nothing was ${touch ? 'tapped' : 'clicked'}.`
+            : `Not finished: ${CUT_OFF} while the ${touch ? 'finger touched the screen' : 'mouse button was being pressed'}: Chrome did not confirm the ` +
+                `${touch ? 'touch' : 'press'}, and the ${touch ? 'finger never lifted' : 'button was never released'}, so the page got no ` +
+                `${touch ? 'tap' : 'click'} — at most the ${touch ? 'touch' : 'press'}. ${LOOK_AFTER_CUT}`,
+        )
       }
-      closedByOwnInput(step, input, isAction)
+      if (press.stage === 'not sent') {
+        throw new ActError(
+          touch
+            ? 'Not done: the tab closed before the finger touched the screen; nothing was tapped.'
+            : 'Not done: the tab closed before the mouse button was pressed (while the pointer moved to it); nothing was clicked.',
+        )
+      }
+      if (press.stage === 'sent') {
+        throw new ActError(
+          `The tab closed while the ${touch ? 'finger touched the screen' : 'mouse button was being pressed'}: Chrome closed it before confirming the ${touch ? 'touch' : 'press'}, so whether the page got it cannot be told.`,
+        )
+      }
+      await closedByOwnInput(step, input, isAction, touch ? 'the page got the touch, and Chrome did not confirm the lift' : 'the page got the press, and Chrome did not confirm the release')
       return
     }
-    if (move) {
+    if (touch) {
+      record.notes.push(`${clickCount === 2 ? 'double-tapped' : 'tapped'} with a finger (touch screen: nothing moved over the page before the touch)`)
+    } else if (move) {
       record.notes.push(`pointer travelled ${Math.round(move.distancePx)}px in ${Math.round(move.achievedDurationMs)}ms`)
       for (const warning of move.warnings) record.notes.push(warning)
     }
-    if (page.isClosed()) closedByOwnInput(step, input, isAction)
+    if (page.isClosed()) await closedByOwnInput(step, input, isAction, null)
   }
 
   async function clickTarget(step: Step, target: RefTarget, clickCount: number, button: 'left' | 'right' | 'middle', offset?: Point): Promise<Point> {
+    if (button !== 'left' && isTouchPage(step.page)) {
+      throw new ActError(
+        button === 'right'
+          ? 'Not done: this browser emulates a touch screen (a phone or tablet preset), which has no right button. On Android Chrome a long press opens ' +
+              "the context menu, but Chrome's touch emulation never turns one into a contextmenu event (measured: a 1.7 s press gives the page a plain " +
+              'click), so it cannot be done here. Nothing was tapped. To test the context menu, use a browser without a device preset.'
+          : 'Not done: this browser emulates a touch screen (a phone or tablet preset), which has no middle button. On a phone a link opens in a new tab ' +
+              'from its long-press menu, which Chrome\'s touch emulation does not show. Nothing was tapped.',
+      )
+    }
     if (await isDisabled(step.probe, target)) {
       throw new ActError(`Not done: ${describeTarget(target)} is disabled right now. A person cannot click it; something on the page must enable it first.`)
     }
@@ -2131,6 +2279,74 @@ export function createActApi(deps: ActDeps): ActApi {
           `not including, ${height} (got ${offset.x}, ${offset.y}), CSS px from its top-left corner. ${nothing}`,
       )
     }
+  }
+
+  /** Where a drag ends: `offset` of `to` (the model's point), or a point of `to` that receives the pointer. Both must be visible now. */
+  async function dragEndPoint(probe: ActProbe, to: RefTarget, offset: Point | undefined, record: ActionRecord): Promise<Point> {
+    if (offset) {
+      const outOfView = `(${offset.x}, ${offset.y}) of ${describeTarget(to)} is not visible while dragging; bring both points into view first.`
+      return (await pointOn(probe, to, offset, await visibleArea(probe, to.frameId), outOfView)).point
+    }
+    const toSurface = await pointerSurface(probe, to, record)
+    const toRects = await quadsOf(probe, toSurface)
+    const viewport = await visibleArea(probe, toSurface.frameId)
+    if (!toRects.some((rect) => intersectRects(rect, viewport) !== null)) {
+      throw new ActError(`${describeTarget(to)} is not visible while dragging; bring both into view first.`)
+    }
+    return (await hitPoint(probe, toSurface, toRects, viewport)).point
+  }
+
+  /**
+   * The way of a drag from `from` to `to`, timed: the human plan gives a person's pace either way;
+   * 'straight' keeps its timing and puts every sample on the straight line, at the minimum-jerk
+   * fraction of the way for its time. Ends exactly at `to`.
+   */
+  async function dragSamples(page: Page, from: Point, to: Point, path: 'human' | 'straight'): Promise<Array<{ tMs: number; x: number; y: number }>> {
+    const trajectory = await deps.humanMouse.plan({ page, from, x: to.x, y: to.y })
+    const endMs = trajectory.samples.at(-1)?.tMs ?? 0
+    const samples =
+      path === 'straight'
+        ? trajectory.samples.map((sample) => {
+            const s = minimumJerkPosition(endMs > 0 ? sample.tMs / endMs : 1)
+            return { tMs: sample.tMs, x: from.x + (to.x - from.x) * s, y: from.y + (to.y - from.y) * s }
+          })
+        : trajectory.samples
+    return [...samples, { tMs: endMs, x: to.x, y: to.y }]
+  }
+
+  /** The report's line for a drag's way, `travelled` px along it. */
+  function dragPathNote(path: 'human' | 'straight', held: string, travelled: number, distance: number): string {
+    return path === 'straight'
+      ? `${held} path: a straight line of ${Math.round(distance)} px`
+      : `${held} path: ${Math.round(travelled)} px of a person's curved path for ${Math.round(distance)} px between the two points; ` +
+          "where the way itself counts (a drawn line), pass { path: 'straight' }"
+  }
+
+  /**
+   * A drag on a touch screen: the finger touches `fromPoint`, rests ~0.1 s, slides along the way to
+   * `to` and lifts there (touch-input.ts) — no pointer travels to it first. Chrome's touch emulation
+   * starts no HTML drag (draggable=true) from a touch; pointer- and touch-driven ones (sliders,
+   * sortable lists, maps, canvases) get the finger's pointermove/touchmove events.
+   */
+  async function touchDrag(step: Step, fromPoint: Point, to: RefTarget, toOffset: Point | undefined, path: 'human' | 'straight'): Promise<void> {
+    const { page, probe, record } = step
+    const toPoint = await dragEndPoint(probe, to, toOffset, record)
+    const way = await dragSamples(page, fromPoint, toPoint, path)
+    const hold = randomBetween(90, 160)
+    const samples = [{ tMs: 0, ...fromPoint }, ...way.filter((sample) => sample.tMs > 0).map((sample) => ({ ...sample, tMs: sample.tMs + hold }))]
+    let travelled = 0
+    samples.forEach((sample, index) => {
+      if (index > 0) travelled += Math.hypot(sample.x - samples[index - 1].x, sample.y - samples[index - 1].y)
+    })
+    try {
+      await untilDialog(probe, touchStroke(probe.cdp, page, samples, randomBetween(80, 160), { sleep }), record)
+    } catch (error) {
+      if (!(await closesSoon(page))) throw error
+      await closedByOwnInput(step, 'the touch drag', true, 'Chrome did not confirm all of the stroke (the touch, the slide and the lift)')
+      return
+    }
+    if (page.isClosed()) await closedByOwnInput(step, 'the touch drag', true, null)
+    record.notes.push(dragPathNote(path, 'finger (touch screen)', travelled, Math.hypot(toPoint.x - fromPoint.x, toPoint.y - fromPoint.y)))
   }
 
   /** A native checkbox/radio's own state (its truth even when it is hidden from the accessibility tree). */
@@ -2726,9 +2942,10 @@ export function createActApi(deps: ActDeps): ActApi {
     }
     refuseIfTooSlow(wanted.length + 4, `Choosing ${wanted} in the colour chooser`, '')
     await clickTarget(step, target, 1, 'left')
-    if (!(await readWhen(true, 1000)).open) {
+    const opened = await readWhen(true, 1000)
+    if (!opened.open) {
       throw new ActError(
-        `Clicked ${describeTarget(target)} but Chrome's colour chooser did not open (the page may handle the click itself). observe() shows what the click did.`,
+        colourChooserNotOpened({ target: describeTarget(target), ref: target.ref, value: opened.value, visibility: await deps.tabVisibility(probe) }),
       )
     }
     // A person takes in the chooser before reaching for the keys; its script is up by then too.
@@ -3151,18 +3368,34 @@ export function createActApi(deps: ActDeps): ActApi {
     // As far as it can still move: a wheel beyond its edge would scroll what contains it.
     const room = Math.max(0, Math.floor(dir > 0 ? before.size - before.at - before.client : before.at))
     const total = Math.min(requested, room) * dir
-    if (total !== 0) {
-      record.dispatched = true
+    const touch = isTouchPage(page)
+    if (total !== 0) record.dispatched = true
+    if (touch && total !== 0) {
+      // A phone has no wheel: a person swipes over the area, measured after each swipe (the touch
+      // slop and a little fling make the distance a swipe scrolls vary). Each starts at the aimed
+      // point and moves at most 45% of the area, so the finger stays on it.
+      let progress = 0
+      let idle = 0
+      for (let swipes = 0; swipes < 40 && idle < 2 && Math.abs(total) - Math.abs(progress) > 16; swipes++) {
+        checkAbort()
+        const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(progress), randomBetween(180, 420))
+        await swipe(step, point, axis === 'x' ? flick : 0, axis === 'y' ? flick : 0, before.client * 0.45)
+        const now = (await restingOffset(frame.world, scrollerId, axis, goneScroller)).raw - before.raw
+        idle = Math.abs(now - progress) < 1 ? idle + 1 : 0
+        progress = now
+        await sleep(randomBetween(70, 150))
+      }
+    } else if (total !== 0) {
       await deps.humanMouse.moveTo({ page, x: point.x, y: point.y })
-    }
-    let done = 0
-    while (Math.abs(done) < Math.abs(total)) {
-      checkAbort()
-      const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(done), randomBetween(180, 420))
-      if (axis === 'y') await page.mouse.wheel(0, flick)
-      else await page.mouse.wheel(flick, 0)
-      done += flick
-      await sleep(randomBetween(70, 150))
+      let done = 0
+      while (Math.abs(done) < Math.abs(total)) {
+        checkAbort()
+        const flick = Math.sign(total) * Math.min(Math.abs(total) - Math.abs(done), randomBetween(180, 420))
+        if (axis === 'y') await page.mouse.wheel(0, flick)
+        else await page.mouse.wheel(flick, 0)
+        done += flick
+        await sleep(randomBetween(70, 150))
+      }
     }
     const after = await restingOffset(frame.world, scrollerId, axis, goneScroller)
     // Chrome's own offset: the distance from the top or left edge of an area that starts at its
@@ -3176,7 +3409,7 @@ export function createActApi(deps: ActDeps): ActApi {
       record.scrollMoved = 0
       record.notes.push(
         remaining >= 1
-          ? `nothing moved although ${label} has more ${words.more} (${where}): the page handles the mouse wheel itself here`
+          ? `nothing moved although ${label} has more ${words.more} (${where}): the page handles ${touch ? 'touch swipes' : 'the mouse wheel'} itself here`
           : container
             ? `nothing moved: ${label} is at the ${words.end}`
             : `nothing moved: nothing in the middle of the screen can scroll further ${direction} (${label} and every scroll area there are at the ${words.end})`,
@@ -3423,14 +3656,21 @@ export function createActApi(deps: ActDeps): ActApi {
             await untilDialog(probe, keys(), record)
           } catch (error) {
             if (!(press.stage === 'not sent' ? page.isClosed() : await closesSoon(page))) throw error
+            if (press.stage !== 'acknowledged' && (await deps.debuggerCut(page))) {
+              throw new ActError(
+                press.stage === 'not sent'
+                  ? `Not done: ${CUT_OFF} before the key ${key} was pressed; the key did not reach the page.`
+                  : `Not finished: ${CUT_OFF} while the key ${key} was being pressed: Chrome did not confirm it, and it was never released, so the page got at most its keydown. ${LOOK_AFTER_CUT}`,
+              )
+            }
             if (press.stage === 'not sent') throw new ActError(`Not done: the tab closed before the key ${key} was pressed; no key reached the page.`)
             if (press.stage === 'sent') {
               throw new ActError(`The tab closed while the key ${key} was being pressed: Chrome closed it before confirming the key, so whether the page got it cannot be told.`)
             }
-            closedByOwnInput(step, `the key ${key}`, true)
+            await closedByOwnInput(step, `the key ${key}`, true, 'the page got its keydown, and Chrome did not confirm its keyup')
             return
           }
-          if (page.isClosed()) closedByOwnInput(step, `the key ${key}`, true)
+          if (page.isClosed()) await closedByOwnInput(step, `the key ${key}`, true, null)
         },
         { refs: options.ref !== undefined ? [options.ref] : [], whileBusy: options.whileBusy, again: options.again, detail: key },
       ),
@@ -3522,6 +3762,13 @@ export function createActApi(deps: ActDeps): ActApi {
       return run(
         'hover',
         async (step) => {
+          if (isTouchPage(step.page)) {
+            throw new ActError(
+              `Not done: this browser emulates a touch screen (a phone or tablet preset), and a finger does not hover: nothing is over the page ` +
+                `until it touches it. On a phone a hover menu or tooltip opens with a tap — act.click(${JSON.stringify(end.ref)}) — which also ` +
+                'gives the page mouseover/mouseenter, as Chrome does for a real tap. The pointer was not moved.',
+            )
+          }
           if (end.offset) await checkOffset(step.probe, step.targets[0], end.offset, 'The pointer was not moved.')
           const point = await aimAt(step, step.targets[0], end.offset)
           step.record.dispatched = true
@@ -3644,6 +3891,10 @@ export function createActApi(deps: ActDeps): ActApi {
           }
           const fromPoint = await aimAt(step, from, fromEnd.offset)
           record.dispatched = true
+          if (isTouchPage(page)) {
+            await touchDrag(step, fromPoint, to, toEnd.offset, path)
+            return
+          }
           await deps.humanMouse.moveTo({ page, x: fromPoint.x, y: fromPoint.y })
           // An HTML drag (draggable=true, links, images) is intercepted the way Playwright's
           // crDragDrop does: Chrome hands over the drag data instead of running a native drag loop
@@ -3664,10 +3915,10 @@ export function createActApi(deps: ActDeps): ActApi {
               await input
             } catch (error) {
               if (!(await closesSoon(page))) throw error
-              closedByOwnInput(step, what, true)
+              await closedByOwnInput(step, what, true, `Chrome did not confirm ${what}`)
               return
             }
-            if (page.isClosed()) closedByOwnInput(step, what, true)
+            if (page.isClosed()) await closedByOwnInput(step, what, true, null)
           }
           let at = fromPoint
           try {
@@ -3678,33 +3929,12 @@ export function createActApi(deps: ActDeps): ActApi {
               await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: at.x, y: at.y, button: 'left', buttons: 1, clickCount: 1 }, 'pressing the mouse button')
               pressed = true
               await sleep(randomBetween(120, 220))
-              if (toEnd.offset) {
-                const outOfView = `(${toEnd.offset.x}, ${toEnd.offset.y}) of ${describeTarget(to)} is not visible while dragging; bring both points into view first.`
-                ;({ point: toPoint } = await pointOn(probe, to, toEnd.offset, await visibleArea(probe, to.frameId), outOfView))
-              } else {
-                const toSurface = await pointerSurface(probe, to, record)
-                const toRects = await quadsOf(probe, toSurface)
-                const viewport = await visibleArea(probe, toSurface.frameId)
-                if (!toRects.some((rect) => intersectRects(rect, viewport) !== null)) {
-                  throw new ActError(`${describeTarget(to)} is not visible while dragging; bring both into view first.`)
-                }
-                ;({ point: toPoint } = await hitPoint(probe, toSurface, toRects, viewport))
-              }
-              // The human plan gives a person's pace either way; 'straight' keeps its timing and puts
-              // every sample on the straight line, at the minimum-jerk fraction of the way for its time.
-              const trajectory = await deps.humanMouse.plan({ page, from: at, x: toPoint.x, y: toPoint.y })
+              toPoint = await dragEndPoint(probe, to, toEnd.offset, record)
               const start = at
-              const endMs = trajectory.samples.at(-1)?.tMs ?? 0
-              const samples =
-                path === 'straight'
-                  ? trajectory.samples.map((sample) => {
-                      const s = minimumJerkPosition(endMs > 0 ? sample.tMs / endMs : 1)
-                      return { tMs: sample.tMs, x: start.x + (toPoint.x - start.x) * s, y: start.y + (toPoint.y - start.y) * s }
-                    })
-                  : trajectory.samples
+              const samples = await dragSamples(page, start, toPoint, path)
               let travelled = 0
               const startedAt = Date.now()
-              for (const sample of [...samples, { tMs: endMs, x: toPoint.x, y: toPoint.y }]) {
+              for (const sample of samples) {
                 checkAbort()
                 const wait = startedAt + sample.tMs - Date.now()
                 if (wait > 0) await sleep(wait)
@@ -3712,13 +3942,7 @@ export function createActApi(deps: ActDeps): ActApi {
                 travelled += Math.hypot(sample.x - at.x, sample.y - at.y)
                 at = { x: sample.x, y: sample.y }
               }
-              const distance = Math.hypot(toPoint.x - start.x, toPoint.y - start.y)
-              record.notes.push(
-                path === 'straight'
-                  ? `held-button path: a straight line of ${Math.round(distance)} px`
-                  : `held-button path: ${Math.round(travelled)} px of a person's curved path for ${Math.round(distance)} px between the two points; ` +
-                      "where the way itself counts (a drawn line), pass { path: 'straight' }",
-              )
+              record.notes.push(dragPathNote(path, 'held-button', travelled, Math.hypot(toPoint.x - start.x, toPoint.y - start.y)))
               at = toPoint
               await sleep(randomBetween(80, 160))
             } finally {
@@ -3736,7 +3960,8 @@ export function createActApi(deps: ActDeps): ActApi {
             }
             releasing = true
           } finally {
-            if (pressed && !record.closedTab) {
+            // A page Chrome took the debugger off (debugger-cut.ts) takes nothing more, not even the release.
+            if (pressed && !record.closedTab && !page.isClosed()) {
               const released = untilDialog(
                 probe,
                 send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: at.x, y: at.y, button: 'left', buttons: 0, clickCount: 1 }, 'releasing the mouse button'),
@@ -4116,22 +4341,50 @@ function duplicateWarnings(after: Observation | null, diff: ObservationDiff | nu
 const REPORT_LIST_MAX = 5
 const LIVE_LIST_MAX = 8
 
-function settleLine(settle: SettleResult): string {
+/**
+ * An iframe's document request as the settle line names it: the iframe by its ref in the picture after
+ * the action, the document's address (its site tells iframes apart; only a long query is cut), and
+ * what Chrome reported of it so far.
+ */
+function iframeDocumentText(request: PendingRequest, after: Observation | null): string {
+  const iframe = request.iframe === undefined ? 'an iframe' : describeIframe(after, request.iframe)
+  let url = request.url
+  try {
+    const parsed = new URL(request.url)
+    const query = `${parsed.search}${parsed.hash}`
+    url = `${parsed.origin}${parsed.pathname}${query.length > 40 ? `${query.slice(0, 39)}…` : query}`
+  } catch {
+    url = request.url.length > 160 ? `${request.url.slice(0, 159)}…` : request.url
+  }
+  const waited = `${(request.ageMs / 1000).toFixed(1)}s`
+  return `${iframe}'s document ${url} — ${request.answered ? `its content is still arriving after ${waited}` : `Chrome has not delivered it after ${waited}`}`
+}
+
+function settleLine(settle: SettleResult, after: Observation | null): string {
   // What the page showed as loading while the settle step waited (skeletons, an aria-busy region, a
   // spinner): the reason it took that long, and what came before the content now shown.
   const meanwhile = settle.busyWhileSettling?.length
     ? `\n        busy while it settled, gone now: ${settle.busyWhileSettling.map((seen) => `${seen.label} (seen ${(seen.seenMs / 1000).toFixed(1)}s)`).join(' · ')}`
     : ''
-  if (settle.settled) return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet${meanwhile}`
+  // Iframes whose documents Chrome had not delivered when the rest went quiet: not waited for.
+  const iframes = settle.iframeDocuments ?? []
+  const shownIframes = iframes.slice(0, 3).map((request) => iframeDocumentText(request, after))
+  const otherIframes = iframes.slice(3).map((request) => (request.iframe === undefined ? '(an iframe not listed)' : iframeRef(after, request.iframe)))
+  const notWaited = iframes.length
+    ? `\n        not waited for: ${iframes.length === 1 ? 'an iframe still loading its document' : `${iframes.length} iframes still loading their documents`} — ${shownIframes.join(' · ')}${otherIframes.length ? ` · +${otherIframes.length} more: ${otherIframes.join(' ')}` : ''}`
+    : ''
+  if (settle.settled) return `SETTLED ${Math.round(settle.waitedMs)}ms — page content and network went quiet${notWaited}${meanwhile}`
   if (settle.reason === 'js-dialog') return 'NOT SETTLED — a native dialog is blocking the page'
   if (settle.reason === 'page-closed') return 'NOT SETTLED — the page was closed'
-  const pending = settle.pendingRequests.slice(0, 4).map((r) => `${r.method} ${shortUrl(r.url)} (${(r.ageMs / 1000).toFixed(1)}s)`)
+  const pending = settle.pendingRequests
+    .slice(0, 4)
+    .map((r) => (r.iframe !== undefined ? iframeDocumentText(r, after) : `${r.method} ${shortUrl(r.url)} (${(r.ageMs / 1000).toFixed(1)}s)`))
   const more = settle.pendingRequests.length - pending.length
   const parts = [
     pending.length ? `waiting on ${pending.join(', ')}${more > 0 ? ` +${more} more` : ''}` : '',
     settle.domChangingIn ? `content still changing in ${settle.domChangingIn}` : '',
   ].filter(Boolean)
-  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${parts.length ? ` — ${parts.join(' · ')}` : ''}${meanwhile}`
+  return `NOT SETTLED after ${Math.round(settle.waitedMs)}ms${parts.length ? ` — ${parts.join(' · ')}` : ''}${notWaited}${meanwhile}`
 }
 
 function navLine(nav: WatchEvents['navigations'][number]): string {
@@ -4142,6 +4395,30 @@ function navLine(nav: WatchEvents['navigations'][number]): string {
     return `NAV     NEW DOCUMENT → ${nav.url} (full load: client-side caches and in-memory app state were reset)`
   }
   return `NAV     in-app route → ${shortUrl(nav.url)} (same document, no reload)`
+}
+
+/**
+ * The line for a call after which the page looks as before. A wait acts on nothing, so a call that
+ * only waited did not "fail to work": it says how long it waited and that nothing changed meanwhile.
+ */
+function noChangeLine(input: ActionReportInput): string {
+  const waitsOnly =
+    input.records.length > 0 && input.rawInputs.length === 0 && input.records.every((record) => record.kind === 'wait' || record.kind === 'waitForIdle')
+  if (!waitsOnly) {
+    return (
+      'NO VISIBLE CHANGE — the page looks the same as before. Do not assume it worked: check observe(), ' +
+      'explain(ref) to see what the element is wired to, or getLatestLogs().'
+    )
+  }
+  const waits = input.records.map((record) => {
+    const waited = `waited ${record.detail ?? ''}`.trim()
+    if (record.kind === 'wait') return waited
+    return record.settle?.settled ? `${waited}; the page was quiet` : `${waited}; the page was still busy`
+  })
+  return (
+    `NOTHING CHANGED WHILE WAITING — ${waits.join(', then ')}; the page looks as it did before the wait. ` +
+    'A wait does nothing to the page, so this says nothing about earlier actions: what they did is already on the page (observe() or find() shows it).'
+  )
 }
 
 /**
@@ -4162,7 +4439,7 @@ export function renderActionReport(input: ActionReportInput): string {
     lines.push(`ACTION  (raw Playwright) ${raw} — no human pointer path, busy check or cover check; prefer act.* with refs from observe()`)
   }
 
-  if (input.settle) lines.push(settleLine(input.settle))
+  if (input.settle) lines.push(settleLine(input.settle, input.after))
   else if (input.settleError) lines.push(`NOT SETTLED — ${input.settleError}`)
 
   const events = input.events
@@ -4238,7 +4515,8 @@ export function renderActionReport(input: ActionReportInput): string {
     const live = events.live
     if (live.length > LIVE_LIST_MAX) lines.push(`LIVE    +${live.length - LIVE_LIST_MAX} earlier announcements`)
     for (const item of live.slice(-LIVE_LIST_MAX)) {
-      lines.push(`LIVE    ${item.role} "${item.text}"${item.transient ? ' (shown briefly, already gone)' : ''}`)
+      // A line break the region shows is ⏎, as on every report line.
+      lines.push(`LIVE    ${item.role} "${item.text.replace(/\n/g, '⏎')}"${item.transient ? ' (shown briefly, already gone)' : ''}`)
     }
   }
 
@@ -4253,10 +4531,7 @@ export function renderActionReport(input: ActionReportInput): string {
     if (diffText) tail.push(diffText)
   }
   if (input.changed === false) {
-    tail.push(
-      'NO VISIBLE CHANGE — the page looks the same as before. Do not assume it worked: check observe(), ' +
-        'explain(ref) to see what the element is wired to, or getLatestLogs().',
-    )
+    tail.push(noChangeLine(input))
   }
   return [head, ...tail].filter(Boolean).join('\n')
 }

@@ -74,7 +74,7 @@ describe('readPointerListeners call shape', () => {
     // The context-menu card is found: the read works.
     const card = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector: '#ctx-card' })
     const { node } = await cdp.send('DOM.describeNode', { nodeId: card.nodeId })
-    expect(listeners.get(node.backendNodeId)).toEqual(['contextmenu'])
+    expect(listeners?.get(node.backendNodeId)).toEqual(['contextmenu'])
 
     const resolve = sent.find((call) => call.method === 'DOM.resolveNode')
     expect(resolve, JSON.stringify(sent)).toBeDefined()

@@ -117,6 +117,7 @@ import {
   type LaunchedNewBrowser,
   type NewBrowserPlan,
 } from './new-browser.js'
+import { markTouchContext } from './touch-input.js'
 import type { NewBrowserOptions } from './new-browser-options.js'
 import { parseRelayDownloadStatus, type RelayDownloadStatus } from './download-file.js'
 import { createPerfGlobals, layoutShiftLines } from './perf.js'
@@ -498,6 +499,12 @@ export interface ExecuteRun {
    * as it goes out ({@link guardHumanRun}).
    */
   humanGuard?: { context: BrowserContext; browser: Browser | null }
+  /**
+   * Set by execute(): waits, when input reached the page earlier in this call, for the settle the
+   * action report will show. Reads (observe(), find(), readPage(), …) call it first, so what they
+   * print is the settled page the report describes, not a page caught halfway through loading.
+   */
+  settleForRead?: () => Promise<void>
 }
 
 /** What the executor tracks between "before the code ran" and the action report. */
@@ -527,6 +534,19 @@ interface ActionScope {
   watchFailures: string[]
   /** Stop watching; closes the file-dialog window of every raw call still in flight. */
   detach: () => Promise<void>
+}
+
+/** The settle after the code's input, as the action report reads it (PlaywrightExecutor.settleActions). */
+interface ActionSettle {
+  /** The tab the report is about: the one the first input went to. */
+  reportPage: Page
+  /** The picture and journal position right before the first input reached that tab. */
+  baseline: { before: Observation | null; checkpoint: WatchCheckpoint | null }
+  /** The tab's probe, or why it could not be watched. */
+  probe: PageProbe | null
+  probeError?: string
+  settle: SettleResult | null
+  settleError?: string
 }
 
 /** A tab raw code acted on, followed from the moment its first raw call went out. */
@@ -701,6 +721,8 @@ class ReadOnlyCdpSession implements ICDPSession {
 interface WarningEvent {
   id: number
   message: string
+  /** A new tab's warning: left out when an action report already gave that tab its TAB/POPUP line. */
+  popup?: Page
 }
 
 interface WarningScope {
@@ -1223,11 +1245,15 @@ export class PlaywrightExecutor {
   private readonly runsToldStillCut = new WeakSet<ExecuteRun>()
   /** Controlled pages that closed and were replaced (replaceClosedPage): a sandbox `page` still holding one follows the replacement. */
   private readonly replacedPages = new WeakSet<Page>()
+  /** Each call's settle after its input so far, and which input it was for (settleActions). */
+  private readonly actionSettles = new WeakMap<ExecuteRun, { key: string; outcome: Promise<ActionSettle> }>()
   /** human (default) or debug — see `PolicyMode`. Fixed per session by whoever created it. */
   private policy: PolicyMode
   private suppressPageCloseWarnings = false
   /** The tab each popup/new tab came from (the report asks the opener how it was opened). */
   private readonly popupOpeners = new WeakMap<Page, Page>()
+  /** New tabs an action report already named in a TAB/POPUP line: their new-page warning would repeat it. */
+  private readonly popupsReported = new WeakSet<Page>()
   /** Set when the controlled tab closed and none was left: the blank tab getCurrentPage opens next is reported. */
   private controlledTabLost = false
 
@@ -1404,9 +1430,9 @@ export class PlaywrightExecutor {
     this.debuggerCuts.forget()
   }
 
-  enqueueWarning(message: string) {
+  enqueueWarning(message: string, popup?: Page) {
     this.nextWarningEventId += 1
-    this.warningEvents.push({ id: this.nextWarningEventId, message })
+    this.warningEvents.push({ id: this.nextWarningEventId, message, ...(popup ? { popup } : {}) })
   }
 
   /** Update the cloud session timeout from external tracking (relay timer). */
@@ -1428,10 +1454,11 @@ export class PlaywrightExecutor {
   }
 
   private flushWarningsForScope(scope: WarningScope): string {
-    const relevantWarnings = this.warningEvents.filter((warning) => {
+    const pending = this.warningEvents.filter((warning) => {
       return warning.id > scope.cursor
     })
-    const latestWarningId = relevantWarnings.at(-1)?.id
+    const latestWarningId = pending.at(-1)?.id
+    const relevantWarnings = pending.filter((warning) => !(warning.popup && this.popupsReported.has(warning.popup)))
     if (latestWarningId && latestWarningId > this.lastDeliveredWarningEventId) {
       this.lastDeliveredWarningEventId = latestWarningId
     }
@@ -1720,19 +1747,17 @@ export class PlaywrightExecutor {
   private setupNewPageLogging(page: Page) {
     // page.on('popup') fires for window.open, target=_blank, and cmd+click
     // (but not context.newPage() or CDP reconnection). The extension
-    // auto-relocates popups to tabs, so these pages are controllable via
-    // context.pages(). Enqueue synchronously so the warning lands in the
-    // enclosing execute() call's scope. initialUrl may be 'about:blank'
-    // for blank-then-scripted popups.
+    // auto-relocates popups to tabs. Enqueue synchronously so the warning lands
+    // in the enclosing execute() call's scope; it is left out when that call's
+    // action report names the tab itself (TAB/POPUP line). initialUrl may be
+    // 'about:blank' for blank-then-scripted popups.
     page.on('popup', (popup) => {
-      const pages = popup.context().pages()
-      const rawIndex = pages.indexOf(popup)
-      const pageIndex = rawIndex >= 0 ? String(rawIndex) : 'unknown'
+      // act.switchTab's index: the open tabs in observe()'s TABS order.
+      const index = popup.context().pages().filter((candidate) => !candidate.isClosed()).indexOf(popup)
       const initialUrl = popup.url() || 'about:blank'
-      this.enqueueWarning(
-        `New page opened from current page (index ${pageIndex}, initial url: ${initialUrl}). ` +
-          `Access it via context.pages()[${pageIndex}] to interact with it.`,
-      )
+      const switchTo = index >= 0 ? `act.switchTab(${index})` : "act.switchTab('<words of its title or URL>')"
+      const how = this.policy === 'human' ? switchTo : `${switchTo}, or context.pages()[${index >= 0 ? index : 'i'}] in code,`
+      this.enqueueWarning(`TAB a new tab opened by this page (${index >= 0 ? `tab ${index}` : 'tab index unknown'}, initial url: ${initialUrl}) — ${how} to work in it`, popup)
     })
   }
 
@@ -2059,7 +2084,10 @@ export class PlaywrightExecutor {
     this.newBrowserLaunch = launched
     const browser = launched.browser
 
-    const context = await browser.newContext(contextOptionsFor(plan))
+    const contextOptions = contextOptionsFor(plan)
+    const context = await browser.newContext(contextOptions)
+    // A phone or tablet preset emulates a touch screen: act taps and swipes there (touch-input.ts).
+    markTouchContext(context, contextOptions)
     try {
       context.setDefaultTimeout(60000)
       context.setDefaultNavigationTimeout(10000)
@@ -2549,6 +2577,7 @@ export class PlaywrightExecutor {
       const getCleanHTMLFn = async (
         options: GetCleanHTMLOptions | (Omit<GetCleanHTMLOptions, 'locator' | 'diffStore'> & { ref: number | string }),
       ) => {
+        await run.settleForRead?.()
         if (options !== undefined && 'ref' in options) {
           const { ref, ...rest } = options
           if ('locator' in rest) throw new ModelFacingError('getCleanHTML: pass `locator` or `ref`, not both.')
@@ -2565,6 +2594,7 @@ export class PlaywrightExecutor {
       }
       // Every option is optional: `getPageMarkdown()` reads the controlled page.
       const getPageMarkdownFn = async (options: PageMarkdownRequest = {}) => {
+        await run.settleForRead?.()
         const target = options.page ?? currentPage()
         // Readability runs in the page's shared probe world, never in the page's own realm.
         const probe = await self.probes.get(target)
@@ -2664,36 +2694,19 @@ export class PlaywrightExecutor {
         }
 
         if (search) {
-          const matchIndices: number[] = []
-          for (let i = 0; i < allLogs.length; i++) {
-            const log = allLogs[i]
-            const isMatch = typeof search === 'string' ? log.includes(search) : isRegExp(search) && search.test(log)
-            if (isMatch) matchIndices.push(i)
-          }
-
-          const CONTEXT_LINES = 5
-          const includedIndices = new Set<number>()
-          for (const idx of matchIndices) {
-            const start = Math.max(0, idx - CONTEXT_LINES)
-            const end = Math.min(allLogs.length - 1, idx + CONTEXT_LINES)
-            for (let i = start; i <= end; i++) {
-              includedIndices.add(i)
-            }
-          }
-
-          const sortedIndices = [...includedIndices].sort((a, b) => a - b)
-          const result: string[] = []
-          for (let i = 0; i < sortedIndices.length; i++) {
-            const logIdx = sortedIndices[i]
-            if (i > 0 && sortedIndices[i - 1] !== logIdx - 1) {
-              result.push('---')
-            }
-            result.push(allLogs[logIdx])
-          }
-          allLogs = result
+          // Only the entries that match: an entry already carries its own `at` lines. A string matches
+          // case-insensitively; a regex is copied without its g/y flags, whose lastIndex would make
+          // test() skip every other match.
+          const pattern = typeof search === 'string'
+            ? new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+            : isRegExp(search)
+              ? new RegExp(search.source, search.flags.replace(/[gy]/g, ''))
+              : null
+          allLogs = pattern ? allLogs.filter((log) => pattern.test(log)) : []
         }
 
-        return count !== undefined ? allLogs.slice(-count) : allLogs
+        if (count === undefined) return allLogs
+        return count > 0 ? allLogs.slice(-count) : []
       }
 
       const clearAllLogs = () => {
@@ -3366,6 +3379,7 @@ export class PlaywrightExecutor {
        * on the page now controlled — never a failure that reads the closed tab.
        */
       const readControlled = async <T,>(explicit: Page | undefined, read: (target: Page) => Promise<T>): Promise<{ target: Page; value: T }> => {
+        await run.settleForRead?.()
         if (explicit) return { target: explicit, value: await read(explicit) }
         const target = await settledPage()
         try {
@@ -3454,6 +3468,7 @@ export class PlaywrightExecutor {
 
       /** Refs are unique across the session's tabs, so the ref alone says which tab to read. */
       const explain = async (ref: number | string): Promise<object> => {
+        await run.settleForRead?.()
         const resolution = self.probes.registry.resolve(ref)
         if (!resolution.ok) {
           throw new ActError(resolution.error)
@@ -3480,20 +3495,23 @@ export class PlaywrightExecutor {
        * `ref` (read-page.ts): nothing it calls can change the page, and no user gesture is involved.
        * The function's console.* lines print with the call's console output.
        */
-      const readPageFn = async (fn: unknown, options?: unknown): Promise<unknown> =>
-        await readPage(fn, options, {
+      const readPageFn = async (fn: unknown, options?: unknown): Promise<unknown> => {
+        await run.settleForRead?.()
+        return await readPage(fn, options, {
           probes: self.probes,
           context,
           currentPage,
           log: (level, text) => consoleLogs.push({ method: level, args: [`[readPage] ${text}`] }),
           resolveQuery: async (query, target) => await queryRef({ probes: self.probes, context }, target, query),
         })
+      }
 
       /**
        * Accessibility audit (page-audit.ts): axe-core in each frame's isolated world plus playwriter's
        * own checks, printed grouped by impact with refs; the full report is the return value.
        */
       const audit = async (options?: unknown): Promise<AuditReport> => {
+        await run.settleForRead?.()
         const report = await runAudit(options, {
           probes: self.probes,
           currentPage,
@@ -3634,6 +3652,11 @@ export class PlaywrightExecutor {
           activity: run.actActivity,
           observeQuietly: (target, known) => self.probes.observe(target, context, {}, false, known),
           setDialogPolicy: (policy, options) => self.probes.setDialogPolicy(policy, options),
+          tabVisibility: (probe) => self.probes.visibility(probe),
+          debuggerCut: async (target) => {
+            await self.noteCutDuringCall(run)
+            return self.debuggerCuts.wasCut(target)
+          },
         }),
         ),
       )
@@ -4750,6 +4773,78 @@ export class PlaywrightExecutor {
     )
   }
 
+  /** Why `page` cannot be read: a page closed by a debugger cut (debugger-cut.ts) belongs to a tab that is still open, so the relay is asked first. */
+  private async whyClosed(run: ExecuteRun, page: Page): Promise<string> {
+    await this.noteCutDuringCall(run)
+    return this.debuggerCuts.wasCut(page) ? 'Chrome took the debugger off the tab (DEBUGGER CUT above)' : 'the page was closed'
+  }
+
+  /**
+   * The settle the action report waits for after the input sent so far: on the tab the first input
+   * went to, causes counted from the journal position right before it, quiet measured from the end
+   * of the last one. It is kept for the run until more input is sent, so a read the code makes after
+   * an action (observe(), find(), readPage(), …) waits for the very settle the report then shows,
+   * and the report does not wait a second time.
+   */
+  private async settleActions(scope: ActionScope, run: ExecuteRun): Promise<ActionSettle> {
+    const dispatchedRecords = run.actRecords.filter((record) => record.dispatched)
+    const endings = dispatchedRecords.map((record) => record.endedAt).filter((endedAt) => endedAt > 0)
+    if (run.rawEndedAt !== undefined) endings.push(run.rawEndedAt)
+    const origin = endings.length > 0 ? Math.max(...endings) : undefined
+    const key = `${dispatchedRecords.length}/${run.rawActions.length}/${origin}`
+    const held = this.actionSettles.get(run)
+    if (held?.key === key) return await held.outcome
+    const outcome = (async (): Promise<ActionSettle> => {
+      const first = dispatchedRecords[0]
+      // The first tab raw code acted on, when its first call went out before the first act record.
+      const firstRaw = scope.rawTargets.values().next().value
+      const rawFirst = firstRaw !== undefined && (!first?.checkpoint || firstRaw.at < first.checkpoint.at)
+      const firstPage = !rawFirst && first?.targetId ? this.probes.pageOf(first.targetId) : null
+      const reportPage = rawFirst ? firstRaw.page : (firstPage ?? scope.page)
+      // The pre-code picture is of the controlled tab only: another tab the code acted on has no
+      // "before", so its report has no diff and makes no claim that nothing changed.
+      const baseline: ActionSettle['baseline'] = rawFirst
+        ? { before: firstRaw.page === scope.page ? scope.codeBefore : null, checkpoint: firstRaw.checkpoint }
+        : first
+          ? { before: first.before ?? null, checkpoint: first.checkpoint ?? null }
+          : { before: scope.codeBefore, checkpoint: scope.checkpoint }
+
+      let probe: PageProbe | null = null
+      let probeError: string | undefined
+      if (rawFirst) {
+        // The probe the tab was followed with: its journal is the one the checkpoint belongs to.
+        probe = firstRaw.probe
+        probeError = firstRaw.probeError
+      } else {
+        try {
+          probe = reportPage === scope.page ? scope.probe : await this.probes.get(reportPage)
+        } catch (error) {
+          probeError = error instanceof Error ? error.message : String(error)
+        }
+      }
+
+      let settle: SettleResult | null = null
+      let settleError: string | undefined
+      if (reportPage.isClosed()) settleError = await this.whyClosed(run, reportPage)
+      else if (!probe) settleError = `the page could not be watched: ${probeError}`
+      else {
+        try {
+          const remaining = run.deadlineAt - Date.now()
+          settle = await probe.watch.settle({
+            since: baseline.checkpoint ?? scope.checkpoint,
+            origin,
+            timeoutMs: Math.min(5000, Math.max(1500, remaining - 1000)),
+          })
+        } catch (error) {
+          settleError = await this.explainFailure(error, reportPage)
+        }
+      }
+      return { reportPage, baseline, probe, probeError, settle, settleError }
+    })()
+    this.actionSettles.set(run, { key, outcome })
+    return await outcome
+  }
+
   /**
    * After the code ran: wait for the page to settle, look again, and describe what the action did —
    * navigation kind, dialogs, live/toast text, console errors and failed requests, popups, downloads
@@ -4787,60 +4882,7 @@ export class PlaywrightExecutor {
       })
     }
 
-    const first = dispatchedRecords[0]
-    // The first tab raw code acted on, when its first call went out before the first act record.
-    const firstRaw = scope.rawTargets.values().next().value
-    const rawFirst = firstRaw !== undefined && (!first?.checkpoint || firstRaw.at < first.checkpoint.at)
-    const firstPage = !rawFirst && first?.targetId ? this.probes.pageOf(first.targetId) : null
-    const reportPage = rawFirst ? firstRaw.page : (firstPage ?? scope.page)
-    // The pre-code picture is of the controlled tab only: another tab the code acted on has no
-    // "before", so its report has no diff and makes no claim that nothing changed.
-    const baseline: { before: Observation | null; checkpoint: WatchCheckpoint | null } = rawFirst
-      ? { before: firstRaw.page === scope.page ? scope.codeBefore : null, checkpoint: firstRaw.checkpoint }
-      : first
-        ? { before: first.before ?? null, checkpoint: first.checkpoint ?? null }
-        : { before: scope.codeBefore, checkpoint: scope.checkpoint }
-    const endings = dispatchedRecords.map((record) => record.endedAt).filter((endedAt) => endedAt > 0)
-    if (run.rawEndedAt !== undefined) endings.push(run.rawEndedAt)
-    const origin = endings.length > 0 ? Math.max(...endings) : undefined
-    const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
-
-    let probe: PageProbe | null = null
-    let probeError: string | undefined
-    if (rawFirst) {
-      // The probe the tab was followed with: its journal is the one the checkpoint belongs to.
-      probe = firstRaw.probe
-      probeError = firstRaw.probeError
-    } else {
-      try {
-        probe = reportPage === scope.page ? scope.probe : await this.probes.get(reportPage)
-      } catch (error) {
-        probeError = messageOf(error)
-      }
-    }
-
-    let settle: SettleResult | null = null
-    // A page closed by a debugger cut (debugger-cut.ts) belongs to a tab that is still open: the relay is
-    // asked before the report calls it closed.
-    const closedWhy = async (): Promise<string> => {
-      await this.noteCutDuringCall(run)
-      return this.debuggerCuts.wasCut(reportPage) ? 'Chrome took the debugger off the tab (DEBUGGER CUT above)' : 'the page was closed'
-    }
-    let settleError: string | undefined
-    if (reportPage.isClosed()) settleError = await closedWhy()
-    else if (!probe) settleError = `the page could not be watched: ${probeError}`
-    else {
-      try {
-        const remaining = run.deadlineAt - Date.now()
-        settle = await probe.watch.settle({
-          since: baseline.checkpoint ?? scope.checkpoint,
-          origin,
-          timeoutMs: Math.min(5000, Math.max(1500, remaining - 1000)),
-        })
-      } catch (error) {
-        settleError = await this.explainFailure(error, reportPage)
-      }
-    }
+    const { reportPage, baseline, probe, probeError, settle, settleError } = await this.settleActions(scope, run)
 
     // A new tab ends in a document, or closes again (a download opened in a new tab does): wait for
     // either, within the call's budget, so its download and its title are in the report.
@@ -4875,7 +4917,7 @@ export class PlaywrightExecutor {
 
     let after: Observation | null = null
     let afterError: string | undefined
-    if (reportPage.isClosed() || settle?.reason === 'page-closed') afterError = await closedWhy()
+    if (reportPage.isClosed() || settle?.reason === 'page-closed') afterError = await this.whyClosed(run, reportPage)
     else {
       try {
         after = await this.probes.observe(reportPage, context)
@@ -4937,6 +4979,8 @@ export class PlaywrightExecutor {
     const openTabs = context.pages().filter((candidate) => !candidate.isClosed())
     const newTabs = await Promise.all(
       scope.popups.map(async (popup) => {
+        // Its TAB/POPUP line below is the one line about it: the new-page warning is left out.
+        this.popupsReported.add(popup)
         const opener = this.popupOpeners.get(popup)
         const opened = opener ? await this.probes.openedBy(popup, opener, scope.checkpoint.at).catch(() => undefined) : undefined
         return {
@@ -5163,7 +5207,15 @@ export class PlaywrightExecutor {
       }
       // Always: raw input and navigations are counted and reported at run time, including the ones
       // the static analysis could not see.
-      scope = await this.beginActionScope({ page, context, analysis, run })
+      const actionScope = await this.beginActionScope({ page, context, analysis, run })
+      scope = actionScope
+      run.settleForRead = async () => {
+        // An action the code did not await is still going: there is nothing finished to settle after yet.
+        if (run.actActivity.depth > 0) return
+        if (run.rawActions.length === 0 && !run.actRecords.some((record) => record.dispatched)) return
+        // Outside the run's context, as the report itself settles (execute() builds it after the code).
+        await executeContext.exit(() => this.settleActions(actionScope, run))
+      }
 
       this.logger.log('Executing code:', code)
 

@@ -24,8 +24,9 @@
  * most of the bytes).
  */
 
+import type { Protocol } from 'devtools-protocol'
 import type { ICDPSession } from './cdp-session.js'
-import { withDeadline } from './isolated-world.js'
+import { isNodeGoneError, PageUnresponsiveError, withDeadline } from './isolated-world.js'
 
 /** Pointer events, besides click, whose listener makes an element something a person acts on. */
 export const POINTER_LISTENER_TYPES: Record<string, true> = {
@@ -41,11 +42,17 @@ export const POINTER_LISTENER_TYPES: Record<string, true> = {
 }
 
 const DEAD_OBJECTS_RE = /Cannot find context with specified id|Execution context was destroyed|Cannot find execution context|Inspected target navigated or closed/i
+/** The document's object went with its context: the frame committed another document after it was resolved. */
+const GONE_OBJECT_RE = /Could not find object with given id|Cannot find context with specified id|Execution context was destroyed/i
 
 /**
  * The pointer listener types (`POINTER_LISTENER_TYPES`) of every element under the document
  * `documentBackendId`, by backend node id, each list sorted. `cdp` is the session that owns the
- * frame.
+ * frame. Null when that document is no longer its frame's: the frame committed another document (or
+ * left the page) since the document was read — Chrome then answers `Node with given id does not
+ * belong to the document` (the old document has no frame), `No node with given id found` (it was
+ * collected) or, between the two calls, loses the document's object with its context. The caller
+ * reads the frame again; there is nothing of the old document left to read.
  */
 export async function readPointerListeners({
   cdp,
@@ -55,20 +62,33 @@ export async function readPointerListeners({
   cdp: ICDPSession
   documentBackendId: number
   timeoutMs: number
-}): Promise<Map<number, string[]>> {
+}): Promise<Map<number, string[]> | null> {
   const objectGroup = `playwriter-listeners-${Date.now()}-${Math.random().toString(36).slice(2)}`
   try {
-    const { object } = await withDeadline(
-      cdp.send('DOM.resolveNode', { backendNodeId: documentBackendId, objectGroup }),
-      timeoutMs,
-      'resolving the document to read its event listeners',
-    )
-    if (!object.objectId) throw new Error('DOM.resolveNode returned the document without an object id; its event listeners cannot be read.')
-    const { listeners } = await withDeadline(
-      cdp.send('DOMDebugger.getEventListeners', { objectId: object.objectId, depth: -1, pierce: true }),
-      timeoutMs,
-      'reading the event listeners of the page (DOMDebugger.getEventListeners)',
-    )
+    let objectId: string | undefined
+    try {
+      const { object } = await withDeadline(
+        cdp.send('DOM.resolveNode', { backendNodeId: documentBackendId, objectGroup }),
+        timeoutMs,
+        'resolving the document to read its event listeners',
+      )
+      objectId = object.objectId
+    } catch (error) {
+      if (isNodeGoneError(error)) return null
+      throw error
+    }
+    if (!objectId) throw new Error('DOM.resolveNode returned the document without an object id; its event listeners cannot be read.')
+    let listeners: Protocol.DOMDebugger.EventListener[]
+    try {
+      ;({ listeners } = await withDeadline(
+        cdp.send('DOMDebugger.getEventListeners', { objectId, depth: -1, pierce: true }),
+        timeoutMs,
+        'reading the event listeners of the page (DOMDebugger.getEventListeners)',
+      ))
+    } catch (error) {
+      if (!(error instanceof PageUnresponsiveError) && GONE_OBJECT_RE.test(error instanceof Error ? error.message : String(error))) return null
+      throw error
+    }
     const byNode = new Map<number, Set<string>>()
     for (const listener of listeners) {
       if (listener.backendNodeId === undefined || !POINTER_LISTENER_TYPES[listener.type]) continue
