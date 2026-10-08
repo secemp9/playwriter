@@ -150,9 +150,31 @@ async function linuxHasListener(port: number): Promise<boolean | null> {
   })
 }
 
+/**
+ * Linux: the pids holding a socket that listens on the port, from iproute2's `ss` (the sockets over
+ * netlink, then one pass over the processes' descriptors in C). Measured on a machine running 1235
+ * processes: 195–203 ms, against 632–659 ms for lsof, which took 5.3 s there during a full test run.
+ * `null` when ss cannot answer (not installed, or a filter it does not know): lsof is asked instead.
+ */
+async function linuxSsPids(port: number): Promise<number[] | null> {
+  try {
+    const { stdout } = await execFileAsync('ss', ['-Hltnp', `sport = :${port}`])
+    // One row per listening socket: `… users:(("node",pid=123,fd=22),("node",pid=124,fd=22))`.
+    return [...new Set([...stdout.matchAll(/pid=(\d+)/g)].map((match) => Number(match[1])))]
+  } catch {
+    return null
+  }
+}
+
 async function getPidsForPortUnix(port: number): Promise<number[]> {
-  if (os.platform() === 'linux' && (await linuxHasListener(port)) === false) {
-    return []
+  if (os.platform() === 'linux') {
+    if ((await linuxHasListener(port)) === false) {
+      return []
+    }
+    const pids = await linuxSsPids(port)
+    if (pids !== null) {
+      return pids
+    }
   }
 
   try {
