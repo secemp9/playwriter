@@ -73,7 +73,10 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
   /** Live text the page showed, stamped by the page. */
   const live: Array<{ id: number; at: number; updatedAt: number | null; role: string; text: string; transient: boolean }> = []
   // The isolated world's journal: installed long ago, no mutations but the ticker's, the live text above.
-  const journal = (expression: string): unknown => {
+  // Its settle waits (settleWait) never see a change of this page: each ends when a later state() read
+  // releases it, answered null, as the real journal does.
+  const settleWaits = new Map<string, () => void>()
+  const journal = async (expression: string): Promise<unknown> => {
     probes.push(expression)
     const now = browserNow()
     if (expression === 'Date.now()') return now
@@ -84,8 +87,22 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
     }
     if (expression.includes('.busy(')) return { now, ok: true, value: { streaming: null, announced: [], spinners: { set: 1, list: [] } } }
     if (expression.includes('.sweep(')) return { now, ok: true, value: 'doc' }
+    // Lazy: in an awaited call the argument is followed by `)).then(function (value) { … })`.
+    const wait = /\.settleWait\((\{.*?\})\)\)/.exec(expression)
+    if (wait) {
+      const waitArg: { id: string } = JSON.parse(wait[1]!)
+      const released = Promise.withResolvers<void>()
+      settleWaits.set(waitArg.id, released.resolve)
+      await released.promise
+      return { now: browserNow(), ok: true, value: null }
+    }
     const state = /\.state\((\{.*\})\)/.exec(expression)
-    const cutoff: unknown = state ? JSON.parse(state[1]!).cutoff : null
+    const stateArg: { cutoff?: unknown; release?: string[] } = state ? JSON.parse(state[1]!) : {}
+    for (const id of stateArg.release ?? []) {
+      settleWaits.get(id)?.()
+      settleWaits.delete(id)
+    }
+    const cutoff: unknown = stateArg.cutoff ?? null
     const churningBefore = typeof cutoff === 'number' && tickerFrom + 100 < cutoff
     const lastTick = now - ((now - tickerFrom) % 50)
     const lastContentAt = options.ticker && !churningBefore ? lastTick : null
@@ -108,7 +125,7 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
       if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
       if (method === 'Runtime.releaseObjectGroup') return {}
       if (method === 'Runtime.evaluate') {
-        if (params.contextId === WORLD) return { result: { type: 'object', value: journal(params.expression!) } }
+        if (params.contextId === WORLD) return { result: { type: 'object', value: await journal(params.expression!) } }
         return { result: { type: 'object', subtype: 'node', objectId: `doc-${params.contextId ?? 'main'}` } }
       }
       if (method === 'DOM.describeNode') return { node: { nodeId: 0, backendNodeId: 1, nodeType: 9, nodeName: '#document', localName: '', nodeValue: '', documentURL: 'http://app.test/' } }
@@ -135,7 +152,7 @@ function setup(options: { closed?: () => boolean; browserAheadMs?: number; ticke
   // An iframe of the page, for console attribution. The frame tree (childFrames) leaves it out,
   // so no journal is read in it.
   const childFrame = frameOf('CHILD', 'http://ads.test/frame')
-  const page = { mainFrame: () => mainFrame, frames: () => [mainFrame, childFrame], on: () => {}, off: () => {} } as unknown as Page
+  const page = { mainFrame: () => mainFrame, frames: () => [mainFrame, childFrame], on: () => {}, once: () => {}, off: () => {} } as unknown as Page
   const errors: unknown[][] = []
   const fake = fakeDialogs()
   // A dedicated worker the page runs, handed over at start as the tap does. Its session is a stand-in

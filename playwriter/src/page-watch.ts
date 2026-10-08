@@ -1938,14 +1938,22 @@ export class PageWatch {
       const where = this.inFrame(handle)
       const arg = JSON.stringify({ id, token: value.token, after: value.last, scrolls: value.scrolls, cutoff, any, keys: value.loading?.map(({ key }) => key) ?? null })
       // Its deadline outlasts the wait (the next read releases it): it only names a page that stopped answering.
-      this.callReader<SettleWaitAnswer>(handle.world, `settleWait(${arg})`, until - Date.now() + PROBE_TIMEOUT_MS, `waiting for the page to change${where}`, true).then(
-        (answer) => {
-          if (answer) for (const key of answer.gone) loadingLog.vanished(`${key}${where}`, this.clock.toLocal(answer.at))
-          changed.resolve()
-        },
-        // The document went away (navigated, closed) or stopped answering: the next read says which.
-        () => changed.resolve(),
-      )
+      this.callReader<SettleWaitAnswer>(handle.world, `settleWait(${arg})`, until - Date.now() + PROBE_TIMEOUT_MS, `waiting for the page to change${where}`, true)
+        .then(
+          (answer) => {
+            changed.resolve()
+            if (answer) for (const key of answer.gone) loadingLog.vanished(`${key}${where}`, this.clock.toLocal(answer.at))
+          },
+          // The document went away (navigated): the next read reads its successor. Any other failure
+          // (a closed page wakes the wait on its close event; one that stopped answering, on the timer)
+          // is said, and the wait goes on: waking on it would read the page again at once, without end.
+          (error: unknown) => {
+            if (DEAD_CONTEXT_RE.test(errorMessage(error))) changed.resolve()
+            else this.reportBackgroundError(`waiting for the page to change${where}`, error)
+          },
+        )
+        // An answer of another shape is the journal's bug: said, never left as an unhandled rejection.
+        .catch((error: unknown) => this.reportBackgroundError(`reading the answer of a wait for the page to change${where}`, error))
     }
     // The one timer: (c) the end of the quiet windows — or of the strong busy signals, or the due look
     // for shadow roots — when nothing happens before it; (a) the cap when that is sooner.

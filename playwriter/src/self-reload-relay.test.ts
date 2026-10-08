@@ -106,6 +106,30 @@ async function restartRelay(): Promise<void> {
   relay = await startPlayWriterCDPRelayServer({ port: TEST_PORT, logger, cdpLogger })
 }
 
+/**
+ * Until the extension's own side of its connection reads connected. The relay lists a connection as soon as
+ * it accepts the socket; the extension's side opens a moment later (its onopen, then its socket and state),
+ * and its self-reload check reads that socket. Under a full test run, a check sent in that moment read
+ * "disconnected" (seen once): this waits on the extension's state, through its store's subscription.
+ */
+async function untilWorkerConnected(worker: Worker): Promise<void> {
+  await worker.evaluate(async () => {
+    if (globalThis.getExtensionState().connectionState === 'connected') return
+    const connected = Promise.withResolvers<void>()
+    const unsubscribe = globalThis.subscribeExtensionState((state) => {
+      if (state.connectionState === 'connected') connected.resolve()
+    })
+    // The cap, a real timer on purpose: a connection that never comes fails the test, naming the state it is in.
+    const cap = setTimeout(() => connected.reject(new Error(`the extension is '${globalThis.getExtensionState().connectionState}', not 'connected', after 15 s`)), 15_000)
+    try {
+      await connected.promise
+    } finally {
+      clearTimeout(cap)
+      unsubscribe()
+    }
+  })
+}
+
 /** Set in the extension's storage.session, which a reload wipes and a worker restart keeps (MEASURED, see self-reload.ts). */
 async function markExtension(worker: Worker): Promise<void> {
   await worker.evaluate(async () => {
@@ -193,6 +217,7 @@ describe('an unpacked extension whose folder gets a newer build', () => {
     // Also on the check right after a connection, as when install.sh restarts the relay.
     await restartRelay()
     await waitForExtension(`the extension reconnected on build ${buildA}`, (extension) => extension.build === buildA)
+    await untilWorkerConnected(worker)
     expect(await worker.evaluate(() => globalThis.checkForNewerBuild())).toEqual({ kind: 'unreadable' })
     for (const content of ['{"id":"not-a-build"}', '{"id":', '[]', '{"id":12345678}']) {
       writeBuildJson(content)
