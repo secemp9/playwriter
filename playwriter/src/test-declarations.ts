@@ -8,6 +8,8 @@ declare global {
   ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
+  /** Calls `listener` on every change of the extension's state; returns the unsubscribe (extension/src/background.ts). */
+  var subscribeExtensionState: (listener: (state: ExtensionState) => void) => () => void
   var checkForNewerBuild: () => Promise<SelfReloadOutcome>
 
   // Browser globals used in evaluate() calls

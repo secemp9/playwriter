@@ -268,9 +268,10 @@ export interface SettleOutcome {
   busy?: BusySignal[]
   /**
    * Loading indicators the settle step saw while it waited that were gone when it ended — an
-   * aria-busy element, skeleton placeholders, a spinner — with how long they were seen (from the
-   * first to the last poll that saw them: a lower bound). Ones still shown are in the busy signals
-   * of the page now.
+   * aria-busy element, skeleton placeholders, a spinner — with how long they were seen: from the
+   * first read that saw them to the DOM change that removed them (human pace: its wait hears of that
+   * change), else to the last read that saw them (a lower bound). Ones still shown are in the busy
+   * signals of the page now.
    */
   busyWhileSettling?: Array<{ label: string; seenMs: number }>
   /** The open dialog when reason is js-dialog. */

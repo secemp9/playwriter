@@ -1088,6 +1088,7 @@ export async function netDelay({
     // page, which is a worse perturbation than the delay itself.
     if (!stopped) {
       const { promise, resolve } = Promise.withResolvers<void>()
+      // A duration that is the feature (e): net.delay holds each matching request `ms`; stopping wakes it at once.
       const timer = setTimeout(resolve, ms)
       const wake = () => {
         clearTimeout(timer)
@@ -1145,6 +1146,7 @@ export async function netDelay({
 
   if (expiresAt) {
     const entry = registry.get(id)!
+    // A duration that is the feature (e): the interceptor's asked lifetime (ttlMs).
     entry.timer = setTimeout(() => {
       void stopEntry(entry, 'ttl')
     }, ttlMs)

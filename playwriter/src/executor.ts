@@ -480,7 +480,7 @@ export interface ExecuteRun {
   deadlineAt: number
   actRecords: ActionRecord[]
   probeOutput: string[]
-  actActivity: { depth: number }
+  actActivity: ActActivity
   /**
    * Raw Playwright input and navigations the code made itself (not through act.*), as labels, in the
    * order they reached the page — seen at run time through the Playwright client instrumentation.
@@ -576,6 +576,41 @@ interface RawCall {
   startedAt: number
 }
 
+/**
+ * How many act.* calls of one execute() are running — act counts itself in and out through `depth` —
+ * and a wait for the count to come back to 0: the report of a call whose code did not await an act
+ * call waits for that call to end.
+ */
+export class ActActivity {
+  private running = 0
+  private idle: PromiseWithResolvers<void> | null = null
+
+  get depth(): number {
+    return this.running
+  }
+
+  set depth(value: number) {
+    this.running = value
+    if (value !== 0 || !this.idle) return
+    this.idle.resolve()
+    this.idle = null
+  }
+
+  /** Resolves once no act.* call is running (at once when none is), or at `capAt` (epoch ms). */
+  async untilIdle(capAt: number): Promise<void> {
+    if (this.running === 0) return
+    this.idle ??= Promise.withResolvers<void>()
+    const capped = Promise.withResolvers<void>()
+    // (a) The cap, a real timer on purpose: an act call stuck past the call's own deadline must not hold the report.
+    const timer = setTimeout(capped.resolve, Math.max(0, capAt - Date.now()))
+    try {
+      await Promise.race([this.idle.promise, capped.promise])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
+
 /** A run for building the sandbox outside execute() (tests that only inspect the globals). */
 function idleExecuteRun(): ExecuteRun {
   return {
@@ -583,7 +618,7 @@ function idleExecuteRun(): ExecuteRun {
     deadlineAt: Date.now() + 10 * 60_000,
     actRecords: [],
     probeOutput: [],
-    actActivity: { depth: 0 },
+    actActivity: new ActActivity(),
     rawActions: [],
     openings: () => 0,
   }
@@ -1305,6 +1340,7 @@ export class PlaywrightExecutor {
     // Whether the user can see a tab: only the extension can tell (tab-visibility.ts); a launched
     // browser does not throttle its background tabs, so it needs no source.
     this.probes = new PageProbes({
+      busyPace: () => this.settlePace(),
       logger: {
         error: (...args: unknown[]) => {
           this.logger.error(...args)
@@ -3716,6 +3752,7 @@ export class PlaywrightExecutor {
         })
         const minWait = options.minWait ?? 0
         if (result.settled && Date.now() - startedAt < minWait) {
+          // A duration that is the feature (e): the caller asked to wait at least `minWait`, settled or not sooner.
           await sleep(minWait - (Date.now() - startedAt))
         }
         const readyState =
@@ -4581,7 +4618,7 @@ export class PlaywrightExecutor {
             'chooses the files, act.dialog.dismiss() cancels it. Nothing from this call was run.',
         )
       }
-      const busy = (await probe.watch.busySignals({ since: probe.history.at(-1)?.checkpoint })).filter(
+      const busy = (await probe.watch.busySignals({ since: probe.history.at(-1)?.checkpoint, pace: this.settlePace() })).filter(
         (signal) => signal.strength === 'strong' && BLOCKING_BUSY_KINDS.has(signal.kind),
       )
       if (busy.length > 0) {
@@ -5141,7 +5178,7 @@ export class PlaywrightExecutor {
       deadlineAt: Date.now() + timeout,
       actRecords: [],
       probeOutput: [],
-      actActivity: { depth: 0 },
+      actActivity: new ActActivity(),
       rawActions: [],
       openings: () => 0,
     }
@@ -5325,10 +5362,8 @@ export class PlaywrightExecutor {
         }
       }
 
-      // An act.* call the code forgot to await is still running; let it finish before reporting.
-      while (run.actActivity.depth > 0 && Date.now() < run.deadlineAt + 2000) {
-        await sleep(50)
-      }
+      // An act.* call the code did not await is still running: the report waits for it to end.
+      await run.actActivity.untilIdle(run.deadlineAt + 2000)
       // Chrome took the debugger off the controlled tab during this call (debugger-cut.ts). A command
       // in flight then fails with Chrome's "Detached while handling command." a moment before the page
       // closes; the close is waited for, then the tab, briefly — so this call already says whether it

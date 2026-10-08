@@ -226,6 +226,8 @@ export class DebuggerCuts {
     }
     const delay = RETRY_DELAYS_MS[Math.min(cut.backoff, RETRY_DELAYS_MS.length - 1)]
     cut.backoff++
+    // The retry backoff, kept on a timer: nothing tells an extension that the frame blocking the debugger
+    // has left the page (see the top of this file); the tab's own events and the relay's requests also retry.
     const timer = setTimeout(() => {
       cut.stopTimer = null
       void this.attempt(cut.tabId)

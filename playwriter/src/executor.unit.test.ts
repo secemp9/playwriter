@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { shouldAutoReturn, wrapCode, isPlaywrightChannelOwner } from './executor.js'
+import { ActActivity, shouldAutoReturn, wrapCode, isPlaywrightChannelOwner } from './executor.js'
 
 describe('shouldAutoReturn', () => {
   it('returns true for simple expressions', () => {
@@ -164,5 +164,50 @@ describe('isPlaywrightChannelOwner', () => {
     expect(isPlaywrightChannelOwner({ _type: 'x', _guid: 'y' })).toBe(false)
     // _type must be a string
     expect(isPlaywrightChannelOwner({ _type: 123, _guid: 'y', _connection: {} })).toBe(false)
+  })
+})
+
+describe('ActActivity', () => {
+  it('wakes the report as the last running act call ends, before the next task', async () => {
+    const activity = new ActActivity()
+    activity.depth += 1
+    activity.depth += 1
+    const order: string[] = []
+    const idle = activity.untilIdle(Date.now() + 60_000).then(() => order.push('idle'))
+    activity.depth -= 1
+    const between = Promise.withResolvers<void>()
+    setImmediate(between.resolve)
+    await between.promise
+    // One of two calls ended: still waiting.
+    expect(order).toEqual([])
+    activity.depth -= 1
+    const nextTask = Promise.withResolvers<void>()
+    setImmediate(() => {
+      order.push('next task')
+      nextTask.resolve()
+    })
+    await Promise.all([idle, nextTask.promise])
+    expect(order).toEqual(['idle', 'next task'])
+  })
+
+  it('answers at once when no act call runs', async () => {
+    const activity = new ActActivity()
+    const nextTask = Promise.withResolvers<string>()
+    setImmediate(() => nextTask.resolve('next task'))
+    expect(await Promise.race([activity.untilIdle(Date.now() + 60_000).then(() => 'idle'), nextTask.promise])).toBe('idle')
+  })
+
+  it('stops waiting at the cap while an act call is still running', async () => {
+    const activity = new ActActivity()
+    activity.depth += 1
+    const startedAt = Date.now()
+    await activity.untilIdle(startedAt + 80)
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(79)
+    expect(activity.depth).toBe(1)
+    // A later end still wakes a later wait.
+    const idle = activity.untilIdle(Date.now() + 60_000)
+    activity.depth -= 1
+    await idle
+    expect(activity.depth).toBe(0)
   })
 })

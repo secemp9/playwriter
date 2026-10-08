@@ -172,9 +172,11 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
       if (attempt < maxAttempts) {
         const delay = attempt * 2000
         console.log(`  Download attempt ${attempt} failed, retrying in ${delay / 1000}s...`)
-        await new Promise((resolve) => {
-          return setTimeout(resolve, delay)
-        })
+        // Retry backoff (d), no state signal to wait on: nothing tells this process when a transient
+        // network or CDN failure is over, so it waits 2 s, then 4 s, before trying again.
+        const backoff = Promise.withResolvers<void>()
+        setTimeout(backoff.resolve, delay)
+        await backoff.promise
       }
     }
   }

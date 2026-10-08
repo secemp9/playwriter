@@ -777,8 +777,11 @@ export function createHumanMouseApi(options: {
     clickOptions.onPress?.('sent')
     await page.mouse.down({ button: clickOptions.button, clickCount: clickOptions.clickCount ?? 1 })
     clickOptions.onPress?.('acknowledged')
+    // A person's hold of the button (b), human pacing: fast mode passes 0, and then no timer runs.
     if (clickOptions.delayMs) {
-      await new Promise((resolve) => setTimeout(resolve, clickOptions.delayMs))
+      const held = Promise.withResolvers<void>()
+      setTimeout(held.resolve, clickOptions.delayMs)
+      await held.promise
     }
     await page.mouse.up({ button: clickOptions.button, clickCount: clickOptions.clickCount ?? 1 })
     return result

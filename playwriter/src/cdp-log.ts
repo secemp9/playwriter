@@ -125,6 +125,8 @@ export function createCdpLogger({
     const line = JSON.stringify(entry, replacer)
     buffer.push(line)
     if (!flushTimer) {
+      // Batching (d), no state signal to flush on: entries arrive one per CDP message (issue #96), and
+      // the interval turns them into one append per FLUSH_INTERVAL_MS; flush() writes at once.
       flushTimer = setInterval(() => {
         queue = queue.then(flushBuffer)
       }, FLUSH_INTERVAL_MS)

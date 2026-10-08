@@ -204,9 +204,10 @@ async function handleStartRecording(params: OffscreenStartRecordingMessage): Pro
       console.log(`MediaRecorder stopped for tab ${tabId}`)
     }
 
-    // Wait for MediaRecorder to actually start before returning.
+    // Wait for MediaRecorder to actually start before returning (its `start` event).
     // This ensures the encoder is initialized and ready to capture frames.
     await new Promise<void>((resolve, reject) => {
+      // The cap (a real timer): a recorder that never starts sends no event saying so.
       const timeout = setTimeout(() => {
         reject(new Error('MediaRecorder failed to start within 5 seconds'))
       }, 5000)

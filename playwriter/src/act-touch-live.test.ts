@@ -54,13 +54,9 @@ beforeAll(async () => {
   if (!address || typeof address === 'string') throw new Error('fixture server has no port')
   baseUrl = `http://127.0.0.1:${address.port}`
   cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'act-touch-'))
-  executor = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: { log: () => {}, error: () => {} }, cwd, policy: 'human' })
-  await executor.planNewBrowser({ device: 'Pixel 7' })
-  await run(`await act.open('${baseUrl}/touch.html')`)
 }, 60_000)
 
 afterAll(async () => {
-  await executor?.disconnect()
   server.closeAllConnections()
   const closed = Promise.withResolvers<void>()
   server.close(() => closed.resolve())
@@ -110,7 +106,17 @@ function tokens(events: SeenEvent[]): string[] {
   return events.map((event) => `${event.type}${event.pointerType ? `:${event.pointerType}` : ''}${event.count > 1 ? `×${event.count}` : ''}`)
 }
 
-describe('act on a touch device (Pixel 7)', () => {
+describe.each(['human', 'fast'] as const)('act on a touch device (Pixel 7), %s mode', (policy) => {
+  beforeAll(async () => {
+    executor = new PlaywrightExecutor({ cdpConfig: { headless: true }, logger: { log: () => {}, error: () => {} }, cwd, policy })
+    await executor.planNewBrowser({ device: 'Pixel 7' })
+    await run(`await act.open('${baseUrl}/touch.html')`)
+  }, 60_000)
+
+  afterAll(async () => {
+    await executor.disconnect()
+  })
+
   it('act.click is a tap: touch events and pointerType touch, no pointer travelling before it', async () => {
     const page = await run('await observe()')
     const before = await recorded()
@@ -179,6 +185,7 @@ describe('act on a touch device (Pixel 7)', () => {
   it('act.scroll swipes and a tap below the fold swipes to it first: no wheel, no mouse pointer', async () => {
     const before = await recorded()
     const scrolled = await run("await act.scroll('down')")
+    console.log(`[act-touch-live] ${policy} mode, act.scroll('down'): ${scrolled.split('\n').find((line) => /scrolled the page/.test(line))?.trim()}`)
     expect(scrolled).toMatch(/scrolled the page \d+px/)
     const page = await run('await observe({ all: true })')
     const report = await run(`await act.click(${refOf(page, /button "Far target"/)})`)

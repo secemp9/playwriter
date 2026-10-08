@@ -76,26 +76,24 @@ const FAST_CDP_COMMAND_TIMEOUT_MS = new Map<string, number>([
   ['Target.setAutoAttach', 10000],
 ])
 
+/**
+ * `method`'s answer, or an error once `timeout` ms pass without one. The cap is a real timer on purpose:
+ * a frozen or discarded renderer accepts the command and never answers it, and Chrome sends no event for that.
+ */
 async function sendCommandWithTimeout(
   debuggee: chrome.debugger.DebuggerSession,
   method: string,
   params: object | undefined,
   timeout: number,
 ): Promise<unknown> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const expired = Promise.withResolvers<never>()
+  const timer = setTimeout(() => {
+    expired.reject(new Error(`CDP command timed out after ${timeout}ms: ${method} (tab may be frozen/hibernated)`))
+  }, timeout)
   try {
-    return await Promise.race([
-      chrome.debugger.sendCommand(debuggee, method, params),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error(`CDP command timed out after ${timeout}ms: ${method} (tab may be frozen/hibernated)`))
-        }, timeout)
-      }),
-    ])
+    return await Promise.race([chrome.debugger.sendCommand(debuggee, method, params), expired.promise])
   } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId)
-    }
+    clearTimeout(timer)
   }
 }
 
@@ -415,8 +413,49 @@ function flushRecordingChunkBuffer(ws: WebSocket): void {
 // self-reload never cuts one.
 let relayMessagesInFlight = 0
 
+/**
+ * How long the extension waits between two tries while it cannot connect to the relay. Kept on a timer
+ * because nothing else can tell it: an extension cannot observe a local port starting to listen, so it
+ * can only ask again. One try is a HEAD request, which a port nobody listens on refuses at once (0.15 ms
+ * measured on Linux 6.8). Short because a relay that was just started waits for an extension for 1 s
+ * (relay-client ensureRelayServer): the extension must come back inside that. MEASURED (Chromium
+ * 145.0.7632.18, extension-reconnect-relay.test.ts, 3 runs): tries 252–256 ms apart while the relay is
+ * down, back 257–281 ms after it listens again. A relay that closes the connection is retried at once
+ * (the socket's close wakes the loop): back 14–30 ms after a restart, against up to 1 s plus a 3 s pause before.
+ */
+const RELAY_RETRY_MS = 250
+
+/**
+ * How long one wait for the relay's extension slot to free may last (`/extension/status?until=free`).
+ * The relay answers as soon as the slot is free, or at this cap with it still taken. It stays under 30 s:
+ * Chrome stops an extension service worker whose fetch() response takes more than 30 seconds
+ * (developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle).
+ */
+const SLOT_WAIT_MS = 20_000
+/** The cap of that request itself, for a relay that never answers: SLOT_WAIT_MS and 5 s for the answer, under 30 s. */
+const SLOT_WAIT_FETCH_CAP_MS = SLOT_WAIT_MS + 5_000
+/**
+ * The backoff before asking again when the relay answered before SLOT_WAIT_MS with the slot still taken.
+ * Only a relay from before `?until=free` does that (it answers every status request at once), so this is
+ * the poll interval against such a relay: no state signal exists there to wait on.
+ */
+const SLOT_POLL_BACKOFF_MS = 3_000
+
+/** The part of `/extension/status` the extension reads. */
+type ExtensionSlotStatus = { connected: boolean; activeTargets: number }
+
+function parseSlotStatus(body: unknown): ExtensionSlotStatus {
+  if (typeof body === 'object' && body !== null && 'connected' in body && typeof body.connected === 'boolean') {
+    const activeTargets = 'activeTargets' in body && typeof body.activeTargets === 'number' ? body.activeTargets : 0
+    return { connected: body.connected, activeTargets }
+  }
+  throw new Error(`/extension/status answered without a boolean 'connected': ${JSON.stringify(body)}`)
+}
+
 class ConnectionManager {
   ws: WebSocket | null = null
+  /** Settles when `ws` closes: what the reconnect loop waits on while it is connected. */
+  private wsClosed: Promise<void> | null = null
   private connectionPromise: Promise<void> | null = null
   // Monotonic id for connect attempts. Every await inside connect() is a suspension point
   // where the attempt may have been superseded (the global timeout fired and the maintain
@@ -476,22 +515,14 @@ class ConnectionManager {
     const isCurrent = () => gen === this.generation
     logger.debug(`Waiting for server at http://${RELAY_HOST}:${RELAY_PORT}...`)
 
-    // Retry for up to 5 seconds with 1s intervals, then give up (maintain loop will retry later)
-    // Using fewer attempts since maintainLoop retries every 3 seconds anyway
-    const maxAttempts = 5
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        await fetch(`http://${RELAY_HOST}:${RELAY_PORT}`, { method: 'HEAD', signal: AbortSignal.timeout(2000) })
-        logger.debug('Server is available')
-        break
-      } catch {
-        if (attempt === maxAttempts - 1) {
-          throw new Error('Server not available')
-        }
-        logger.debug(`Server not available, retrying... (attempt ${attempt + 1}/${maxAttempts})`)
-        await sleep(1000)
-      }
+    // One try. When the relay is not there, the reconnect loop tries again after RELAY_RETRY_MS.
+    try {
+      // The cap of the probe (a real timer): a relay that accepted the connection and never answers.
+      await fetch(`http://${RELAY_HOST}:${RELAY_PORT}`, { method: 'HEAD', signal: AbortSignal.timeout(2000) })
+    } catch {
+      throw new Error('Server not available')
     }
+    logger.debug('Server is available')
 
     const identity = await getExtensionIdentity()
     if (!isCurrent()) {
@@ -524,6 +555,7 @@ class ConnectionManager {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
+      // The cap of the WebSocket handshake (a real timer): a relay that never completes it.
       const timeout = setTimeout(() => {
         if (settled) return
         settled = true
@@ -578,6 +610,8 @@ class ConnectionManager {
     }
 
     this.ws = socket
+    const closed = Promise.withResolvers<void>()
+    this.wsClosed = closed.promise
 
     const onMessage = async (event: MessageEvent) => {
       let message: any
@@ -760,7 +794,6 @@ class ConnectionManager {
             // if such tabs must be visible to their requesting client, the workspace key
             // has to be threaded from the relay onto the ghost-browser command first.
             setTabConnecting(tabId, { workspaceKey: null, workspaceLabel: null })
-            await sleep(100)
             await attachTab(tabId)
           }
         }
@@ -790,10 +823,12 @@ class ConnectionManager {
       // Stale-socket guard: only the socket the manager currently owns may drive state
       // transitions. A superseded socket closing late (e.g. the relay's 4001 after a
       // same-key replacement) must not tear down or poison the live connection's state.
-      if (this.ws !== socket) {
-        return
+      if (this.ws === socket) {
+        this.handleClose(event.reason, event.code)
       }
-      this.handleClose(event.reason, event.code)
+      // After handleClose, whose state the reconnect loop reads once this wakes it. A superseded
+      // socket wakes it too: the loop then waits on the current socket.
+      closed.resolve()
     }
 
     this.ws.onerror = (event: Event) => {
@@ -876,118 +911,152 @@ class ConnectionManager {
 
   async maintainLoop(): Promise<void> {
     while (true) {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        await sleep(1000)
-        continue
-      }
-
-      // When another Playwriter extension took over, poll until no same-key replacement is
+      // When another Playwriter extension took over, wait until no same-key replacement is
       // connected anymore. Reclaiming while another worker is merely idle is racy: a fresh
       // replacement reports activeTargets=0 before it re-attaches tabs, so the old worker can
       // steal the slot back and disconnect the live browser instance.
       if (store.getState().connectionState === 'extension-replaced') {
-        try {
-          const response = await fetch(`http://${RELAY_HOST}:${RELAY_PORT}/extension/status`, {
-            method: 'GET',
-            signal: AbortSignal.timeout(2000),
-          })
-          const data = (await response.json()) as { connected: boolean; activeTargets: number }
-          const slotAvailable = !data.connected
-          if (slotAvailable) {
-            store.setState({ connectionState: 'idle', errorText: undefined })
-            logger.debug(
-              'Extension slot is free (connected:',
-              data.connected,
-              'activeTargets:',
-              data.activeTargets,
-              '), cleared error state',
-            )
-          } else {
-            logger.debug('Extension slot still taken (activeTargets:', data.activeTargets, '), will retry...')
-          }
-        } catch {
-          logger.debug('Server not available, will retry...')
-        }
-        await sleep(3000)
+        await this.waitWhileReplaced()
         continue
       }
 
-      // Ensure tabs are in 'connecting' state when WS is not connected
-      // This handles edge cases where handleClose wasn't called or state got out of sync
-      const currentTabs = store.getState().tabs
-      const hasConnectedTabs = Array.from(currentTabs.values()).some((t) => t.state === 'connected')
-      if (hasConnectedTabs) {
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        // Ensure tabs are in 'connecting' state when WS is not connected
+        // This handles edge cases where handleClose wasn't called or state got out of sync
+        const currentTabs = store.getState().tabs
+        const hasConnectedTabs = Array.from(currentTabs.values()).some((t) => t.state === 'connected')
+        if (hasConnectedTabs) {
+          store.setState((state) => {
+            const newTabs = new Map(state.tabs)
+            for (const [tabId, tab] of newTabs) {
+              if (tab.state === 'connected') {
+                newTabs.set(tabId, { ...tab, state: 'connecting' })
+              }
+            }
+            return { tabs: newTabs }
+          })
+        }
+
+        // Try to connect silently in background - don't show 'connecting' badge
+        // Individual tab states will show 'connecting' when user explicitly clicks
+        try {
+          await this.ensureConnection()
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error)
+          logger.debug('Connection attempt failed:', message)
+          // Check if rejected because another extension is actively in use
+          if (message === 'Extension Already In Use') {
+            store.setState({
+              connectionState: 'extension-replaced',
+              errorText: 'Another Playwriter extension is actively in use',
+            })
+            // The wait for the slot is the next iteration's.
+            continue
+          }
+          store.setState({ connectionState: 'idle' })
+          // The relay-down backoff (RELAY_RETRY_MS): nothing can tell the extension the relay is back.
+          await sleep(RELAY_RETRY_MS)
+          continue
+        }
+      }
+
+      // Connected, by this loop or by a click's connectTab: the tabs a disconnect left 'connecting' are
+      // re-attached on every new connection, whichever path opened it.
+      const closed = this.wsClosed
+      store.setState({ connectionState: 'connected' })
+      await this.reattachConnectingTabs()
+      this.preserveTabsOnDetach = false
+      if (closed !== null) {
+        await closed
+      }
+    }
+  }
+
+  /** Re-attach any tabs that are in 'connecting' state (from a previous disconnect). */
+  private async reattachConnectingTabs(): Promise<void> {
+    const tabsToReattach = Array.from(store.getState().tabs.entries())
+      .filter(([_, tab]) => tab.state === 'connecting')
+      .map(([tabId]) => tabId)
+
+    for (const tabId of tabsToReattach) {
+      // Re-check state before attaching - might have been attached by user click
+      const currentTab = store.getState().tabs.get(tabId)
+      if (!currentTab || currentTab.state !== 'connecting') {
+        logger.debug('Skipping reattach, tab state changed:', tabId, currentTab?.state)
+        continue
+      }
+
+      try {
+        await chrome.tabs.get(tabId)
+        // A connect may have finished this tab while Chrome answered.
+        if (store.getState().tabs.get(tabId)?.state === 'connected') {
+          logger.debug('Skipping reattach, tab connected meanwhile:', tabId)
+          continue
+        }
+        // Single-flight: if a connect of this tab is attaching it, this joins that attach.
+        await attachTab(tabId)
+        logger.debug('Successfully re-attached tab:', tabId)
+      } catch (error: unknown) {
+        logger.debug('Failed to re-attach tab:', tabId, error instanceof Error ? error.message : String(error))
+        // Drop only the TabInfo this pass set out to re-attach. A connect that took the tab over
+        // meanwhile (setTabConnecting writes a new TabInfo) reports its own failure on it, and a
+        // tab some other attach connected stays connected.
+        if (store.getState().tabs.get(tabId) !== currentTab) {
+          logger.debug('Keeping tab another connect took over:', tabId)
+          continue
+        }
         store.setState((state) => {
           const newTabs = new Map(state.tabs)
-          for (const [tabId, tab] of newTabs) {
-            if (tab.state === 'connected') {
-              newTabs.set(tabId, { ...tab, state: 'connecting' })
-            }
-          }
+          newTabs.delete(tabId)
           return { tabs: newTabs }
         })
       }
+    }
+  }
 
-      // Try to connect silently in background - don't show 'connecting' badge
-      // Individual tab states will show 'connecting' when user explicitly clicks
+  /**
+   * While another Playwriter extension holds the relay's slot: one wait for it to free. Returns once the
+   * slot is free (the state becomes 'idle'), once something else moved the state on (a click that
+   * reconnects), or after one backoff.
+   */
+  private async waitWhileReplaced(): Promise<void> {
+    const movedOn = new AbortController()
+    const unsubscribe = store.subscribe((state) => {
+      if (state.connectionState !== 'extension-replaced') movedOn.abort()
+    })
+    try {
+      const asked = performance.now()
+      let backoffMs = RELAY_RETRY_MS
       try {
-        await this.ensureConnection()
-        store.setState({ connectionState: 'connected' })
-
-        // Re-attach any tabs that were in 'connecting' state (from a previous disconnect)
-        const tabsToReattach = Array.from(store.getState().tabs.entries())
-          .filter(([_, tab]) => tab.state === 'connecting')
-          .map(([tabId]) => tabId)
-
-        for (const tabId of tabsToReattach) {
-          // Re-check state before attaching - might have been attached by user click
-          const currentTab = store.getState().tabs.get(tabId)
-          if (!currentTab || currentTab.state !== 'connecting') {
-            logger.debug('Skipping reattach, tab state changed:', tabId, currentTab?.state)
-            continue
-          }
-
-          try {
-            await chrome.tabs.get(tabId)
-            // A connect may have finished this tab while Chrome answered.
-            if (store.getState().tabs.get(tabId)?.state === 'connected') {
-              logger.debug('Skipping reattach, tab connected meanwhile:', tabId)
-              continue
-            }
-            // Single-flight: if a connect of this tab is attaching it, this joins that attach.
-            await attachTab(tabId)
-            logger.debug('Successfully re-attached tab:', tabId)
-          } catch (error: unknown) {
-            logger.debug('Failed to re-attach tab:', tabId, error instanceof Error ? error.message : String(error))
-            // Drop only the TabInfo this pass set out to re-attach. A connect that took the tab over
-            // meanwhile (setTabConnecting writes a new TabInfo) reports its own failure on it, and a
-            // tab some other attach connected stays connected.
-            if (store.getState().tabs.get(tabId) !== currentTab) {
-              logger.debug('Keeping tab another connect took over:', tabId)
-              continue
-            }
-            store.setState((state) => {
-              const newTabs = new Map(state.tabs)
-              newTabs.delete(tabId)
-              return { tabs: newTabs }
-            })
-          }
+        const response = await fetch(`http://${RELAY_HOST}:${RELAY_PORT}/extension/status?until=free&waitMs=${SLOT_WAIT_MS}`, {
+          signal: AbortSignal.any([movedOn.signal, AbortSignal.timeout(SLOT_WAIT_FETCH_CAP_MS)]),
+        })
+        const slot = parseSlotStatus(await response.json())
+        if (!slot.connected) {
+          store.setState({ connectionState: 'idle', errorText: undefined })
+          logger.debug('Extension slot is free (activeTargets:', slot.activeTargets, '), cleared error state')
+          return
         }
-        this.preserveTabsOnDetach = false
-      } catch (error: any) {
-        logger.debug('Connection attempt failed:', error.message)
-        // Check if rejected because another extension is actively in use
-        if (error.message === 'Extension Already In Use') {
-          store.setState({
-            connectionState: 'extension-replaced',
-            errorText: 'Another Playwriter extension is actively in use',
-          })
-        } else {
-          store.setState({ connectionState: 'idle' })
-        }
+        // The relay held the request its whole wait: ask again at once.
+        if (performance.now() - asked >= SLOT_WAIT_MS) return
+        logger.debug(
+          `Extension slot still taken (activeTargets: ${slot.activeTargets}) and the relay answered at once: ` +
+            `a relay from before ?until=free; asking again in ${SLOT_POLL_BACKOFF_MS} ms`,
+        )
+        backoffMs = SLOT_POLL_BACKOFF_MS
+      } catch (error: unknown) {
+        if (movedOn.signal.aborted) return
+        logger.debug('Could not read the extension slot, will retry:', error instanceof Error ? error.message : String(error))
       }
-
-      await sleep(3000)
+      const backoff = Promise.withResolvers<void>()
+      // The backoff (SLOT_POLL_BACKOFF_MS against a relay from before ?until=free, RELAY_RETRY_MS while the
+      // relay is down); a state change ends it early.
+      const timer = setTimeout(backoff.resolve, backoffMs)
+      movedOn.signal.addEventListener('abort', () => backoff.resolve(), { once: true })
+      await backoff.promise
+      clearTimeout(timer)
+    } finally {
+      unsubscribe()
     }
   }
 }
@@ -1008,6 +1077,8 @@ globalThis.toggleExtensionForActiveTab = toggleExtensionForActiveTab
 globalThis.disconnectEverything = disconnectEverything
 // @ts-ignore
 globalThis.getExtensionState = () => store.getState()
+// @ts-ignore
+globalThis.subscribeExtensionState = (listener: (state: ExtensionState) => void) => store.subscribe(listener)
 
 declare global {
   var toggleExtensionForActiveTab: (
@@ -1016,6 +1087,8 @@ declare global {
   ) => Promise<{ isConnected: boolean; state: ExtensionState }>
   var getExtensionState: () => ExtensionState
   var disconnectEverything: () => Promise<void>
+  /** Calls `listener` on every change of the extension's state; returns the unsubscribe. Lets a test wait on a state instead of polling getExtensionState. */
+  var subscribeExtensionState: (listener: (state: ExtensionState) => void) => () => void
   /** Start Chrome's element picker on a connected tab, as the context menu does. */
   var startElementPick: (tabId: number, purpose: PickPurpose) => Promise<void>
   /** Run the self-reload's check now, as a connection or the periodic wake does (self-reload.ts). Absent in dev builds. */
@@ -1530,9 +1603,9 @@ async function handleCommand(msg: ExtensionCommandMessage): Promise<any> {
       // By disabling first, we force Chrome to re-send all execution context events when we
       // re-enable, ensuring the new client receives them. The relay server waits for the
       // executionContextCreated events before returning. See cdp-timing.md for details.
+      // The enable follows the disable's response at once: Chrome has handled the disable by then.
       try {
         await sendCommandWithTimeout(runtimeSession, 'Runtime.disable', undefined, 10000)
-        await sleep(50)
       } catch (e) {
         logger.debug('Error disabling Runtime (ignoring):', e)
       }
@@ -1558,8 +1631,7 @@ async function handleCommand(msg: ExtensionCommandMessage): Promise<any> {
         )
       }
       setTabConnecting(tab.id, { workspaceKey, workspaceLabel })
-      logger.debug('Created tab:', tab.id, 'waiting for it to load...')
-      await sleep(100)
+      logger.debug('Created tab:', tab.id, 'attaching it')
       const { targetInfo } = await attachTab(tab.id)
       return { targetId: targetInfo.targetId } satisfies Protocol.Target.CreateTargetResponse
     }
@@ -2076,7 +2148,6 @@ async function attachTabNow(
           tabId,
         )
         await removeRestrictedIframes(tabId)
-        await sleep(50)
       }
     }
 
@@ -2468,6 +2539,14 @@ async function disconnectTab(tabId: number): Promise<void> {
   // WS connection is maintained even with no tabs - maintainConnection handles it
 }
 
+/**
+ * The cap of a toggle's wait for its tab to leave 'connecting'. Its connect is capped at 15 s
+ * (ensureConnection's GLOBAL_TIMEOUT_MS) and its attach fails at the first setup command Chrome does not
+ * answer within ATTACH_SETUP_TIMEOUT_MS (10 s), so a tab still 'connecting' after this waits for a relay
+ * the extension cannot reach; the reconnect loop attaches it once the relay accepts the extension.
+ */
+const TOGGLE_SETTLE_CAP_MS = 30_000
+
 async function toggleExtensionForActiveTab(
   workspaceKey: string | null,
   workspaceLabel: string | null,
@@ -2483,18 +2562,27 @@ async function toggleExtensionForActiveTab(
   // permanently freestyle (Z6).
   await applyActionForTab(tab, workspaceKey, workspaceLabel)
 
-  await new Promise<void>((resolve) => {
-    const check = () => {
-      const state = store.getState()
-      const tabInfo = state.tabs.get(tab.id!)
-      if (tabInfo?.state === 'connecting') {
-        setTimeout(check, 100)
-        return
-      }
-      resolve()
-    }
-    check()
+  // Settled when the tab leaves 'connecting' (connected, failed, or no longer tracked).
+  const tabId = tab.id
+  const settled = Promise.withResolvers<void>()
+  const unsubscribe = store.subscribe((state) => {
+    if (state.tabs.get(tabId)?.state !== 'connecting') settled.resolve()
   })
+  if (store.getState().tabs.get(tabId)?.state !== 'connecting') settled.resolve()
+  // The cap (a real timer), TOGGLE_SETTLE_CAP_MS.
+  const cap = setTimeout(() => {
+    const reason =
+      connectionManager.ws?.readyState === WebSocket.OPEN
+        ? 'its attach has not finished'
+        : `the extension is not connected to the relay on ${RELAY_HOST}:${RELAY_PORT} (connection '${store.getState().connectionState}'); it attaches the tab once the relay accepts it`
+    settled.reject(new Error(`Tab ${tabId} is still connecting ${TOGGLE_SETTLE_CAP_MS} ms after the toggle: ${reason}`))
+  }, TOGGLE_SETTLE_CAP_MS)
+  try {
+    await settled.promise
+  } finally {
+    unsubscribe()
+    clearTimeout(cap)
+  }
 
   const state = store.getState()
   const isConnected = state.tabs.has(tab.id) && state.tabs.get(tab.id)?.state === 'connected'
@@ -2769,14 +2857,6 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
 // restores rehydrated tabs with ownership intact. Rehydrated tabs are marked 'connecting',
 // never 'connected': their debugger is detached, so 'connected' would be a lying state
 // machine. maintainLoop always starts (finally), even if rehydration hiccups.
-// Wake source of last resort. MV3 kills the service worker whenever Chrome deems it
-// idle; the relay's WebSocket pings extend its life only best-effort (observed on
-// Chrome 149: workers terminated ~2.5min after connect despite 5s pings). A dead worker
-// has no maintainLoop, so without an external wake the extension silently vanishes from
-// the relay until some user event in this profile fires. The periodic alarm bounds that
-// outage at ~30s: waking the worker re-runs module evaluation, which restarts
-// maintainLoop, which reconnects. The listener body is intentionally empty — being woken
-// IS the work.
 // A short random id unique to THIS service-worker instance. MV3 kills and respawns the
 // worker constantly and every log line lands in the same shared relay log, so without an
 // instance tag it is impossible to tell which lines belong to which worker life. Every
@@ -2858,6 +2938,14 @@ if (selfReload !== null) {
   globalThis.checkForNewerBuild = selfReload.check
 }
 
+// The periodic wake, kept on a timer: an alarm is the only thing that starts a terminated worker. MV3
+// kills the service worker whenever Chrome deems it idle; the relay's WebSocket pings extend its life
+// only best-effort (observed on Chrome 149: workers terminated ~2.5min after connect despite 5s pings).
+// A dead worker has no maintainLoop, so without an external wake the extension silently vanishes from
+// the relay until some user event in this profile fires. This alarm bounds that outage at ~30 s (half a
+// minute is Chrome's floor for alarms): waking the worker re-runs module evaluation, which restarts
+// maintainLoop, which reconnects. A running worker uses the wake for the self-reload's check, which
+// finds a newer build put in its folder while no new relay connection came (self-reload.ts).
 const RECONNECT_ALARM = 'playwriter-reconnect'
 void chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -2867,9 +2955,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 })
 
-// Worker heartbeat. The service worker's console is not observable from outside the
-// browser, and this worker has been repeatedly terminated mid-work; the heartbeat gives
-// the relay log (a) a timestamped record of how long each worker instance actually
+// Worker heartbeat, kept on a timer: its point is the regular record. The service worker's console is
+// not observable from outside the browser, and this worker has been repeatedly terminated mid-work; the
+// heartbeat gives the relay log (a) a timestamped record of how long each worker instance actually
 // lives, and (b) whether the chrome.* API pipeline still answers (bounded probe — this
 // same pipeline has been observed to stop settling calls). The completed API call also
 // resets the idle timer, belt-and-suspenders alongside the relay's WS pings.
@@ -2889,6 +2977,7 @@ setInterval(() => {
   const { connectionState, tabs } = store.getState()
   void Promise.race([
     chrome.runtime.getPlatformInfo(),
+    // The probe's cap: a pipeline that stopped settling calls never answers, and nothing announces that.
     new Promise<never>((_, reject) => {
       setTimeout(() => {
         reject(new Error('probe timeout'))
@@ -3066,7 +3155,8 @@ function checkMemory(): void {
   }
 }
 
-// Check memory every 5 seconds
+// Check memory every 5 seconds, kept on a timer: Chrome has no event for the heap growing, and the log
+// records the growth rate per interval (MEMORY_GROWTH_THRESHOLD).
 setInterval(checkMemory, 5000)
 
 // Initial memory check
@@ -3121,7 +3211,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
             // relocated popup (see windows.onCreated below). Connecting it as freestyle hid it
             // from the agent that opened it while Playwright still drove it, and the relay then
             // answered Target.getTargetInfo for it with another tab's id.
+            // Read once: the entry is used up here, whatever this tab turns out to be.
             const sourceTabId = popupSourceTabMap.get(tabId)
+            popupSourceTabMap.delete(tabId)
             const opener = sourceTabId !== undefined ? tabs.get(sourceTabId) : undefined
             if (opener) {
               logger.debug('Tab opened by connected tab', sourceTabId, 'joined its group:', tabId)
@@ -3162,16 +3254,40 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // chrome.tabs.Tab.openerTabId is unreliable for window.open popups — on
 // Chromium 145 it is left null. onCreatedNavigationTarget gives a reliable
 // source_tab_id → new_tab_id mapping for every window.open / target=_blank
-// / cmd+click. Entries expire after 10s to cap memory for plain-new-tab
-// cases that never trigger windows.onCreated.
+// / cmd+click. An entry lives until it is used — by the popup relocation below, or by the
+// tab joining a playwriter group (tabs.onUpdated above) — or until its tab closes (onTabRemoved).
 const popupSourceTabMap = new Map<number, number>()
 
 chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
   popupSourceTabMap.set(details.tabId, details.sourceTabId)
-  setTimeout(() => {
-    popupSourceTabMap.delete(details.tabId)
-  }, 10000)
 })
+
+/**
+ * The cap of the wait for a new popup window's tab: a window with no tab by then is left alone.
+ * MEASURED (Chromium 145.0.7632.18, window.open popups through the test harness): chrome.tabs.query
+ * already lists the tab when windows.onCreated arrives, 8 of 8; the tab's own tabs.onCreated covers a
+ * window whose tab comes later.
+ */
+const POPUP_TAB_CAP_MS = 1000
+
+/** The tabs of a window windows.onCreated just announced: the ones listed at once, else the first created in it. */
+async function tabsOfNewWindow(windowId: number): Promise<number[]> {
+  const created = Promise.withResolvers<number[]>()
+  const onCreated = (tab: chrome.tabs.Tab): void => {
+    if (tab.windowId === windowId && tab.id !== undefined) created.resolve([tab.id])
+  }
+  // Listening before the query: a tab created after the query read the window reaches the listener.
+  chrome.tabs.onCreated.addListener(onCreated)
+  // The cap (a real timer), POPUP_TAB_CAP_MS.
+  const cap = setTimeout(() => created.resolve([]), POPUP_TAB_CAP_MS)
+  try {
+    const listed = (await chrome.tabs.query({ windowId })).flatMap((tab) => (tab.id === undefined ? [] : [tab.id]))
+    return listed.length > 0 ? listed : await created.promise
+  } finally {
+    chrome.tabs.onCreated.removeListener(onCreated)
+    clearTimeout(cap)
+  }
+}
 
 // Relocate popup windows opened by a Playwriter-connected tab into the
 // source tab's window as a regular tab, since Playwriter cannot attach
@@ -3184,21 +3300,9 @@ chrome.windows.onCreated.addListener(async (popupWindow) => {
     return
   }
   try {
-    // Retry tab discovery — windows.onCreated can fire before
-    // chrome.tabs.query({ windowId }) sees the new popup tab.
-    let popupTabs: chrome.tabs.Tab[] = []
-    for (let attempt = 0; attempt < 5; attempt++) {
-      popupTabs = await chrome.tabs.query({ windowId: popupWindow.id })
-      if (popupTabs.length > 0) break
-      await sleep(20)
-    }
-    const tabIds = popupTabs
-      .map((t) => t.id)
-      .filter((id): id is number => {
-        return id !== undefined
-      })
+    const tabIds = await tabsOfNewWindow(popupWindow.id)
     if (tabIds.length === 0) {
-      logger.debug(`Popup window ${popupWindow.id} has no tabs after retry, skipping`)
+      logger.debug(`Popup window ${popupWindow.id} has no tab ${POPUP_TAB_CAP_MS} ms after it was created, leaving it alone`)
       return
     }
 

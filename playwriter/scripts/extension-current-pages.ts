@@ -7,8 +7,9 @@ async function main() {
   const contexts = browser.contexts()
   console.log(`Found ${contexts.length} browser context(s)`)
 
-  // Sleep 200 ms
-  await new Promise((resolve) => setTimeout(resolve, 1000))
+  // No wait: the relay announces every page (Target.attachedToTarget) before it answers the
+  // connect's Target.setAutoAttach, and connectOverCDP resolves once those pages are initialized
+  // (playwright-core crBrowser.ts connect → _waitForAllPagesToBeInitialized).
   for (const context of contexts) {
     const pages = context.pages()
     console.log(`Context has ${pages.length} page(s):`)

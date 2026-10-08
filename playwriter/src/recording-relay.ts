@@ -210,6 +210,7 @@ export class RecordingRelay {
         resolve(result)
       }
       recording.resolveStop = wrappedResolve
+      // The cap (a): the extension's recording data (resolveStop) answers first.
       timeoutId = setTimeout(() => {
         if (recording.resolveStop) {
           recording.resolveStop = undefined

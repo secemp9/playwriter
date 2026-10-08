@@ -137,6 +137,18 @@ describe('action report', () => {
     expect(result.text).toMatch(/AFTER-STATE UNAVAILABLE — the page was closed/)
   })
 
+  it('reports an act call the code did not await, once it has ended', async () => {
+    const { executor, observation } = await openFixture('human')
+    const a = refOf(observation, /button "A"/)
+    // Assigned, not awaited: the code returns while the human-paced click is still travelling.
+    const result = await executor.execute(`state.pending = act.click(${a})`, 30000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(new RegExp(`✓ click \\[${a}\\] button "A"`))
+    expect(result.text).toMatch(/A pressed/)
+    const look = await executor.execute('await observe()', 30000)
+    expect(look.text).toMatch(/A pressed/)
+  })
+
   it('follows raw input to the tab it went to, names that tab, and makes no claim without a picture of it', async () => {
     const { executor } = await openFixture('debug')
     const opened = await executor.execute('state.other = await context.newPage()', 30000)

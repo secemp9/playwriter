@@ -140,7 +140,7 @@ describe('one DOM read serves the page model and the accessibility snapshot', ()
 
   it('observe() reads the DOM once per renderer session and each frame’s accessibility tree once', async () => {
     const page = await openPage('containers.html')
-    const probes = new PageProbes({ logger: { error: () => {} } })
+    const probes = new PageProbes({ logger: { error: () => {} }, busyPace: () => 'human' })
     await probes.get(page)
     const { value: observation, axTrees, domReads } = await counted(() => probes.observe(page, context, {}, false))
     // Main document + the same-process srcdoc iframe: one session, two frames.
@@ -153,7 +153,7 @@ describe('one DOM read serves the page model and the accessibility snapshot', ()
 
   it('an observation built from a busy read’s trees is the observation read afresh', async () => {
     const page = await openPage('form.html')
-    const probes = new PageProbes({ logger: { error: () => {} } })
+    const probes = new PageProbes({ logger: { error: () => {} }, busyPace: () => 'human' })
     const probe = await probes.get(page)
     const known = await probe.watch.readBusy({})
     const reused = await counted(() => probes.observe(page, context, { all: true }, false, known))
@@ -166,7 +166,7 @@ describe('one DOM read serves the page model and the accessibility snapshot', ()
 
   it('observe() measures images from the layout it already read: no DOM.getBoxModel per image, the same images listed', async () => {
     const page = await openPage('spacer.html')
-    const probes = new PageProbes({ logger: { error: () => {} } })
+    const probes = new PageProbes({ logger: { error: () => {} }, busyPace: () => 'human' })
     await probes.get(page)
     const { value: observation, methods } = await counted(() => probes.observe(page, context, {}, false))
     // Before: one DOM.getBoxModel per image the accessibility tree lists (spacer.html: the chart, the icon, the spacers and pixels).

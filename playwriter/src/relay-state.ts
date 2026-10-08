@@ -136,6 +136,45 @@ export function createRelayStore(): StoreApi<RelayState> {
   }))
 }
 
+/**
+ * The longest wait a status long-poll takes (`?until=…&waitMs=N`, cdp-relay.ts): one minute, the
+ * contract its clients (relay-client, the extension) are written against.
+ */
+export const STATUS_WAIT_MAX_MS = 60_000
+
+/**
+ * Resolves true as soon as `holds(state)` is true (at once when it already is), false when `waitMs`
+ * passes or `signal` aborts first. The store's own subscription wakes it on every state change: no
+ * polling. Behind the relay's status long-polls (cdp-relay.ts `?until=`).
+ */
+export function untilRelayState(
+  store: StoreApi<RelayState>,
+  holds: (state: RelayState) => boolean,
+  { waitMs, signal }: { waitMs: number; signal: AbortSignal },
+): Promise<boolean> {
+  if (holds(store.getState())) {
+    return Promise.resolve(true)
+  }
+  if (signal.aborted) {
+    return Promise.resolve(false)
+  }
+  const settled = Promise.withResolvers<boolean>()
+  const unsubscribe = store.subscribe((state) => {
+    if (holds(state)) {
+      settled.resolve(true)
+    }
+  })
+  const onAbort = () => settled.resolve(false)
+  signal.addEventListener('abort', onAbort, { once: true })
+  // The cap (a): the caller's `waitMs`, the one timer of this wait; the state change answers first.
+  const cap = setTimeout(() => settled.resolve(false), waitMs)
+  return settled.promise.finally(() => {
+    unsubscribe()
+    clearTimeout(cap)
+    signal.removeEventListener('abort', onAbort)
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Derivation helpers
 // ---------------------------------------------------------------------------

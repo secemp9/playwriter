@@ -56,12 +56,30 @@ export interface TouchSample {
   y: number
 }
 
-/** How long and how a finger touches: waits come from the caller, so an aborted call stops between events. */
-export interface TouchTiming {
-  sleep: (ms: number) => Promise<void>
-  /** Told when the touch-down goes out and when Chrome confirms it, like a mouse press. */
-  onPress?: (stage: 'sent' | 'acknowledged') => void
-}
+/**
+ * How a finger touches. `human`: a person's timing, waited for (the waits come from the caller, so an
+ * aborted call stops between events). `fast` (fast mode): nothing waits. A tap's touch and lift go at
+ * once; a stroke's events go at once, at most FAST_STROKE_MOVES moves, each carrying the time a
+ * person's stroke gives it (CDP `timestamp`, the stroke ending now), so Chrome's gesture detection —
+ * fling velocity, the rest before the lift — reads the stroke a person makes. Measured on Chromium 145
+ * (Pixel-size touch emulation, 5 runs each): a tap and a double tap sent at once gave click and
+ * dblclick 5 of 5 (8–12 and 39–54 ms against 85–88 and 312 ms); a 300 px swipe sent as 3 stamped
+ * moves scrolled 285 px like the paced swipe (109–112 ms against 459–478), and a 1200 px one as 5
+ * moves 1185 px like it (94–95 ms against 462–479). Sent at once without the times, the swipe flung on
+ * (430–459 px for 300). The times are this process's clock: a browser on another machine with a clock
+ * of its own reads them shifted, which moves the whole stroke and keeps its spacing.
+ */
+export type TouchTiming =
+  | {
+      pace: 'human'
+      sleep: (ms: number) => Promise<void>
+      /** Told when the touch-down goes out and when Chrome confirms it, like a mouse press. */
+      onPress?: (stage: 'sent' | 'acknowledged') => void
+    }
+  | { pace: 'fast'; onPress?: (stage: 'sent' | 'acknowledged') => void }
+
+/** The most moves a fast stroke sends (see TouchTiming): each touchmove waits for a frame, so fewer is faster. */
+const FAST_STROKE_MOVES = 3
 
 function between(min: number, max: number): number {
   return min + Math.random() * (max - min)
@@ -72,44 +90,72 @@ function contact(at: Point, radius: number): Protocol.Input.TouchPoint {
   return { x: at.x, y: at.y, radiusX: radius, radiusY: radius * between(0.85, 1.05), force: 1, id: 0 }
 }
 
-async function dispatch(cdp: ICDPSession, type: 'touchStart' | 'touchMove' | 'touchEnd', touchPoints: Protocol.Input.TouchPoint[], what: string): Promise<void> {
-  await withDeadline(cdp.send('Input.dispatchTouchEvent', { type, touchPoints }), TOUCH_TIMEOUT_MS, what)
+async function dispatch(
+  cdp: ICDPSession,
+  type: 'touchStart' | 'touchMove' | 'touchEnd',
+  touchPoints: Protocol.Input.TouchPoint[],
+  what: string,
+  timestamp: number | undefined,
+): Promise<void> {
+  await withDeadline(cdp.send('Input.dispatchTouchEvent', { type, touchPoints, ...(timestamp !== undefined ? { timestamp } : {}) }), TOUCH_TIMEOUT_MS, what)
+}
+
+/** At most FAST_STROKE_MOVES of `moves`, evenly by index, the last one kept. */
+function fewerMoves(moves: TouchSample[]): TouchSample[] {
+  if (moves.length <= FAST_STROKE_MOVES) return moves
+  return Array.from({ length: FAST_STROKE_MOVES }, (_, index) => moves[Math.round(((index + 1) * moves.length) / FAST_STROKE_MOVES) - 1])
 }
 
 /**
  * A finger down at the first sample, along the others, up at the last; `restMs` it stays still
  * before lifting (a finger that rests first does not fling a scroller). The page's pointer track
- * (recordings) gets the touch as a press, moves and a release.
+ * (recordings) gets the touch as a press, moves and a release. In fast mode nothing waits and the
+ * events carry the stroke's times instead (TouchTiming).
  */
 export async function touchStroke(cdp: ICDPSession, page: Page, samples: TouchSample[], restMs: number, timing: TouchTiming): Promise<void> {
   const [first] = samples
   if (!first) return
   const track = pointerTrackFor(page)
   const radius = between(9, 13)
+  const moves = timing.pace === 'fast' ? fewerMoves(samples.slice(1)) : samples.slice(1)
+  const endMs = (moves.at(-1)?.tMs ?? 0) + restMs
+  // Fast: the stroke's times on the CDP clock (seconds since the epoch), ending now. A tap (no move) goes unstamped.
+  const stampedFrom = timing.pace === 'fast' && moves.length > 0 ? Date.now() - endMs : null
+  const stamp = (tMs: number): number | undefined => (stampedFrom === null ? undefined : (stampedFrom + tMs) / 1000)
   timing.onPress?.('sent')
   track.record({ x: first.x, y: first.y, kind: 'down', button: 'left' })
-  await dispatch(cdp, 'touchStart', [contact(first, radius)], 'touching the screen')
+  await dispatch(cdp, 'touchStart', [contact(first, radius)], 'touching the screen', stamp(0))
   timing.onPress?.('acknowledged')
   const startedAt = Date.now()
   let last: Point = first
-  for (const sample of samples.slice(1)) {
-    const wait = startedAt + sample.tMs - Date.now()
-    if (wait > 0) await timing.sleep(wait)
+  for (const sample of moves) {
+    if (timing.pace === 'human') {
+      // Human pacing (b): the finger's way on its own clock.
+      const wait = startedAt + sample.tMs - Date.now()
+      if (wait > 0) await timing.sleep(wait)
+    }
     track.record({ x: sample.x, y: sample.y, kind: 'move', button: 'left' })
-    await dispatch(cdp, 'touchMove', [contact(sample, radius)], 'moving the finger on the screen')
+    await dispatch(cdp, 'touchMove', [contact(sample, radius)], 'moving the finger on the screen', stamp(sample.tMs))
     last = sample
   }
-  if (restMs > 0) await timing.sleep(restMs)
+  // Human pacing (b): the finger rests before it lifts.
+  if (timing.pace === 'human' && restMs > 0) await timing.sleep(restMs)
   track.record({ x: last.x, y: last.y, kind: 'up', button: 'left' })
-  await dispatch(cdp, 'touchEnd', [], 'lifting the finger')
+  await dispatch(cdp, 'touchEnd', [], 'lifting the finger', stamp(endMs))
 }
 
-/** A person's tap at `at`: touch down, ~50–110 ms, lift. `count` 2 is a double tap (a second tap 100–180 ms later, a pixel or two off). */
+/**
+ * A person's tap at `at`: touch down, ~50–110 ms, lift. `count` 2 is a double tap (a second tap 100–180 ms
+ * later, a pixel or two off). In fast mode the touches and lifts go at once (TouchTiming).
+ */
 export async function tap(cdp: ICDPSession, page: Page, at: Point, count: number, timing: TouchTiming): Promise<void> {
   for (let index = 0; index < count; index++) {
-    if (index > 0) await timing.sleep(between(100, 180))
+    // Human pacing (b): the gap between the taps of a double tap.
+    if (index > 0 && timing.pace === 'human') await timing.sleep(between(100, 180))
     const point = index === 0 ? at : { x: at.x + between(-2, 2), y: at.y + between(-2, 2) }
-    await touchStroke(cdp, page, [{ tMs: 0, ...point }], between(50, 110), index === 0 ? timing : { sleep: timing.sleep })
+    const rest = timing.pace === 'human' ? between(50, 110) : 0
+    const strokeTiming: TouchTiming = timing.pace === 'human' ? { pace: 'human', sleep: timing.sleep, ...(index === 0 ? { onPress: timing.onPress } : {}) } : { pace: 'fast', ...(index === 0 ? { onPress: timing.onPress } : {}) }
+    await touchStroke(cdp, page, [{ tMs: 0, ...point }], rest, strokeTiming)
   }
 }
 

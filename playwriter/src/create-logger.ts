@@ -24,6 +24,8 @@ export function createFileLogger({ logFilePath }: { logFilePath?: string } = {})
 
   // Batch buffer: accumulate log lines and flush periodically to reduce disk I/O
   // under high CDP event throughput. See: https://github.com/remorses/playwriter/issues/96
+  // Batching (d), no state signal to flush on: lines arrive one at a time, and the interval turns them
+  // into one append per 500 ms; flush() writes what is buffered at once (before an exit).
   const FLUSH_INTERVAL_MS = 500
   let buffer: string[] = []
   let flushTimer: ReturnType<typeof setInterval> | undefined

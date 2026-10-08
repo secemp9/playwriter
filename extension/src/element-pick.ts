@@ -30,9 +30,14 @@ import {
 
 export type PickPurpose = 'pin' | 'react-source'
 
-/** The human has this long to click before the picker turns itself off. */
+/**
+ * The human has this long to click before the picker turns itself off. A duration that is the feature: no
+ * event says the human gave up, and a picker left on would keep the tab in inspect mode.
+ */
 const PICK_TIMEOUT_MS = 60_000
+/** How long the picked element stays highlighted: a duration that is the feature (the human sees the flash). */
 const FLASH_MS = 900
+/** The cap of one script or source-map fetch: a server that never answers. */
 const SOURCE_FETCH_TIMEOUT_MS = 5000
 
 const FLASH_OK = { r: 34, g: 197, b: 94 }

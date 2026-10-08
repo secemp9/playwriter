@@ -206,7 +206,8 @@ async function main(): Promise<void> {
       log(`  [STATS] ${successCount}/${totalRuns} successful (${rate}%), ${errorCount} errors`)
     }
 
-    // Wait before next iteration
+    // The soak's cadence (e), by design: one round of operations every INTERVAL_MS for the whole
+    // duration, so hours of use are spread out the way a person's are; nothing here is waited for.
     await Bun.sleep(INTERVAL_MS)
   }
 

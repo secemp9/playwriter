@@ -349,6 +349,8 @@ export class FileChooserGate {
     this.tailTimer = null
     const wait = this.tailUntil - Date.now()
     if (wait > 0) {
+      // Chrome's own clock (e): an input's user activation lasts ACTIVATION_LIFESPAN_MS, and no event says it ended;
+      // until then the page may still open a file dialog, so the hold stays.
       this.tailTimer = setTimeout(() => {
         this.tailTimer = null
         this.scheduleRelease()

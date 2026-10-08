@@ -68,6 +68,7 @@
  * this process's clock before they leave this module. Quiet windows are durations on one clock.
  */
 
+import { randomUUID } from 'node:crypto'
 import type { Frame } from '@xmorse/playwright-core'
 import type { Protocol } from 'devtools-protocol'
 import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js'
@@ -104,11 +105,13 @@ const WEBSOCKET_CAP = 2000
 const DOCUMENT_CAP = 5
 const BODY_CAP_CHARS = 64 * 1024
 const CONSOLE_TEXT_CAP = 2000
-/** Settle poll period. One poll is a single Runtime.evaluate of a few fields (~1-3ms locally). */
-const POLL_MS = 75
 /** Per-probe deadline inside settle: long enough for a busy renderer, short enough to notice a wedge. */
 const PROBE_TIMEOUT_MS = 3000
-/** How often a long wait looks again for shadow roots the page attached without a DOM mutation (closed ones, late upgrades). */
+/**
+ * At most how often a human-pace settle's reads look again for shadow roots the page attached without
+ * a DOM mutation the journal sees (closed ones, late upgrades): a DOMSnapshot per session is not free.
+ * When elements were inserted since the last look, the next one is due this long after it.
+ */
 const ROOT_DISCOVERY_MS = 1000
 /** A response whose last body bytes arrived within this window is still streaming. */
 const STREAM_RECENT_MS = 500
@@ -234,6 +237,10 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
   var nextSpinnerSet = 1;
   // Fast-settle passes waiting in this world: each hears of every content batch as it is recorded.
   var contentWaiters = [];
+  // Human-pace settle waits armed in this world, by id (see settleWait).
+  var settleWaits = {};
+  // Elements inserted, and scroll events: what a settle wait counts as having come after its read.
+  var added = 0, scrolls = 0;
 
   function norm(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
   function clip(s, n) { return s.length > n ? s.slice(0, n - 1) + '\u2026' : s; }
@@ -502,6 +509,7 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
         for (var j = 0; j < m.addedNodes.length; j++) {
           var n = m.addedNodes[j];
           if (n.nodeType !== 1 || !n.isConnected) continue;
+          added++;
           adopt(n, watchInside);
           if (n.matches(WATCH_SEL)) watch(n);
           watchInside(n);
@@ -542,6 +550,10 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     if (content && contentWaiters.length) {
       var recorded = batches[batches.length - 1];
       contentWaiters.slice().forEach(function (notify) { notify(recorded); });
+    }
+    if (content || cosmetic || ambient) {
+      var newest = batches[batches.length - 1];
+      for (var id in settleWaits) checkSettleWait(id, newest);
     }
   }
 
@@ -646,21 +658,31 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     return out;
   }
 
+  /**
+   * Busy signals the journal reads. \`streamingUntil\` (page clock): when \`streaming\` stops by itself
+   * if no more content comes — its newest batch grows older than STREAM_RECENT_MS, or the
+   * STREAM_MIN_BATCHES-th newest leaves STREAM_WINDOW_MS, whichever is first. \`arg.quietFrom\` (page
+   * clock, fast mode): the end of the page's last settle, which proved the content quiet then; only
+   * batches after it count.
+   */
   function busy(arg) {
     var cutoff = arg.since;
-    var now = Date.now(), recent = 0, newest = null, hotEl = null;
-    for (var i = batches.length - 1; i >= 0 && now - batches[i].at < STREAM_WINDOW_MS; i--) {
+    var quietFrom = arg.quietFrom == null ? null : arg.quietFrom;
+    var now = Date.now(), recent = 0, newest = null, hotEl = null, oldestNeeded = null;
+    for (var i = batches.length - 1; i >= 0 && now - batches[i].at < STREAM_WINDOW_MS && (quietFrom === null || batches[i].at > quietFrom); i--) {
       var b = batches[i];
       if (!b.content) continue;
       var t = batchTarget(b, cutoff);
       if (t === false) continue;
       recent++;
       if (newest === null) { newest = b.at; hotEl = t; }
+      if (recent === STREAM_MIN_BATCHES) oldestNeeded = b.at;
     }
-    var streaming = null;
+    var streaming = null, streamingUntil = null;
     if (newest !== null && now - newest < STREAM_RECENT_MS && recent >= STREAM_MIN_BATCHES) {
       var place = placeOf(hotEl);
       streaming = 'content still changing' + (place ? ' in ' + place : '');
+      streamingUntil = Math.min(newest + STREAM_RECENT_MS, oldestNeeded + STREAM_WINDOW_MS);
     }
     var announced = [];
     if (cutoff !== null) {
@@ -671,10 +693,14 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
         announced.push(rec.role + ' "' + clip(rec.text, 80) + '"');
       }
     }
-    return { streaming: streaming, announced: announced, spinners: spinners() };
+    return { streaming: streaming, streamingUntil: streamingUntil, announced: announced, spinners: spinners() };
   }
 
-  /** The journal's state: arg.cutoff excludes earlier churn; arg.from with arg.labels names the ambient changes since then. */
+  /**
+   * The journal's state: arg.cutoff excludes earlier churn; arg.from with arg.labels names the ambient
+   * changes since then. \`last\`, \`added\` and \`scrolls\` mark where it was read (the newest batch, the
+   * elements inserted and the scrolls so far): a settle wait counts what came after them.
+   */
   function stateOf(arg) {
     var last = lastContent(arg.cutoff);
     return {
@@ -682,7 +708,8 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
       hot: arg.labels ? placeOf(last.el) : null,
       ambient: arg.labels && arg.from !== null ? ambientSince(arg.cutoff, arg.from) : [],
       content: totals.content, cosmetic: totals.cosmetic,
-      loading: arg.loading ? loading() : null
+      loading: arg.loading ? loading() : null,
+      last: nextBatchId - 1, added: added, scrolls: scrolls
     };
   }
 
@@ -699,7 +726,6 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     function result(records) {
       var out = stateOf({ cutoff: arg.cutoff, from: arg.from, labels: true, loading: true });
       out.records = records;
-      out.last = nextBatchId - 1;
       return out;
     }
     if (after !== null) {
@@ -727,12 +753,61 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     });
   }
 
+  /**
+   * Whether the settle wait \`id\` fires on batch \`b\` (null: a scroll), and its answer if so. It fires
+   * on a batch that counts as content; with \`any\`, on any batch or scroll; with \`keys\` (the
+   * loading indicators the host's read saw), on a batch or scroll after which they differ.
+   */
+  function checkSettleWait(id, b) {
+    var w = settleWaits[id];
+    var counts = b !== null && b.content > 0 && batchTarget(b, w.cutoff) !== false;
+    var shown = w.keys ? loading().map(function (l) { return l.key; }) : null;
+    var changed = shown !== null && (shown.length !== w.keys.length || shown.some(function (k) { return w.keys.indexOf(k) < 0; }));
+    if (!counts && !w.any && !changed) return;
+    delete settleWaits[id];
+    w.resolve({ at: b !== null ? b.at : Date.now(), gone: shown !== null ? w.keys.filter(function (k) { return shown.indexOf(k) < 0; }) : [] });
+  }
+  function releaseSettleWait(id) {
+    var w = settleWaits[id];
+    if (!w) return;
+    delete settleWaits[id];
+    w.resolve(null);
+  }
+  /**
+   * A human-pace settle's wait in this frame, which the host races with its own events (requests, a
+   * dialog, a navigation, the quiet windows' end, the cap): resolves on the first change after the
+   * host's read (arg.token's state at arg.after and arg.scrolls) that can move its verdict
+   * (checkSettleWait), with when it came (page clock) and which of arg.keys were gone then; at once
+   * when one came since that read, or when the read was of another document. Resolves null when
+   * released: a later state() names it in arg.release (the host stopped waiting), or the journal stops.
+   */
+  function settleWait(arg) {
+    var waiting = Promise.withResolvers();
+    if (arg.token !== token) {
+      waiting.resolve({ at: Date.now(), gone: [] });
+      return waiting.promise;
+    }
+    settleWaits[arg.id] = { cutoff: arg.cutoff, any: arg.any, keys: arg.keys, resolve: waiting.resolve };
+    if (arg.scrolls !== scrolls) checkSettleWait(arg.id, null);
+    for (var i = 0; i < batches.length && settleWaits[arg.id]; i++) if (batches[i].id > arg.after) checkSettleWait(arg.id, batches[i]);
+    return waiting.promise;
+  }
+  function onScroll() {
+    scrolls++;
+    for (var id in settleWaits) checkSettleWait(id, null);
+  }
+  // Capture: a scroll of any element reaches the document only in that phase. Passive: never delays scrolling.
+  document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+
   observeRoot(document);
   adopt(document, null);
 
   globalThis.__playwriterWatch = {
     version: VERSION,
-    state: stateOf,
+    state: function (arg) {
+      (arg.release || []).forEach(releaseSettleWait);
+      return stateOf(arg);
+    },
     read: function (sinceAt) {
       var outLive = [];
       for (var i = 0; i < live.length; i++) {
@@ -749,6 +824,7 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
     },
     busy: busy,
     pass: pass,
+    settleWait: settleWait,
     spinnerTargets: function (set) { var els = spinnerSets[set] || []; delete spinnerSets[set]; return els; },
     valueChangedAt: function (el) { return el ? valueChangedAt.get(el) || null : null; },
     /** A shadow root found through CDP: a closed one, invisible to script. */
@@ -759,7 +835,12 @@ const WATCH_SOURCE_TEMPLATE = String.raw`(function () {
       return true;
     },
     sweep: function () { sweep(); return token; },
-    stop: function () { observer.disconnect(); delete globalThis.__playwriterWatch; }
+    stop: function () {
+      observer.disconnect();
+      document.removeEventListener('scroll', onScroll, { capture: true });
+      Object.keys(settleWaits).forEach(releaseSettleWait);
+      delete globalThis.__playwriterWatch;
+    }
   };
 })();`
 
@@ -834,9 +915,12 @@ interface LoadingIndicator {
   label: string
 }
 
-/** One frame journal's state. */
+/** One frame journal's state, and where it was read: its newest batch (`last`), the elements inserted (`added`) and the scrolls so far. */
 interface WorldState extends ContentState {
   token: string
+  last: number
+  added: number
+  scrolls: number
 }
 
 interface WorldLive {
@@ -877,15 +961,19 @@ interface WorldSpinner {
 
 interface WorldBusy {
   streaming: string | null
+  /** When `streaming` stops by itself if no more content comes (page clock); null when not streaming. */
+  streamingUntil: number | null
   announced: string[]
   spinners: { set: number; list: WorldSpinner[] }
 }
 
-/** One frame's fast-settle pass: its journal's state at the end, whether content changed during it, and the newest batch id it saw. */
+/** One frame's fast-settle pass: its journal's state at the end, and whether content changed during it. */
 interface WorldPass extends WorldState {
   records: boolean
-  last: number
 }
+
+/** A frame's settle wait answered (the journal's settleWait): when (page clock) and which loading indicators of its read were gone then; null when it was released. */
+type SettleWaitAnswer = { at: number; gone: string[] } | null
 
 /** The newest journal batch a pass saw in a frame's document (its journal `token`): the next pass counts what came after it. */
 interface JournalMark {
@@ -1028,6 +1116,15 @@ export interface BusyOptions {
    * value changed within the last PROGRESS_MOVING_MS. A bar standing still is no signal either way.
    */
   since?: WatchCheckpoint
+  /**
+   * `fast` (fast mode): content counts as still changing only from the end of this page's last settle,
+   * and from one change on. A fast settle proves the content quiet when it ends, so an action's own
+   * burst of changes, over by then, is no stream; a change after it is the page's own (a stream, a
+   * timer, a late answer) — one within STREAM_RECENT_MS is still changing. Human pace (the default):
+   * STREAM_MIN_BATCHES changes within STREAM_WINDOW_MS, whatever came before — a single re-render
+   * after an action is no stream, and its pacing lets the action's burst age out of the window.
+   */
+  pace?: 'human' | 'fast'
 }
 
 /** A frame's accessibility tree as one busy read got it, for its document `loaderId`. */
@@ -1087,10 +1184,15 @@ interface FastRun {
 type Paced = { pace: 'human' } | { pace: 'fast'; fast: FastSettleEvidence }
 const HUMAN: { pace: 'human' } = { pace: 'human' }
 
-/** Loading indicators the reads of a settle step saw: what was shown while it waited and is gone at the end is reported. */
+/**
+ * Loading indicators the reads of a settle step saw: what was shown while it waited and is gone at the
+ * end is reported, with how long it was seen — from the first read that showed it to the DOM change
+ * that removed it when a human-pace settle's wait saw that change (`vanished`), else to the last read
+ * that showed it.
+ */
 class LoadingLog {
-  /** Key → latest label, and the first and last read that showed it. */
-  private readonly seen = new Map<string, { label: string; first: number; last: number }>()
+  /** Key → latest label, the first and last read that showed it, and the change that removed it (null: none seen since). */
+  private readonly seen = new Map<string, { label: string; first: number; last: number; until: number | null }>()
   /** The keys the latest read showed. */
   private shown = new Set<string>()
 
@@ -1098,13 +1200,19 @@ class LoadingLog {
     this.shown = new Set(loading.map(({ key }) => key))
     for (const { key, label } of loading) {
       const seen = this.seen.get(key)
-      if (seen) Object.assign(seen, { label, last: at })
-      else this.seen.set(key, { label, first: at, last: at })
+      if (seen) Object.assign(seen, { label, last: at, until: null })
+      else this.seen.set(key, { label, first: at, last: at, until: null })
     }
   }
 
+  /** `key` was no longer shown after a DOM change at `at` (this process's clock); one older than the last read that showed it is stale. */
+  vanished(key: string, at: number): void {
+    const seen = this.seen.get(key)
+    if (seen && at >= seen.last) seen.until = at
+  }
+
   gone(): Array<{ label: string; seenMs: number }> {
-    return [...this.seen].filter(([key]) => !this.shown.has(key)).map(([, seen]) => ({ label: seen.label, seenMs: seen.last - seen.first }))
+    return [...this.seen].filter(([key]) => !this.shown.has(key)).map(([, seen]) => ({ label: seen.label, seenMs: (seen.until ?? seen.last) - seen.first }))
   }
 }
 
@@ -1261,8 +1369,20 @@ export class PageWatch {
   private mainDocumentId: string | null = null
   private currentUrl: string | null = null
   private mainFrameLoading = false
-  /** Woken on a dialog change, a navigation commit or the main frame finishing loading. */
+  /** When a settle of this page last ended settled (this process's clock): fast busy reads count content changes from it. */
+  private settledAt: number | null = null
+  /** Woken on a dialog change, a navigation commit, the main frame finishing loading or dispose. */
   private readonly wakers = new Set<() => void>()
+  /**
+   * Human-pace settle waits, told of a request journaled, answered or ended (the request), and of the
+   * main frame starting to load or a new main document (null): what moves its windows besides wakers'.
+   */
+  private readonly settleWaiters = new Set<(request: RequestEntry | null) => void>()
+  /** Names this watch's settle waits in the frames' journals, which another watch of the tab may share. */
+  private readonly waitPrefix = randomUUID()
+  private settleWaitCount = 0
+  /** Settle waits armed in the frames' journals that are over: the next state read releases them. */
+  private readonly staleWaits = new Set<string>()
   /** Woken on every dialog change. */
   private readonly dialogWaiters = new Set<() => void>()
   /** Requests a fast settle awaits → resolved when the request is answered (response headers) or ends. */
@@ -1311,6 +1431,7 @@ export class PageWatch {
       if (e.frameId !== this.frames.mainFrameId()) return
       this.mainFrameLoading = true
       this.readBeforeLeaving()
+      this.settleChanged(null)
     })
     this.listenPage('Page.frameStoppedLoading', (e) => {
       if (e.frameId !== this.frames.mainFrameId()) return
@@ -1450,13 +1571,32 @@ export class PageWatch {
 
   /** busySignals, with the accessibility trees they were read from: the next observation needs them too. */
   async readBusy(options: BusyOptions = {}): Promise<BusyRead> {
+    const { signals, axTrees } = await this.readBusyTimed(options)
+    return { signals, axTrees }
+  }
+
+  /**
+   * readBusy, and when its strong signals end by themselves if nothing else happens (this process's
+   * clock): the latest of their own ends — content streaming or a response body arriving goes stale,
+   * a bar stops counting as moving — or null when one only ends on a change (an aria-busy, a spinner
+   * or skeleton, an indeterminate bar, a bar that advanced since the action). -Infinity: none is strong.
+   */
+  private async readBusyTimed(options: BusyOptions): Promise<BusyRead & { strongEndsAt: number | null }> {
     await this.waitOutAutoDialog('reading busy signals')
     // Compared in the page with the journal's stamps: on the browser's clock.
     const sinceAt = options.since ? await this.onBrowserClock(options.since.at) : null
-    const perFrame = await this.eachFrame(await this.readableFrames(), (entry) => this.frameBusySignals(entry, sinceAt))
+    const quietFromAt = options.pace === 'fast' && this.settledAt !== null ? await this.onBrowserClock(this.settledAt) : null
+    const endsAt = new Map<BusySignal, number>()
+    const perFrame = await this.eachFrame(await this.readableFrames(), (entry) => this.frameBusySignals(entry, sinceAt, quietFromAt, endsAt))
     const signals = perFrame.flatMap(({ value }) => value.signals)
-    signals.push(...this.networkBusy())
-    return { signals, axTrees: new Map(perFrame.map(({ handle, value }) => [handle.frameId, { loaderId: handle.loaderId, nodes: value.nodes }])) }
+    signals.push(...this.networkBusy(endsAt))
+    let strongEndsAt: number | null = -Infinity
+    for (const signal of signals) {
+      if (signal.strength !== 'strong') continue
+      const end = endsAt.get(signal)
+      strongEndsAt = end === undefined || strongEndsAt === null ? null : Math.max(strongEndsAt, end)
+    }
+    return { signals, axTrees: new Map(perFrame.map(({ handle, value }) => [handle.frameId, { loaderId: handle.loaderId, nodes: value.nodes }])), strongEndsAt }
   }
 
   /**
@@ -1475,18 +1615,20 @@ export class PageWatch {
    */
   async settle(options: SettleOptions = {}): Promise<SettleResult> {
     const origin = options.origin ?? Date.now()
-    if (options.pace === 'fast') {
-      return await this.waitSettledFast({ timeoutMs: options.timeoutMs ?? 5000, origin, causalFrom: options.since?.at ?? origin, since: options.since })
-    }
-    return await this.waitQuiet({
-      timeoutMs: options.timeoutMs ?? 5000,
-      domQuietMs: options.domQuietMs ?? 300,
-      networkQuietMs: options.networkQuietMs ?? 500,
-      origin,
-      causalFrom: options.since?.at ?? origin,
-      since: options.since,
-      needIdle: false,
-    })
+    const result =
+      options.pace === 'fast'
+        ? await this.waitSettledFast({ timeoutMs: options.timeoutMs ?? 5000, origin, causalFrom: options.since?.at ?? origin, since: options.since })
+        : await this.waitQuiet({
+            timeoutMs: options.timeoutMs ?? 5000,
+            domQuietMs: options.domQuietMs ?? 300,
+            networkQuietMs: options.networkQuietMs ?? 500,
+            origin,
+            causalFrom: options.since?.at ?? origin,
+            since: options.since,
+            needIdle: false,
+          })
+    if (result.settled) this.settledAt = Date.now()
+    return result
   }
 
   /**
@@ -1497,7 +1639,7 @@ export class PageWatch {
    */
   async waitForIdle(options: IdleOptions = {}): Promise<SettleResult> {
     const origin = options.origin ?? Date.now()
-    return await this.waitQuiet({
+    const result = await this.waitQuiet({
       timeoutMs: options.timeoutMs ?? 60000,
       domQuietMs: options.quietMs ?? 1500,
       networkQuietMs: options.networkQuietMs ?? 1000,
@@ -1506,6 +1648,8 @@ export class PageWatch {
       since: options.since,
       needIdle: true,
     })
+    if (result.settled) this.settledAt = Date.now()
+    return result
   }
 
   requests(filter: { urlIncludes?: string; method?: string; failedOnly?: boolean; limit?: number } = {}): NetworkRecord[] {
@@ -1643,82 +1787,176 @@ export class PageWatch {
   // settle
   // ---------------------------------------------------------------------------
 
+  /**
+   * Human pace: read every frame's journal, then sleep until something that can change the verdict
+   * happens (untilSettleChange) and read again — never on a period. Between reads it listens to the
+   * frames' journals (a content change; any change while waiting for idle on a strong busy signal; a
+   * change of the loading indicators shown), the request journal, navigations, dialogs and the page
+   * closing; its one timer is the earliest moment the verdict could change with nothing happening (the
+   * quiet windows' end, a strong busy signal's own end, a shadow-root look that is due), or the cap.
+   */
   private async waitQuiet(goal: QuietGoal): Promise<SettleResult> {
     const startedAt = Date.now()
     const deadline = startedAt + goal.timeoutMs
     const openAtStart = this.openEndpoints(goal.causalFrom)
     let origin = goal.origin
     let rootsLookedAt = 0
-    // A busy read walks the whole accessibility tree; the next poll waits at least as long as it took.
-    let busyReadMs = 0
-    // Loading indicators the polls saw: what was shown while waiting and is gone at the end is reported.
+    // The elements each frame's journal had seen inserted when shadow roots were last looked for, and at the last read.
+    let insertedAtLook = ''
+    let inserted = ''
+    // Loading indicators the reads saw: what was shown while waiting and is gone at the end is reported.
     const loadingLog = new LoadingLog()
-    for (;;) {
-      const blocked = this.blockedResult(startedAt, goal.causalFrom, openAtStart, HUMAN)
-      if (blocked) return blocked
-      if (this.dialogs.current()) {
-        // The policy answers this one by itself; the page is frozen until it closes and then
-        // resumes running, so the quiet windows start again from the close.
-        await this.untilDialogChange(deadline)
-        if (!this.dialogs.current()) origin = Math.max(origin, Date.now())
-      } else if (!this.mainFrameLoading) {
-        let state: ContentState | undefined
-        try {
-          if (Date.now() - rootsLookedAt >= ROOT_DISCOVERY_MS) {
-            const discovered = await this.unlessDialog(this.readableFrames().then((entries) => this.discoverShadowRoots(entries)))
-            if ('dialog' in discovered) continue
-            rootsLookedAt = Date.now()
-          }
-          const raced = await this.unlessDialog(this.readState(goal.since?.at ?? null, null, PROBE_TIMEOUT_MS, false, true))
-          if ('dialog' in raced) continue
-          state = raced.value
-          loadingLog.note(state.loading ?? [], Date.now())
-        } catch (error) {
-          const ended = this.endedResult(startedAt, error, HUMAN)
-          if (ended) return ended
-          // A document was replaced between the loading check and the read: measure the new one next round.
-          if (!DEAD_CONTEXT_RE.test(errorMessage(error))) throw error
+    // A page that closes while the loop waits wakes it; the loop then reports it.
+    const onClose = (): void => this.wake()
+    this.frames.page.once('close', onClose)
+    try {
+      for (;;) {
+        const blocked = this.blockedResult(startedAt, goal.causalFrom, openAtStart, HUMAN)
+        if (blocked) return blocked
+        if (this.dialogs.current()) {
+          // The policy answers this one by itself; the page is frozen until it closes and then
+          // resumes running, so the quiet windows start again from the close.
+          await this.untilDialogChange(deadline)
+          if (!this.dialogs.current()) origin = Math.max(origin, Date.now())
+          if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, loadingLog.gone())
+          continue
         }
-        if (state) {
-          const now = Date.now()
-          const domQuietFor = Math.min(now - origin, msSinceContent(state))
-          if (domQuietFor >= goal.domQuietMs && this.networkQuietFor(now, origin, goal.causalFrom, openAtStart) >= goal.networkQuietMs) {
-            // Only waiting for idle needs the busy signals (a strong one keeps it waiting). After settle,
-            // the report reads them from the after-picture it takes next, so settle does not read them.
-            let busy: BusySignal[] | undefined
-            if (goal.needIdle) {
-              const busyReadStart = Date.now()
-              const read = await this.unlessDialog(this.busySignals({ since: goal.since }))
-              if ('dialog' in read) continue
-              busyReadMs = Date.now() - busyReadStart
-              busy = read.value
+        // What the wait below listens to: the frames read (their journals' waits), whether any change
+        // counts (waiting for idle on a strong busy signal), and when the verdict could change with
+        // nothing happening (null: only an event can change it).
+        let reads: Array<{ handle: FrameEntry; value: WorldState }> = []
+        let any = false
+        let changesAt: number | null = null
+        // A cross-document navigation in progress: the main frame's frameNavigated, frameStoppedLoading
+        // or loadEventFired wakes the wait, and the new document is read then.
+        if (!this.mainFrameLoading) {
+          let state: ContentState | undefined
+          try {
+            const looking = Date.now() - rootsLookedAt >= ROOT_DISCOVERY_MS
+            if (looking) {
+              const discovered = await this.unlessDialog(this.readableFrames().then((entries) => this.discoverShadowRoots(entries)))
+              if ('dialog' in discovered) continue
+              rootsLookedAt = Date.now()
             }
-            if (!busy?.some((s) => s.strength === 'strong')) {
-              const ambient = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS))
-              if ('dialog' in ambient) continue
-              const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
-              const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
-              const gone = loadingLog.gone()
-              return {
-                pace: 'human',
-                settled: true,
-                waitedMs: Date.now() - startedAt,
-                reason: 'quiet',
-                pendingRequests: [],
-                ...(iframeDocuments.length ? { iframeDocuments } : {}),
-                ...(uncaused.length ? { uncaused } : {}),
-                ...(ambient.value.ambient.length ? { ambient: ambient.value.ambient } : {}),
-                ...(state.lastContentAt !== null ? { msSinceLastContentMutation: state.now - state.lastContentAt } : {}),
-                ...(busy ? { busy } : {}),
-                ...(gone.length ? { busyWhileSettling: gone } : {}),
+            const raced = await this.unlessDialog(this.readFrameStates(goal.since?.at ?? null, null, PROBE_TIMEOUT_MS, false, true))
+            if ('dialog' in raced) continue
+            reads = raced.value
+            inserted = reads.map(({ handle, value }) => `${handle.frameId} ${value.token} ${value.added}`).join('\n')
+            if (looking) insertedAtLook = inserted
+            state = this.combineStates(reads, true)
+            loadingLog.note(state.loading ?? [], Date.now())
+          } catch (error) {
+            const ended = this.endedResult(startedAt, error, HUMAN)
+            if (ended) return ended
+            // A document was replaced between the loading check and the read: its successor's main
+            // world (settleChanged) or the navigation's events wake the wait, and it is read then.
+            if (!DEAD_CONTEXT_RE.test(errorMessage(error))) throw error
+          }
+          if (state) {
+            const now = Date.now()
+            const domQuietFor = Math.min(now - origin, msSinceContent(state))
+            if (domQuietFor >= goal.domQuietMs && this.networkQuietFor(now, origin, goal.causalFrom, openAtStart) >= goal.networkQuietMs) {
+              // Only waiting for idle needs the busy signals (a strong one keeps it waiting). After settle,
+              // the report reads them from the after-picture it takes next, so settle does not read them.
+              let busy: BusySignal[] | undefined
+              if (goal.needIdle) {
+                const read = await this.unlessDialog(this.readBusyTimed({ since: goal.since }))
+                if ('dialog' in read) continue
+                busy = read.value.signals
+                // Still busy: any change can end it (an aria-busy removed, a spinner hidden by a class, a
+                // bar's value, a scroll), and so can a strong signal's own end.
+                any = true
+                changesAt = read.value.strongEndsAt
               }
+              if (!busy?.some((s) => s.strength === 'strong')) {
+                const ambient = await this.unlessDialog(this.readState(goal.since?.at ?? null, origin, PROBE_TIMEOUT_MS))
+                if ('dialog' in ambient) continue
+                const uncaused = this.uncausedRequests(now, goal.causalFrom, openAtStart)
+                const iframeDocuments = this.undeliveredIframeDocuments(now, goal.causalFrom, openAtStart)
+                const gone = loadingLog.gone()
+                return {
+                  pace: 'human',
+                  settled: true,
+                  waitedMs: Date.now() - startedAt,
+                  reason: 'quiet',
+                  pendingRequests: [],
+                  ...(iframeDocuments.length ? { iframeDocuments } : {}),
+                  ...(uncaused.length ? { uncaused } : {}),
+                  ...(ambient.value.ambient.length ? { ambient: ambient.value.ambient } : {}),
+                  ...(state.lastContentAt !== null ? { msSinceLastContentMutation: state.now - state.lastContentAt } : {}),
+                  ...(busy ? { busy } : {}),
+                  ...(gone.length ? { busyWhileSettling: gone } : {}),
+                }
+              }
+            } else {
+              const network = this.networkQuietAt(now, origin, goal.causalFrom, openAtStart, goal.networkQuietMs)
+              // The content's window ends domQuietMs after its last change (measured at the read, so never early) and after `origin`.
+              changesAt = network === null ? null : Math.max(origin + goal.domQuietMs, now + goal.domQuietMs - msSinceContent(state), network)
             }
           }
         }
+        if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, loadingLog.gone())
+        // Elements were inserted since shadow roots were last looked for: a closed root attached to one
+        // makes no DOM mutation the journal sees, so the look is due ROOT_DISCOVERY_MS after the last one.
+        if (inserted !== insertedAtLook) changesAt = Math.min(changesAt ?? Infinity, rootsLookedAt + ROOT_DISCOVERY_MS)
+        const relevant = any
+          ? (entry: RequestEntry): boolean => !entry.isAdRelated
+          : (entry: RequestEntry): boolean =>
+              !entry.isAdRelated && !(entry.resourceType !== undefined && NEVER_HOLDS[entry.resourceType]) && this.caused(entry, goal.causalFrom, openAtStart)
+        await this.untilSettleChange(reads, goal, any, relevant, Math.min(changesAt ?? deadline, deadline), loadingLog)
       }
-      if (Date.now() >= deadline) return await this.timeoutResult(startedAt, goal, origin, openAtStart, loadingLog.gone())
-      await this.pause(Math.min(Math.max(POLL_MS, busyReadMs), Math.max(0, deadline - Date.now())))
-      busyReadMs = 0
+    } finally {
+      this.frames.page.off('close', onClose)
+    }
+  }
+
+  /**
+   * Until something happens that can change a human-pace settle's verdict: a frame read in `reads`
+   * answers its journal's settle wait (a content change; with `any`, any change; a change of the
+   * loading indicators that read saw, whose ends go to `loadingLog`) or fails (its document went
+   * away); a request event `relevant` keeps; wake() (a dialog, a navigation committed, the main frame
+   * done loading, the page closed, dispose); settleChanged(null) (the main frame started loading, a new
+   * main document); or `until`.
+   */
+  private async untilSettleChange(
+    reads: Array<{ handle: FrameEntry; value: WorldState }>,
+    goal: QuietGoal,
+    any: boolean,
+    relevant: (entry: RequestEntry) => boolean,
+    until: number,
+    loadingLog: LoadingLog,
+  ): Promise<void> {
+    const changed = Promise.withResolvers<void>()
+    const onSettle = (request: RequestEntry | null): void => {
+      if (request === null || relevant(request)) changed.resolve()
+    }
+    this.wakers.add(changed.resolve)
+    this.settleWaiters.add(onSettle)
+    const id = `${this.waitPrefix}.${++this.settleWaitCount}`
+    const cutoff = goal.since ? this.clock.toBrowser(goal.since.at) : null
+    for (const { handle, value } of reads) {
+      const where = this.inFrame(handle)
+      const arg = JSON.stringify({ id, token: value.token, after: value.last, scrolls: value.scrolls, cutoff, any, keys: value.loading?.map(({ key }) => key) ?? null })
+      // Its deadline outlasts the wait (the next read releases it): it only names a page that stopped answering.
+      this.callReader<SettleWaitAnswer>(handle.world, `settleWait(${arg})`, until - Date.now() + PROBE_TIMEOUT_MS, `waiting for the page to change${where}`, true).then(
+        (answer) => {
+          if (answer) for (const key of answer.gone) loadingLog.vanished(`${key}${where}`, this.clock.toLocal(answer.at))
+          changed.resolve()
+        },
+        // The document went away (navigated, closed) or stopped answering: the next read says which.
+        () => changed.resolve(),
+      )
+    }
+    // The one timer: (c) the end of the quiet windows — or of the strong busy signals, or the due look
+    // for shadow roots — when nothing happens before it; (a) the cap when that is sooner.
+    const timer = setTimeout(changed.resolve, Math.max(0, until - Date.now()))
+    try {
+      await changed.promise
+    } finally {
+      clearTimeout(timer)
+      this.wakers.delete(changed.resolve)
+      this.settleWaiters.delete(onSettle)
+      if (reads.length > 0) this.staleWaits.add(id)
     }
   }
 
@@ -2031,8 +2269,48 @@ export class PageWatch {
     return now - last
   }
 
-  /** Response bodies still arriving (strong) and requests the server holds without answering (weak). */
-  private networkBusy(): BusySignal[] {
+  /**
+   * The earliest moment networkQuietFor can reach `quietMs` if no request event comes first: `quietMs`
+   * after the last caused request started or ended — or, while caused requests hold quiet, when the
+   * last of them stops holding by itself (stopsHoldingAt). null while one holds quiet until it ends.
+   */
+  private networkQuietAt(now: number, origin: number, causalFrom: number, openAtStart: Set<string>, quietMs: number): number | null {
+    let last = origin
+    let released = -Infinity
+    for (const r of this.requestLog) {
+      if (!this.caused(r, causalFrom, openAtStart)) continue
+      if (this.holdsQuiet(r, now)) {
+        const stops = this.stopsHoldingAt(r)
+        if (stops === null) return null
+        released = Math.max(released, stops)
+        last = Math.max(last, this.startOf(r))
+        continue
+      }
+      if (r.isAdRelated || (r.resourceType !== undefined && NEVER_HOLDS[r.resourceType])) continue
+      last = Math.max(last, this.startOf(r), r.endedAt ?? 0)
+    }
+    return Math.max(released, last + quietMs)
+  }
+
+  /**
+   * When an open request that holds quiet stops holding it with no event (this process's clock): an
+   * image, font or media request STALLED_ASSET_MS after its last bytes, an iframe's undelivered
+   * document IFRAME_DOCUMENT_MS after it started (both checks are strict, hence the 1 ms); null when
+   * only its end can.
+   */
+  private stopsHoldingAt(entry: RequestEntry): number | null {
+    const type = entry.resourceType
+    const stalls = type !== undefined && STALLABLE[type] === true ? (entry.lastDataAt ?? this.startOf(entry)) + STALLED_ASSET_MS + 1 : Infinity
+    const undelivered = entry.headersAt === undefined && !entry.isAdRelated && this.iframeOf(entry) !== undefined ? this.startOf(entry) + IFRAME_DOCUMENT_MS + 1 : Infinity
+    const stops = Math.min(stalls, undelivered)
+    return stops === Infinity ? null : stops
+  }
+
+  /**
+   * Response bodies still arriving (strong) and requests the server holds without answering (weak).
+   * `endsAt` gets when each streaming signal goes stale if no more bytes come.
+   */
+  private networkBusy(endsAt?: Map<BusySignal, number>): BusySignal[] {
     const now = Date.now()
     const out: BusySignal[] = []
     for (const r of this.requestLog) {
@@ -2041,7 +2319,9 @@ export class PageWatch {
       if (r.headersAt !== undefined) {
         const streamable = (r.resourceType !== undefined && STREAMABLE[r.resourceType]) || r.mimeType === EVENT_STREAM_MIME
         if (streamable && r.lastDataAt !== undefined && now - r.lastDataAt < STREAM_RECENT_MS) {
-          out.push({ strength: 'strong', kind: 'network-streaming', label: `response still arriving (${age}): ${r.method} ${this.shortUrl(r.url)}` })
+          const signal: BusySignal = { strength: 'strong', kind: 'network-streaming', label: `response still arriving (${age}): ${r.method} ${this.shortUrl(r.url)}` }
+          out.push(signal)
+          endsAt?.set(signal, r.lastDataAt + STREAM_RECENT_MS)
         }
       } else if ((this.holdsQuiet(r, now) || this.undeliveredIframeDocument(r, now)) && now - this.startOf(r) > HELD_REQUEST_MS) {
         const iframe = this.iframeOf(r)
@@ -2061,14 +2341,20 @@ export class PageWatch {
    * skeletons. `sinceAt` is on the browser's clock. A determinate progressbar is busy only while
    * its value moves (since the action, or within PROGRESS_MOVING_MS without one): a bar standing
    * still — a chart, GitHub's language bar, a finished upload — tells a person nothing is working.
+   * `endsAt` gets when each strong signal that ends by itself does (this process's clock).
    */
-  private async frameBusySignals(entry: FrameHandle, sinceAt: number | null): Promise<{ signals: BusySignal[]; nodes: Protocol.Accessibility.AXNode[] }> {
+  private async frameBusySignals(
+    entry: FrameHandle,
+    sinceAt: number | null,
+    quietFromAt: number | null,
+    endsAt: Map<BusySignal, number>,
+  ): Promise<{ signals: BusySignal[]; nodes: Protocol.Accessibility.AXNode[] }> {
     const where = this.inFrame(entry)
     // A session answers for the frame it is rooted at by default; its same-process iframes are named.
     const scope = entry.frameId === entry.sessionRootId ? {} : { frameId: entry.frameId }
     const [ax, page] = await Promise.all([
       withDeadline(entry.cdp.send('Accessibility.getFullAXTree', scope), PROBE_TIMEOUT_MS, `reading the accessibility tree for busy state${where}`),
-      this.callReader<WorldBusy>(entry.world, `busy(${JSON.stringify({ since: sinceAt })})`, PROBE_TIMEOUT_MS, `reading busy signals in the isolated world${where}`),
+      this.callReader<WorldBusy>(entry.world, `busy(${JSON.stringify({ since: sinceAt, quietFrom: quietFromAt })})`, PROBE_TIMEOUT_MS, `reading busy signals in the isolated world${where}`),
     ])
     const out: BusySignal[] = []
     const byId = new Map(ax.nodes.map((node) => [node.nodeId, node]))
@@ -2104,11 +2390,18 @@ export class PageWatch {
         const unfinished = typeof max !== 'number' || value < max
         if (moved === null || moved === undefined || moved < movedSince || !unfinished) return
         const how = sinceAt !== null ? ' (advanced since the action)' : ' (moving)'
-        out.push({ strength: 'strong', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where}${how}` })
+        const signal: BusySignal = { strength: 'strong', kind: 'progressbar', label: `${progressLabel(node, value, byId)}${where}${how}` }
+        out.push(signal)
+        // Without an action, moving means within PROGRESS_MOVING_MS (a strict check, hence the 1 ms).
+        if (sinceAt === null) endsAt.set(signal, this.clock.toLocal(moved) + PROGRESS_MOVING_MS + 1)
       })
     }
     out.push(...(await this.spinnerSignals(entry, page.spinners, sinceAt)))
-    if (page.streaming) out.push({ strength: 'strong', kind: 'dom-streaming', label: `${page.streaming}${where}` })
+    if (page.streaming) {
+      const signal: BusySignal = { strength: 'strong', kind: 'dom-streaming', label: `${page.streaming}${where}` }
+      out.push(signal)
+      if (page.streamingUntil !== null) endsAt.set(signal, this.clock.toLocal(page.streamingUntil))
+    }
     for (const text of page.announced) out.push({ strength: 'weak', kind: 'status-text', label: `${text}${where} (announced since the action)` })
     return { signals: out, nodes: ax.nodes }
   }
@@ -2298,18 +2591,26 @@ export class PageWatch {
    * loading indicators each frame shows now (the settle loop notes what it waits through).
    */
   private async readState(cutoff: number | null, from: number | null, timeoutMs: number, labels = from !== null, loading = false): Promise<ContentState> {
+    return this.combineStates(await this.readFrameStates(cutoff, from, timeoutMs, labels, loading), loading)
+  }
+
+  /** readState's reads, frame by frame. Each also releases the settle waits that are over (`staleWaits`). */
+  private async readFrameStates(cutoff: number | null, from: number | null, timeoutMs: number, labels: boolean, loading: boolean): Promise<Array<{ handle: FrameEntry; value: WorldState }>> {
+    const release = [...this.staleWaits]
     const arg = JSON.stringify({
       cutoff: cutoff === null ? null : await this.onBrowserClock(cutoff),
       from: from === null ? null : await this.onBrowserClock(from),
       labels,
       loading,
+      release,
     })
     const reads = await this.eachFrame(await this.readableFrames(), async (entry) => {
       const state = await this.callReader<WorldState>(entry.world, `state(${arg})`, timeoutMs, `reading the page journal state${this.inFrame(entry)}`)
       this.noteDocument(entry, state.token)
       return state
     })
-    return this.combineStates(reads, loading)
+    for (const id of release) this.staleWaits.delete(id)
+    return reads
   }
 
   /**
@@ -2772,6 +3073,7 @@ export class PageWatch {
       this.droppedSeq.network = dropped.seq
       if (this.requestsById.get(dropped.requestId) === dropped) this.requestsById.delete(dropped.requestId)
     }
+    this.settleChanged(entry)
   }
 
   /** The journaled request `requestId`, now reported by `session` — the one that holds what Chrome reports of it from here on, its body included. */
@@ -2904,6 +3206,7 @@ export class PageWatch {
     entry.download = e.suggestedFilename
     delete entry.failed
     entry.endedAt ??= arrivedAt
+    this.settleChanged(entry)
   }
 
   private onSocketFrame(session: SessionWatch, e: Protocol.Network.WebSocketFrameSentEvent, direction: WebSocketFrameRecord['direction'], arrivedAt: number): void {
@@ -2952,6 +3255,7 @@ export class PageWatch {
     if (session.rootFrame === null && frameId === this.frames.mainFrameId()) {
       session.contexts.set(e.context.id, Promise.resolve({}))
       void this.installJournals([this.frames.main]).catch((error) => this.reportBackgroundError('installing the page journal', error))
+      this.settleChanged(null)
       return
     }
     // A frame Playwright does not know yet is identified from the context itself when it logs.
@@ -3179,22 +3483,16 @@ export class PageWatch {
 
   /** `entry` was answered or ended: what awaits it goes on. */
   private answered(entry: RequestEntry): void {
+    this.settleChanged(entry)
     const waiter = this.answerWaiters.get(entry)
     if (!waiter) return
     this.answerWaiters.delete(entry)
     waiter.resolve()
   }
 
-  private async pause(ms: number): Promise<void> {
-    const woken = Promise.withResolvers<void>()
-    this.wakers.add(woken.resolve)
-    const timer = setTimeout(woken.resolve, ms)
-    try {
-      await woken.promise
-    } finally {
-      clearTimeout(timer)
-      this.wakers.delete(woken.resolve)
-    }
+  /** Tell the human-pace settle waits of `request` journaled, answered or ended, or (null) of a document change. */
+  private settleChanged(request: RequestEntry | null): void {
+    for (const notify of [...this.settleWaiters]) notify(request)
   }
 
   private wake(): void {

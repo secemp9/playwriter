@@ -1,6 +1,6 @@
 import { startPlayWriterCDPRelayServer } from './cdp-relay.js'
 import { createFileLogger } from './create-logger.js'
-import { RELAY_PORT, waitForRelayVersion } from './relay-client.js'
+import { RELAY_PORT, getRelayServerVersion, type RelayDaemonMessage } from './relay-client.js'
 import { LOG_CDP_FILE_PATH } from './utils.js'
 
 process.title = 'playwriter-ws-server'
@@ -18,6 +18,28 @@ async function exitAfterLog(code: number, ...line: unknown[]): Promise<never> {
     await logger.flush()
   } finally {
     process.exit(code)
+  }
+}
+
+/**
+ * Tells the process that spawned this daemon (relay-client's ensureRelayServer, over the spawn's
+ * 'ipc' channel) that a relay answers on the port, then closes the channel: the daemon outlives that
+ * process. Started any other way, there is no channel and nothing to tell.
+ */
+async function tellSpawner(message: RelayDaemonMessage): Promise<void> {
+  if (!process.send || !process.connected) {
+    return
+  }
+  const sent = Promise.withResolvers<void>()
+  process.send(message, undefined, undefined, (error: Error | null) => {
+    if (error) {
+      void logger.log('Could not tell the process that started this relay that it is ready:', error)
+    }
+    sent.resolve()
+  })
+  await sent.promise
+  if (process.connected) {
+    process.disconnect()
   }
 }
 
@@ -43,16 +65,18 @@ export async function startServer({
     // instead of crashing with a scary error in the logs.
     const errWithCode = err as NodeJS.ErrnoException
     if (errWithCode?.code === 'EADDRINUSE') {
-      // The winner may have bound the port but not be ready to answer /version
-      // yet, so poll for up to 2 seconds before giving up.
-      const version = await waitForRelayVersion({ port })
+      // The winner listens already (Node binds and listens in one step), so this one request waits in
+      // its accept backlog until it serves HTTP (getRelayServerVersion).
+      const version = await getRelayServerVersion(port)
       if (version) {
+        await tellSpawner({ otherRelay: version })
         return exitAfterLog(0, `Another relay (v${version}) already bound to port ${port}, exiting gracefully`)
       }
       return exitAfterLog(1, `Port ${port} is in use by a non-relay process`)
     }
     throw err
   }
+  await tellSpawner({ listening: port })
 
   console.log('CDP Relay Server running. Press Ctrl+C to stop.')
   console.log('Logs are being written to:', logger.logFilePath)

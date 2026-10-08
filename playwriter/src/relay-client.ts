@@ -4,12 +4,15 @@
  */
 
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import pc from 'picocolors'
 import { getListeningPidsForPort, killPortProcess } from './kill-port.js'
-import { VERSION, sleep, LOG_FILE_PATH } from './utils.js'
+import { STATUS_WAIT_MAX_MS } from './relay-state.js'
+import { VERSION, LOG_FILE_PATH } from './utils.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -29,9 +32,26 @@ export type ExtensionStatus = {
   newerBuild: string | null
 }
 
+/**
+ * What the relay daemon (start-relay-server.ts) tells the process that spawned it, over the spawn's
+ * 'ipc' channel, before it closes that channel: it listens on port `listening`, or another relay, of
+ * version `otherRelay`, already answers on the port it was to take.
+ */
+export type RelayDaemonMessage = { listening: number } | { otherRelay: string }
+
+/**
+ * The version of the relay on `port`, or null when none answers. A relay that listens but has not
+ * served HTTP yet (still starting, or its event loop busy) needs no retry: the kernel holds the
+ * request in the listener's accept backlog and the relay answers it when it gets to it (measured,
+ * Linux 6.8 / Node 22: a request sent 5 ms after listen() to a server then blocked for 1500 ms was
+ * answered 200 after 1530 ms). Nothing listening refuses at once (ECONNREFUSED in 0.15 ms, also when
+ * the port is bound without listen()), and only a new attempt can tell when that changes; but Node
+ * binds and listens in one step, so a Node relay is never seen bound and not yet listening.
+ */
 export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<string | null> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/version`, {
+      // The cap (a): the relay's answer settles the request first; 2 s bounds one that never answers.
       signal: AbortSignal.timeout(2000),
     })
     if (!response.ok) {
@@ -44,36 +64,12 @@ export async function getRelayServerVersion(port: number = RELAY_PORT): Promise<
   }
 }
 
-/**
- * Poll /version until a relay responds or timeout expires.
- * Used during startup races where a relay may have bound the port
- * but isn't serving HTTP yet (issue #75).
- */
-export async function waitForRelayVersion({
-  port = RELAY_PORT,
-  timeoutMs = 2000,
-  intervalMs = 200,
-}: {
-  port?: number
-  timeoutMs?: number
-  intervalMs?: number
-} = {}): Promise<string | null> {
-  const end = Date.now() + timeoutMs
-  while (Date.now() < end) {
-    const version = await getRelayServerVersion(port)
-    if (version) {
-      return version
-    }
-    await sleep(intervalMs)
-  }
-  return null
-}
-
 export async function getExtensionStatus(
   port: number = RELAY_PORT,
 ): Promise<{ connected: boolean; activeTargets: number; playwriterVersion: string | null } | null> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/extension/status`, {
+      // The cap (a): the relay answers this from memory at once; 500 ms bounds a relay that does not.
       signal: AbortSignal.timeout(500),
     })
     if (!response.ok) {
@@ -85,13 +81,25 @@ export async function getExtensionStatus(
   }
 }
 
-export async function getExtensionsStatus(port: number = RELAY_PORT): Promise<ExtensionStatus[]> {
+/**
+ * The extensions connected to the relay on `port`. With `untilConnectedMs`, the relay holds its
+ * answer until one is connected or that many ms have passed (its `?until=connected` long-poll); a
+ * relay from before the long-poll answers at once.
+ */
+export async function getExtensionsStatus(
+  port: number = RELAY_PORT,
+  { untilConnectedMs }: { untilConnectedMs?: number } = {},
+): Promise<ExtensionStatus[]> {
+  const query = untilConnectedMs === undefined ? '' : `?until=connected&waitMs=${untilConnectedMs}`
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/extensions/status`, {
-      signal: AbortSignal.timeout(2000),
+    const response = await fetch(`http://127.0.0.1:${port}/extensions/status${query}`, {
+      // The cap (a): the relay answers by `untilConnectedMs` itself; the 2 s on top bound a relay that
+      // never answers, as for a plain status read.
+      signal: AbortSignal.timeout((untilConnectedMs ?? 0) + 2000),
     })
     if (!response.ok) {
       const fallback = await fetch(`http://127.0.0.1:${port}/extension/status`, {
+        // The cap (a), as above.
         signal: AbortSignal.timeout(2000),
       })
       if (!fallback.ok) {
@@ -136,51 +144,74 @@ export async function getExtensionsStatus(port: number = RELAY_PORT): Promise<Ex
 }
 
 /**
- * Wait for at least one extension to appear in extensions status.
- * Returns connected extension entries, or [] on timeout.
+ * Waits for at least one extension to be connected to the relay: one request, which the relay answers
+ * as soon as an extension connects (its `?until=connected` long-poll, woken by its own state) or at
+ * `timeoutMs`. Returns the connected extensions, or [] when none connected in time.
  */
 export async function waitForConnectedExtensions(
   options: {
     port?: number
     timeoutMs?: number
-    pollIntervalMs?: number
-    logger?: { log: (...args: any[]) => void }
+    logger?: { log: (...args: unknown[]) => void }
   } = {},
 ): Promise<ExtensionStatus[]> {
-  const { port = RELAY_PORT, timeoutMs = 5000, pollIntervalMs = 200, logger } = options
-  const startTime = Date.now()
+  const { port = RELAY_PORT, timeoutMs = 5000, logger } = options
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > STATUS_WAIT_MAX_MS) {
+    throw new RangeError(
+      `waitForConnectedExtensions: timeoutMs must be a whole number of milliseconds from 0 to ${STATUS_WAIT_MAX_MS}, the relay's longest wait; got ${timeoutMs}`,
+    )
+  }
 
   logger?.log(pc.dim('Waiting for extension to connect...'))
 
-  while (Date.now() - startTime < timeoutMs) {
-    const extensions = await getExtensionsStatus(port)
-    if (extensions.length > 0) {
-      logger?.log(pc.green('Extension connected'))
-      return extensions
-    }
-    await sleep(pollIntervalMs)
+  const extensions = await getExtensionsStatus(port, { untilConnectedMs: timeoutMs })
+  if (extensions.length > 0) {
+    logger?.log(pc.green('Extension connected'))
+    return extensions
   }
 
   logger?.log(pc.yellow('Extension did not connect within timeout'))
   return []
 }
 
+/**
+ * Kills the relay on `port` and returns once its port is free. A connection to the relay, opened
+ * before the kill, is closed by the kernel when the relay's process dies, so its `close` is the
+ * signal; one listener check after it confirms nothing listens there any more.
+ */
 async function killRelayServer(options: { port: number; waitForFreeMs?: number }): Promise<void> {
   const { port, waitForFreeMs = 3000 } = options
 
+  // The cap (a) of the whole stop, the one timer: the relay's connection closing answers first.
+  const deadline = AbortSignal.timeout(waitForFreeMs)
+  const watch = new net.Socket({ signal: deadline })
+  // Refused (nothing listens), reset by the dying relay, or the cap: told apart below, by `connected`
+  // and `deadline.aborted`.
+  watch.on('error', () => {})
+  const closed = Promise.withResolvers<void>()
+  const opened = Promise.withResolvers<boolean>()
+  watch.once('connect', () => opened.resolve(true))
+  watch.once('close', () => {
+    opened.resolve(false)
+    closed.resolve()
+  })
+  watch.connect(port, '127.0.0.1')
+  const connected = await opened.promise
+
   try {
     await killPortProcess({ port })
-  } catch {
-    return
+  } catch (error) {
+    watch.destroy()
+    throw new Error(`Could not kill the relay on port ${port}`, { cause: error })
   }
 
-  const startTime = Date.now()
-  while (Date.now() - startTime < waitForFreeMs) {
-    const pids = await getListeningPidsForPort({ port }).catch(() => [])
-    if (pids.length === 0) {
-      return
-    }
-    await sleep(100)
+  if (connected) {
+    await closed.promise
+  }
+  const pids = await getListeningPidsForPort({ port })
+  if (pids.length > 0) {
+    const waited = connected && deadline.aborted ? `; its connection was still open after ${waitForFreeMs}ms` : ''
+    throw new Error(`Killed the relay on port ${port}, but pid(s) ${pids.join(', ')} still listen there${waited}`)
   }
 }
 
@@ -316,10 +347,10 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
   } else {
     const listeningPids = await getListeningPidsForPort({ port: RELAY_PORT }).catch(() => [])
     if (listeningPids.length > 0) {
-      // Something is on the port but /version didn't respond. It might be a
-      // relay that's still starting (race with another CLI/MCP instance).
-      // Poll /version briefly before deciding to kill it (issue #75).
-      const foundVersion = await waitForRelayVersion({ port: RELAY_PORT })
+      // Something listens on the port but /version didn't answer: it might be a relay that is still
+      // starting (race with another CLI/MCP instance, issue #75). It listens, so this one request
+      // waits in its accept backlog until it serves HTTP (getRelayServerVersion).
+      const foundVersion = await getRelayServerVersion(RELAY_PORT)
       if (foundVersion) {
         // A relay came up while we waited; use it
         if (foundVersion === VERSION || compareVersions(foundVersion, VERSION) > 0) {
@@ -371,28 +402,86 @@ async function ensureRelayServerImpl(options: EnsureRelayServerOptions = {}): Pr
   delete daemonEnv.CLAUDECODE
   Object.assign(daemonEnv, additionalEnv)
 
-  const serverProcess = spawn(isRunningFromSource ? 'tsx' : process.execPath, [scriptPath], {
+  const logFilePath = additionalEnv?.PLAYWRITER_LOG_FILE_PATH || LOG_FILE_PATH
+  // From source the daemon is this Node with tsx's loader, not the `tsx` CLI: the CLI runs the script in a
+  // child of its own, a second process that lives as long as the daemon and keeps the 'ipc' channel open
+  // after the daemon has closed its end. Measured (tsx 4.20.6, Node 22.22.3): the ready message came
+  // 429–498 ms after spawn this way, 588–606 ms through the CLI. The loader is resolved from this file,
+  // not from the daemon's cwd (the home folder), where tsx is not installed.
+  const sourceArgs = (): string[] => {
+    let loader: string
+    try {
+      loader = createRequire(__filename).resolve('tsx')
+    } catch (error) {
+      throw new Error(`Cannot start the CDP relay server from source: tsx is not installed next to ${__filename}`, { cause: error })
+    }
+    return ['--import', pathToFileURL(loader).href, scriptPath]
+  }
+  const command = process.execPath
+  const args = isRunningFromSource ? sourceArgs() : [scriptPath]
+  // Its output goes to its log file; the 'ipc' channel carries the one message it sends once it
+  // listens (RelayDaemonMessage), then the daemon closes it.
+  const serverProcess = spawn(command, args, {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     cwd: os.homedir(),
     env: daemonEnv,
   })
 
-  serverProcess.unref()
-
-  const startTimeoutMs = 5000
-  const startTime = Date.now()
-
-  while (Date.now() - startTime < startTimeoutMs) {
-    await sleep(200)
-    const newVersion = await getRelayServerVersion(RELAY_PORT)
-    if (newVersion) {
-      logger?.log(pc.green('CDP relay server started successfully'))
-      await sleep(1000)
-      return true
+  const ready = Promise.withResolvers<RelayDaemonMessage>()
+  const onMessage = (message: unknown) => {
+    if (typeof message !== 'object' || message === null) {
+      return
+    }
+    if ('listening' in message && typeof message.listening === 'number') {
+      ready.resolve({ listening: message.listening })
+    } else if ('otherRelay' in message && typeof message.otherRelay === 'string') {
+      ready.resolve({ otherRelay: message.otherRelay })
     }
   }
+  // 'close', not 'exit': it comes after the IPC channel has delivered everything the daemon sent.
+  const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+    const how = signal ? `was killed by ${signal}` : `exited with code ${code}`
+    ready.reject(new Error(`The CDP relay server ${how} before it listened on port ${RELAY_PORT}. Check logs at: ${logFilePath}`))
+  }
+  const onError = (error: Error) => {
+    ready.reject(new Error(`Could not start the CDP relay server (${command} ${args.join(' ')}): ${error.message}`, { cause: error }))
+  }
+  serverProcess.on('message', onMessage)
+  serverProcess.once('close', onClose)
+  serverProcess.once('error', onError)
+  const startTimeoutMs = 5000
+  // The cap (a): the daemon's message, or its exit, answers first; 5 s bounds one that does neither.
+  const cap = setTimeout(() => {
+    ready.reject(
+      new Error(`The CDP relay server neither listened nor exited within ${startTimeoutMs}ms. Check logs at: ${logFilePath}`),
+    )
+  }, startTimeoutMs)
 
-  const waitedMs = Date.now() - startTime
-  throw new Error(`Failed to start CDP relay server within ${waitedMs}ms. Check logs at: ${LOG_FILE_PATH}`)
+  let started: RelayDaemonMessage
+  try {
+    started = await ready.promise
+  } finally {
+    clearTimeout(cap)
+    serverProcess.off('message', onMessage)
+    serverProcess.off('close', onClose)
+    serverProcess.off('error', onError)
+    // The daemon outlives this process: nothing of it may keep this one running.
+    if (serverProcess.connected) {
+      serverProcess.disconnect()
+    }
+    serverProcess.unref()
+  }
+  logger?.log(
+    'listening' in started
+      ? pc.green('CDP relay server started successfully')
+      : pc.green(`CDP relay server v${started.otherRelay} started by another process answers on port ${RELAY_PORT}`),
+  )
+
+  // What this start used to sleep 1 s for (commit 2decaf6, "waiting for extension to connect"): an
+  // extension connecting. The relay's long-poll answers as soon as one does; the cap (a) is that same
+  // 1 s, so a start never takes longer than it did. An extension retries every 3 s
+  // (extension/src/background.ts maintainLoop), so callers that need one wait longer themselves.
+  await getExtensionsStatus(RELAY_PORT, { untilConnectedMs: 1000 })
+  return true
 }

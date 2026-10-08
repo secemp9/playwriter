@@ -22,7 +22,7 @@ function globalsFor(policy: PolicyMode): StorageGlobals {
     currentPage: (): Page => {
       throw new Error('the page was reached: the call should have stopped before it')
     },
-    probes: new PageProbes({ logger: { error: () => {} } }),
+    probes: new PageProbes({ logger: { error: () => {} }, busyPace: () => 'human' }),
     fs: new ScopedFS(),
     browser: () => null,
     viaExtension: false,

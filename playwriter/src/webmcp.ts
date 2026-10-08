@@ -515,7 +515,7 @@ export function createWebMcpApi(deps: WebMcpDeps): WebMcpApi {
   async function busyGuard(probe: ActProbe, whileBusy: boolean | undefined): Promise<void> {
     if (deps.mode === 'debug' || whileBusy) return
     const last = [...probe.history].reverse().find((record) => record.dispatched)
-    const signals = await probe.watch.busySignals({ since: last?.checkpoint })
+    const signals = await probe.watch.busySignals({ since: last?.checkpoint, pace: deps.mode === 'fast' ? 'fast' : 'human' })
     const busy = signals.filter((signal) => signal.strength === 'strong' && BLOCKING_BUSY_KINDS.has(signal.kind))
     if (busy.length === 0) return
     throw new ActError(

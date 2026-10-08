@@ -173,6 +173,12 @@ export function inputStamp(label: string, atMs: number): StampedInput {
   return { kind: 'key', label, atMs, adjustments: [] }
 }
 
+/**
+ * Until the page has produced a frame with its current DOM: the second requestAnimationFrame callback
+ * runs once the frame the first one preceded has been produced.
+ */
+const NEXT_FRAME = '() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())))'
+
 /** Capture `count` JPEG frames of a scene, applying its `mutate` before each. */
 export async function captureSceneFrames(
   browser: Browser,
@@ -190,19 +196,19 @@ export async function captureSceneFrames(
     for (let i = 0; i < count; i++) {
       const script = scene.mutate?.(i)
       if (script) await page.evaluate(script)
-      // A short settle so the mutation is actually painted before it is captured.
-      await new Promise((r) => setTimeout(r, 40))
+      // The mutation is painted before it is captured: a frame has been produced since it.
+      await page.evaluate(NEXT_FRAME)
       // `Page.captureScreenshot` intermittently answers "Unable to capture screenshot" when
       // the compositor has no frame ready yet — observed once in ~250 captures here. It is
-      // a property of the harness, not of anything under test, so it is retried rather than
-      // allowed to look like a visual regression.
+      // a property of the harness, not of anything under test, so it is retried, once the page has
+      // produced its next frame, rather than allowed to look like a visual regression.
       let shot: { data: string } | undefined
       for (let attempt = 0; attempt < 4 && !shot; attempt++) {
         try {
           shot = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 })
         } catch (err) {
           if (attempt === 3) throw err
-          await new Promise((r) => setTimeout(r, 150))
+          await page.evaluate(NEXT_FRAME)
         }
       }
       out.push(Buffer.from(shot!.data, 'base64'))

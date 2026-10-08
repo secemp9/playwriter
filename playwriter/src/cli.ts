@@ -76,7 +76,6 @@ cli
 
         const connectedExtensions = await waitForConnectedExtensions({
           timeoutMs: 15000,
-          pollIntervalMs: 250,
           logger: console,
         })
 
@@ -193,11 +192,13 @@ async function fetchExtensionsStatus({ host, token }: { host?: string; token?: s
     const serverUrl = await getServerUrl(host)
     const headers = buildAuthHeaders({ token })
     const response = await fetch(`${serverUrl}/extensions/status`, {
+      // The cap (a): the relay's answer settles the request first; 2 s bounds one that never answers.
       signal: AbortSignal.timeout(2000),
       headers,
     })
     if (!response.ok) {
       const fallback = await fetch(`${serverUrl}/extension/status`, {
+        // The cap (a), as above.
         signal: AbortSignal.timeout(2000),
         headers,
       })
@@ -264,7 +265,6 @@ async function executeCode(options: {
       const connectedExtensions = await waitForConnectedExtensions({
         logger: console,
         timeoutMs: 10000,
-        pollIntervalMs: 250,
       })
       if (connectedExtensions.length === 0) {
         console.error('Warning: Extension not connected. Commands may fail.')
@@ -549,7 +549,6 @@ cli
       await ensureRelayServer({ logger: console })
       extensions = await waitForConnectedExtensions({
         timeoutMs: 12000,
-        pollIntervalMs: 250,
         logger: console,
       })
 
@@ -557,7 +556,6 @@ cli
         console.log(pc.dim('Waiting briefly for extension to reconnect...'))
         extensions = await waitForConnectedExtensions({
           timeoutMs: 10000,
-          pollIntervalMs: 250,
           logger: console,
         })
       }
@@ -1134,6 +1132,7 @@ cli
     try {
       const response = await fetch(`${serverUrl}/cli/sessions`, {
         headers: buildAuthHeaders({ token: options.token }),
+        // The cap (a): the relay's answer settles the request first; 2 s bounds one that never answers.
         signal: AbortSignal.timeout(2000),
       })
       if (!response.ok) {
@@ -1410,7 +1409,7 @@ cli
 
     const [extensions, directInstances] = await Promise.all([
       isLocal
-        ? waitForConnectedExtensions({ timeoutMs: 2000, pollIntervalMs: 200, logger: console })
+        ? waitForConnectedExtensions({ timeoutMs: 2000, logger: console })
         : fetchExtensionsStatus({ host: options.host, token: options.token }),
       isLocal ? discoverChromeInstances() : Promise.resolve([] as DiscoveredInstance[]),
     ])
@@ -1504,7 +1503,12 @@ cli
       const deadline = Date.now() + expiresIn * 1000
 
       while (Date.now() < deadline) {
-        await new Promise((r) => { setTimeout(r, pollInterval) })
+        // Polling (d), no state signal exists: RFC 8628 §3.4–3.5 has the device client poll the token
+        // endpoint, waiting the server's `interval` (default 5 s) between requests; approval in the
+        // browser is pushed to nobody.
+        const interval = Promise.withResolvers<void>()
+        setTimeout(interval.resolve, pollInterval)
+        await interval.promise
         const { data: tokenData, error: pollError } = await client.device.token({
           grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
           device_code: deviceCode,

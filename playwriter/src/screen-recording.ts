@@ -316,7 +316,10 @@ export function createRecordingApi(options: CreateRecordingApiOptions): {
     return outputPath
   }
 
-  /** Stop on its own after maxDurationMs (default 15 min) so a forgotten recording cannot fill the disk; 0 or Infinity disables it. */
+  /**
+   * A duration that is the feature (e): stop on its own after maxDurationMs (default 15 min) so a forgotten
+   * recording cannot fill the disk; 0 or Infinity disables it.
+   */
   const scheduleAutoStop = (maxMs: number, opts: StartRecordingWithDefaultsOptions | undefined): void => {
     if (maxMs > 0 && maxMs < Infinity) {
       maxDurationTimer = setTimeout(() => {

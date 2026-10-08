@@ -177,9 +177,12 @@ export class PageProbes {
    * are not throttled (measured, tab-visibility.ts), so there is nothing to tell.
    */
   private readonly readTabVisibility: ((targetId: string) => Promise<TabVisibility>) | undefined
+  /** The session's pace now (its mode can change at `browser use`/`new`): busy reads in fast mode count content changes from the last settle (page-watch BusyOptions). */
+  private readonly busyPace: () => 'human' | 'fast'
 
-  constructor(options: { logger: ProbeLogger; readTabVisibility?: (targetId: string) => Promise<TabVisibility> }) {
+  constructor(options: { logger: ProbeLogger; busyPace: () => 'human' | 'fast'; readTabVisibility?: (targetId: string) => Promise<TabVisibility> }) {
     this.logger = options.logger
+    this.busyPace = options.busyPace
     this.readTabVisibility = options.readTabVisibility
   }
 
@@ -388,7 +391,7 @@ export class PageProbes {
       known ??
       (probe.dialogs.current()?.handling === 'agent'
         ? null
-        : await probe.watch.readBusy(since ? { since } : {}).catch((error: unknown) => {
+        : await probe.watch.readBusy(since ? { since, pace: this.busyPace() } : { pace: this.busyPace() }).catch((error: unknown) => {
             if (probe.dialogs.current()) return null
             throw error
           }))

@@ -531,6 +531,7 @@ export async function startPlayWriterCDPRelayServer({
     const fence: OrderingFence = {
       waitingFor,
       queued: [],
+      // The cap (a) of this wait; the answers to `waitingFor` release it first (ORDERING_FENCE_TIMEOUT_MS).
       timer: setTimeout(() => {
         logger?.log(
           pc.yellow(
@@ -580,6 +581,10 @@ export async function startPlayWriterCDPRelayServer({
       clearInterval(ext.pingInterval)
     }
 
+    // Keepalive (d), no state signal to wait on: the extension's MV3 service worker is stopped after
+    // 30 s without an event, and a WebSocket message it receives resets that idle timer (Chrome 116+,
+    // developer.chrome.com/docs/extensions/how-to/web-platform/websockets). An idle relay sends nothing
+    // else, so it pings every 5 s, well inside the 30 s.
     const pingInterval = setInterval(() => {
       const latestExt = store.getState().extensions.get(extensionId)
       latestExt?.ws?.send(JSON.stringify({ method: 'ping' }))
@@ -847,6 +852,7 @@ export async function startPlayWriterCDPRelayServer({
     }
 
     return new Promise((resolve, reject) => {
+      // The cap (a) of this request: the extension's answer, matched by id, settles it first.
       const timeoutId = setTimeout(() => {
         store.setState((s) =>
           relayState.removeExtensionPendingRequest(s, {
@@ -1386,6 +1392,7 @@ export async function startPlayWriterCDPRelayServer({
               }
             }
           }
+          // The cap (a) of this wait; the main-frame executionContextCreated event above answers first.
           const timeout = setTimeout(() => {
             emitter.off('cdp:event', handler)
             logger?.log(
@@ -1543,7 +1550,47 @@ export async function startPlayWriterCDPRelayServer({
     return c.json({ version: VERSION })
   })
 
-  app.get('/extension/status', (c) => {
+  /** Aborted by close(): a status long-poll still waiting answers then, with the state as it is. */
+  const closing = new AbortController()
+
+  /**
+   * The long-poll of a status route: `?until=<condition>&waitMs=N` holds the answer until the
+   * condition holds (answering at once when it already does) or N ms (0–STATUS_WAIT_MAX_MS) have
+   * passed, then answers the same JSON with HTTP 200 either way. Without `until` the route answers
+   * at once, as it always has. Woken by the relay store's subscription (untilRelayState), not a poll.
+   * Returns why the query is malformed, for a 400.
+   */
+  async function waitForStatus(
+    c: { req: { query: (name: string) => string | undefined; raw: Request } },
+    condition: 'connected' | 'free',
+    holds: (state: relayState.RelayState) => boolean,
+  ): Promise<string | null> {
+    const until = c.req.query('until')
+    const waitMsText = c.req.query('waitMs')
+    if (until === undefined) {
+      return waitMsText === undefined ? null : `waitMs needs until=${condition}`
+    }
+    if (until !== condition) {
+      return `until must be "${condition}" on this route, got "${until}"`
+    }
+    const waitMs = Number(waitMsText)
+    if (!waitMsText || !Number.isInteger(waitMs) || waitMs < 0 || waitMs > relayState.STATUS_WAIT_MAX_MS) {
+      return `waitMs must be a whole number of milliseconds from 0 to ${relayState.STATUS_WAIT_MAX_MS}, got ${waitMsText ?? 'none'}`
+    }
+    await relayState.untilRelayState(store, holds, {
+      waitMs,
+      // A client that went away, or the relay closing, ends the wait.
+      signal: AbortSignal.any([c.req.raw.signal, closing.signal]),
+    })
+    return null
+  }
+
+  /** `?until=free&waitMs=N`: answers as soon as `connected` is false, the slot an extension told 'Extension Already In Use' waits for. */
+  app.get('/extension/status', async (c) => {
+    const malformed = await waitForStatus(c, 'free', (state) => state.extensions.size === 0)
+    if (malformed) {
+      return c.json({ error: malformed }, 400)
+    }
     const defaultExtension = getExtensionConnection(null, { allowFallback: true })
     const connected = store.getState().extensions.size > 0
     const activeTargets = defaultExtension?.connectedTargets.size || 0
@@ -1558,7 +1605,12 @@ export async function startPlayWriterCDPRelayServer({
     })
   })
 
-  app.get('/extensions/status', (c) => {
+  /** `?until=connected&waitMs=N`: answers as soon as at least one extension is connected. */
+  app.get('/extensions/status', async (c) => {
+    const malformed = await waitForStatus(c, 'connected', (state) => state.extensions.size > 0)
+    if (malformed) {
+      return c.json({ error: malformed }, 400)
+    }
     const extensions = Array.from(store.getState().extensions.values()).map((ext) => {
       return {
         extensionId: ext.id,
@@ -3355,6 +3407,9 @@ export async function startPlayWriterCDPRelayServer({
     }
   }
 
+  // TTL eviction (d), no state signal to wait on: idleness is the absence of events, and a cloud VM's
+  // hard timeout (timeoutAt) is a wall-clock time, so a sweep reads both, once a minute against a
+  // 10-minute TTL (CLOUD_IDLE_TIMEOUT_MS).
   // Synchronous: nothing in it is awaited, and a callback that returned a promise would leave a throw
   // (a malformed cloud URL) as a rejection nobody handles.
   const cloudIdleInterval = setInterval(() => {
@@ -3439,6 +3494,7 @@ export async function startPlayWriterCDPRelayServer({
       // up to its first `await` synchronously, so a caller that ignores the returned promise
       // still gets sockets closed, timers cleared and the port unbound before close() returns.
       // Keep the single await LAST.
+      closing.abort()
       const { extensions, playwrightClients } = store.getState()
 
       for (const client of playwrightClients.values()) {

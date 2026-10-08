@@ -51,7 +51,7 @@ import { dialogAnswerText, dialogLabel, type BeforeUnloadPolicy, type DialogCont
 import { chooserOpener, describeOpener, type ChooserWindow, type FileChooserGate, type FileChooserRecord } from './file-chooser-gate.js'
 import type { HumanMouseApi, HumanMoveResult } from './human-mouse-driver.js'
 import { minimumJerkPosition } from './human-mouse.js'
-import { isTouchPage, swipeFor, swipeSamples, tap, touchStroke } from './touch-input.js'
+import { isTouchPage, swipeFor, swipeSamples, tap, touchStroke, type TouchTiming } from './touch-input.js'
 import { axStatesFromNode, type AxStates } from './ax-states.js'
 import { isSecretField } from './aria-snapshot.js'
 import { colourChooserNotOpened, type TabVisibility } from './tab-state.js'
@@ -1497,6 +1497,11 @@ export function createActApi(deps: ActDeps): ActApi {
     await sleep(randomBetween(min, max))
   }
 
+  /** How a finger touches in this mode (touch-input.ts TouchTiming): a person's timing, or at once with its times stamped. */
+  function touchTiming(onPress?: (stage: 'sent' | 'acknowledged') => void): TouchTiming {
+    return fast ? { pace: 'fast', ...(onPress ? { onPress } : {}) } : { pace: 'human', sleep, ...(onPress ? { onPress } : {}) }
+  }
+
   /**
    * Arm the scroll watch (SCROLL_WATCH_ARM_JS) in `world` before a wheel or swipe; the function it
    * returns waits, after the input, until the scroll it started ended or none started
@@ -1742,7 +1747,7 @@ export function createActApi(deps: ActDeps): ActApi {
     const screen = step.page.viewportSize() ?? (await visibleArea(step.probe, step.probe.frames.mainFrameId()))
     const { dx } = swipeFor(at, 'x', scrollX, screen, Math.min(limit, screen.width * 0.6))
     const { dy } = swipeFor(at, 'y', scrollY, screen, Math.min(limit, screen.height * 0.6))
-    await untilDialog(step.probe, touchStroke(step.probe.cdp, step.page, swipeSamples(at, dx, dy), randomBetween(100, 160), { sleep }), step.record)
+    await untilDialog(step.probe, touchStroke(step.probe.cdp, step.page, swipeSamples(at, dx, dy), randomBetween(100, 160), touchTiming()), step.record)
   }
 
   /** Nothing of `target` a person could point at is inside `viewport`: its box (or the point `offset` of it), else null. */
@@ -2064,7 +2069,7 @@ export function createActApi(deps: ActDeps): ActApi {
       }
     }
     if (deps.mode !== 'debug' && BUSY_GUARDED_KINDS[kind] && !options.whileBusy) {
-      const read = await probe.watch.readBusy({ since: lastDispatched(probe)?.checkpoint })
+      const read = await probe.watch.readBusy({ since: lastDispatched(probe)?.checkpoint, pace: fast ? 'fast' : 'human' })
       const busy = read.signals.filter((s) => s.strength === 'strong' && BLOCKING_BUSY_KINDS.has(s.kind))
       if (busy.length > 0) {
         throw new ActError(
@@ -2458,8 +2463,9 @@ export function createActApi(deps: ActDeps): ActApi {
       if (stage === 'acknowledged' || !page.isClosed()) press.stage = stage
     }
     const touch = isTouchPage(page)
+    // Human pacing (b) in human mode — a person's hold and double-tap gap; fast mode taps at once (touchTiming).
     const clicking: Promise<HumanMoveResult | null> = touch
-      ? tap(step.probe.cdp, page, point, clickCount, { sleep, onPress }).then(() => null)
+      ? tap(step.probe.cdp, page, point, clickCount, touchTiming(onPress)).then(() => null)
       : deps.humanMouse.click({ page, x: point.x, y: point.y, button, clickCount, delayMs: fast ? 0 : Math.round(randomBetween(45, 110)), onPress })
     const input = `the ${clickCount === 2 ? `double ${touch ? 'tap' : 'click'}` : touch ? 'tap' : 'click'}${record.hit ? ` on ${record.hit}` : ''}`
     const isAction = record.kind === 'click' || record.kind === 'dblclick'
@@ -2608,7 +2614,7 @@ export function createActApi(deps: ActDeps): ActApi {
       if (index > 0) travelled += Math.hypot(sample.x - samples[index - 1].x, sample.y - samples[index - 1].y)
     })
     try {
-      await untilDialog(probe, touchStroke(probe.cdp, page, samples, randomBetween(80, 160), { sleep }), record)
+      await untilDialog(probe, touchStroke(probe.cdp, page, samples, randomBetween(80, 160), touchTiming()), record)
     } catch (error) {
       if (!(await closesSoon(page))) throw error
       await closedByOwnInput(step, 'the touch drag', true, 'Chrome did not confirm all of the stroke (the touch, the slide and the lift)')
@@ -3454,6 +3460,7 @@ export function createActApi(deps: ActDeps): ActApi {
           await page.keyboard.insertText(typed)
           record.notes.push(`inserted ${typed.length} characters as IME text (no paste event)`)
         } else {
+          // Human pacing (b): keys at a person's pace (typeHuman's pauses); none in fast mode.
           await typeLines(page, text, options.newline)
           if (lineBreaks > 0) record.notes.push(`typed ${lineBreaks} line break${lineBreaks === 1 ? '' : 's'} as ${options.newline}`)
           if (typedSecret) record.notes.push('typed a secret (masked in this report)')
@@ -4245,6 +4252,7 @@ export function createActApi(deps: ActDeps): ActApi {
               const startedAt = Date.now()
               for (const sample of samples) {
                 checkAbort()
+                // Human pacing (b): the trajectory replayed on its own clock. Fast mode's samples all have tMs 0, so it never waits.
                 const wait = startedAt + sample.tMs - Date.now()
                 if (wait > 0) await sleep(wait)
                 await send(probe.cdp, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: sample.x, y: sample.y, button: 'left', buttons: 1 }, 'moving the pointer with the button held')
@@ -4505,6 +4513,7 @@ export function createActApi(deps: ActDeps): ActApi {
         const left = Math.max(0, Math.round(remainingMs() - 3000))
         const capped = Math.min(ms, WAIT_CAP_MS, left)
         const startedAt = Date.now()
+        // A duration that is the feature (e): the caller asked to wait `ms`; act.waitForIdle() waits for the page instead.
         await sleep(capped)
         const waited = Date.now() - startedAt
         const reason = capped === ms ? null : capped === left ? `this execute() call had ${left}ms left before its timeout` : `act.wait waits at most ${WAIT_CAP_MS / 1000}s; act.waitForIdle() waits for the page`

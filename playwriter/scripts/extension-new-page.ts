@@ -7,8 +7,9 @@ async function main() {
   const contexts = browser.contexts()
   console.log(`Found ${contexts.length} browser context(s)`)
 
-  // Sleep 200 ms
-  await new Promise((resolve) => setTimeout(resolve, 200))
+  // No wait: the relay announces every page (Target.attachedToTarget) before it answers the
+  // connect's Target.setAutoAttach, and connectOverCDP resolves once those pages are initialized
+  // (playwright-core crBrowser.ts connect → _waitForAllPagesToBeInitialized).
   for (const context of contexts) {
     const pages = context.pages()
     console.log(`Context has ${pages.length} page(s):`)
@@ -18,8 +19,10 @@ async function main() {
     const sumResult = await newPage.evaluate(() => 2 + 3)
     console.log(`Evaluated sum 2 + 3 = ${sumResult}`)
 
-    // Sleep 1 second
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    // A duration that is the demo itself (e): the new tab stays up 1 s for the person watching it.
+    const shown = Promise.withResolvers<void>()
+    setTimeout(shown.resolve, 1000)
+    await shown.promise
     // Close the page
     await newPage.close()
   }

@@ -118,6 +118,8 @@
     chrome.alarms.onAlarm.addListener((a) => {
       if (a.name === ALARM) poll()
     })
+    // Kept on a timer, in dev builds only: an extension cannot watch files, so nothing tells it the
+    // folder got a new build; a running worker reads build.json every second.
     setInterval(poll, 1000)
     poll()
   } catch (err) {

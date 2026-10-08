@@ -94,6 +94,7 @@ const TEST_RELAY_PORTS: Readonly<Record<string, number>> = Object.freeze({
   'attach-race-relay.test.ts': 19866,
   'frames-journal-relay.test.ts': 19878,
   'self-reload-relay.test.ts': 19884,
+  'extension-reconnect-relay.test.ts': 19896,
 })
 
 // Invariants (1) and (2), enforced at module load so a bad edit cannot reach a test run.

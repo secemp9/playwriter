@@ -140,6 +140,7 @@ export class RelayDebuggerCuts {
         this.waiters.set(targetId, waiting)
       }
       waiting.add(wake)
+      // The cap (a): a change of this tab's cut (its waiters) wakes the wait first.
       const timer = setTimeout(wake, left)
       await changed.promise
       clearTimeout(timer)

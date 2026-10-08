@@ -1680,6 +1680,8 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
     }
     measureScreenshotScale()
     let inFlight = false
+    // The frame rate is the feature (e): this fallback recorder captures a frame every 1000/fps ms (60 ms at
+    // least); one still in flight skips the tick.
     pollTimer = setInterval(() => {
       if (stopped || inFlight || frames.length >= maxFrames) return
       inFlight = true
@@ -1854,6 +1856,7 @@ export async function startCdpScreencast(options: CdpScreencastOptions): Promise
       // Two passes, because the first frame may only arrive DURING the wait — and until
       // it does, how much of the hold the video will actually show is unknowable. The
       // second pass tops up by exactly what the first repaint turned out to cost.
+      // A duration that is the feature (e): the video shows the page held this long.
       for (let pass = 0; pass < 2; pass++) {
         const remaining = Math.max(0, Math.round(target - onScreenNow()))
         if (remaining === 0) break

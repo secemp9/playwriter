@@ -350,6 +350,7 @@ function clearIdleHideTimer(): void {
 
 function scheduleIdleHide(): void {
   clearIdleHideTimer()
+  // A duration that is the feature (e): the recorded cursor fades once the pointer has rested IDLE_HIDE_DELAY_MS.
   idleHideTimer = setTimeout(() => {
     idleHideTimer = null
     if (!runtime.enabled || !runtime.innerElement) {
