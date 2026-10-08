@@ -20,7 +20,7 @@ const executors: PlaywrightExecutor[] = []
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
-    const fixture = /^\/(act-(?:newline|drag)\.html)$/.exec(new URL(req.url ?? '/', 'http://localhost').pathname)
+    const fixture = /^\/(act-(?:newline|drag|drag-edge)\.html)$/.exec(new URL(req.url ?? '/', 'http://localhost').pathname)
     if (!fixture) {
       res.writeHead(404)
       res.end()
@@ -422,5 +422,24 @@ describe('act.drag between points of an element', () => {
     const result = await executor.execute(`await act.click(${tall})`, 60000)
     expect(result.isError, result.text).toBe(false)
     expect(result.text).toMatch(/text: "down [\d.]+ [\d.]+"/)
+  })
+})
+
+describe('act.drag whose end is below the window while its start is in view', () => {
+  it('wheels the end into view before pressing, keeps the start in view, and drags between the two points', async () => {
+    const executor = await openFixture('act-drag-edge.html')
+    const look = (await executor.execute('await observe({ all: true })', 30000)).text
+    const pad = refOf(look, /image "Edge stroke pad"/)
+    // (100, 20) of the pad is 20px above the window's bottom edge, (150, 70) 30px below it.
+    const result = await executor.execute(`await act.drag({ ref: ${pad}, x: 100, y: 20 }, { ref: ${pad}, x: 150, y: 70 })`, 60000)
+    expect(result.isError, result.text).toBe(false)
+    expect(result.text).toMatch(/for the end of the drag: scrolled with the mouse wheel to reach it/)
+    const logged = await executor.execute(`return await readPage(() => 'LOG<' + document.getElementById('log').textContent + '>')`, 30000)
+    const match = /LOG<down ([\d.]+) ([\d.]+); up ([\d.]+) ([\d.]+)>/.exec(logged.text)
+    expect(match, logged.text).not.toBeNull()
+    const [, downX, downY, upX, upY] = (match ?? []).map(Number)
+    for (const [actual, expected] of [[downX, 100], [downY, 20], [upX, 150], [upY, 70]] as const) {
+      expect(Math.abs(actual - expected), `${actual} is not within 1px of ${expected}`).toBeLessThanOrEqual(1)
+    }
   })
 })

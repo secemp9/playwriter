@@ -2139,7 +2139,7 @@ await state.page.mouse.up()
 await act.drag({ ref: 40, x: 20, y: 30 }, { ref: 40, x: 260, y: 140 })   // a stroke across canvas [40]
 ```
 
-x/y are CSS px from the top-left of the element's border box as laid out, x from 0 up to, not including, the width and y from 0 up to, not including, the height (the far edges are outside it; for a slider's maximum use `x: width - 1`); rotated, scaled and perspective-tilted elements are mapped through their transform. An offset outside that range is refused and the refusal gives the box size. Both points are hit-tested; the from-point is wheeled into view first (a point by the page edge or at the end of a list needs no scrolling), the to-point must already be visible.
+x/y are CSS px from the top-left of the element's border box as laid out, x from 0 up to, not including, the width and y from 0 up to, not including, the height (the far edges are outside it; for a slider's maximum use `x: width - 1`); rotated, scaled and perspective-tilted elements are mapped through their transform. An offset outside that range is refused and the refusal gives the box size. Both points are hit-tested. Before the press both are wheeled into view, the from-point first, then the to-point (a point by the page edge or at the end of a list needs no scrolling); two points that do not fit on the screen together are refused before anything is pressed.
 
 ```js
 // Debug mode: the raw stroke, several inputs in one call

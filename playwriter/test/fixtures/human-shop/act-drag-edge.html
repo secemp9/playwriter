@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Stroke across the bottom edge</title>
+<style>
+  body { font: 14px sans-serif; margin: 0; }
+  /* The pad starts 40px above the bottom of the window: a point 20px into it is in view, one 70px into it is below the window. */
+  #spacer { height: calc(100vh - 40px); }
+  #pad { display: block; background: #f1f5f9; }
+  #log { position: fixed; top: 0; right: 0; width: 300px; margin: 0; font: 12px monospace; background: #fff; }
+</style>
+</head>
+<body>
+  <p id="log"></p>
+  <div id="spacer"></div>
+  <canvas id="pad" width="300" height="1200" role="img" aria-label="Edge stroke pad" tabindex="0"></canvas>
+  <script>
+    const pad = document.getElementById('pad')
+    const lines = []
+    const log = (type, event) => {
+      lines.push(`${type} ${event.offsetX} ${event.offsetY}`)
+      document.getElementById('log').textContent = lines.join('; ')
+    }
+    pad.addEventListener('pointerdown', (event) => log('down', event))
+    pad.addEventListener('pointerup', (event) => log('up', event))
+  </script>
+</body>
+</html>

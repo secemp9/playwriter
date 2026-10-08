@@ -1568,6 +1568,16 @@ export function createActApi(deps: ActDeps): ActApi {
     await untilDialog(step.probe, touchStroke(step.probe.cdp, step.page, swipeSamples(at, dx, dy), randomBetween(100, 160), { sleep }), step.record)
   }
 
+  /** Nothing of `target` a person could point at is inside `viewport`: its box (or the point `offset` of it), else null. */
+  async function outOfView(probe: ActProbe, target: RefTarget, offset: Point | undefined, rects: Rect[], viewport: Rect): Promise<Rect | null> {
+    if (offset) {
+      const at = (await borderBox(probe, target)).at(offset)
+      const inside = at.x >= viewport.x && at.x < viewport.x + viewport.width && at.y >= viewport.y && at.y < viewport.y + viewport.height
+      return inside ? null : { ...at, width: 0, height: 0 }
+    }
+    return rects.some((rect) => intersectRects(rect, viewport) !== null) ? null : rects[0]
+  }
+
   /**
    * Wheel until the target is in view, the way a person does: over the scroller that clips it
    * (an outer one first when that scroller is itself off-screen), at a point the wheel really
@@ -1591,14 +1601,7 @@ export function createActApi(deps: ActDeps): ActApi {
     let idleWheels = 0
     const what = offset ? `(${offset.x}, ${offset.y}) of ${describeTarget(target)}` : describeTarget(target)
     // Nothing of the target a person could point at is inside `viewport`: its box (or the chosen point of it), else null.
-    const outOfSight = async (rects: Rect[], viewport: Rect): Promise<Rect | null> => {
-      if (offset) {
-        const at = (await borderBox(probe, target)).at(offset)
-        const inside = at.x >= viewport.x && at.x < viewport.x + viewport.width && at.y >= viewport.y && at.y < viewport.y + viewport.height
-        return inside ? null : { ...at, width: 0, height: 0 }
-      }
-      return rects.some((rect) => intersectRects(rect, viewport) !== null) ? null : rects[0]
-    }
+    const outOfSight = (rects: Rect[], viewport: Rect): Promise<Rect | null> => outOfView(probe, target, offset, rects, viewport)
     const reached = (rects: Rect[], viewport: Rect): { rects: Rect[]; viewport: Rect; notes: string[] } => {
       if (scrolled.size > 0) {
         notes.push(`scrolled with ${isTouchPage(page) ? 'finger swipes' : 'the mouse wheel'} to reach it: ${[...scrolled].map(([where, px]) => `${Math.round(px)}px in ${where}`).join(', then ')}`)
@@ -3888,6 +3891,22 @@ export function createActApi(deps: ActDeps): ActApi {
           if (path === 'straight') record.detail += ' along a straight line'
           for (const { target, offset } of [{ target: from, offset: fromEnd.offset }, { target: to, offset: toEnd.offset }]) {
             if (offset) await checkOffset(probe, target, offset, 'Nothing was dragged.')
+          }
+          // Both ends in view before the press, as a person scrolls before dragging: the start, then the end.
+          // A scroll stops as soon as its point shows, at the edge it came in from, so the end of a drag just
+          // past its start can still be out of view after the start's scroll alone (seen: the start at y 706
+          // of the viewport, the end 20 px below it, under the bottom edge).
+          if (fromEnd.offset || !from.viaLabel) record.notes.push(...(await bringIntoView(step, from, fromEnd.offset)).notes)
+          if (toEnd.offset || !to.viaLabel) {
+            const end = await bringIntoView(step, to, toEnd.offset)
+            record.notes.push(...end.notes.map((note) => `for the end of the drag: ${note}`))
+            if (end.notes.length > 0 && (await outOfView(probe, from, fromEnd.offset, await quadsOf(probe, from), await visibleArea(probe, from.frameId))) !== null) {
+              throw new ActError(
+                `Not done: the start (${fromEnd.offset ? pointIn(fromEnd.offset, from) : describeTarget(from)}) and the end (${onto}) of this drag do not ` +
+                  'fit on the screen together: scrolling to the end moved the start out of view. Nothing was dragged: a person cannot hold the button ' +
+                  'from one to the other without the page scrolling on the way, which act.drag does not do. A larger window would show both (ask the user).',
+              )
+            }
           }
           const fromPoint = await aimAt(step, from, fromEnd.offset)
           record.dispatched = true
