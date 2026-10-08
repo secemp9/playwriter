@@ -283,7 +283,7 @@ describe('an unpacked extension whose folder gets a newer build', () => {
     await page.close()
   }, 180_000)
 
-  it('lists an extension that reports no build id with the one ↻ the user has to click', async () => {
+  it('lists an extension that reports no build id as one that does not reload itself, with the ↻ for the fork’s folder', async () => {
     // An extension built before build ids, on the wire: its hello has the version and no build.
     const installId = 'before-self-reload'
     const old = new WebSocket(`ws://127.0.0.1:${TEST_PORT}/extension?browser=Chrome&installId=${installId}&v=${VERSION}`, {
@@ -297,7 +297,7 @@ describe('an unpacked extension whose folder gets a newer build', () => {
       await waitForExtension('the extension without a build id', (extension) => extension.stableKey === `install:Chrome:${installId}`)
       const list = await browserList()
       expect(list).toContain(
-        `key install:Chrome:${installId} · Chrome · extension built with playwriter ${VERSION}, before it could reload itself: ask the user to click ↻ on its card in chrome://extensions once · 0 attached tabs`,
+        `key install:Chrome:${installId} · Chrome · extension built with playwriter ${VERSION}, without a build id: it does not reload itself into new builds (built before that, or not loaded from the fork's folder, e.g. a Chrome Web Store install); if it is the fork's folder, ask the user to click ↻ on its card in chrome://extensions once · 0 attached tabs`,
       )
       expect(list).toContain(`extension built with playwriter ${VERSION}, build ${buildA} · 0 attached tabs`)
     } finally {

@@ -245,7 +245,7 @@ function describeExtension(extension: ConnectedExtension): string {
   const built = `extension built with playwriter ${extension.playwriterVersion ?? '(version not reported)'}`
   const build =
     extension.build === null
-      ? `${built}, before it could reload itself: ask the user to click ↻ on its card in chrome://extensions once`
+      ? `${built}, without a build id: it does not reload itself into new builds (built before that, or not loaded from the fork's folder, e.g. a Chrome Web Store install); if it is the fork's folder, ask the user to click ↻ on its card in chrome://extensions once`
       : !BUILD_ID.test(extension.build)
         ? `${built}, from a build that did not finish (it reloads itself into the next build written to its folder)`
         : extension.newerBuild === null
